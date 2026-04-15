@@ -29,10 +29,35 @@ from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
 class KTIRParser:
     """KTIR MLIR parser.
 
-    Parses compiler-generated KTIR including multi-line operations
-    (e.g. ktdp.construct_memory_view spanning 3-4 lines), nested
-    regions (scf.for loop bodies), and compiler-specific constant
-    syntax like {1823 : index} or {dense<0.0>}.
+    Parsing proceeds in three phases:
+
+    1. **Module-level pre-scan** — collects named attribute aliases
+       (``#name = value``) so that dialect parsers can resolve ``#name``
+       references during op parsing.
+
+    2. **Tokenization** (``_tokenize_operations``) — splits the body
+       text of a function or region into complete operation strings.
+       Multi-line ops are joined, and ``{ }`` blocks are classified
+       structurally: blocks whose content contains ``%`` SSA
+       references are extracted as **regions** (recursively parsed);
+       all others are kept as inline **attribute blocks**.
+
+    3. **Op dispatch** — each operation string is dispatched to a
+       dialect-registered parser (``register_parser`` in
+       ``dialects/registry.py``).  Unrecognised ops fall through to
+       the general-purpose parser.
+
+    To add support for a new operation, register a parser in the
+    appropriate dialect module — the tokenizer and dispatcher are
+    dialect-agnostic and should not require changes.  Specifically:
+
+    - Do **not** add operation-specific keywords to the tokenizer
+      (e.g. continuation-line prefixes).  Multi-line grouping relies
+      on type-terminal detection, blank-line boundaries, and SSA
+      assignment signals — all of which are structural.
+    - Do **not** hardcode op names for region detection.  Regions are
+      detected by the ``%`` heuristic; any ``{ }`` block that
+      contains SSA references is automatically treated as a region.
     """
 
     def parse_file(self, filepath: str) -> IRModule:
