@@ -196,7 +196,7 @@ class KTIRInterpreter:
             if handler:
                 result = handler(op, context, self._env)
             else:
-                print(f"Warning: Unknown operation {op.op_type}, skipping")
+                raise ValueError(f"Unknown operation: {op.op_type}")
 
         except Exception as e:
             print(f"Error executing {op.op_type} on core {context.core_id}: {e}")

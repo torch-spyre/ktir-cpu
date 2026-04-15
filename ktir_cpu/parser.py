@@ -250,38 +250,56 @@ class KTIRParser:
             line = lines[i]
             stripped = line.strip()
 
-            # Skip empty lines and comments
+            # A blank line (or comment) separates operations.  Flush
+            # the accumulated op if braces are balanced.
             if not stripped or stripped.startswith('//'):
-                # If we have accumulated lines for an operation, a blank line
-                # might separate it. But we should only flush if the accumulated
-                # op looks complete.
+                if current_op_lines:
+                    accumulated = ' '.join(current_op_lines)
+                    open_braces = accumulated.count('{') - accumulated.count('}')
+                    if open_braces == 0:
+                        results.append((accumulated, current_regions))
+                        current_op_lines = []
+                        current_regions = []
                 i += 1
                 continue
 
-            # Only flush when the accumulated op text has balanced braces —
-            # an open { ... } attribute block must stay on one logical op.
-            # parse_attr_block uses the same depth-counting loop internally,
-            # so we reuse it here: a balanced block means it found a closing '}'.
-            # NOTE: underlying assumption is that the KTIR is well-formed with no 
-            #       stray braces.
+            # Flush when the accumulated op is structurally complete
+            # (type annotation or void terminator) with balanced braces,
+            # OR when the incoming line is an SSA assignment (%name = )
+            # which unambiguously starts a new operation.
+            #
+            # Type-terminal flush (adjacent ops without blank line):
+            #   %c0 = arith.constant 0 : index   <- complete (: index)
+            #   %c1 = arith.constant 1 : index   <- new op
+            #
+            # SSA flush (prev op has no type terminal, e.g. dimensions=):
+            #   linalg.broadcast ... dimensions = [1]   <- no type
+            #   %next = arith.subf ...                  <- SSA triggers flush
+            #
+            # Multi-line ops stay together until complete:
+            #   %t = construct_indirect_access_tile   <- no type yet
+            #       intermediate_variables(...)        <- continuation
+            #       %view[...] { ... } : ... -> type  <- complete
             accumulated = ' '.join(current_op_lines)
             open_braces = accumulated.count('{') - accumulated.count('}')
-            # Don't flush when accumulated ends with '=' — the next line is
-            # a continuation (e.g. multi-result: %a, %b, %c =\n  scf.for ...)
-            ends_with_eq = accumulated.rstrip().endswith('=')
-            if self._is_new_operation(stripped) and current_op_lines and open_braces == 0 and not ends_with_eq:
-                # Flush the previous operation
-                results.append((accumulated, current_regions))
-                current_op_lines = []
-                current_regions = []
+            # A line starting with '->' is always a result-type
+            # continuation (e.g. `: input_types\n  -> result_type`).
+            if current_op_lines and open_braces == 0 and not stripped.startswith('->'):
+                starts_ssa = re.match(
+                    r'(?:%\w+\s*,\s*)*%\w+\s*=\s', stripped
+                )
+                if self._is_op_complete(accumulated) or starts_ssa:
+                    results.append((accumulated, current_regions))
+                    current_op_lines = []
+                    current_regions = []
 
             current_op_lines.append(stripped)
 
-            # Check if this line opens a region body (scf.for, scf.if).
-            # A region starts when a line ends with '{' and the operation
-            # is a control flow op (scf.for, scf.if).
-            # We need to find the matching '}' across subsequent lines.
-            if self._line_opens_region(stripped, current_op_lines):
+            # Check if this line opens a region body.
+            # A region { } is distinguished from an attribute { } by
+            # peeking inside: regions contain %SSA references,
+            # attribute blocks do not.
+            if self._line_opens_region(stripped, lines, i):
                 # The '{' at the end of this line opens a region.
                 # Remove the trailing '{' from the op text.
                 current_op_lines[-1] = stripped.rstrip('{').rstrip()
@@ -305,76 +323,54 @@ class KTIRParser:
 
         return results
 
-    def _is_new_operation(self, stripped_line: str) -> bool:
-        """Check if a stripped line starts a new operation.
+    # Regex matching a terminal type token at end of op text.
+    # Covers: tensor<...>, memref<...>, !ktdp.access_tile<...>,
+    #         index, i32, f16, f32, etc.
+    _TYPE_TERMINAL_RE = re.compile(
+        r'(?::\s|->)\s*.*(?:>|index|[iuf]\d+)\s*$'
+    )
 
-        A new operation starts with:
-        - %result = op_name ...
-        - op_name ...  (where op_name matches dialect.op pattern)
-        - return ...
-        - scf.for, scf.if, scf.yield
+    def _is_op_complete(self, accumulated: str) -> bool:
+        """Check whether *accumulated* op text is structurally complete.
 
-        Continuation lines start with:
-        - sizes:, strides:, base_map, access_tile_set
-        - : (type annotation on its own line)
-        - } (closing brace of attribute block)
+        An MLIR operation is complete when it has a terminal type
+        annotation (``:``, ``->``) or is a void terminator (``return``,
+        ``scf.yield``).  Ops that end without a type annotation
+        (e.g. ``linalg.reduce ... dimensions = [1]``) rely on a
+        trailing blank line to flush instead.
         """
-        # Continuation patterns: these never start a new operation
-        if stripped_line.startswith((
-            'sizes:', 'strides:', 'base_map', 'access_tile_set',
-            'ins(', 'outs(', 'dimensions', 'permutation',  # linalg ops continuation
-        )):
+        # Strip trailing inline comments
+        text = re.sub(r'//[^\n]*', '', accumulated).rstrip()
+        if not text:
             return False
-        if stripped_line.startswith('}'):
-            return False
-        # A line starting with ':' is a type continuation
-        if stripped_line.startswith(':'):
-            return False
-
-        # Check for result assignment: %name = op_type
-        # Also handles multi-result: %a, %b, %c = op_type  (or split across lines: %a, %b, %c =)
-        if re.match(r'(?:%\w+\s*,\s*)*%\w+\s*=\s*[a-z_]', stripped_line):
+        # Void terminators
+        if text == 'return' or text.startswith('return ') or text.startswith('scf.yield'):
             return True
-        if re.match(r'(?:%\w+\s*,\s*)*%\w+\s*=\s*$', stripped_line):
+        # Type annotation: `: <type>` or `-> <type>` at end
+        if self._TYPE_TERMINAL_RE.search(text):
             return True
-
-        # Infix shorthand: %result = %lhs * %rhs : index
-        if re.match(r'%\w+\s*=\s*%\w+\s*[\+\-\*]', stripped_line):
-            return True
-
-        # Check for operation without result: op_type operands
-        if re.match(r'[a-z_][a-z0-9_\.]*\s', stripped_line):
-            return True
-
-        # Stand-alone operation names like "return" or "scf.yield"
-        if re.match(r'[a-z_][a-z0-9_\.]*$', stripped_line):
-            return True
-
         return False
 
-    def _line_opens_region(self, stripped_line: str, current_op_lines: List[str]) -> bool:
-        """Check if the current line opens a region body for scf.for etc.
+    def _line_opens_region(self, stripped_line: str, lines: List[str], line_idx: int) -> bool:
+        """Check if the current line opens a region body.
 
-        A region is opened when:
-        1. The line ends with '{'
-        2. The operation is a control flow op (scf.for, scf.if)
-
-        We check the accumulated op lines to see if the operation is scf.for.
+        A region ``{`` is distinguished from an attribute block ``{``
+        structurally: attribute blocks contain ``key = value`` pairs
+        (no ``%`` SSA references), while region blocks contain
+        operations that always reference ``%`` SSA names.  We peek
+        into the ``{ }`` block and check for ``%``.
         """
         if not stripped_line.endswith('{'):
             return False
-
-        # Look through accumulated lines for the operation type
-        op_text = ' '.join(current_op_lines)
-        # scf.for opens a region
-        if 'scf.for ' in op_text or op_text.startswith('scf.for'):
-            return True
-        if 'scf.if ' in op_text or op_text.startswith('scf.if'):
-            return True
-        # linalg.generic: the region opens on the outs(...) { line, not on
-        # the first { which is the inline attribute block.
-        if 'linalg.generic' in op_text and 'outs(' in op_text:
-            return True
+        # Peek into the { } block — if any line contains %, it's a region.
+        depth = 1
+        for j in range(line_idx + 1, len(lines)):
+            inner = lines[j]
+            depth += inner.count('{') - inner.count('}')
+            if '%' in inner:
+                return True
+            if depth <= 0:
+                break
         return False
 
     def _extract_region_from_lines(self, lines: List[str], open_brace_line: int) -> Tuple[Optional[str], int]:

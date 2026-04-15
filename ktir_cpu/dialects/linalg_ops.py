@@ -31,8 +31,17 @@ def linalg__reduce(op, context, env):
     """Standard linalg.reduce — removes the reduced dimension."""
     # operands[0] is the ins tensor; the outs tensor is handled separately via outs_var
     tile = context.get_value(op.operands[0])
-    # combiner function e.g. arith.addf, arith.maxnumf
-    reduce_fn = op.attributes.get("reduce_fn", "arith.addf")
+    # combiner function e.g. arith.addf, arith.maxnumf.
+    # When the combiner was in an explicit region body, the parser
+    # stores reduce_fn=None and the region ops contain the arith op.
+    reduce_fn = op.attributes.get("reduce_fn")
+    if reduce_fn is None and op.regions:
+        for region_op in op.regions[0]:
+            if region_op.op_type.startswith("arith."):
+                reduce_fn = region_op.op_type
+                break
+    if reduce_fn is None:
+        reduce_fn = "arith.addf"
     # axis to reduce along; None means reduce all elements to a scalar
     dim = op.attributes.get("dim")
 
@@ -249,6 +258,12 @@ def linalg__transpose(op, context, env):
 # Parsers
 # ---------------------------------------------------------------------------
 
+# NOTE: linalg.reduce has an optional explicit region body
+# (e.g. `(%a : f32, %b : f32) { arith.addf ... linalg.yield ... }`),
+# but we do NOT use opens_region here because the region body is simple
+# enough to extract the combiner function via regex from the joined op text.
+# If the region body grows more complex, this should switch to opens_region
+# with recursive parsing.
 @register_parser("linalg.reduce")
 def parse_linalg_reduce(op_text, parse_ctx):
     """Parse standard linalg.reduce with ins/outs/dimensions syntax.
@@ -277,8 +292,9 @@ def parse_linalg_reduce(op_text, parse_ctx):
         if generic_match:
             reduce_fn = generic_match.group(1)
 
-    if reduce_fn is None:
-        raise ValueError(f"linalg.reduce: could not extract combiner from: {op_text!r}")
+    # reduce_fn may be None when the combiner is in an explicit region
+    # body that was extracted by the tokenizer.  The executor resolves
+    # the combiner from op.regions at execution time.
 
     # dimensions = [1]
     dim = None
