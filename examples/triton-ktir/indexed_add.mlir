@@ -24,7 +24,7 @@ module {
     } : memref<128x64x8x128xf16>
 
     %x_tile = ktdp.construct_indirect_access_tile
-        intermediate_variables(%d0, %d1, %d2, %d3)
+        intermediate_variables (%d0, %d1, %d2, %d3)
         %x_view[ind(%index_view[%grid0 + %d0]), (%dim1_start + %d1), (%grid1 + %d2), (%d3)] {
           variables_space_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 0 >= 0, d3 >= 0, -d3 + 127 >= 0)>,
           variables_space_order = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>

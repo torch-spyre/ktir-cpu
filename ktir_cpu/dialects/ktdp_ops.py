@@ -501,7 +501,7 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
     result_name = result_match.group(1)
 
     # Extract intermediate variable names from: intermediate_variables(%m, %k)
-    iv_match = re.search(r'intermediate_variables\(([^)]+)\)', op_text)
+    iv_match = re.search(r'intermediate_variables\s*\(([^)]+)\)', op_text)
     if not iv_match:
         return None
     intermediate_vars = [v.strip().lstrip('%') for v in iv_match.group(1).split(',')]
