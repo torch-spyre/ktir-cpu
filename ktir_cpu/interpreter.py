@@ -23,7 +23,7 @@ import numpy as np
 import math
 
 from .ir_types import Operation, IRModule, Tile
-from .parser import KTIRParser
+from .parser import KTIRParser, KTIRParserBase
 from .memory import SpyreMemoryHierarchy
 from .grid import GridExecutor, CoreContext
 from .ops.comm_ops import RingNetwork
@@ -49,7 +49,12 @@ class KTIRInterpreter:
     Loads KTIR MLIR code, sets up execution environment, and executes functions.
     """
 
-    def __init__(self, latency_config: Optional[HardwareConfig] = None, trace_latency: bool = False):
+    def __init__(
+        self,
+        latency_config: Optional[HardwareConfig] = None,
+        trace_latency: bool = False,
+        parser: Optional[KTIRParserBase] = None,
+    ):
         """Create a KTIR interpreter.
 
         Args:
@@ -61,12 +66,16 @@ class KTIRInterpreter:
                 record a per-operation trace in addition to aggregate
                 counters.  Useful for inspecting the cost of individual
                 operations.
+            parser: Parser to use in ``load()``.  Defaults to ``KTIRParser``
+                when ``None``.  Any object satisfying ``KTIRParserBase``
+                (i.e. has ``parse_module(str) -> IRModule``) is accepted.
         """
         self.module: Optional[IRModule] = None
         self.memory: Optional[SpyreMemoryHierarchy] = None
         self.grid_executor: Optional[GridExecutor] = None
         self.ring_network: Optional[RingNetwork] = None
         self._env: Optional[ExecutionEnv] = None
+        self._parser: Optional[KTIRParserBase] = parser
         self._latency_tracker: Optional[LatencyTracker] = (
             LatencyTracker(latency_config, trace=trace_latency)
             if latency_config is not None else None
@@ -76,9 +85,11 @@ class KTIRInterpreter:
         """Load and parse KTIR from a file path or MLIR text.
 
         Args:
-            ktir_source: Path to a KTIR file, or MLIR text directly
+            ktir_source: Path to a KTIR file, or MLIR text directly.
+                File paths are dispatched to ``parse_file``; inline text
+                is dispatched to ``parse_module``.
         """
-        parser = KTIRParser()
+        parser = self._parser if self._parser is not None else KTIRParser()
         if '\n' in ktir_source or ktir_source.lstrip().startswith('module'):
             self.module = parser.parse_module(ktir_source)
         else:
