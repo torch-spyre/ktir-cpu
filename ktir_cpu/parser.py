@@ -21,12 +21,33 @@ and all attribute syntaxes produced by the compiler.
 """
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Tuple
 from .ir_types import Operation, IRFunction, IRModule
 from .dialects import dispatch_parser, make_parse_context, ParseContext
 from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
 
-class KTIRParser:
+
+class KTIRParserBase(ABC):
+    """Abstract mixin for KTIR parsers.
+
+    Subclasses implement ``parse_module``; ``parse_file`` is provided
+    concretely and reads the file before calling ``parse_module``.
+
+    Concrete implementations:
+        KTIRParser          — regex + custom dialect parsers (this file)
+        MLIRBindingsParser  — mlir.ir walk (ktir_cpu/bindings/parser.py)
+    """
+
+    @abstractmethod
+    def parse_module(self, mlir_text: str) -> IRModule: ...
+
+    def parse_file(self, filepath: str) -> IRModule:
+        with open(filepath) as f:
+            return self.parse_module(f.read())
+
+
+class KTIRParser(KTIRParserBase):
     """KTIR MLIR parser.
 
     Parsing proceeds in three phases:
@@ -59,19 +80,6 @@ class KTIRParser:
       detected by the ``%`` heuristic; any ``{ }`` block that
       contains SSA references is automatically treated as a region.
     """
-
-    def parse_file(self, filepath: str) -> IRModule:
-        """Parse KTIR MLIR file.
-
-        Args:
-            filepath: Path to MLIR file
-
-        Returns:
-            IRModule
-        """
-        with open(filepath, 'r') as f:
-            text = f.read()
-        return self.parse_module(text)
 
     def parse_module(self, mlir_text: str) -> IRModule:
         """Parse KTIR MLIR text into module.
