@@ -72,9 +72,9 @@ class TileRef:
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""
+        from .memory import _bytes_per_elem
         total_elements = np.prod(self.shape)
-        bytes_per_element = 2 if self.dtype == "f16" else 1  # f16=2, mxfp8=1
-        return int(total_elements * bytes_per_element)
+        return int(total_elements * _bytes_per_elem(self.dtype))
 
 
 @dataclass
