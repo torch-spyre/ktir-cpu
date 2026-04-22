@@ -142,8 +142,10 @@ class IRFunction:
     grid: Tuple[int, int, int]  # Grid shape from function attributes
     return_type: Optional[str] = None
     tensor_sizes: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    arg_names: List[str] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self):
+        self.arg_names = [name.lstrip("%") for name, _ in self.arguments]
         for op in _iter_ops(self.operations):
             if op.op_type == "ktdp.construct_memory_view" and op.operands:
                 arg_name = op.operands[0].lstrip("%")
