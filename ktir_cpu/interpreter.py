@@ -235,6 +235,12 @@ class KTIRInterpreter:
 
         return result
 
+    def arg_names(self, func_name: str) -> List[str]:
+        """Return argument names for a function in declaration order (without %)."""
+        if not self.module:
+            raise RuntimeError("No module loaded. Call load() first.")
+        return self.module.get_function(func_name).arg_names
+
     def tensor_input_output_sizes(self, func_name: str) -> Dict[str, Dict[str, Any]]:
         """Return shape and dtype for each tensor argument of a function.
 
