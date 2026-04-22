@@ -1,6 +1,6 @@
 """
 Adapter tests: same assertions as test_dialects_parse.py, but driven through
-MLIRBindingsParser instead of the regex parser.
+MLIRFrontendParser instead of the regex parser.
 
 Each ``TestXxxAdapt`` class inherits the corresponding ``TestXxxParsers`` base
 and overrides only tests that rely on regex-parser-specific syntax not accepted
@@ -25,14 +25,14 @@ from test_dialects_parse import (  # noqa: E402
     TestScfParsers as _TestScfParsers,
 )
 
-from ktir_cpu.bindings.parser import MLIRBindingsParser  # noqa: E402
+from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Mixin
 # ---------------------------------------------------------------------------
 
-class BindingsParseTestMixin:
-    """Override _parse to drive tests through MLIRBindingsParser."""
+class MLIRFrontendParseTestMixin:
+    """Override _parse to drive tests through MLIRFrontendParser."""
 
     def assert_operand_names(self, op, *names):
         pass  # bindings parser uses positional %argN names — not portable
@@ -59,7 +59,7 @@ module {{
   }}
 }}
 """
-        ir_module = MLIRBindingsParser().parse_module(module_text)
+        ir_module = MLIRFrontendParser().parse_module(module_text)
         for op in ir_module.get_function("_test").operations:
             if op.op_type not in ("func.return", "return"):
                 return op
@@ -70,32 +70,32 @@ module {{
 # Arith
 # ---------------------------------------------------------------------------
 
-class TestArithAdapt(BindingsParseTestMixin, _TestArithParsers):
-    """Arith tests via MLIRBindingsParser."""
+class TestArithAdapt(MLIRFrontendParseTestMixin, _TestArithParsers):
+    """Arith tests via MLIRFrontendParser."""
 
 
 # ---------------------------------------------------------------------------
 # Linalg
 # ---------------------------------------------------------------------------
 
-class TestLinalgAdapt(BindingsParseTestMixin, _TestLinalgParsers):
-    """Linalg tests via MLIRBindingsParser."""
+class TestLinalgAdapt(MLIRFrontendParseTestMixin, _TestLinalgParsers):
+    """Linalg tests via MLIRFrontendParser."""
 
 
 # ---------------------------------------------------------------------------
 # Tensor
 # ---------------------------------------------------------------------------
 
-class TestTensorAdapt(BindingsParseTestMixin, _TestTensorParsers):
-    """Tensor tests via MLIRBindingsParser."""
+class TestTensorAdapt(MLIRFrontendParseTestMixin, _TestTensorParsers):
+    """Tensor tests via MLIRFrontendParser."""
 
 
 # ---------------------------------------------------------------------------
 # Ktdp
 # ---------------------------------------------------------------------------
 
-class TestKtdpAdapt(BindingsParseTestMixin, _TestKtdpParsers):
-    """Ktdp tests via MLIRBindingsParser."""
+class TestKtdpAdapt(MLIRFrontendParseTestMixin, _TestKtdpParsers):
+    """Ktdp tests via MLIRFrontendParser."""
 
 
     # test_construct_access_tile: inherited
@@ -109,5 +109,5 @@ class TestKtdpAdapt(BindingsParseTestMixin, _TestKtdpParsers):
 # ---------------------------------------------------------------------------
 
 
-class TestScfAdapt(BindingsParseTestMixin, _TestScfParsers):
-    """Scf tests via MLIRBindingsParser."""
+class TestScfAdapt(MLIRFrontendParseTestMixin, _TestScfParsers):
+    """Scf tests via MLIRFrontendParser."""
