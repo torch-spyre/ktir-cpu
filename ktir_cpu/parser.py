@@ -36,7 +36,7 @@ class KTIRParserBase(ABC):
 
     Concrete implementations:
         KTIRParser          — regex + custom dialect parsers (this file)
-        MLIRBindingsParser  — mlir.ir walk (ktir_cpu/bindings/parser.py)
+        MLIRFrontendParser  — mlir.ir walk (ktir_cpu/mlir_frontend/parser.py)
     """
 
     @abstractmethod

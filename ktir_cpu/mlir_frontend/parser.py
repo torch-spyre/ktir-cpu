@@ -1,5 +1,5 @@
 """
-MLIR Python bindings parser.
+MLIR frontend parser.
 
 Produces the same ir_types.IRModule / IRFunction / Operation objects as
 KTIRParser, but drives the mlir.ir structural walk instead of regex-based
@@ -7,12 +7,12 @@ text parsing.
 
 Design: adapter pattern
 -----------------------
-MLIRTypeAdapter    — converts mlir.ir typed attribute objects to ktir_cpu
-                     abstraction types (AffineMap, AffineSet, Python scalars).
-                     Subclass to customise individual conversions.
+MLIRTypeAdapter      — converts mlir.ir typed attribute objects to ktir_cpu
+                       abstraction types (AffineMap, AffineSet, Python scalars).
+                       Subclass to customise individual conversions.
 
-MLIRBindingsParser — drives the mlir.ir parse/verify/walk pipeline and
-                     delegates all type conversions to an MLIRTypeAdapter.
+MLIRFrontendParser   — drives the mlir.ir parse/verify/walk pipeline and
+                       delegates all type conversions to an MLIRTypeAdapter.
 
 Handler design rules
 --------------------
@@ -482,7 +482,7 @@ def _adapt_arith_cmpi(mlir_op, attributes, result_type, operands):
 # Parser
 # ---------------------------------------------------------------------------
 
-class MLIRBindingsParser(KTIRParserBase):
+class MLIRFrontendParser(KTIRParserBase):
     """Parse MLIR text into IRModule objects using the MLIR Python bindings.
 
     Uses MLIRTypeAdapter (or a subclass) for all mlir.ir → ktir_cpu type
@@ -490,7 +490,7 @@ class MLIRBindingsParser(KTIRParserBase):
 
     Usage::
 
-        parser = MLIRBindingsParser()
+        parser = MLIRFrontendParser()
         module = parser.parse_module(mlir_text)
 
     Raises ImportError at construction time if mlir_ktdp is not installed.
@@ -502,7 +502,7 @@ class MLIRBindingsParser(KTIRParserBase):
         if not _HAS_MLIR:
             raise ImportError(
                 "mlir_ktdp / tools_ktdp not installed; "
-                "MLIRBindingsParser is unavailable."
+                "MLIRFrontendParser is unavailable."
             )
         self._adapter = adapter or MLIRTypeAdapter()
 

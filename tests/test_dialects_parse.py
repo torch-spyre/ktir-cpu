@@ -28,7 +28,7 @@ Design rule
 -----------
 The goal of the regex parser is to parse valid MLIR.  All op text examples
 in this file must therefore be valid MLIR.  Non-MLIR syntax forces the
-corresponding test_bindings_adapt.py test to be skipped, which defeats the
+corresponding test_parse_adapt.py test to be skipped, which defeats the
 purpose of sharing tests between the two parser backends.
 
 All op text examples have been verified to parse with both backends.
@@ -67,7 +67,7 @@ class ParseTestMixin:
     Parser-specific — override in subclasses or avoid in base tests:
         assert_operand_names: checks exact SSA names; only valid for the
         regex parser. BindingsParseTestMixin overrides this to a no-op since
-        the bindings parser uses positional %argN names.
+        the MLIR frontend parser uses positional %argN names.
     """
 
     def _parse(self, op_text, parse_ctx=None, args=None):
@@ -125,7 +125,7 @@ class ParseTestMixin:
 
     def assert_operand_names(self, op, *names):
         """Regex-parser-specific: checks exact SSA operand names.
-        Override to no-op in bindings subclasses."""
+        Override to no-op in MLIR frontend subclasses."""
         for name in names:
             assert name in op.operands
 

@@ -47,7 +47,7 @@ class InterpreterTestMixin:
     ----------------------------
     Tests must not hardcode argument names from the MLIR source (e.g.
     ``"x_ptr"``) because different parser backends may normalise them
-    differently (e.g. the MLIR bindings parser normalises to positional
+    differently (e.g. the MLIR frontend parser normalises to positional
     ``arg0``, ``arg1``, ...).  Instead, use ``interp.arg_names(func_name)``
     to get the names in declaration order and unpack them positionally::
 
