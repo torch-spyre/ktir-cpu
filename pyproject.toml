@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ktir-cpu"
+dynamic = ["version"]
+description = "KTIR CPU interpreter for IBM Spyre AI accelerators"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+authors = [
+    { name = "IBM Research" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Compilers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[tool.setuptools_scm]
+
+[tool.setuptools.packages.find]
+include = ["ktir_cpu*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.mlir"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "spec_gap: RFC conformance gap — feature not yet implemented in the interpreter",
+]
