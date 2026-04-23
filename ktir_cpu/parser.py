@@ -232,6 +232,10 @@ class KTIRParser:
         Returns:
             List of operations
         """
+        # Step 0: Strip inline comments so downstream methods don't need
+        # to worry about % or other tokens appearing inside comments.
+        body_text = self._preprocess_text(body_text)
+
         # Step 1: Tokenize body into complete operation strings.
         # An "operation string" is one or more physical lines that together
         # form a single MLIR operation. Multi-line ops like
@@ -252,6 +256,18 @@ class KTIRParser:
                 operations.append(op)
 
         return operations
+
+    @staticmethod
+    def _preprocess_text(text: str) -> str:
+        """Normalize MLIR text before tokenization.
+
+        Applied once before ``_tokenize_operations`` so that downstream
+        methods (region detection, type-terminal checks) operate on
+        clean text.  Currently strips inline comments (``// ...``
+        through end-of-line); future preprocessing steps (e.g.
+        whitespace normalization) can be added here.
+        """
+        return re.sub(r'//[^\n]*', '', text)
 
     def _tokenize_operations(self, body_text: str) -> List[Tuple[str, List[str]]]:
         """Split body text into (operation_text, [region_bodies]) pairs.
@@ -364,8 +380,7 @@ class KTIRParser:
         (e.g. ``linalg.reduce ... dimensions = [1]``) rely on a
         trailing blank line to flush instead.
         """
-        # Strip trailing inline comments
-        text = re.sub(r'//[^\n]*', '', accumulated).rstrip()
+        text = accumulated.rstrip()
         if not text:
             return False
         # Void terminators
@@ -376,23 +391,28 @@ class KTIRParser:
             return True
         return False
 
+    # MLIR SSA value names: % followed by a digit, letter, or id-punct [$._-].
+    _SSA_REF_RE = re.compile(r'%[\w$.]')
+
     def _line_opens_region(self, stripped_line: str, lines: List[str], line_idx: int) -> bool:
         """Check if the current line opens a region body.
 
         A region ``{`` is distinguished from an attribute block ``{``
         structurally: attribute blocks contain ``key = value`` pairs
         (no ``%`` SSA references), while region blocks contain
-        operations that always reference ``%`` SSA names.  We peek
-        into the ``{ }`` block and check for ``%``.
+        operations that always reference ``%`` SSA names.
+
+        Comments are already stripped by ``_preprocess_text``, so we
+        only need to check for ``%`` followed by a valid SSA name
+        character (letter, digit, ``$``, ``.``, ``_``).
         """
         if not stripped_line.endswith('{'):
             return False
-        # Peek into the { } block — if any line contains %, it's a region.
         depth = 1
         for j in range(line_idx + 1, len(lines)):
             inner = lines[j]
             depth += inner.count('{') - inner.count('}')
-            if '%' in inner:
+            if self._SSA_REF_RE.search(inner):
                 return True
             if depth <= 0:
                 break
