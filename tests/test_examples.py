@@ -473,7 +473,7 @@ class TestPagedAttentionExecution(InterpreterTestMixin):
         expected = (acc_ref / L_ref[:, None]).reshape(2, 4, 128).astype(np.float16)
 
         actual = result[0:2, 0:4, :]
-        np.testing.assert_allclose(actual, expected, rtol=5e-2, atol=5e-2)
+        np.testing.assert_allclose(actual, expected, rtol=1e-2, atol=1e-2)
 
 
 class TestSdpaExecution(InterpreterTestMixin):
@@ -508,5 +508,4 @@ class TestSdpaExecution(InterpreterTestMixin):
         P_norm = (P / np.sum(P, axis=1, keepdims=True)).astype(np.float16)
         expected = (P_norm.astype(np.float32) @ V.astype(np.float32)).astype(np.float16)
 
-        # Two f16 matmuls accumulate rounding error; tolerance matched to matmul test.
-        np.testing.assert_allclose(result, expected, rtol=2e-2, atol=2e-1)
+        np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)

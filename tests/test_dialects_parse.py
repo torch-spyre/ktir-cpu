@@ -222,6 +222,21 @@ class TestArithParsers(ParseTestMixin):
         assert op.op_type == "arith.constant"
         assert op.attributes["value"] == 42
 
+    def test_constant_hex_integer(self):
+        # hex integer constant (e.g. 0xFF800000 for -inf bitcast)
+        op = self._parse("%x = arith.constant 0xFF800000 : i32")
+        self.assert_op_type(op, "arith.constant")
+        # 0xFF800000: regex returns 4286578688 (unsigned), MLIR returns
+        # -8388608 (signed i32).  Both are the same bit pattern — accept either.
+        val = op.attributes["value"]
+        assert val == 0xFF800000 or val == -8388608
+
+    def test_constant_float(self):
+        # float constant
+        op = self._parse("%x = arith.constant 0.0 : f32")
+        self.assert_op_type(op, "arith.constant")
+        assert op.attributes["value"] == 0.0
+
     def test_constant_dense_tensor(self):
         # dense<0.0> tensor constant sets is_tensor, shape, and dtype
         op = self._parse("%t = arith.constant dense<0.0> : tensor<4xf16>")

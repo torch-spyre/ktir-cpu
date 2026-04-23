@@ -330,9 +330,16 @@ def _adapt_construct_indirect_access_tile(mlir_op, attributes, result_type, oper
         )
     attributes["shape"] = tuple(int(d) for d in m.group(1).split("x"))
     attributes["dim_subscripts"] = dim_subscripts
-    # Derive intermediate variable names from the region's block arguments.
+    # Derive intermediate variable count from the region's block arguments.
     # The region has one block whose arguments are the iteration variables
     # (matching d{n_ssa}..d{n_total-1} in the per-dim affine maps).
+    #
+    # Only the count matters here, not the names.  The executor looks up
+    # each name in the SSA context to distinguish outer scalars (like %pid1,
+    # which resolve to a value) from pure iteration variables (which don't).
+    # Iteration variables are never SSA-defined — they're loop coordinates
+    # enumerated by variables_space_set — so the lookup always falls through
+    # regardless of the name we assign.
     n_iter = len(list(list(mlir_op.regions[0])[0].arguments))
     attributes["intermediate_vars"] = [f"d{i}" for i in range(n_iter)]
     attributes["variables_space_set"] = parse_affine_set(
