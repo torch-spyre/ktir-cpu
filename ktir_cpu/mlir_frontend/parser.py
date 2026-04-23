@@ -330,7 +330,11 @@ def _adapt_construct_indirect_access_tile(mlir_op, attributes, result_type, oper
         )
     attributes["shape"] = tuple(int(d) for d in m.group(1).split("x"))
     attributes["dim_subscripts"] = dim_subscripts
-    attributes["intermediate_vars"] = []
+    # Derive intermediate variable names from the region's block arguments.
+    # The region has one block whose arguments are the iteration variables
+    # (matching d{n_ssa}..d{n_total-1} in the per-dim affine maps).
+    n_iter = len(list(list(mlir_op.regions[0])[0].arguments))
+    attributes["intermediate_vars"] = [f"d{i}" for i in range(n_iter)]
     attributes["variables_space_set"] = parse_affine_set(
         str(mlir_op.attributes["variables_space_set"])
     )
