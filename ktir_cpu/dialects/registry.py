@@ -55,9 +55,6 @@ def get_latency_category(op_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Parser signature: (op_text: str, parse_ctx: ParseContext) -> Optional[Operation]
-# ParseContext carries everything dialect parsers need beyond the op text itself
-# (currently just the alias table).  Using a typed object keeps the signature
-# stable when new parse-time context is added later.
 ParserFn = Callable[[str, "ParseContext"], Optional[Operation]]
 
 _PARSER_REGISTRY: Dict[str, ParserFn] = {}

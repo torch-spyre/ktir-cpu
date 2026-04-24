@@ -31,8 +31,16 @@ def linalg__reduce(op, context, env):
     """Standard linalg.reduce — removes the reduced dimension."""
     # operands[0] is the ins tensor; the outs tensor is handled separately via outs_var
     tile = context.get_value(op.operands[0])
-    # combiner function e.g. arith.addf, arith.maxnumf
-    reduce_fn = op.attributes.get("reduce_fn", "arith.addf")
+    # Resolve the combiner op name.  The shorthand form stores it in
+    # attributes; the explicit-region form has it in op.regions.
+    reduce_fn = op.attributes.get("reduce_fn")
+    if reduce_fn is None and op.regions:
+        for region_op in op.regions[0]:
+            if region_op.op_type != "linalg.yield":
+                reduce_fn = region_op.op_type
+                break
+    if reduce_fn is None:
+        reduce_fn = "arith.addf"
     # axis to reduce along; None means reduce all elements to a scalar
     dim = op.attributes.get("dim")
 
@@ -249,36 +257,34 @@ def linalg__transpose(op, context, env):
 # Parsers
 # ---------------------------------------------------------------------------
 
+# linalg.reduce has two forms:
+#   Shorthand:  linalg.reduce { arith.addf } ins(...) outs(...) dimensions = [1]
+#     The { arith.addf } has no %SSA references, so the tokenizer keeps it
+#     as inline op text.  The parser extracts the combiner name via regex.
+#   Explicit region:  linalg.reduce ins(...) outs(...) dimensions = [1]
+#                       (%a : f32, %b : f32) { %s = arith.addf ... }
+#     The { } block contains %SSA references, so the tokenizer extracts it
+#     as a region.  The parser sets reduce_fn=None and the executor resolves
+#     the combiner from op.regions.
+#
+# In both cases the executor maps the combiner name to a NumPy reduction
+# (e.g. arith.addf → np.sum) rather than executing the region body
+# element-by-element.  A Python-level fold over every element would be
+# prohibitively slow for the tile sizes seen in practice.
 @register_parser("linalg.reduce")
 def parse_linalg_reduce(op_text, parse_ctx):
-    """Parse standard linalg.reduce with ins/outs/dimensions syntax.
-
-    Example:
-        %r = linalg.reduce { arith.addf }
-            ins(%x : tensor<1x1024xf16>)
-            outs(%init : tensor<1xf16>)
-            dimensions = [1]
-    """
+    """Parse linalg.reduce — shorthand or explicit-region form."""
     result_match = re.match(r'(%\w+)\s*=\s*linalg\.reduce\s+', op_text)
     if not result_match:
         return None
 
     result_name = result_match.group(1)
 
-    # Combiner: shorthand { arith.addf } or generic region { %tmp = arith.addf ... }
+    # Shorthand combiner: { arith.addf } in the op text (no %SSA inside)
     reduce_fn = None
-    combiner_match = re.search(r'\{\s*(arith\.\w+)\s*\}', op_text)
+    combiner_match = re.search(r'\{\s*(\w+\.\w+)\s*\}', op_text)
     if combiner_match:
         reduce_fn = combiner_match.group(1)
-    else:
-        # Generic MLIR format: the region body is joined into the op_text as
-        # "... { %tmp = arith.OP %in, %out : type linalg.yield ... }"
-        generic_match = re.search(r'\{\s*%\w+\s*=\s*(arith\.\w+)\b', op_text)
-        if generic_match:
-            reduce_fn = generic_match.group(1)
-
-    if reduce_fn is None:
-        raise ValueError(f"linalg.reduce: could not extract combiner from: {op_text!r}")
 
     # dimensions = [1]
     dim = None
