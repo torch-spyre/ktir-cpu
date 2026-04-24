@@ -18,6 +18,7 @@ import re
 
 import numpy as np
 
+from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
@@ -150,7 +151,7 @@ def arith__constant(op, context, env):
     if op.attributes.get("is_tensor"):
         shape = op.attributes["shape"]
         dtype_str = op.attributes.get("dtype", "f16")
-        np_dtype = np.float16 if dtype_str == "f16" else np.int32
+        np_dtype = to_np_dtype(dtype_str)
         return Tile(np.full(shape, value, dtype=np_dtype), dtype_str, shape)
     return value
 

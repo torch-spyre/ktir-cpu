@@ -91,20 +91,7 @@ import numpy as np
 # Module-level helpers shared by HBMSimulator and LXScratchpad
 # ---------------------------------------------------------------------------
 
-def _get_np_dtype(dtype: str) -> np.dtype:
-    """Convert a KTIR dtype string to a NumPy dtype."""
-    if dtype in ("f16", "fp16", "float16"):
-        return np.float16
-    if dtype in ("i32", "si32", "index"):
-        return np.int32
-    if dtype in ("i64", "si64"):
-        return np.int64
-    return np.float32  # f8 / mxfp8 / others approximated as float32
-
-
-def _bytes_per_elem(dtype: str) -> int:
-    """Return element size in bytes for a KTIR dtype string."""
-    return int(np.dtype(_get_np_dtype(dtype)).itemsize)
+from .dtypes import to_np_dtype as _get_np_dtype, bytes_per_elem as _bytes_per_elem
 
 
 def _find_allocation(
@@ -294,7 +281,7 @@ class HBMSimulator:
             Use ``read(ptr, 1, dtype)[0]`` instead.  This method will be
             removed when the tt dialect is updated.
         """
-        bytes_per_elem = 2 if dtype in ("f16", "fp16", "float16") else 4
+        bytes_per_elem = _bytes_per_elem(dtype)
         alloc = _find_allocation(self.memory, addr, bytes_per_elem)
         if alloc is None:
             return np.float16(0.0)

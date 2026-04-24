@@ -31,16 +31,7 @@ from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
 
-def _ktir_dtype(np_dtype: np.dtype) -> str:
-    """Map a numpy dtype to a KTIR dtype string."""
-    if np_dtype == np.float16:
-        return "f16"
-    elif np_dtype == np.float32:
-        return "f32"
-    elif np_dtype == np.int32:
-        return "i32"
-    else:
-        return "f16"
+from .dtypes import to_ktir_dtype as _ktir_dtype
 
 
 class KTIRInterpreter:

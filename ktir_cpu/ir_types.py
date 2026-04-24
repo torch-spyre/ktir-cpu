@@ -37,7 +37,7 @@ class Tile:
     in MLIR).  Produced by load operations and consumed by compute ops.
     """
     data: np.ndarray
-    dtype: str  # "f16" or "mxfp8"
+    dtype: str  # see dtypes.SUPPORTED_DTYPES
     shape: Tuple[int, ...]
 
     def copy(self) -> 'Tile':
@@ -72,9 +72,8 @@ class TileRef:
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""
-        from .memory import _bytes_per_elem
-        total_elements = np.prod(self.shape)
-        return int(total_elements * _bytes_per_elem(self.dtype))
+        from .dtypes import bytes_per_elem
+        return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
 
 
 @dataclass
