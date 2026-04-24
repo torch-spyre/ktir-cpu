@@ -6,13 +6,8 @@ that are not exercised by the generic test_examples_adapt suite (which
 validates numerical correctness against NumPy references).
 """
 
-import sys
-import os
-
 import numpy as np
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from ktir_cpu import KTIRInterpreter
 from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser

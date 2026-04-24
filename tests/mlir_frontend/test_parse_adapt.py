@@ -9,15 +9,9 @@ arith.cmpi integer predicate → string) is handled by MLIRTypeAdapter handlers,
 so the inherited assertions pass unchanged.
 """
 
-import re
-import sys
-import os
-
 import pytest
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-from test_dialects_parse import (  # noqa: E402
+from test_dialects_parse import (
     TestArithParsers as _TestArithParsers,
     TestLinalgParsers as _TestLinalgParsers,
     TestTensorParsers as _TestTensorParsers,

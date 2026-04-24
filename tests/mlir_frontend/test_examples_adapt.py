@@ -6,15 +6,10 @@ Each TestXxxAdapt class inherits the corresponding TestXxxExecution base.
 MLIRFrontendInterpMixin overrides _make_interp() to inject MLIRFrontendParser.
 """
 
-import sys
-import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
 from ktir_cpu import KTIRInterpreter
 from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser
 
-from test_examples import (  # noqa: E402
+from test_examples import (
     TestVectorAddExecution as _TestVectorAddExecution,
     TestSoftmaxExecution as _TestSoftmaxExecution,
     TestLayerNormExecution as _TestLayerNormExecution,
