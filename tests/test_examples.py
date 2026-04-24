@@ -184,7 +184,7 @@ class TestSoftmaxExecution(InterpreterTestMixin):
         kwargs["n_cols"] = n_real_cols  # fill dynamic kwarg
 
         outputs = interp.execute_function(
-            func_name, **{**kwargs, output_ptr: out, input_ptr: inp, n_rows: n_rows_val},
+            func_name, **{**kwargs, output_ptr: out, input_ptr: inp},
         )
         result = outputs[output_ptr]
 
