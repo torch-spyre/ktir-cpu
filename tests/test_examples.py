@@ -63,6 +63,20 @@ class InterpreterTestMixin:
     def _make_interp(self):
         return KTIRInterpreter()
 
+    @staticmethod
+    def _build_kwargs(entry, tensors, overrides=None):
+        """Merge execute_kwargs scalars with tensor args for execute_function.
+
+        Raises AssertionError if any key appears in both scalars and tensors,
+        preventing silent overwrites like the duplicate-n_rows bug.
+        """
+        scalars = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+        if overrides:
+            scalars.update(overrides)
+        overlap = scalars.keys() & tensors.keys()
+        assert not overlap, f"duplicate keys in tensors and scalars: {overlap}"
+        return {**scalars, **tensors}
+
 
 # ---------------------------------------------------------------------------
 # Parsing tests — all example files must parse into valid modules
@@ -124,11 +138,8 @@ class TestVectorAddExecution(InterpreterTestMixin):
         y = rng.standard_normal(n).astype(np.float16)
         output = np.zeros(n, dtype=np.float16)
 
-        outputs = interp.execute_function(
-            func_name,
-            **{x_ptr: x, y_ptr: y, output_ptr: output,
-               BLOCK_SIZE: entry["execute_kwargs"]["BLOCK_SIZE"]},
-        )
+        kwargs = self._build_kwargs(entry, {x_ptr: x, y_ptr: y, output_ptr: output})
+        outputs = interp.execute_function(func_name, **kwargs)
 
         result = outputs[output_ptr]
         expected = (x + y).astype(np.float16)
@@ -147,11 +158,8 @@ class TestVectorAddExecution(InterpreterTestMixin):
         y = np.linspace(-10, 10, n, dtype=np.float16)
         output = np.zeros(n, dtype=np.float16)
 
-        outputs = interp.execute_function(
-            func_name,
-            **{x_ptr: x, y_ptr: y, output_ptr: output,
-               BLOCK_SIZE: entry["execute_kwargs"]["BLOCK_SIZE"]},
-        )
+        kwargs = self._build_kwargs(entry, {x_ptr: x, y_ptr: y, output_ptr: output})
+        outputs = interp.execute_function(func_name, **kwargs)
 
         result = outputs[output_ptr]
         expected = (x + y).astype(np.float16)
@@ -180,12 +188,11 @@ class TestSoftmaxExecution(InterpreterTestMixin):
         ).astype(np.float16)
         out = np.zeros((n_rows_val, n_padded_cols), dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        kwargs["n_cols"] = n_real_cols  # fill dynamic kwarg
-
-        outputs = interp.execute_function(
-            func_name, **{**kwargs, output_ptr: out, input_ptr: inp},
+        kwargs = self._build_kwargs(
+            entry, {output_ptr: out, input_ptr: inp},
+            overrides={"n_cols": n_real_cols},
         )
+        outputs = interp.execute_function(func_name, **kwargs)
         result = outputs[output_ptr]
 
         # NumPy reference: softmax per row
@@ -217,12 +224,9 @@ class TestSoftmaxExecution(InterpreterTestMixin):
         inp = rng.standard_normal((n_rows_val, n_cols)).astype(np.float16)
         out = np.zeros((n_rows_val, n_cols), dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+        kwargs = self._build_kwargs(entry, {output_ptr: out, input_ptr: inp})
         with pytest.raises(MemoryError, match=entry["exception_msg"]):
-            interp.execute_function(
-                func_name,
-                **{**kwargs, output_ptr: out, input_ptr: inp},
-            )
+            interp.execute_function(func_name, **kwargs)
 
 
 class TestLayerNormExecution(InterpreterTestMixin):
@@ -249,15 +253,11 @@ class TestLayerNormExecution(InterpreterTestMixin):
         Mean_data = np.zeros(n_rows, dtype=np.float16)
         Rstd_data = np.zeros(n_rows, dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        outputs = interp.execute_function(
-            func_name,
-            **{X: X_data, Y: Y_data, W: W_data, B: B_data,
-               Mean: Mean_data, Rstd: Rstd_data,
-               N: kwargs.pop("N"), eps: kwargs.pop("eps"),
-               BLOCK_SIZE: kwargs.pop("BLOCK_SIZE"),
-               **kwargs},  # remaining: stride (body-level)
-        )
+        kwargs = self._build_kwargs(entry, {
+            X: X_data, Y: Y_data, W: W_data, B: B_data,
+            Mean: Mean_data, Rstd: Rstd_data,
+        })
+        outputs = interp.execute_function(func_name, **kwargs)
         result_Y = outputs[Y]
         result_Mean = outputs[Mean]
 
@@ -296,7 +296,8 @@ class TestReduceExplicitRegion(InterpreterTestMixin):
 
         (arg0,) = interp.arg_names(func_name)
         data = np.array([[1, 2, 3, 4]], dtype=np.float16)
-        outputs = interp.execute_function(func_name, **{arg0: data})
+        kwargs = self._build_kwargs(entry, {arg0: data})
+        outputs = interp.execute_function(func_name, **kwargs)
         result = outputs[arg0]
 
         expected = np.full((1, 4), 10.0, dtype=np.float16)
@@ -310,7 +311,8 @@ class TestReduceExplicitRegion(InterpreterTestMixin):
 
         (arg0,) = interp.arg_names(func_name)
         data = np.zeros((1, 4), dtype=np.float16)
-        outputs = interp.execute_function(func_name, **{arg0: data})
+        kwargs = self._build_kwargs(entry, {arg0: data})
+        outputs = interp.execute_function(func_name, **kwargs)
         result = outputs[arg0]
 
         np.testing.assert_allclose(result, np.zeros((1, 4), dtype=np.float16), atol=1e-3)
@@ -326,22 +328,15 @@ class TestMatMulExecution(InterpreterTestMixin):
         interp.load(path)
 
         a_ptr, b_ptr, c_ptr, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = interp.arg_names(func_name)
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        M, N, K_val = kwargs["M"], kwargs["N"], kwargs["K"]
+        ek = entry["execute_kwargs"]
+        M, N, K_val = ek["M"], ek["N"], ek["K"]
         rng = np.random.default_rng(42)
         A = rng.standard_normal((M, K_val)).astype(np.float16)
         B = rng.standard_normal((K_val, N)).astype(np.float16)
         C = np.zeros((M, N), dtype=np.float16)
 
-        outputs = interp.execute_function(
-            func_name,
-            **{a_ptr: A, b_ptr: B, c_ptr: C,
-               K: kwargs.pop("K"),
-               BLOCK_SIZE_M: kwargs.pop("BLOCK_SIZE_M"),
-               BLOCK_SIZE_N: kwargs.pop("BLOCK_SIZE_N"),
-               BLOCK_SIZE_K: kwargs.pop("BLOCK_SIZE_K"),
-               **kwargs},  # remaining: M, N, stride_* (body-level)
-        )
+        kwargs = self._build_kwargs(entry, {a_ptr: A, b_ptr: B, c_ptr: C})
+        outputs = interp.execute_function(func_name, **kwargs)
         result_C = outputs[c_ptr]
 
         expected = (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float16)
@@ -366,13 +361,11 @@ class TestIndexedAddExecution(InterpreterTestMixin):
         y = rng.standard_normal((2, 32, 8, 128)).astype(np.float16)
         index = np.array([3, 7], dtype=np.int64)
         output = np.zeros((2, 32, 8, 128), dtype=np.float16)
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        dim1_start_val = kwargs.get("dim1_start", 0)
-        outputs = interp.execute_function(
-            func_name,
-            **{x_ptr: x, y_ptr: y, index_ptr: index,
-               output_ptr: output, dim1_start: dim1_start_val},
-        )
+        dim1_start_val = entry["execute_kwargs"].get("dim1_start", 0)
+        kwargs = self._build_kwargs(entry, {
+            x_ptr: x, y_ptr: y, index_ptr: index, output_ptr: output,
+        })
+        outputs = interp.execute_function(func_name, **kwargs)
         result = outputs[output_ptr]
         assert result.shape == (2, 32, 8, 128)
         assert not np.any(np.isnan(result)), "output contains NaN"
@@ -408,22 +401,16 @@ class TestPagedAttentionExecution(InterpreterTestMixin):
         value_cache = rng.standard_normal((64, 16, 8, 128)).astype(np.float16)
         block_tables = rng.integers(0, 64, size=(1, 16), dtype=np.int32)
         output = np.zeros((8, 32, 128), dtype=np.float16)
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        scale_val = kwargs.pop("scale")
-        num_tiles_val = kwargs.pop("num_tiles")
-        context_len_val = kwargs.pop("context_len")
-        cur_batch_start_index_val = kwargs.pop("cur_batch_start_index", 0)
-        block_table_offset_val = kwargs.pop("block_table_offset", 0)
-        outputs = interp.execute_function(
-            func_name,
-            **{output_ptr: output, query_ptr: query,
-               key_cache_ptr: key_cache, value_cache_ptr: value_cache,
-               block_tables_ptr: block_tables,
-               cur_batch_start_index: cur_batch_start_index_val,
-               block_table_offset: block_table_offset_val,
-               scale: scale_val, num_tiles: num_tiles_val, context_len: context_len_val,
-               **kwargs},
-        )
+        ek = entry["execute_kwargs"]
+        scale_val = ek["scale"]
+        num_tiles_val = ek["num_tiles"]
+        context_len_val = ek["context_len"]
+        kwargs = self._build_kwargs(entry, {
+            output_ptr: output, query_ptr: query,
+            key_cache_ptr: key_cache, value_cache_ptr: value_cache,
+            block_tables_ptr: block_tables,
+        })
+        outputs = interp.execute_function(func_name, **kwargs)
         result = outputs[output_ptr]
         assert result.shape == (8, 32, 128)
         assert not np.any(np.isnan(result)), "output contains NaN"
@@ -494,9 +481,8 @@ class TestSdpaExecution(InterpreterTestMixin):
         V = rng.standard_normal((n_rows, head_dim)).astype(np.float16)
         output = np.zeros((n_rows, head_dim), dtype=np.float16)
 
-        outputs = interp.execute_function(
-            func_name, **{q_ptr: Q, k_ptr: K, v_ptr: V, output_ptr: output},
-        )
+        kwargs = self._build_kwargs(entry, {q_ptr: Q, k_ptr: K, v_ptr: V, output_ptr: output})
+        outputs = interp.execute_function(func_name, **kwargs)
         result = outputs[output_ptr]
 
         # NumPy reference: scaled dot-product attention (f32 for stability)
