@@ -292,7 +292,6 @@ class MemoryOps:
                     )
                     mem = context.hbm if idx_view.memory_space == "HBM" else context.lx
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
-                    from ..memory import _bytes_per_elem
                     addr = idx_view.base_ptr + offset * _bytes_per_elem(idx_view.dtype)
                     raw = mem.read(addr, 1, idx_view.dtype)
                     coord.append(int(raw[0]))

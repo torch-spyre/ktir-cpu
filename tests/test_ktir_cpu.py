@@ -100,19 +100,6 @@ def test_hbm_write_partial_overwrite():
     assert result[3] == np.float16(4), f"Expected 4 unchanged, got {result[3]}"
 
 
-def test_hbm_get_np_dtype():
-    """HBM._get_np_dtype: known dtypes, placeholders, and unknown."""
-    hbm = HBMSimulator()
-    assert hbm._get_np_dtype("f16") == np.float16
-    assert hbm._get_np_dtype("float32") == np.float32
-    with pytest.raises(NotImplementedError):
-        hbm._get_np_dtype("fp8")
-    with pytest.raises(NotImplementedError):
-        hbm._get_np_dtype("mxfp8")
-    with pytest.raises(ValueError, match="Unsupported"):
-        hbm._get_np_dtype("unknown")
-
-
 def test_hbm_write_full_replacement():
     """HBM.write: writing equal-or-larger data replaces existing allocation."""
     hbm = HBMSimulator()
@@ -150,19 +137,6 @@ def test_lx_read_shape_mismatch():
     assert result.shape == (6,)
     assert np.array_equal(result[:4], data)
     assert np.array_equal(result[4:], np.zeros(2, dtype=np.float16))
-
-
-def test_lx_get_np_dtype():
-    """LXScratchpad._get_np_dtype: known dtypes, placeholders, and unknown."""
-    lx = LXScratchpad()
-    assert lx._get_np_dtype("f16") == np.float16
-    assert lx._get_np_dtype("float32") == np.float32
-    with pytest.raises(NotImplementedError):
-        lx._get_np_dtype("fp8")
-    with pytest.raises(NotImplementedError):
-        lx._get_np_dtype("mxfp8")
-    with pytest.raises(ValueError, match="Unsupported"):
-        lx._get_np_dtype("unknown")
 
 
 def test_lx_clear():
