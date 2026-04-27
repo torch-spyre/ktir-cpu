@@ -73,10 +73,14 @@ class ParseTestMixin:
     def _parse(self, op_text, parse_ctx=None, args=None):
         """Parse a single op and return the resulting Operation.
 
-        ``args`` is an optional schema that declares the SSA arguments the op
-        depends on, as a ``{name: mlir_type}`` mapping.  This is a convenience
-        for single-op testing: it avoids writing a full MLIR module while still
-        providing explicit types for operands with complex types.  Example::
+        ``args`` is an optional ``{name: mlir_type}`` mapping that declares
+        **all** external SSA operands the op depends on — values defined
+        outside the op text that the op references.  Names defined *within*
+        the op (results on the LHS of ``=``, region block args like ``%i``
+        in ``scf.for %i = ...``, and iter-args) should **not** be included.
+
+        This is a convenience for single-op testing: it avoids writing a
+        full MLIR module while still providing explicit types.  Example::
 
             self._parse(
                 "%r = linalg.reduce { arith.maxnumf }"
@@ -86,10 +90,13 @@ class ParseTestMixin:
                 args={"%x": "tensor<1x1024xf16>", "%init": "tensor<1xf16>"},
             )
 
-        The regex parser ignores ``args`` and operates on the op text directly.
-        ``BindingsParseTestMixin`` uses it to build a typed function wrapper.
+        The regex parser ignores ``args`` and operates on the op text
+        directly.  The MLIR frontend adapter uses it to build a typed
+        ``func.func`` wrapper, so **missing operands will cause MLIR
+        verification errors** when the adapter tests run.
 
-        If ``args`` is provided, every name must appear in ``op_text``.
+        If ``args`` is provided, every declared name must appear in
+        ``op_text``.
         """
         args = self._resolve_args(op_text, args)
         ctx = parse_ctx or _parse_ctx()
