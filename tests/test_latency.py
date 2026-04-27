@@ -589,6 +589,27 @@ class TestLatencyEdgeCases:
         n_elems = LatencyTracker._num_elements(zero_tile, [])
         assert n_elems == 0
 
+    def test_lx_index_views_excluded_from_hbm_bytes(self):
+        """_data_size() ignores LX index views; _memory_space() falls back to parent."""
+        from ktir_cpu.latency import LatencyTracker
+        from ktir_cpu.ir_types import IndirectAccessTile, Tile, TileRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        vss = parse_affine_set("(d0, d1) : (d0 >= 0, d1 >= 0)")
+        lx_idx = TileRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
+                         memory_space="LX", dtype="i32")
+        parent = TileRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
+                         memory_space="HBM", dtype="f16")
+        iat = IndirectAccessTile(
+            parent_ref=parent, shape=(4, 4), dim_subscripts=[],
+            index_views=[lx_idx, lx_idx],
+            variables_space_set=vss, variables_space_order=None,
+        )
+        result = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+
+        assert LatencyTracker._data_size(result, [iat]) == result.data.nbytes
+        assert LatencyTracker._memory_space([iat]) == "HBM"
+
     def test_empty_counters_bottleneck(self):
         """LatencyReport with no counters reports bottleneck='none'."""
         from ktir_cpu.latency import LatencyReport

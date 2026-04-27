@@ -77,6 +77,8 @@ class HardwareConfig:
             costs ``2·M·N·K / systolic_flops_per_cycle`` cycles.
         transcendental_penalty: Multiplier for transcendental ops vs elementwise (estimated).
     """
+    # TODO: add gather_bandwidth_tb_s if Spyre scatter/gather BW differs from
+    # sequential HBM BW. Until confirmed by hardware team, both share hbm_bandwidth_tb_s.
     num_cores: int = 32
     clock_ghz: float = 1.0
     hbm_bandwidth_tb_s: float = 1.0
