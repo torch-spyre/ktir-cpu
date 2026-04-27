@@ -80,8 +80,7 @@ def tensor__splat(op, context, env):
     else:
         np_dtype = to_np_dtype(dtype_str)
 
-    scalar_val = float(scalar) if np.issubdtype(np_dtype, np.floating) else int(scalar)
-    data = np.full(shape, scalar_val, dtype=np_dtype)
+    data = np.full(shape, scalar, dtype=np_dtype)
     return Tile(data, dtype_str, shape)
 
 
