@@ -45,10 +45,15 @@ jobs:
             "https://raw.githubusercontent.com/$KTIR_MLIR_REPO/ktir-mlir-frontend/$KTIR_MLIR_FRONTEND_COMMIT/scripts/setup_mlir.py" \
             -o /tmp/setup_mlir.py
           MLIR_DIR=$(uv run python /tmp/setup_mlir.py --wheel --hash "$LLVM_HASH")
+          # Pre-install build-system deps for ktir-mlir-frontend so the source build
+          # can run with --no-build-isolation (mlir_wheel is not on PyPI so uv cannot
+          # resolve build-system.requires in an isolated env; scikit-build-core and
+          # nanobind are on PyPI and safe to install here).
+          uv pip install scikit-build-core "nanobind>=2.12.0"
           echo "CMAKE_ARGS=-DMLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
 
       - name: Install project and dependencies
-        run: uv sync --extra dev --extra mlir-frontend
+        run: uv sync --extra dev --extra mlir-frontend --no-build-isolation
 
       - name: Run tests
         run: uv run pytest -v
