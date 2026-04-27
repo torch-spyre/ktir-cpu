@@ -192,12 +192,8 @@ def _adapt_scf_for(mlir_op, attributes, result_type, operands):
 
 @MLIRTypeAdapter.install("ktdp.get_compute_tile_id")
 def _adapt_get_compute_tile_id(mlir_op, attributes, result_type, operands):
-    """Synthesize num_dims from result count; extract dim if present."""
+    """Synthesize num_dims from result count."""
     attributes["num_dims"] = len(mlir_op.results)
-    if "dim" in mlir_op.attributes:
-        attributes["dim"] = mlir_op.attributes["dim"]
-        if isinstance(attributes["dim"], IntegerAttr):
-            attributes["dim"] = attributes["dim"].value
 
 
 @MLIRTypeAdapter.install("ktdp.construct_access_tile")

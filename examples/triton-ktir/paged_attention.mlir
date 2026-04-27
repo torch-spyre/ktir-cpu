@@ -75,8 +75,7 @@ module {
     %scale                 : f32      // attention scale = 1/sqrt(head_size)
   ) attributes {grid = [4, 8]} {
 
-    %pid0 = ktdp.get_compute_tile_id { dim = 0 } : index   // query-block index
-    %pid1 = ktdp.get_compute_tile_id { dim = 1 } : index   // KV-head index
+    %pid0, %pid1 = ktdp.get_compute_tile_id : index, index   // dim 0: query-block, dim 1: KV-head
     %c0   = arith.constant 0 : index
     %c1   = arith.constant 1 : index
     %c2   = arith.constant 2 : index   // BLOCK_Q

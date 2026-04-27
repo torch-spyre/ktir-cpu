@@ -35,7 +35,7 @@ module {
     // Program id (axis=0): which query block.  With seq_len=32, BLOCK_SIZE_M=32
     // there is exactly one block, but the translation is general.
     // -----------------------------------------------------------------------
-    %pid_m = ktdp.get_compute_tile_id { dim = 0 } : index
+    %pid_m = ktdp.get_compute_tile_id : index
 
     // -----------------------------------------------------------------------
     // Constants
