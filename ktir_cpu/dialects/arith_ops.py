@@ -191,9 +191,12 @@ def arith__bitcast(op, context, env):
         if dst_type in ("i32", "si32"):
             return Tile(val.data.view(np.int32), "i32", val.shape)
         raise NotImplementedError(f"arith.bitcast: unsupported dst_type '{dst_type}' for Tile")
-    # Scalar path
+    # Scalar path — convert via raw bytes to handle both signed and unsigned
+    # integer inputs (e.g. 0xFF800000 from regex as unsigned, -8388608 from
+    # MLIR frontend as signed — both represent the same bit pattern).
     if dst_type == "f32":
-        return float(np.frombuffer(np.int32(val).tobytes(), dtype=np.float32)[0])
+        return float(np.frombuffer(int(val).to_bytes(4, "little", signed=(val < 0)),
+                                   dtype=np.float32)[0])
     if dst_type in ("i32", "si32"):
         return int(np.frombuffer(np.float32(val).tobytes(), dtype=np.int32)[0])
     raise NotImplementedError(f"arith.bitcast: unsupported dst_type '{dst_type}' for scalar")
@@ -307,8 +310,24 @@ def parse_arith_constant(op_text, parse_ctx):
                 attributes["dtype"] = type_info.get("dtype", "f16")
                 attributes["is_tensor"] = True
     else:
-        simple_match = re.match(r'(-?[\d.eE+\-]+)\s*:\s*(.+)$', rest)
-        if simple_match:
+        # Match unbraced dense<value> followed by `: type`.  Covers:
+        #   dense<0.0> : tensor<4xf16>       (splat tensor constant)
+        #   dense<42> : tensor<1xi32>         (scalar tensor constant)
+        dense_match = re.match(r'dense<([^>]+)>\s*:\s*(.+)$', rest)
+        # Match a scalar value followed by `: type`.  Covers:
+        #   42 : index              (decimal integer)
+        #   0.0 : f32               (float)
+        #   -1.5e-3 : f16           (scientific notation)
+        #   0xFF800000 : i32        (hex integer, e.g. -inf bit pattern)
+        simple_match = re.match(r'(-?(?:0[xX][0-9a-fA-F]+|[\d.eE+\-]+))\s*:\s*(.+)$', rest)
+        if dense_match:
+            value = parse_numeric(dense_match.group(1))
+            result_type = dense_match.group(2).strip()
+            type_info = parse_tensor_type(result_type)
+            attributes["shape"] = type_info["shape"]
+            attributes["dtype"] = type_info["dtype"]
+            attributes["is_tensor"] = True
+        elif simple_match:
             value = parse_numeric(simple_match.group(1))
             result_type = simple_match.group(2).strip()
         else:

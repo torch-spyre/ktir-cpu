@@ -142,6 +142,10 @@ class IRFunction:
     return_type: Optional[str] = None
     tensor_sizes: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
+    @property
+    def arg_names(self) -> List[str]:
+        return [name.lstrip("%") for name, _ in self.arguments]
+
     def __post_init__(self):
         for op in _iter_ops(self.operations):
             if op.op_type == "ktdp.construct_memory_view" and op.operands:

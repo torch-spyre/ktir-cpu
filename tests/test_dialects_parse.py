@@ -23,6 +23,15 @@ Covers:
 - ktdp dialect parsers: ktdp.get_compute_tile_id, ktdp.construct_memory_view,
                          ktdp.construct_access_tile
 - scf dialect parsers: scf.for, scf.yield
+
+Design rule
+-----------
+The goal of the regex parser is to parse valid MLIR.  All op text examples
+in this file must therefore be valid MLIR.  Non-MLIR syntax forces the
+corresponding test_bindings_adapt.py test to be skipped, which defeats the
+purpose of sharing tests between the two parser backends.
+
+All op text examples have been verified to parse with both backends.
 """
 
 import numpy as np
@@ -39,12 +48,93 @@ def _parse_ctx():
     return make_parse_context(aliases={})
 
 
-def _parse(op_text, parse_ctx=None):
-    """Dispatch-parse a single op line and return the Operation."""
-    ctx = parse_ctx or _parse_ctx()
-    parser_fn = dispatch_parser(op_text)
-    assert parser_fn is not None, f"No parser found for: {op_text!r}"
-    return parser_fn(op_text, ctx)
+class ParseTestMixin:
+    """Mixin that provides _parse and a portable assertion API.
+
+    Subclasses can override _parse to inject a different parser backend
+    (e.g. MLIRBindingsParser).
+
+    Assertion API
+    -------------
+    Use these methods for all op-level checks in base test classes.
+    They define the boundary between parser-agnostic checks (safe to
+    inherit) and parser-specific checks (must be overridden or skipped).
+
+    Parser-agnostic — always use these in base tests:
+        assert_op_type, assert_num_operands, assert_result_type,
+        assert_attribute
+
+    Parser-specific — override in subclasses or avoid in base tests:
+        assert_operand_names: checks exact SSA names; only valid for the
+        regex parser. BindingsParseTestMixin overrides this to a no-op since
+        the bindings parser uses positional %argN names.
+    """
+
+    def _parse(self, op_text, parse_ctx=None, args=None):
+        """Parse a single op and return the resulting Operation.
+
+        ``args`` is an optional ``{name: mlir_type}`` mapping that declares
+        **all** external SSA operands the op depends on — values defined
+        outside the op text that the op references.  Names defined *within*
+        the op (results on the LHS of ``=``, region block args like ``%i``
+        in ``scf.for %i = ...``, and iter-args) should **not** be included.
+
+        This is a convenience for single-op testing: it avoids writing a
+        full MLIR module while still providing explicit types.  Example::
+
+            self._parse(
+                "%r = linalg.reduce { arith.maxnumf }"
+                " ins(%x : tensor<1x1024xf16>)"
+                " outs(%init : tensor<1xf16>)"
+                " dimensions = [1]",
+                args={"%x": "tensor<1x1024xf16>", "%init": "tensor<1xf16>"},
+            )
+
+        The regex parser ignores ``args`` and operates on the op text
+        directly.  The MLIR frontend adapter uses it to build a typed
+        ``func.func`` wrapper, so **missing operands will cause MLIR
+        verification errors** when the adapter tests run.
+
+        If ``args`` is provided, every declared name must appear in
+        ``op_text``.
+        """
+        args = self._resolve_args(op_text, args)
+        ctx = parse_ctx or _parse_ctx()
+        ops = KTIRParser()._parse_operations(op_text, ctx)
+        assert ops, f"No op parsed from: {op_text!r}"
+        return ops[0]
+
+    def _resolve_args(self, op_text, args):
+        """Normalise and validate the args schema against op_text.
+
+        Returns ``args`` as a ``dict``, defaulting to ``{}`` if not provided.
+        Asserts that every declared name appears in ``op_text``.
+        """
+        args = args or {}
+        for name in args:
+            assert name in op_text, f"arg {name!r} not found in op_text"
+        return args
+
+    def assert_op_type(self, op, expected):
+        assert op.op_type == expected
+
+    def assert_num_operands(self, op, n):
+        assert len(op.operands) == n
+
+    def assert_result_type(self, op, expected):
+        assert op.result_type == expected
+
+    def assert_attribute(self, op, key, value, transform=None):
+        actual = op.attributes[key]
+        if transform is not None:
+            actual = transform(actual)
+        assert actual == value
+
+    def assert_operand_names(self, op, *names):
+        """Regex-parser-specific: checks exact SSA operand names.
+        Override to no-op in bindings subclasses."""
+        for name in names:
+            assert name in op.operands
 
 
 # ---------------------------------------------------------------------------
@@ -132,171 +222,218 @@ class TestModuleParser:
 # arith dialect parsers
 # ---------------------------------------------------------------------------
 
-class TestArithParsers:
+class TestArithParsers(ParseTestMixin):
     def test_constant_scalar(self):
         # scalar integer constant parsed with correct value
-        op = _parse("%c0 = arith.constant 42 : index")
+        op = self._parse("%c0 = arith.constant 42 : index")
         assert op.op_type == "arith.constant"
         assert op.attributes["value"] == 42
 
     def test_constant_dense_tensor(self):
         # dense<0.0> tensor constant sets is_tensor, shape, and dtype
-        op = _parse("%t = arith.constant {dense<0.0>} : tensor<4xf16>")
-        assert op.attributes["is_tensor"] is True
-        assert op.attributes["shape"] == (4,)
-        assert op.attributes["dtype"] == "f16"
+        op = self._parse("%t = arith.constant dense<0.0> : tensor<4xf16>")
+        self.assert_op_type(op, "arith.constant")
+        self.assert_attribute(op, "is_tensor", True)
+        self.assert_attribute(op, "shape", (4,))
+        self.assert_attribute(op, "dtype", "f16")
 
     def test_cmpi_basic(self):
         # cmpi records predicate and both operands
-        op = _parse("%b = arith.cmpi slt, %a, %c0 : index")
-        assert op.op_type == "arith.cmpi"
-        assert op.attributes["predicate"] == "slt"
-        assert "%a" in op.operands
-        assert "%c0" in op.operands
+        op = self._parse(
+            "%b = arith.cmpi slt, %a, %c0 : index",
+            args={"%a": "index", "%c0": "index"},
+        )
+        self.assert_op_type(op, "arith.cmpi")
+        self.assert_attribute(op, "predicate", "slt")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%c0")
 
     def test_cmpi_all_predicates(self):
         # all six comparison predicates are recognised
         for pred in ("eq", "ne", "slt", "sle", "sgt", "sge"):
-            op = _parse(f"%b = arith.cmpi {pred}, %x, %y : i32")
-            assert op.attributes["predicate"] == pred
+            op = self._parse(
+                f"%b = arith.cmpi {pred}, %x, %y : i32",
+                args={"%x": "i32", "%y": "i32"},
+            )
+            self.assert_attribute(op, "predicate", pred)
 
     def test_sitofp(self):
         # sitofp records operand and target float type
-        op = _parse("%f = arith.sitofp %i : i32 to f16")
-        assert op.op_type == "arith.sitofp"
-        assert op.operands == ["%i"]
-        assert op.result_type == "f16"
+        op = self._parse(
+            "%f = arith.sitofp %i : i32 to f16",
+            args={"%i": "i32"},
+        )
+        self.assert_op_type(op, "arith.sitofp")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%i")
+        self.assert_result_type(op, "f16")
 
 
 # ---------------------------------------------------------------------------
 # linalg dialect parsers
 # ---------------------------------------------------------------------------
 
-class TestLinalgParsers:
+class TestLinalgParsers(ParseTestMixin):
     def test_reduce(self):
         # reduce records reduce_fn, dim, outs_var, and ins operand
-        op = _parse(
+        op = self._parse(
             "%r = linalg.reduce { arith.maxnumf }"
             " ins(%x : tensor<1x1024xf16>)"
             " outs(%init : tensor<1xf16>)"
-            " dimensions = [1]"
+            " dimensions = [1]",
+            args={"%x": "tensor<1x1024xf16>", "%init": "tensor<1xf16>"},
         )
-        assert op.op_type == "linalg.reduce"
-        assert op.attributes["reduce_fn"] == "arith.maxnumf"
-        assert op.attributes["dim"] == 1
-        assert op.attributes["outs_var"] == "%init"
-        assert "%x" in op.operands
+        self.assert_op_type(op, "linalg.reduce")
+        self.assert_attribute(op, "reduce_fn", "arith.maxnumf")
+        self.assert_attribute(op, "dim", 1)
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
 
     def test_fill(self):
         # fill records both ins and outs operands
-        op = _parse(
-            "%out = linalg.fill ins(%val : f16) outs(%buf : tensor<4xf16>) -> tensor<4xf16>"
+        op = self._parse(
+            "%out = linalg.fill ins(%val : f16) outs(%buf : tensor<4xf16>) -> tensor<4xf16>",
+            args={"%val": "f16", "%buf": "tensor<4xf16>"},
         )
-        assert op.op_type == "linalg.fill"
-        assert "%val" in op.operands
-        assert "%buf" in op.operands
+        self.assert_op_type(op, "linalg.fill")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%val", "%buf")
 
     def test_broadcast(self):
         # broadcast records dimensions and both ins/outs operands
-        op = _parse(
-            "%out = linalg.broadcast ins(%x : tensor<4xf16>) outs(%buf : tensor<4x8xf16>) dimensions = [1]"
+        op = self._parse(
+            "%out = linalg.broadcast ins(%x : tensor<4xf16>) outs(%buf : tensor<4x8xf16>) dimensions = [1]",
+            args={"%x": "tensor<4xf16>", "%buf": "tensor<4x8xf16>"},
         )
-        assert op.op_type == "linalg.broadcast"
-        assert op.attributes["dimensions"] == [1]
-        assert "%x" in op.operands
-        assert "%buf" in op.operands
+        self.assert_op_type(op, "linalg.broadcast")
+        self.assert_attribute(op, "dimensions", [1])
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%x", "%buf")
 
 
 # ---------------------------------------------------------------------------
 # tensor dialect parsers
 # ---------------------------------------------------------------------------
 
-class TestTensorParsers:
+class TestTensorParsers(ParseTestMixin):
     def test_empty(self):
         # tensor.empty records shape and dtype from type annotation
-        op = _parse("%t = tensor.empty() : tensor<1x1024xf16>")
-        assert op.op_type == "tensor.empty"
-        assert op.attributes["shape"] == (1, 1024)
-        assert op.attributes["dtype"] == "f16"
+        op = self._parse("%t = tensor.empty() : tensor<1x1024xf16>")
+        self.assert_op_type(op, "tensor.empty")
+        self.assert_attribute(op, "shape", (1, 1024))
+        self.assert_attribute(op, "dtype", "f16")
 
     def test_splat(self):
         # tensor.splat records scalar operand and target shape
-        op = _parse("%t = tensor.splat %val : tensor<4xf16>")
-        assert op.op_type == "tensor.splat"
-        assert op.operands == ["%val"]
-        assert op.attributes["shape"] == (4,)
+        op = self._parse(
+            "%t = tensor.splat %val : tensor<4xf16>",
+            args={"%val": "f16"},
+        )
+        self.assert_op_type(op, "tensor.splat")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%val")
+        self.assert_attribute(op, "shape", (4,))
 
     def test_extract(self):
         # tensor.extract records tensor operand and index operands
-        op = _parse("%s = tensor.extract %t[%i, %j] : tensor<4x4xf16>")
-        assert op.op_type == "tensor.extract"
-        assert op.operands[0] == "%t"
-        assert "%i" in op.operands
-        assert "%j" in op.operands
+        op = self._parse(
+            "%s = tensor.extract %t[%i, %j] : tensor<4x4xf16>",
+            args={"%t": "tensor<4x4xf16>", "%i": "index", "%j": "index"},
+        )
+        self.assert_op_type(op, "tensor.extract")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%t", "%i", "%j")
 
     def test_expand_shape(self):
         # tensor.expand_shape records source operand and target shape
-        op = _parse("%out = tensor.expand_shape %in into tile<1x1024xf16>")
-        assert op.op_type == "tensor.expand_shape"
-        assert op.operands == ["%in"]
-        assert op.attributes["target_shape"] == (1, 1024)
+        op = self._parse(
+            "%out = tensor.expand_shape %in [[0, 1]] output_shape [1, 1024]"
+            " : tensor<1024xf16> into tensor<1x1024xf16>",
+            args={"%in": "tensor<1024xf16>"},
+        )
+        self.assert_op_type(op, "tensor.expand_shape")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%in")
+        self.assert_attribute(op, "target_shape", (1, 1024))
 
 
 # ---------------------------------------------------------------------------
 # ktdp dialect parsers
 # ---------------------------------------------------------------------------
 
-class TestKtdpParsers:
+class TestKtdpParsers(ParseTestMixin):
     def test_get_compute_tile_id_single(self):
-        # single-result form records num_dims=1 and result name
-        op = _parse("%id = ktdp.get_compute_tile_id : index")
-        assert op.op_type == "ktdp.get_compute_tile_id"
-        assert op.attributes["num_dims"] == 1
-        assert op.result == "%id"
+        # single-result form records num_dims=1 and a scalar result
+        op = self._parse("%id = ktdp.get_compute_tile_id : index")
+        self.assert_op_type(op, "ktdp.get_compute_tile_id")
+        self.assert_attribute(op, "num_dims", 1)
+        assert isinstance(op.result, str)
 
     def test_get_compute_tile_id_multi(self):
         # multi-result form records num_dims=2 and a list result
-        op = _parse("%x, %y = ktdp.get_compute_tile_id : index, index")
-        assert op.op_type == "ktdp.get_compute_tile_id"
-        assert op.attributes["num_dims"] == 2
+        op = self._parse("%x, %y = ktdp.get_compute_tile_id : index, index")
+        self.assert_op_type(op, "ktdp.get_compute_tile_id")
+        self.assert_attribute(op, "num_dims", 2)
         assert isinstance(op.result, list)
 
     def test_construct_memory_view(self):
-        # construct_memory_view records shape, dtype, and pointer operand
-        op = _parse(
-            "%view = ktdp.construct_memory_view %ptr,"
-            " sizes: [1024], strides: [1] : index -> memref<1024xf16>"
+        # construct_memory_view records shape, strides, dtype, memory_space, and pointer operand
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [1024], strides: [1]"
+            " { coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1023 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+            args={"%ptr": "index"},
         )
-        assert op.op_type == "ktdp.construct_memory_view"
-        assert op.attributes["shape"] == (1024,)
-        assert op.attributes["dtype"] == "f16"
-        assert op.operands == ["%ptr"]
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "shape", (1024,))
+        self.assert_attribute(op, "strides", [1])
+        self.assert_attribute(op, "dtype", "f16")
+        self.assert_attribute(op, "memory_space", "HBM")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%ptr")
 
     def test_construct_access_tile(self):
-        # construct_access_tile records tile shape and base view operand
-        op = _parse(
+        # construct_access_tile records tile shape and all operands
+        op = self._parse(
             "%acc = ktdp.construct_access_tile %view[%c0]"
-            " : memref<1024xf16> -> !ktdp.access_tile<128xindex>"
+            " { access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,"
+            " access_tile_order = affine_map<(d0) -> (d0)> }"
+            " : memref<1024xf16> -> !ktdp.access_tile<128xindex>",
+            args={"%view": "memref<1024xf16>", "%c0": "index"},
         )
-        assert op.op_type == "ktdp.construct_access_tile"
-        assert op.attributes["shape"] == (128,)
-        assert "%view" in op.operands
+        self.assert_op_type(op, "ktdp.construct_access_tile")
+        self.assert_attribute(op, "shape", (128,))
+        self.assert_attribute(op, "base_map", "affine_map<(d0) -> (d0)>", transform=lambda x: x.source)
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%view", "%c0")
 
     def test_construct_access_tile_non_index_elem_type_rejected(self):
         # Per spec, AccessTileType element type must be 'index'; any other type
         # is a spec violation and must be rejected at parse time.
-        with pytest.raises(ValueError, match="element type must be 'index'"):
-            _parse(
+        # The result type below is !ktdp.access_tile<128xf16> — 'f16' must be 'index'.
+        # regex raises: ValueError "AccessTileType element type must be 'index', got 'f16'"
+        # mlir  raises: MLIRError  "tile element type must be 'index', but got: 'f16'"
+        with pytest.raises(Exception, match=r"element type must be 'index'.*f16"):
+            self._parse(
                 "%acc = ktdp.construct_access_tile %view[%c0]"
-                " : memref<1024xf16> -> !ktdp.access_tile<128xf16>"
+                " { access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,"
+                " access_tile_order = affine_map<(d0) -> (d0)> }"
+                " : memref<1024xf16> -> !ktdp.access_tile<128xf16>",
+                args={"%view": "memref<1024xf16>", "%c0": "index"},
             )
 
     def test_construct_access_tile_malformed_type_rejected(self):
-        # A type string with no alphabetic element-type suffix is malformed.
-        with pytest.raises(ValueError, match="Malformed access_tile type"):
-            _parse(
+        # The result type !ktdp.access_tile<128> has no element type (must be <128xindex>).
+        # Both parsers reject the missing 'x<type>' suffix, with different messages:
+        # regex raises: ValueError "Malformed access_tile type '128': expected '<dims>xindex>'"
+        # mlir  raises: MLIRError  "expected 'x' in dimension list"
+        with pytest.raises(Exception, match=r"Malformed access_tile|expected 'x' in dimension"):
+            self._parse(
                 "%acc = ktdp.construct_access_tile %view[%c0]"
-                " : memref<1024xf16> -> !ktdp.access_tile<128>"
+                " { access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,"
+                " access_tile_order = affine_map<(d0) -> (d0)> }"
+                " : memref<1024xf16> -> !ktdp.access_tile<128>",
+                args={"%view": "memref<1024xf16>", "%c0": "index"},
             )
 
 
@@ -304,58 +441,91 @@ class TestKtdpParsers:
 # scf dialect parsers
 # ---------------------------------------------------------------------------
 
-class TestScfParsers:
+class TestScfParsers(ParseTestMixin):
     def test_for_basic(self):
         # scf.for records iter_var and lb/ub/step operands in order
-        op = _parse("scf.for %i = %lb to %ub step %step {")
-        assert op.op_type == "scf.for"
-        assert op.attributes["iter_var"] == "%i"
-        assert op.operands[:3] == ["%lb", "%ub", "%step"]
+        op = self._parse(
+            "scf.for %i = %lb to %ub step %step {\n      scf.yield\n    }",
+            args={"%lb": "index", "%ub": "index", "%step": "index"},
+        )
+        self.assert_op_type(op, "scf.for")
+        self.assert_attribute(op, "iter_var", "%i")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%lb", "%ub", "%step")
 
     def test_for_with_result(self):
         # optional result prefix on scf.for is captured
-        op = _parse("%res = scf.for %i = %lb to %ub step %step {")
-        assert op.result == "%res"
-        assert op.attributes["iter_var"] == "%i"
+        op = self._parse(
+            "%res = scf.for %i = %lb to %ub step %step iter_args(%acc = %lb) -> (index) {\n"
+            "      scf.yield %acc : index\n    }",
+            args={"%lb": "index", "%ub": "index", "%step": "index"},
+        )
+        assert isinstance(op.result, str)
+        self.assert_attribute(op, "iter_var", "%i")
 
     def test_for_iter_args(self):
         # iter_args clause records carried variable and init operand
-        op = _parse(
-            "scf.for %i = %lb to %ub step %step iter_args(%acc = %init) {"
+        op = self._parse(
+            "%res = scf.for %i = %lb to %ub step %step iter_args(%acc = %init) -> (f16) {\n"
+            "      scf.yield %acc : f16\n    }",
+            args={"%lb": "index", "%ub": "index", "%step": "index", "%init": "f16"},
         )
-        assert op.attributes["iter_args"] == ["%acc"]
-        assert "%init" in op.operands
+        self.assert_attribute(op, "iter_args", ["%acc"])
+        self.assert_operand_names(op, "%init")
 
     def test_for_multi_result(self):
         # multi-result scf.for records a list of result names
-        op = _parse(
+        op = self._parse(
             "%M, %L, %acc = scf.for %j = %c0 to %n step %c1"
-            " iter_args(%m = %M0, %l = %L0, %a = %A0) {"
+            " iter_args(%m = %M0, %l = %L0, %a = %A0) -> (f16, f16, f16) {\n"
+            "      scf.yield %m, %l, %a : f16, f16, f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index",
+                  "%M0": "f16", "%L0": "f16", "%A0": "f16"},
         )
-        assert op.op_type == "scf.for"
+        self.assert_op_type(op, "scf.for")
         assert isinstance(op.result, list)
-        assert op.result == ["%M", "%L", "%acc"]
-        assert op.attributes["iter_var"] == "%j"
-        assert op.attributes["iter_args"] == ["%m", "%l", "%a"]
-        assert op.operands[:3] == ["%c0", "%n", "%c1"]
+        assert len(op.result) == 3
+        self.assert_attribute(op, "iter_var", "%j")
+        self.assert_attribute(op, "iter_args", ["%m", "%l", "%a"])
+        # operands = [lb, ub, step, init_m, init_l, init_a]
+        self.assert_num_operands(op, 6)
+        self.assert_operand_names(op, "%c0", "%n", "%c1", "%M0", "%L0", "%A0")
 
     def test_for_multi_result_two(self):
         # two-result variant also produces a list
-        op = _parse("%x, %y = scf.for %i = %lo to %hi step %s {")
+        op = self._parse(
+            "%x, %y = scf.for %i = %lo to %hi step %s"
+            " iter_args(%a = %lo, %b = %hi) -> (index, index) {\n"
+            "      scf.yield %a, %b : index, index\n    }",
+            args={"%lo": "index", "%hi": "index", "%s": "index"},
+        )
         assert isinstance(op.result, list)
-        assert op.result == ["%x", "%y"]
+        assert len(op.result) == 2
 
     def test_yield_single(self):
         # scf.yield with one value records the operand
-        op = _parse("scf.yield %val : f16")
-        assert op.op_type == "scf.yield"
-        assert "%val" in op.operands
+        for_op = self._parse(
+            "%res = scf.for %i = %lb to %ub step %step iter_args(%acc = %val) -> (f16) {\n"
+            "      scf.yield %val : f16\n    }",
+            args={"%lb": "index", "%ub": "index", "%step": "index", "%val": "f16"},
+        )
+        op = for_op.regions[0][0]
+        self.assert_op_type(op, "scf.yield")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%val")
 
     def test_yield_multi(self):
         # scf.yield with two values records both operands
-        op = _parse("scf.yield %a, %b : f16, f16")
-        assert "%a" in op.operands
-        assert "%b" in op.operands
+        for_op = self._parse(
+            "%r, %s = scf.for %i = %lb to %ub step %step"
+            " iter_args(%acc = %a, %acc2 = %b) -> (f16, f16) {\n"
+            "      scf.yield %a, %b : f16, f16\n    }",
+            args={"%lb": "index", "%ub": "index", "%step": "index",
+                  "%a": "f16", "%b": "f16"},
+        )
+        op = for_op.regions[0][0]
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%b")
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,57 @@ from ktir_cpu import KTIRInterpreter
 from conftest import get_test_params, parse_example
 
 
+class InterpreterTestMixin:
+    """Mixin that provides _make_interp() for injecting alternative parser backends.
+
+    Usage
+    -----
+    Execution test classes inherit this mixin and call ``self._make_interp()``
+    instead of constructing ``KTIRInterpreter()`` directly.  To run the same
+    tests against a different parser backend, subclass the execution test class
+    and override ``_make_interp()``::
+
+        class MyAdaptTests(MyBackendMixin, TestVectorAddExecution):
+            pass
+
+    where ``MyBackendMixin`` overrides ``_make_interp`` to inject the
+    alternative parser.
+
+    Parser-agnostic test hygiene
+    ----------------------------
+    Tests must not hardcode argument names from the MLIR source (e.g.
+    ``"x_ptr"``) because different parser backends may normalise them
+    differently (e.g. the MLIR bindings parser normalises to positional
+    ``arg0``, ``arg1``, ...).  Instead, use ``interp.arg_names(func_name)``
+    to get the names in declaration order and unpack them positionally::
+
+        x_ptr, y_ptr, output_ptr, BLOCK_SIZE = interp.arg_names(func_name)
+        sizes = interp.tensor_input_output_sizes(func_name)
+        (n,) = sizes[x_ptr]["shape"]
+        outputs = interp.execute_function(
+            func_name, **{x_ptr: x, y_ptr: y, output_ptr: out, BLOCK_SIZE: bs}
+        )
+        result = outputs[output_ptr]
+    """
+
+    def _make_interp(self):
+        return KTIRInterpreter()
+
+    @staticmethod
+    def _build_kwargs(entry, tensors, overrides=None):
+        """Merge execute_kwargs scalars with tensor args for execute_function.
+
+        Raises AssertionError if any key appears in both scalars and tensors,
+        preventing silent overwrites like the duplicate-n_rows bug.
+        """
+        scalars = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+        if overrides:
+            scalars.update(overrides)
+        overlap = scalars.keys() & tensors.keys()
+        assert not overlap, f"duplicate keys in tensors and scalars: {overlap}"
+        return {**scalars, **tensors}
+
+
 # ---------------------------------------------------------------------------
 # Parsing tests — all example files must parse into valid modules
 # ---------------------------------------------------------------------------
@@ -70,81 +121,79 @@ class TestExampleParsing:
 # Execution tests — run KTIR through the interpreter and check results
 # ---------------------------------------------------------------------------
 
-class TestVectorAddExecution:
+class TestVectorAddExecution(InterpreterTestMixin):
     """End-to-end execution of vector_add MLIR."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_single_core(self, path, func_name, entry):
         """Run vector add on K cores, verify output = x + y."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        x_ptr, y_ptr, output_ptr, BLOCK_SIZE = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
-        (n,) = sizes["x_ptr"]["shape"]
+        (n,) = sizes[x_ptr]["shape"]
         rng = np.random.default_rng(42)
         x = rng.standard_normal(n).astype(np.float16)
         y = rng.standard_normal(n).astype(np.float16)
         output = np.zeros(n, dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        outputs = interp.execute_function(
-            func_name, x_ptr=x, y_ptr=y, output_ptr=output, **kwargs,
-        )
+        kwargs = self._build_kwargs(entry, {x_ptr: x, y_ptr: y, output_ptr: output})
+        outputs = interp.execute_function(func_name, **kwargs)
 
-        result = outputs["output_ptr"]
+        result = outputs[output_ptr]
         expected = (x + y).astype(np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_various_values(self, path, func_name, entry):
         """Vector add with zeros, negatives, and large values."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        x_ptr, y_ptr, output_ptr, BLOCK_SIZE = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
-        (n,) = sizes["x_ptr"]["shape"]
+        (n,) = sizes[x_ptr]["shape"]
         x = np.zeros(n, dtype=np.float16)
         y = np.linspace(-10, 10, n, dtype=np.float16)
         output = np.zeros(n, dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        outputs = interp.execute_function(
-            func_name, x_ptr=x, y_ptr=y, output_ptr=output, **kwargs,
-        )
+        kwargs = self._build_kwargs(entry, {x_ptr: x, y_ptr: y, output_ptr: output})
+        outputs = interp.execute_function(func_name, **kwargs)
 
-        result = outputs["output_ptr"]
+        result = outputs[output_ptr]
         expected = (x + y).astype(np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
 
-class TestSoftmaxExecution:
+class TestSoftmaxExecution(InterpreterTestMixin):
     """End-to-end execution of softmax MLIR."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("softmax_kernel", filter="triton-ktir"))
     def test_softmax_correct(self, path, func_name, entry):
         """Run softmax on 32 cores, verify against NumPy ground truth."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        output_ptr, input_ptr, n_rows = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows, n_padded_cols = sizes["input_ptr"]["shape"]
+        n_rows_val, n_padded_cols = sizes[input_ptr]["shape"]
         rng = np.random.default_rng(42)
         n_real_cols = int(n_padded_cols * 0.76)  # test with padding: ~76% real data
 
         # Padded input: first n_real_cols are real data, rest is -inf
-        inp = np.full((n_rows, n_padded_cols), float('-inf'), dtype=np.float16)
+        inp = np.full((n_rows_val, n_padded_cols), float('-inf'), dtype=np.float16)
         inp[:, :n_real_cols] = rng.standard_normal(
-            (n_rows, n_real_cols)
+            (n_rows_val, n_real_cols)
         ).astype(np.float16)
-        out = np.zeros((n_rows, n_padded_cols), dtype=np.float16)
+        out = np.zeros((n_rows_val, n_padded_cols), dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        kwargs["n_cols"] = n_real_cols  # fill dynamic kwarg
-
-        outputs = interp.execute_function(
-            func_name, output_ptr=out, input_ptr=inp, **kwargs,
+        kwargs = self._build_kwargs(
+            entry, {output_ptr: out, input_ptr: inp},
+            overrides={"n_cols": n_real_cols},
         )
-        result = outputs["output_ptr"]
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[output_ptr]
 
         # NumPy reference: softmax per row
         m = np.max(inp, axis=1, keepdims=True)
@@ -165,59 +214,55 @@ class TestSoftmaxExecution:
         This is exactly the scenario that online_rowchunk solves by
         chunking the column dimension.
         """
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        output_ptr, input_ptr, *_ = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows, n_cols = sizes["input_ptr"]["shape"]
+        n_rows_val, n_cols = sizes[input_ptr]["shape"]
         rng = np.random.default_rng(42)
-        inp = rng.standard_normal((n_rows, n_cols)).astype(np.float16)
-        out = np.zeros((n_rows, n_cols), dtype=np.float16)
+        inp = rng.standard_normal((n_rows_val, n_cols)).astype(np.float16)
+        out = np.zeros((n_rows_val, n_cols), dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+        kwargs = self._build_kwargs(entry, {output_ptr: out, input_ptr: inp})
         with pytest.raises(MemoryError, match=entry["exception_msg"]):
-            interp.execute_function(
-                func_name,
-                output_ptr=out,
-                input_ptr=inp,
-                **kwargs,
-            )
+            interp.execute_function(func_name, **kwargs)
 
 
-class TestLayerNormExecution:
+class TestLayerNormExecution(InterpreterTestMixin):
     """End-to-end execution of layernorm_fwd_ktir.mlir."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("_layer_norm_fwd_fused"))
     def test_layernorm_32_cores(self, path, func_name, entry):
         """Run layer norm on 32 cores, verify Y and Mean."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        X, Y, W, B, Mean, Rstd, N, eps, BLOCK_SIZE = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows, n_cols = sizes["X"]["shape"]
+        n_rows, n_cols = sizes[X]["shape"]
         rng = np.random.default_rng(42)
-        X = rng.standard_normal((n_rows, n_cols)).astype(np.float16)
+        X_data = rng.standard_normal((n_rows, n_cols)).astype(np.float16)
         # W and B are 1D weight/bias vectors, but the MLIR construct_memory_view
         # declares them as 2D (n_rows × n_cols) — same row tiled across all rows.
         W_1d = rng.standard_normal(n_cols).astype(np.float16)
         B_1d = rng.standard_normal(n_cols).astype(np.float16)
-        W = np.tile(W_1d, (n_rows, 1))
-        B = np.tile(B_1d, (n_rows, 1))
-        Y = np.zeros((n_rows, n_cols), dtype=np.float16)
-        Mean = np.zeros(n_rows, dtype=np.float16)
-        Rstd = np.zeros(n_rows, dtype=np.float16)
+        W_data = np.tile(W_1d, (n_rows, 1))
+        B_data = np.tile(B_1d, (n_rows, 1))
+        Y_data = np.zeros((n_rows, n_cols), dtype=np.float16)
+        Mean_data = np.zeros(n_rows, dtype=np.float16)
+        Rstd_data = np.zeros(n_rows, dtype=np.float16)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        outputs = interp.execute_function(
-            func_name,
-            X=X, Y=Y, W=W, B=B, Mean=Mean, Rstd=Rstd,
-            **kwargs,
-        )
-        result_Y = outputs["Y"]
-        result_Mean = outputs["Mean"]
+        kwargs = self._build_kwargs(entry, {
+            X: X_data, Y: Y_data, W: W_data, B: B_data,
+            Mean: Mean_data, Rstd: Rstd_data,
+        })
+        outputs = interp.execute_function(func_name, **kwargs)
+        result_Y = outputs[Y]
+        result_Mean = outputs[Mean]
 
         # NumPy reference: standard layer norm
-        X_f32 = X.astype(np.float32)
+        X_f32 = X_data.astype(np.float32)
         W_f32 = W_1d.astype(np.float32)
         B_f32 = B_1d.astype(np.float32)
         mean_ref = np.mean(X_f32, axis=1)
@@ -235,7 +280,7 @@ class TestLayerNormExecution:
         )
 
 
-class TestReduceExplicitRegion:
+class TestReduceExplicitRegion(InterpreterTestMixin):
     """End-to-end execution of reduce_generic.mlir.
 
     Verifies that linalg.reduce in the generic MLIR format (explicit combiner
@@ -246,12 +291,14 @@ class TestReduceExplicitRegion:
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
     def test_reduce_sum(self, path, func_name, entry):
         """Reduce [1, 2, 3, 4] along dim 1 — result broadcast to [10, 10, 10, 10]."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        (arg0,) = interp.arg_names(func_name)
         data = np.array([[1, 2, 3, 4]], dtype=np.float16)
-        outputs = interp.execute_function(func_name, arg0=data)
-        result = outputs["arg0"]
+        kwargs = self._build_kwargs(entry, {arg0: data})
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[arg0]
 
         expected = np.full((1, 4), 10.0, dtype=np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
@@ -259,36 +306,38 @@ class TestReduceExplicitRegion:
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
     def test_reduce_zeros(self, path, func_name, entry):
         """Reduce all-zeros — result should be all zeros."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        (arg0,) = interp.arg_names(func_name)
         data = np.zeros((1, 4), dtype=np.float16)
-        outputs = interp.execute_function(func_name, arg0=data)
-        result = outputs["arg0"]
+        kwargs = self._build_kwargs(entry, {arg0: data})
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[arg0]
 
         np.testing.assert_allclose(result, np.zeros((1, 4), dtype=np.float16), atol=1e-3)
 
 
-class TestMatMulExecution:
+class TestMatMulExecution(InterpreterTestMixin):
     """End-to-end execution of matmul_fwd_ktir.mlir."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("matmul_kernel"))
     def test_matmul(self, path, func_name, entry):
         """Run matmul on the full grid, verify C ≈ A @ B."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        M, N, K = kwargs["M"], kwargs["N"], kwargs["K"]
+        a_ptr, b_ptr, c_ptr, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = interp.arg_names(func_name)
+        ek = entry["execute_kwargs"]
+        M, N, K_val = ek["M"], ek["N"], ek["K"]
         rng = np.random.default_rng(42)
-        A = rng.standard_normal((M, K)).astype(np.float16)
-        B = rng.standard_normal((K, N)).astype(np.float16)
+        A = rng.standard_normal((M, K_val)).astype(np.float16)
+        B = rng.standard_normal((K_val, N)).astype(np.float16)
         C = np.zeros((M, N), dtype=np.float16)
 
-        outputs = interp.execute_function(
-            func_name, a_ptr=A, b_ptr=B, c_ptr=C, **kwargs,
-        )
-        result_C = outputs["c_ptr"]
+        kwargs = self._build_kwargs(entry, {a_ptr: A, b_ptr: B, c_ptr: C})
+        outputs = interp.execute_function(func_name, **kwargs)
+        result_C = outputs[c_ptr]
 
         expected = (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float16)
         # K=2048 with BLOCK_SIZE_K=128 → 16 accumulation iterations in f16;
@@ -296,30 +345,28 @@ class TestMatMulExecution:
         np.testing.assert_allclose(result_C, expected, rtol=2e-2, atol=2e-1)
 
 
-class TestIndexedAddExecution:
+class TestIndexedAddExecution(InterpreterTestMixin):
     """End-to-end execution of indexed_add.mlir."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("indexed_add_kernel"))
     def test_indexed_add(self, path, func_name, entry):
         """Run indexed_add with indirect x access, verify output = x[index[grid0]] + y."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
+
+        x_ptr, y_ptr, index_ptr, output_ptr, dim1_start = interp.arg_names(func_name)
         rng = np.random.default_rng(0)
         # x: [128, 64, 8, 128], y: [2, 32, 8, 128], index: [2] (i64), output: [2, 32, 8, 128]
         x = rng.standard_normal((128, 64, 8, 128)).astype(np.float16)
         y = rng.standard_normal((2, 32, 8, 128)).astype(np.float16)
         index = np.array([3, 7], dtype=np.int64)
         output = np.zeros((2, 32, 8, 128), dtype=np.float16)
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        outputs = interp.execute_function(
-            func_name,
-            x_ptr=x,
-            y_ptr=y,
-            index_ptr=index,
-            output_ptr=output,
-            **kwargs,
-        )
-        result = outputs["output_ptr"]
+        dim1_start_val = entry["execute_kwargs"].get("dim1_start", 0)
+        kwargs = self._build_kwargs(entry, {
+            x_ptr: x, y_ptr: y, index_ptr: index, output_ptr: output,
+        })
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[output_ptr]
         assert result.shape == (2, 32, 8, 128)
         assert not np.any(np.isnan(result)), "output contains NaN"
         assert not np.any(np.isinf(result)), "output contains Inf"
@@ -328,13 +375,12 @@ class TestIndexedAddExecution:
         #   For each grid0 ∈ {0,1}, grid1 ∈ {0..7}:
         #     x_row = index[grid0]
         #     output[grid0, :, grid1, :] = x[x_row, 0:32, grid1, :] + y[grid0, :, grid1, :]
-        dim1_start = kwargs.get("dim1_start", 0)
         x_rows = x[index.astype(np.intp)]  # (2, 64, 8, 128)
-        expected = (x_rows[:, dim1_start:dim1_start + 32, :, :] + y).astype(np.float16)
+        expected = (x_rows[:, dim1_start_val:dim1_start_val + 32, :, :] + y).astype(np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
 
-class TestPagedAttentionExecution:
+class TestPagedAttentionExecution(InterpreterTestMixin):
     """End-to-end execution of paged_attention.mlir."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("kernel_unified_attention_spyre_2d"))
@@ -344,25 +390,28 @@ class TestPagedAttentionExecution:
         Verifies shape, finiteness, and checks the first query block
         (pid0=0, pid1=0) against a NumPy reference.
         """
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
+        (output_ptr, query_ptr, key_cache_ptr, value_cache_ptr,
+         block_tables_ptr, cur_batch_start_index, block_table_offset,
+         num_tiles, context_len, scale) = interp.arg_names(func_name)
         rng = np.random.default_rng(42)
         query = rng.standard_normal((8, 32, 128)).astype(np.float16)
         key_cache = rng.standard_normal((64, 16, 8, 128)).astype(np.float16)
         value_cache = rng.standard_normal((64, 16, 8, 128)).astype(np.float16)
         block_tables = rng.integers(0, 64, size=(1, 16), dtype=np.int32)
         output = np.zeros((8, 32, 128), dtype=np.float16)
-        kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-        outputs = interp.execute_function(
-            func_name,
-            output_ptr=output,
-            query_ptr=query,
-            key_cache_ptr=key_cache,
-            value_cache_ptr=value_cache,
-            block_tables_ptr=block_tables,
-            **kwargs,
-        )
-        result = outputs["output_ptr"]
+        ek = entry["execute_kwargs"]
+        scale_val = ek["scale"]
+        num_tiles_val = ek["num_tiles"]
+        context_len_val = ek["context_len"]
+        kwargs = self._build_kwargs(entry, {
+            output_ptr: output, query_ptr: query,
+            key_cache_ptr: key_cache, value_cache_ptr: value_cache,
+            block_tables_ptr: block_tables,
+        })
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[output_ptr]
         assert result.shape == (8, 32, 128)
         assert not np.any(np.isnan(result)), "output contains NaN"
         assert not np.any(np.isinf(result)), "output contains Inf"
@@ -374,26 +423,23 @@ class TestPagedAttentionExecution:
         #                    V = value_cache[block_tables[0,j], :, 0, :] → (16, 128)
         #   Causal mask: seq_offset(j,col) = j*16+col; mask where > context_len + query_pos
         #   output = softmax(Q @ K^T * scale, masked) @ V, then reshape to (2, 4, 128)
-        scale = kwargs["scale"]
-        num_tiles = kwargs["num_tiles"]
-        context_len = kwargs["context_len"]
         pid0 = 0
         Q = query[0:2, 0:4, :].reshape(8, 128).astype(np.float32)
         K_full = np.concatenate([
-            key_cache[block_tables[0, j], :, 0, :] for j in range(num_tiles)
+            key_cache[block_tables[0, j], :, 0, :] for j in range(num_tiles_val)
         ], axis=0).astype(np.float32)  # (num_tiles*16, 128)
         V_full = np.concatenate([
-            value_cache[block_tables[0, j], :, 0, :] for j in range(num_tiles)
+            value_cache[block_tables[0, j], :, 0, :] for j in range(num_tiles_val)
         ], axis=0).astype(np.float32)
 
-        scores = Q @ K_full.T * scale  # (8, num_tiles*16)
+        scores = Q @ K_full.T * scale_val  # (8, num_tiles*16)
 
         # Causal mask: query_pos[row] = pid0*2 + row//4
         #              query_abs_pos = context_len + query_pos
         #              seq_offset[col] = col  (flattened across tiles)
         for row in range(8):
-            query_abs_pos = context_len + pid0 * 2 + row // 4
-            for col in range(num_tiles * 16):
+            query_abs_pos = context_len_val + pid0 * 2 + row // 4
+            for col in range(num_tiles_val * 16):
                 if col > query_abs_pos:
                     scores[row, col] = -np.inf
 
@@ -401,7 +447,7 @@ class TestPagedAttentionExecution:
         M_ref = np.full(8, -np.inf, dtype=np.float32)
         L_ref = np.ones(8, dtype=np.float32)
         acc_ref = np.zeros((8, 128), dtype=np.float32)
-        for j in range(num_tiles):
+        for j in range(num_tiles_val):
             S_j = scores[:, j*16:(j+1)*16]
             m_j = np.maximum(M_ref, S_j.max(axis=1))
             P_j = np.exp(S_j - m_j[:, None])
@@ -417,27 +463,27 @@ class TestPagedAttentionExecution:
         np.testing.assert_allclose(actual, expected, rtol=5e-2, atol=5e-2)
 
 
-class TestSdpaExecution:
+class TestSdpaExecution(InterpreterTestMixin):
     """End-to-end execution of sdpa_2d.mlir."""
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("sdpa_kernel_2d"))
     def test_sdpa(self, path, func_name, entry):
         """Run SDPA on 1 core, verify output ≈ softmax(Q @ K^T * scale) @ V."""
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
+        q_ptr, k_ptr, v_ptr, output_ptr = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows, head_dim = sizes["q_ptr"]["shape"]
+        n_rows, head_dim = sizes[q_ptr]["shape"]
         rng = np.random.default_rng(42)
         Q = rng.standard_normal((n_rows, head_dim)).astype(np.float16)
         K = rng.standard_normal((n_rows, head_dim)).astype(np.float16)
         V = rng.standard_normal((n_rows, head_dim)).astype(np.float16)
         output = np.zeros((n_rows, head_dim), dtype=np.float16)
 
-        outputs = interp.execute_function(
-            func_name, q_ptr=Q, k_ptr=K, v_ptr=V, output_ptr=output,
-        )
-        result = outputs["output_ptr"]
+        kwargs = self._build_kwargs(entry, {q_ptr: Q, k_ptr: K, v_ptr: V, output_ptr: output})
+        outputs = interp.execute_function(func_name, **kwargs)
+        result = outputs[output_ptr]
 
         # NumPy reference: scaled dot-product attention (f32 for stability)
         scale = np.float32(0.125)  # 1/sqrt(64), matches MLIR constant

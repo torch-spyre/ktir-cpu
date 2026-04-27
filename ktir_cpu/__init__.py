@@ -22,5 +22,6 @@ __version__ = "0.1.0"
 
 from .interpreter import KTIRInterpreter
 from .latency import HardwareConfig, LatencyReport
+from .parser import KTIRParserBase
 
-__all__ = ["KTIRInterpreter", "HardwareConfig", "LatencyReport"]
+__all__ = ["KTIRInterpreter", "HardwareConfig", "LatencyReport", "KTIRParserBase"]

@@ -156,8 +156,8 @@ module {
 # 3. Unknown op dispatch — warning, no exception
 # ---------------------------------------------------------------------------
 
-def test_unknown_op_does_not_raise(capsys):
-    """An unregistered op_type prints a warning and does not raise."""
+def test_unknown_op_raises():
+    """An unregistered op_type raises ValueError."""
     ktir = """
 module {
     func.func @dummy() -> () attributes { grid = [1, 1, 1] } {
@@ -176,38 +176,8 @@ module {
         result_type=None,
         regions=[],
     )
-    # Must not raise
-    interp._execute_operation(unknown_op, core, interp.ring_network)
-
-    captured = capsys.readouterr()
-    assert "totally.unknown_op" in captured.out
-    assert "Warning" in captured.out or "unknown" in captured.out.lower()
-
-
-def test_unknown_op_result_not_stored(capsys):
-    """Result SSA name is not populated for unknown ops."""
-    ktir = """
-module {
-    func.func @dummy() -> () attributes { grid = [1, 1, 1] } {
-        return
-    }
-}
-"""
-    interp = _make_interpreter_with_module(ktir)
-    core = _minimal_core(interp)
-
-    op = Operation(
-        result="%ghost",
-        op_type="nonexistent.op",
-        operands=[],
-        attributes={},
-        result_type=None,
-        regions=[],
-    )
-    interp._execute_operation(op, core, interp.ring_network)
-
-    with pytest.raises(KeyError):
-        core.get_value("%ghost")
+    with pytest.raises(ValueError, match="totally.unknown_op"):
+        interp._execute_operation(unknown_op, core, interp.ring_network)
 
 
 # ---------------------------------------------------------------------------
