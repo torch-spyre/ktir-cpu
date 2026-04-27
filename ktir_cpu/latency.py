@@ -272,6 +272,8 @@ class LatencyTracker:
             if isinstance(v, AccessTile):
                 return v.parent_ref.memory_space
             if isinstance(v, IndirectAccessTile):
+                if any(iv.memory_space == "HBM" for iv in v.index_views):
+                    return "HBM"
                 return v.parent_ref.memory_space
         return "HBM"
 
@@ -291,10 +293,11 @@ class LatencyTracker:
                     if iv.memory_space == "HBM":
                         total += int(np.prod(iv.shape)) * _bytes_per_elem(iv.dtype)
             elif isinstance(v, Tile):
-                assert result is None, (
-                    f"_data_size: Tile in operands but result is also a Tile ({type(result)}); "
-                    "no ktdp op should produce both"
-                )
+                if result is not None:
+                    raise ValueError(
+                        f"_data_size: Tile in operands but result is also a Tile ({type(result)}); "
+                        "no ktdp op should produce both"
+                    )
                 total += v.data.nbytes
         return total
 
