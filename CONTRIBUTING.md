@@ -8,6 +8,13 @@ Thank you for your interest in contributing! This project is an experimental KTI
 uv sync --extra dev
 ```
 
+## MLIR Frontend Bindings (optional)
+
+The `tests/mlir_frontend/` tests require the optional `mlir-frontend` dependency.
+See [README.md — MLIR frontend bindings](README.md#mlir-frontend-bindings-optional)
+for install instructions; the setup will simplify to a single `uv sync --extra mlir-frontend`
+once wheels are available.
+
 ## Running Tests
 
 ```bash

@@ -17,7 +17,39 @@ This works in practice because ktir_cpu is **fast**, **actionable**, and **deter
 ## Setup
 
 ```bash
-uv sync 
+uv sync
+```
+
+### MLIR frontend bindings (optional)
+
+The `tests/mlir_frontend/` tests use `mlir_ktdp` from
+[ktir-mlir-frontend](https://github.com/torch-spyre/ktir-mlir-frontend).
+Until a PyPI release is available, build from source:
+
+**Prerequisites:** CMake ≥ 3.20, Ninja, C++17 compiler.
+
+```bash
+KTIR_MLIR_FRONTEND_COMMIT=55a8a7eaf3a3344d95c2e8793da0bc220c62d9c0
+LLVM_HASH=e9846648fd6183ee6d8cbdb4502213fcf902a211
+
+# Fetch setup_mlir.py from the pinned commit
+curl -fsSL \
+  "https://raw.githubusercontent.com/fabianlim/ktir-mlir-frontend/$KTIR_MLIR_FRONTEND_COMMIT/scripts/setup_mlir.py" \
+  -o /tmp/setup_mlir.py
+
+# Resolve MLIR — --wheel activates the mlir_wheel fallback (no GitHub token needed);
+# --hash records the targeted LLVM build (drop --wheel once artifacts are public)
+MLIR_DIR=$(uv run python /tmp/setup_mlir.py --wheel --hash "$LLVM_HASH")
+
+# Build and install
+CMAKE_ARGS="-DMLIR_DIR=$MLIR_DIR" uv sync --extra mlir-frontend
+```
+
+Once [torch-spyre/ktir-mlir-frontend#12](https://github.com/torch-spyre/ktir-mlir-frontend/issues/12)
+is resolved and wheels are published, this will simplify to:
+
+```bash
+uv sync --extra mlir-frontend
 ```
 
 ## Quick start
