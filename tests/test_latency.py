@@ -622,8 +622,16 @@ class TestIndirectAccessLatency:
 
         sizes = interp.tensor_input_output_sizes(func_name)
         _dtype_map = {"f16": np.float16, "i32": np.int32, "f32": np.float32}
-        # Addresses are arith.constant values baked into indirect-access-copy.mlir.
-        _addr_map = {"X_addr": 0, "IDX1_addr": 8192, "IDX2_addr": 16384, "Y_addr": 24576}
+
+        # Derive addresses from parsed module so the test stays correct if
+        # indirect-access-copy.mlir changes its arith.constant values.
+        func = interp.module.get_function(func_name)
+        constants = {
+            op.result.lstrip("%"): op.attributes["value"]
+            for op in func.operations
+            if op.op_type == "arith.constant" and op.result
+        }
+        _addr_map = {name: constants[name] for name in sizes}
 
         _orig = interp._prepare_execution
         def _prepare_and_seed(grid_shape):
@@ -653,6 +661,4 @@ class TestIndirectAccessLatency:
         assert counters.total_bytes == expected_total_bytes, (
             f"total_bytes={counters.total_bytes}, expected={expected_total_bytes}"
         )
-        assert abs(counters.memory_cycles - expected_memory_cycles) < 1.0, (
-            f"memory_cycles={counters.memory_cycles}, expected={expected_memory_cycles}"
-        )
+        assert counters.memory_cycles == pytest.approx(expected_memory_cycles, rel=1e-3)
