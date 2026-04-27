@@ -309,13 +309,24 @@ def parse_arith_constant(op_text, parse_ctx):
                 attributes["dtype"] = type_info.get("dtype", "f16")
                 attributes["is_tensor"] = True
     else:
+        # Match unbraced dense<value> followed by `: type`.  Covers:
+        #   dense<0.0> : tensor<4xf16>       (splat tensor constant)
+        #   dense<42> : tensor<1xi32>         (scalar tensor constant)
+        dense_match = re.match(r'dense<([^>]+)>\s*:\s*(.+)$', rest)
         # Match a scalar value followed by `: type`.  Covers:
         #   42 : index              (decimal integer)
         #   0.0 : f32               (float)
         #   -1.5e-3 : f16           (scientific notation)
         #   0xFF800000 : i32        (hex integer, e.g. -inf bit pattern)
         simple_match = re.match(r'(-?(?:0[xX][0-9a-fA-F]+|[\d.eE+\-]+))\s*:\s*(.+)$', rest)
-        if simple_match:
+        if dense_match:
+            value = parse_numeric(dense_match.group(1))
+            result_type = dense_match.group(2).strip()
+            type_info = parse_tensor_type(result_type)
+            attributes["shape"] = type_info["shape"]
+            attributes["dtype"] = type_info["dtype"]
+            attributes["is_tensor"] = True
+        elif simple_match:
             value = parse_numeric(simple_match.group(1))
             result_type = simple_match.group(2).strip()
         else:
