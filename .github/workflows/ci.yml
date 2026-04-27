@@ -55,5 +55,8 @@ jobs:
       - name: Install project and dependencies
         run: uv sync --extra dev --extra mlir-frontend --no-build-isolation
 
-      - name: Run tests
-        run: uv run pytest -v
+      - name: Run basic tests (with regex parser)
+        run: uv run pytest -v --ignore=tests/mlir_frontend
+
+      - name: Run MLIR frontend parser tests
+        run: uv run pytest tests/mlir_frontend/ -v
