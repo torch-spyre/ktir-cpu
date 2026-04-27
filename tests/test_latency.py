@@ -596,3 +596,63 @@ class TestLatencyEdgeCases:
         assert report.bottleneck == "none"
         assert report.kernel_cycles == 0.0
         assert report.kernel_time_us == 0.0
+
+
+class TestIndirectAccessLatency:
+    """Verify that indirect access loads account for index tensor HBM traffic."""
+
+    @pytest.mark.parametrize("path,func_name,_entry", get_test_params("indirect_access_copy"))
+    def test_indirect_load_includes_index_tensor_bytes(self, path, func_name, _entry):
+        """memory_cycles should reflect index tensor reads, not just the result tile.
+
+        indirect-access-copy.mlir does a 2-D gather: Y[m,k] = X[IDX1[m,k], IDX2[m,k]]
+        with 64x64 tiles. A single ktdp.load on the IndirectAccessTile should cost:
+          result (X gather):  64*64*2 (f16) =  8,192 bytes
+          IDX1:               64*64*4 (i32) = 16,384 bytes
+          IDX2:               64*64*4 (i32) = 16,384 bytes
+          total = 40,960 bytes
+
+        With default HardwareConfig (1 core, 1 TB/s HBM BW):
+          hbm_bytes_per_cycle_per_core = 1e12 / 1e9 / 1 = 1000
+          expected memory_cycles for one load = 40,960 / 1000 = 40.96
+        """
+        cfg = HardwareConfig(num_cores=1)
+        interp = KTIRInterpreter(latency_config=cfg)
+        interp.load(path)
+
+        sizes = interp.tensor_input_output_sizes(func_name)
+        _dtype_map = {"f16": np.float16, "i32": np.int32, "f32": np.float32}
+        # Addresses are arith.constant values baked into indirect-access-copy.mlir.
+        _addr_map = {"X_addr": 0, "IDX1_addr": 8192, "IDX2_addr": 16384, "Y_addr": 24576}
+
+        _orig = interp._prepare_execution
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            hbm = interp.memory.hbm
+            for name, info in sizes.items():
+                n_elements = int(np.prod(info["shape"]))
+                hbm.write(_addr_map[name], np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
+        interp._prepare_execution = _prepare_and_seed
+
+        interp.execute_function(func_name)
+        report = interp.get_latency_report()
+
+        # With 1 core, all work is on core 0.
+        counters = report.counters[0]
+
+        # The kernel does 1 indirect load (X via IDX1+IDX2) + 1 regular store (Y).
+        def _nbytes(name):
+            info = sizes[name]
+            return int(np.prod(info["shape"])) * np.dtype(_dtype_map[info["dtype"]]).itemsize
+        expected_load_bytes = _nbytes("X_addr") + _nbytes("IDX1_addr") + _nbytes("IDX2_addr")
+        expected_store_bytes = _nbytes("Y_addr")
+        expected_total_bytes = expected_load_bytes + expected_store_bytes
+        bw = cfg.hbm_bytes_per_cycle_per_core
+        expected_memory_cycles = expected_total_bytes / bw
+
+        assert counters.total_bytes == expected_total_bytes, (
+            f"total_bytes={counters.total_bytes}, expected={expected_total_bytes}"
+        )
+        assert abs(counters.memory_cycles - expected_memory_cycles) < 1.0, (
+            f"memory_cycles={counters.memory_cycles}, expected={expected_memory_cycles}"
+        )
