@@ -6,7 +6,7 @@ module {
     %core_id = ktdp.get_compute_tile_id : index
 
     %c0 = arith.constant 0 : index
-    %c32 = arith.constant 32 : index
+    %c1 = arith.constant 1 : index
     %c128 = arith.constant 128 : index
     %start_row = arith.muli %core_id, %c128 : index
     %end_row = arith.addi %start_row, %c128 : index
@@ -19,7 +19,7 @@ module {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 4095 >= 0, d1 >= 0, -d1 + 1023 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
     } : memref<4096x1024xf16>
 
-    scf.for %row = %start_row to %end_row step %c32  : index {
+    scf.for %row = %start_row to %end_row step %c1 : index {
 
       %input_acc = ktdp.construct_access_tile %input_view[%row, %c0] {
         access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 1023 >= 0)>,
