@@ -174,6 +174,7 @@ MLIRTypeAdapter.install(
     "math.exp",
     "math.sqrt",
     "tensor.extract",
+    "ktdp.get_compute_tile_id",
     "ktdp.load",
     "ktdp.store",
     # emitted by the bindings walk but not present in text IR
@@ -189,11 +190,6 @@ def _adapt_scf_for(mlir_op, attributes, result_type, operands):
     if len(body_args) > 1:
         attributes["iter_args"] = [a.get_name() for a in body_args[1:]]
 
-
-@MLIRTypeAdapter.install("ktdp.get_compute_tile_id")
-def _adapt_get_compute_tile_id(mlir_op, attributes, result_type, operands):
-    """Synthesize num_dims from result count."""
-    attributes["num_dims"] = len(mlir_op.results)
 
 
 @MLIRTypeAdapter.install("ktdp.construct_access_tile")

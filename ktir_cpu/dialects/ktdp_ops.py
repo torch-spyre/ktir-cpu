@@ -28,9 +28,7 @@ from .registry import ParseContext, register, register_parser
 
 @register("ktdp.get_compute_tile_id")
 def ktdp__get_compute_tile_id(op, context, env):
-    if "num_dims" not in op.attributes:
-        raise ValueError("get_compute_tile_id: missing required attribute 'num_dims'")
-    num_dims = op.attributes["num_dims"]
+    num_dims = 1 if isinstance(op.result, str) else len(op.result)
     if num_dims == 1:
         return GridOps.gridid(context, 0)
     return tuple(GridOps.gridid(context, d) for d in range(num_dims))
@@ -129,26 +127,13 @@ def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
     if not multi_match:
         return None
 
-    results_str = multi_match.group(1)
-    type_str = multi_match.group(2).strip()
-    result_names = [r.strip() for r in results_str.split(',')]
-    num_dims = type_str.count('index')
-
-    if num_dims == 1:
-        return Operation(
-            result=result_names[0],
-            op_type="ktdp.get_compute_tile_id",
-            operands=[],
-            attributes={"num_dims": 1},
-            result_type="index"
-        )
-
-    # Multi-result: store all result names for the interpreter to unpack
+    result_names = [r.strip() for r in multi_match.group(1).split(',')]
+    result = result_names[0] if len(result_names) == 1 else result_names
     return Operation(
-        result=result_names,
+        result=result,
         op_type="ktdp.get_compute_tile_id",
         operands=[],
-        attributes={"num_dims": num_dims},
+        attributes={},
         result_type="index"
     )
 
