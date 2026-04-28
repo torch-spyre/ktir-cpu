@@ -53,7 +53,7 @@ get_latency_report() → LatencyReport
 Key design points:
 
 - **Registry-based dispatch**: Operations are dispatched through a central registry (`dialects/registry.py`). Each dialect module registers its handlers and latency categories at import time via `@register()`.
-- **Post-execution recording**: The tracker runs *after* each op executes, so the result shape is known for accurate size estimation. This means `ktdp.load` costs are derived from the loaded Tile's `nbytes`, not from memref metadata.
+- **Post-execution recording**: The tracker runs *after* each op executes, so the result shape is known for accurate size estimation. For direct loads, `ktdp.load` cost is the result Tile's `nbytes`. For indirect (gather) loads the index tensors are also counted — see [Indirect access memory cost](#indirect-access-memory-cost).
 - **Operand resolution before the try block**: Operands are resolved once into a flat list before the operation's try block. This avoids duplicating resolution logic inside every op branch while keeping the cost negligible (dict lookups on already-populated SSA maps).
 - **Control flow is zero-cost**: `scf.for`, `scf.if`, and `scf.yield` are classified as zero-cost. Child operations inside loops/branches record their own costs naturally via recursive `execute_region` calls, so loop iterations accumulate correctly without the tracker needing to understand control flow.
 - **Memory-space-aware**: LX (on-chip SRAM) load/store is zero-cost. Only HBM transfers incur latency. This reflects the hardware: all live Tiles reside in LX, so an LX load/store is redundant with SSA dataflow — it's just an on-chip copy.
@@ -93,6 +93,26 @@ def arith__addf(op, context, env):
 | **Compute (matmul)** | `COMPUTE_MATMUL` | `2·M·N·K / systolic_flops_per_cycle` |
 | **Compute (integer)** | `COMPUTE_INT` | 1 cycle (scalar) or `elements / simd_elements_per_cycle` (tile) |
 | **Communication** | `COMM` | `bytes / ring_bytes_per_cycle` (`ktdp.reduce` adds `× log2(num_cores)`) |
+
+## Indirect access memory cost
+
+A `ktdp.load` over an `IndirectAccessTile` with N indirect dimensions performs N+1 HBM reads. The tracker counts all HBM-resident transfers; LX-resident index views are free (on-chip):
+
+```
+memory_bytes = result_tile_bytes + Σ(i=1..N) index_view_i_bytes   (HBM views only)
+```
+
+For `indirect-access-copy.mlir` (64×64 gather, all HBM):
+
+```
+X    (f16,  64×64): 64×64 × 2 =  8,192 bytes   ← data tensor
+IDX1 (i32, 64×64): 64×64 × 4 = 16,384 bytes   ┐
+IDX2 (i32, 64×64): 64×64 × 4 = 16,384 bytes   ┘ N=2 index tensors
+                               ─────────────
+Total:                          40,960 bytes
+```
+
+**Open question**: the model applies `hbm_bandwidth_tb_s` uniformly across all dtypes. Whether f16 data tensors and i32 index tensors achieve the same effective HBM bandwidth on Spyre is unconfirmed — if they differ, a separate bandwidth parameter would be needed.
 
 ## Hardware parameters
 
