@@ -28,7 +28,7 @@ Design rule
 -----------
 The goal of the regex parser is to parse valid MLIR.  All op text examples
 in this file must therefore be valid MLIR.  Non-MLIR syntax forces the
-corresponding test_bindings_adapt.py test to be skipped, which defeats the
+corresponding test_parse_adapt.py test to be skipped, which defeats the
 purpose of sharing tests between the two parser backends.
 
 All op text examples have been verified to parse with both backends.
@@ -67,7 +67,7 @@ class ParseTestMixin:
     Parser-specific — override in subclasses or avoid in base tests:
         assert_operand_names: checks exact SSA names; only valid for the
         regex parser. BindingsParseTestMixin overrides this to a no-op since
-        the bindings parser uses positional %argN names.
+        the MLIR frontend parser uses positional %argN names.
     """
 
     def _parse(self, op_text, parse_ctx=None, args=None):
@@ -132,7 +132,7 @@ class ParseTestMixin:
 
     def assert_operand_names(self, op, *names):
         """Regex-parser-specific: checks exact SSA operand names.
-        Override to no-op in bindings subclasses."""
+        Override to no-op in MLIR frontend subclasses."""
         for name in names:
             assert name in op.operands
 
@@ -228,6 +228,21 @@ class TestArithParsers(ParseTestMixin):
         op = self._parse("%c0 = arith.constant 42 : index")
         assert op.op_type == "arith.constant"
         assert op.attributes["value"] == 42
+
+    def test_constant_hex_integer(self):
+        # hex integer constant (e.g. 0xFF800000 for -inf bitcast)
+        op = self._parse("%x = arith.constant 0xFF800000 : i32")
+        self.assert_op_type(op, "arith.constant")
+        # 0xFF800000: regex returns 4286578688 (unsigned), MLIR returns
+        # -8388608 (signed i32).  Both are the same bit pattern — accept either.
+        val = op.attributes["value"]
+        assert val == 0xFF800000 or val == -8388608
+
+    def test_constant_float(self):
+        # float constant
+        op = self._parse("%x = arith.constant 0.0 : f32")
+        self.assert_op_type(op, "arith.constant")
+        assert op.attributes["value"] == 0.0
 
     def test_constant_dense_tensor(self):
         # dense<0.0> tensor constant sets is_tensor, shape, and dtype
