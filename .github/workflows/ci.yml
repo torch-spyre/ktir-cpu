@@ -21,8 +21,42 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: uv sync --extra dev
+      - name: Install build tools
+        run: sudo apt-get install -y ninja-build
 
-      - name: Run tests
-        run: uv run pytest -v
+      # Temporary: download setup_mlir.py from the pinned ktir-mlir-frontend commit
+      # and run it to obtain MLIR_DIR.  We pass --wheel to explicitly activate the
+      # mlir_wheel fallback — the artifact-based path (keyed by LLVM_HASH) requires a
+      # GitHub token not available in public CI.  --hash is still passed so the intent
+      # is explicit; remove --wheel once the artifact is publicly accessible and this
+      # will automatically use the pinned LLVM build instead.
+      # CMAKE_ARGS is written to $GITHUB_ENV so uv sync inherits it automatically
+      # in the next step without needing an explicit prefix on the command line.
+      # Drop-in removal: once ktir-mlir-frontend publishes a wheel to PyPI, delete
+      # this step entirely — CMAKE_ARGS will be unset and `uv sync --extra mlir-frontend`
+      # will install the wheel directly without a source build.
+      - name: Set up MLIR
+        env:
+          KTIR_MLIR_REPO: fabianlim
+          KTIR_MLIR_FRONTEND_COMMIT: 55a8a7eaf3a3344d95c2e8793da0bc220c62d9c0
+          LLVM_HASH: e9846648fd6183ee6d8cbdb4502213fcf902a211
+        run: |
+          curl -fsSL \
+            "https://raw.githubusercontent.com/$KTIR_MLIR_REPO/ktir-mlir-frontend/$KTIR_MLIR_FRONTEND_COMMIT/scripts/setup_mlir.py" \
+            -o /tmp/setup_mlir.py
+          MLIR_DIR=$(uv run python /tmp/setup_mlir.py --wheel --hash "$LLVM_HASH")
+          # Pre-install build-system deps for ktir-mlir-frontend so the source build
+          # can run with --no-build-isolation (mlir_wheel is not on PyPI so uv cannot
+          # resolve build-system.requires in an isolated env; scikit-build-core and
+          # nanobind are on PyPI and safe to install here).
+          uv pip install scikit-build-core "nanobind>=2.12.0"
+          echo "CMAKE_ARGS=-DMLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
+
+      - name: Install project and dependencies
+        run: uv sync --extra dev --extra mlir-frontend --no-build-isolation
+
+      - name: Run basic tests (with regex parser)
+        run: uv run pytest -v --ignore=tests/mlir_frontend
+
+      - name: Run MLIR frontend parser tests
+        run: uv run pytest tests/mlir_frontend/ -v

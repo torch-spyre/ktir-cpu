@@ -589,6 +589,27 @@ class TestLatencyEdgeCases:
         n_elems = LatencyTracker._num_elements(zero_tile, [])
         assert n_elems == 0
 
+    def test_lx_index_views_excluded_from_hbm_bytes(self):
+        """_data_size() ignores LX index views; _memory_space() falls back to parent."""
+        from ktir_cpu.latency import LatencyTracker
+        from ktir_cpu.ir_types import IndirectAccessTile, Tile, TileRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        vss = parse_affine_set("(d0, d1) : (d0 >= 0, d1 >= 0)")
+        lx_idx = TileRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
+                         memory_space="LX", dtype="i32")
+        parent = TileRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
+                         memory_space="HBM", dtype="f16")
+        iat = IndirectAccessTile(
+            parent_ref=parent, shape=(4, 4), dim_subscripts=[],
+            index_views=[lx_idx, lx_idx],
+            variables_space_set=vss, variables_space_order=None,
+        )
+        result = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+
+        assert LatencyTracker._data_size(result, [iat]) == result.data.nbytes
+        assert LatencyTracker._memory_space([iat]) == "HBM"
+
     def test_empty_counters_bottleneck(self):
         """LatencyReport with no counters reports bottleneck='none'."""
         from ktir_cpu.latency import LatencyReport
@@ -596,3 +617,69 @@ class TestLatencyEdgeCases:
         assert report.bottleneck == "none"
         assert report.kernel_cycles == 0.0
         assert report.kernel_time_us == 0.0
+
+
+class TestIndirectAccessLatency:
+    """Verify that indirect access loads account for index tensor HBM traffic."""
+
+    @pytest.mark.parametrize("path,func_name,_entry", get_test_params("indirect_access_copy"))
+    def test_indirect_load_includes_index_tensor_bytes(self, path, func_name, _entry):
+        """memory_cycles should reflect index tensor reads, not just the result tile.
+
+        indirect-access-copy.mlir does a 2-D gather: Y[m,k] = X[IDX1[m,k], IDX2[m,k]]
+        with 64x64 tiles. A single ktdp.load on the IndirectAccessTile should cost:
+          result (X gather):  64*64*2 (f16) =  8,192 bytes
+          IDX1:               64*64*4 (i32) = 16,384 bytes
+          IDX2:               64*64*4 (i32) = 16,384 bytes
+          total = 40,960 bytes
+
+        With default HardwareConfig (1 core, 1 TB/s HBM BW):
+          hbm_bytes_per_cycle_per_core = 1e12 / 1e9 / 1 = 1000
+          expected memory_cycles for one load = 40,960 / 1000 = 40.96
+        """
+        cfg = HardwareConfig(num_cores=1)
+        interp = KTIRInterpreter(latency_config=cfg)
+        interp.load(path)
+
+        sizes = interp.tensor_input_output_sizes(func_name)
+        _dtype_map = {"f16": np.float16, "i32": np.int32, "f32": np.float32}
+
+        # Derive addresses from parsed module so the test stays correct if
+        # indirect-access-copy.mlir changes its arith.constant values.
+        func = interp.module.get_function(func_name)
+        constants = {
+            op.result.lstrip("%"): op.attributes["value"]
+            for op in func.operations
+            if op.op_type == "arith.constant" and op.result
+        }
+        _addr_map = {name: constants[name] for name in sizes}
+
+        _orig = interp._prepare_execution
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            hbm = interp.memory.hbm
+            for name, info in sizes.items():
+                n_elements = int(np.prod(info["shape"]))
+                hbm.write(_addr_map[name], np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
+        interp._prepare_execution = _prepare_and_seed
+
+        interp.execute_function(func_name)
+        report = interp.get_latency_report()
+
+        # With 1 core, all work is on core 0.
+        counters = report.counters[0]
+
+        # The kernel does 1 indirect load (X via IDX1+IDX2) + 1 regular store (Y).
+        def _nbytes(name):
+            info = sizes[name]
+            return int(np.prod(info["shape"])) * np.dtype(_dtype_map[info["dtype"]]).itemsize
+        expected_load_bytes = _nbytes("X_addr") + _nbytes("IDX1_addr") + _nbytes("IDX2_addr")
+        expected_store_bytes = _nbytes("Y_addr")
+        expected_total_bytes = expected_load_bytes + expected_store_bytes
+        bw = cfg.hbm_bytes_per_cycle_per_core
+        expected_memory_cycles = expected_total_bytes / bw
+
+        assert counters.total_bytes == expected_total_bytes, (
+            f"total_bytes={counters.total_bytes}, expected={expected_total_bytes}"
+        )
+        assert counters.memory_cycles == pytest.approx(expected_memory_cycles, rel=1e-3)
