@@ -39,7 +39,9 @@ SUPPORTED_DTYPES: dict[str, np.dtype] = {
 # Placeholder dtypes: not yet exercised by any example.  to_np_dtype raises
 # NotImplementedError for these so that any future example that uses them
 # fails test_examples immediately, forcing a proper implementation first.
-# Pending confirmation from @kiszk @Prasanth-Chatarasi on simulation semantics.
+# fp8/mxfp8 are registered as placeholders that raise NotImplementedError. 
+# RFC 0682 doesn't define them; torch-spyre uses "fp8" at 1 byte/elem on hardware. 
+# NOTE: What should the simulation representation be?
 _PLACEHOLDER_DTYPES: frozenset[str] = frozenset({"fp8", "mxfp8"})
 
 _REVERSE_MAP: dict[np.dtype, str] = {
