@@ -25,7 +25,8 @@ Functions
 ---------
 parse_subscript_expr  — parse one subscript token into an AST tuple
 eval_subscript_expr   — evaluate a subscript tuple against a variable point
-_classify_refs        — post-process ("ref", ...) nodes from the affine parser
+_classify_refs        — post-process ("ref", ...) nodes from the text-parser path
+_reclassify_dims      — post-process ("dim", N) nodes from the MLIR-frontend-parser path
 """
 
 from __future__ import annotations
@@ -64,6 +65,42 @@ def _classify_refs(node, var_names: list):
     if tag == "neg":
         return (tag, _classify_refs(node[1], var_names))
     return node  # "const", "dim" — pass through unchanged
+
+
+def _reclassify_dims(node, ssa_operand_names: list):
+    """Post-process ("dim", N) nodes from an affine map into ktdp nodes.
+
+    Counterpart to _classify_refs, but for the MLIR frontend parser path.
+
+    _classify_refs handles text-parsed IR: _Parser emits ("ref", "%name") for
+    every variable reference and _classify_refs decides whether the name is an
+    iteration variable or an outer SSA scalar.
+
+    _reclassify_dims handles affine-map-parsed IR: the MLIR frontend exposes subscript
+    expressions as AffineMap objects whose domain dims encode both SSA operands
+    (d0..d(n_ssa-1)) and iteration variables (d(n_ssa)..).  _Parser already
+    emits ("dim", N) for dN notation, so no "ref" nodes exist; instead we
+    reclassify by index:
+
+      ("dim", N) where N < n_ssa  → ("ssa", ssa_operand_names[N])
+      ("dim", N) where N >= n_ssa → ("dim", N - n_ssa)   (iteration variable)
+
+    After reclassification the AST is identical to what _classify_refs produces,
+    and the executor handles it without any further changes.
+    """
+    n_ssa = len(ssa_operand_names)
+    tag = node[0]
+    if tag == "dim":
+        j = node[1]
+        return ("ssa", ssa_operand_names[j]) if j < n_ssa else ("dim", j - n_ssa)
+    if tag in ("add", "sub"):
+        return (tag, _reclassify_dims(node[1], ssa_operand_names),
+                _reclassify_dims(node[2], ssa_operand_names))
+    if tag == "mul":
+        return (tag, node[1], _reclassify_dims(node[2], ssa_operand_names))
+    if tag == "neg":
+        return (tag, _reclassify_dims(node[1], ssa_operand_names))
+    return node  # "const" — pass through unchanged
 
 
 def parse_subscript_expr(token: str, var_names: list):

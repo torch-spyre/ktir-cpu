@@ -168,10 +168,18 @@ def linalg__generic(op, context, env):
 
     region = op.regions[0] if op.regions else []
 
-    # Find bb0 arg names from the synthetic linalg.bb0_args op.
+    # Resolve bb0 block-argument names.
+    # Path 1: synthetic linalg.bb0_args op prepended to the region.
+    # Path 2: names stored directly in op.attributes["bb0_names"].
+    # TODO: consider whether the synthetic op can be removed in favour of Path 2 only.
     bb0_op = next((o for o in region if o.op_type == "linalg.bb0_args"), None)
     body_ops = [o for o in region if o.op_type != "linalg.bb0_args"]
-    bb0_names = bb0_op.attributes.get("names", []) if bb0_op else []
+    if bb0_op is not None:
+        bb0_names = bb0_op.attributes.get("names", [])
+    elif "bb0_names" in op.attributes:
+        bb0_names = op.attributes["bb0_names"]
+    else:
+        raise ValueError("linalg.generic: cannot determine bb0 argument names")
 
     if not isinstance(outs_val, Tile):
         raise TypeError(f"linalg.generic: outs must be a Tile, got {type(outs_val)}")
