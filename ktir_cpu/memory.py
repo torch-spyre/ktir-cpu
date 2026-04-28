@@ -91,26 +91,13 @@ import numpy as np
 # Module-level helpers shared by HBMSimulator and LXScratchpad
 # ---------------------------------------------------------------------------
 
-def _get_np_dtype(dtype: str) -> np.dtype:
-    """Convert a KTIR dtype string to a NumPy dtype."""
-    if dtype in ("f16", "fp16", "float16"):
-        return np.float16
-    if dtype in ("i32", "si32", "index"):
-        return np.int32
-    if dtype in ("i64", "si64"):
-        return np.int64
-    return np.float32  # f8 / mxfp8 / others approximated as float32
-
-
-def _bytes_per_elem(dtype: str) -> int:
-    """Return element size in bytes for a KTIR dtype string."""
-    return int(np.dtype(_get_np_dtype(dtype)).itemsize)
+from .dtypes import to_np_dtype, bytes_per_elem
 
 
 def _find_allocation(
     memory: Dict[int, np.ndarray],
     ptr: int,
-    bytes_per_elem: int,
+    elem_size: int,
 ) -> Optional[Tuple[int, np.ndarray, int]]:
     """Find the allocation containing byte address *ptr*.
 
@@ -126,17 +113,17 @@ def _find_allocation(
         return (ptr, memory[ptr], 0)
     for base_ptr, data in memory.items():
         # Use the allocation's own itemsize to compute its byte span,
-        # not the caller's bytes_per_elem (which reflects the access dtype
+        # not the caller's elem_size (which reflects the access dtype
         # and may differ from the stored dtype).
         end_ptr = base_ptr + data.size * data.itemsize
- 
+
         # NOTE: the ptr in memory check in the first return
         #       actually handles the ptr == base_ptr case.
         # - therefore the strict equality base_ptr < ptr
-        #   is meant to emphasize that equality checks will 
+        #   is meant to emphasize that equality checks will
         #   not come to this branch of logic.
         if base_ptr < ptr < end_ptr:
-            elem_offset = (ptr - base_ptr) // bytes_per_elem
+            elem_offset = (ptr - base_ptr) // elem_size
             return (base_ptr, data, elem_offset)
     return None
 
@@ -146,7 +133,7 @@ def _read_flat(
     ptr: int,
     n_elements: int,
     np_dtype: np.dtype,
-    bytes_per_elem: int,
+    elem_size: int,
 ) -> np.ndarray:
     """Read *n_elements* elements starting at byte address *ptr*.
 
@@ -160,10 +147,10 @@ def _read_flat(
         memory = {0x1000: np.arange(16, dtype=np.float16)}
         # Read 13 elements starting at element 2 (byte offset 4 from base)
         flat = _read_flat(memory, ptr=0x1004, n_elements=13,
-                          np_dtype=np.float16, bytes_per_elem=2)
+                          np_dtype=np.float16, elem_size=2)
         # flat == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     """
-    alloc = _find_allocation(memory, ptr, bytes_per_elem)
+    alloc = _find_allocation(memory, ptr, elem_size)
     if alloc is None:
         raise ValueError(f"Read from unmapped address 0x{ptr:x} (n_elements={n_elements})")
     _, data, elem_offset = alloc
@@ -267,8 +254,8 @@ class HBMSimulator:
         Returns:
             Flat NumPy array of length n_elements
         """
-        np_dtype = _get_np_dtype(dtype)
-        return _read_flat(self.memory, ptr, n_elements, np_dtype, _bytes_per_elem(dtype))
+        np_dtype = to_np_dtype(dtype)
+        return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
 
     def write(self, ptr: int, data: np.ndarray):
         """Write *data* (flat ndarray) starting at byte address *ptr*.
@@ -294,16 +281,12 @@ class HBMSimulator:
             Use ``read(ptr, 1, dtype)[0]`` instead.  This method will be
             removed when the tt dialect is updated.
         """
-        bytes_per_elem = 2 if dtype in ("f16", "fp16", "float16") else 4
-        alloc = _find_allocation(self.memory, addr, bytes_per_elem)
+        elem_size = bytes_per_elem(dtype)
+        alloc = _find_allocation(self.memory, addr, elem_size)
         if alloc is None:
             return np.float16(0.0)
         _, data, elem_offset = alloc
         return data.flat[elem_offset]
-
-    def _get_np_dtype(self, dtype: str) -> np.dtype:
-        return _get_np_dtype(dtype)
-
 
 class LXScratchpad:
     """Simulates 2MB per-core scratchpad memory.
@@ -333,8 +316,8 @@ class LXScratchpad:
         Returns:
             Flat NumPy array of length n_elements
         """
-        np_dtype = _get_np_dtype(dtype)
-        return _read_flat(self.memory, ptr, n_elements, np_dtype, _bytes_per_elem(dtype))
+        np_dtype = to_np_dtype(dtype)
+        return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
 
     def write(self, ptr: int, data: np.ndarray):
         """Write *data* (flat ndarray) starting at byte address *ptr*.
@@ -353,10 +336,6 @@ class LXScratchpad:
         self.memory.clear()
         self.next_ptr = 0
         self.used = 0
-
-    def _get_np_dtype(self, dtype: str) -> np.dtype:
-        return _get_np_dtype(dtype)
-
 
 class SpyreMemoryHierarchy:
     """Complete memory hierarchy for Spyre: one shared HBM + per-core LX scratchpads.
