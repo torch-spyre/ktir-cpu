@@ -100,16 +100,6 @@ def test_hbm_write_partial_overwrite():
     assert result[3] == np.float16(4), f"Expected 4 unchanged, got {result[3]}"
 
 
-def test_hbm_get_np_dtype():
-    """HBM._get_np_dtype: fp8 and else branches."""
-    hbm = HBMSimulator()
-    assert hbm._get_np_dtype("f16") == np.float16
-    assert hbm._get_np_dtype("fp8") == np.float32
-    assert hbm._get_np_dtype("mxfp8") == np.float32
-    assert hbm._get_np_dtype("float32") == np.float32
-    assert hbm._get_np_dtype("unknown") == np.float32
-
-
 def test_hbm_write_full_replacement():
     """HBM.write: writing equal-or-larger data replaces existing allocation."""
     hbm = HBMSimulator()
@@ -147,16 +137,6 @@ def test_lx_read_shape_mismatch():
     assert result.shape == (6,)
     assert np.array_equal(result[:4], data)
     assert np.array_equal(result[4:], np.zeros(2, dtype=np.float16))
-
-
-def test_lx_get_np_dtype():
-    """LXScratchpad._get_np_dtype: fp8 and else branches."""
-    lx = LXScratchpad()
-    assert lx._get_np_dtype("f16") == np.float16
-    assert lx._get_np_dtype("fp8") == np.float32
-    assert lx._get_np_dtype("mxfp8") == np.float32
-    assert lx._get_np_dtype("float32") == np.float32
-    assert lx._get_np_dtype("unknown") == np.float32
 
 
 def test_lx_clear():
@@ -426,13 +406,26 @@ def test_tile_operations():
     print("  ✓ TileRef works")
 
 
+@pytest.mark.parametrize("dtype, shape, expected_bytes", [
+    ("f16", (4,),  8),
+    ("f32", (4,), 16),
+    ("i32", (4,), 16),
+    ("i64", (4,), 32),
+])
+def test_tileref_size_bytes(dtype, shape, expected_bytes):
+    """TileRef.size_bytes: correct byte count for each supported dtype."""
+    ref = TileRef(base_ptr=0, shape=shape, strides=[1], memory_space="HBM", dtype=dtype)
+    assert ref.size_bytes() == expected_bytes
 
 
 def test_ktir_dtype_branches():
-    """_ktir_dtype: known dtypes and fallback."""
+    """_ktir_dtype: known dtypes and unknown raises."""
+    assert _ktir_dtype(np.dtype("float16")) == "f16"
     assert _ktir_dtype(np.dtype("float32")) == "f32"
     assert _ktir_dtype(np.dtype("int32")) == "i32"
-    assert _ktir_dtype(np.dtype("float16")) == "f16"
+    assert _ktir_dtype(np.dtype("int64")) == "i64"
+    with pytest.raises(ValueError):
+        _ktir_dtype(np.dtype("float64"))
 
 
 def test_interpreter_no_module_guard():

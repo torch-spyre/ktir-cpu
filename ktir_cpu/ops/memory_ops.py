@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 from ..affine import AffineMap
 from ..dialects.ktdp_helpers import eval_subscript_expr
+from ..dtypes import bytes_per_elem as _bytes_per_elem
 from ..ir_types import Tile, TileRef
 from ..grid import CoreContext
 
@@ -91,9 +92,9 @@ class MemoryOps:
             TileRef for the sub-tile
         """
         base_coords = base_map.eval(indices)
-        bytes_per_elem = 2 if parent_ref.dtype in ("f16", "fp16", "float16") else 4
+        bpe = _bytes_per_elem(parent_ref.dtype)
         offset = sum(coord * stride for coord, stride in zip(base_coords, parent_ref.strides))
-        new_ptr = parent_ref.base_ptr + offset * bytes_per_elem
+        new_ptr = parent_ref.base_ptr + offset * bpe
 
         return TileRef(
             base_ptr=new_ptr,
@@ -291,7 +292,6 @@ class MemoryOps:
                     )
                     mem = context.hbm if idx_view.memory_space == "HBM" else context.lx
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
-                    from ..memory import _bytes_per_elem
                     addr = idx_view.base_ptr + offset * _bytes_per_elem(idx_view.dtype)
                     raw = mem.read(addr, 1, idx_view.dtype)
                     coord.append(int(raw[0]))

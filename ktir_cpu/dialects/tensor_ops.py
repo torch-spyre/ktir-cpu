@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from ..grid import CoreContext
+from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
 from .registry import register, register_parser
 
@@ -47,7 +48,7 @@ def tensor__empty(op, context, env):
     """Create an uninitialized tensor of the given shape."""
     shape = op.attributes.get("shape", (1,))
     dtype_str = op.attributes.get("dtype", "f16")
-    dtype = np.float16 if "f16" in dtype_str else np.float32
+    dtype = to_np_dtype(dtype_str)
     data = np.zeros(shape, dtype=dtype)
     return Tile(data, dtype_str, shape)
 
@@ -77,10 +78,9 @@ def tensor__splat(op, context, env):
         np_dtype = np.int32
         dtype_str = "i32"
     else:
-        np_dtype = np.float16 if dtype_str in ("f16", "f32") else np.int32
+        np_dtype = to_np_dtype(dtype_str)
 
-    scalar_val = float(scalar) if np_dtype == np.float16 else int(scalar)
-    data = np.full(shape, scalar_val, dtype=np_dtype)
+    data = np.full(shape, scalar, dtype=np_dtype)
     return Tile(data, dtype_str, shape)
 
 
