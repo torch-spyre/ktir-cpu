@@ -30,7 +30,7 @@ import math
 import numpy as np
 
 from .ir_types import AccessTile, IndirectAccessTile, Tile, TileRef
-from .memory import _bytes_per_elem
+from .dtypes import bytes_per_elem
 
 
 from .dialects.registry import get_latency_category
@@ -293,7 +293,7 @@ class LatencyTracker:
             if isinstance(v, IndirectAccessTile):
                 for iv in v.index_views:
                     if iv.memory_space == "HBM":
-                        total += int(np.prod(iv.shape)) * _bytes_per_elem(iv.dtype)
+                        total += int(np.prod(iv.shape)) * bytes_per_elem(iv.dtype)
             elif isinstance(v, Tile):
                 if result is not None:
                     raise ValueError(
