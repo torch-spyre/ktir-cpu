@@ -6,8 +6,7 @@ module {
     %output_ptr : index,
     %dim1_start : index
   ) attributes {grid = [2, 8]} {
-    %grid0 = ktdp.get_compute_tile_id { dim = 0 } : index
-    %grid1 = ktdp.get_compute_tile_id { dim = 1 } : index
+    %grid0, %grid1 = ktdp.get_compute_tile_id : index, index
     %c0 = arith.constant 0 : index
 
     // Memory view for index tensor: shape [2] (num_indices), stride [1]
