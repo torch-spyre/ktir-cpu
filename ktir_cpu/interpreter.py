@@ -129,6 +129,15 @@ class KTIRInterpreter:
         func = self.module.get_function(func_name)
         self._prepare_execution(func.grid)
 
+        # If the parser normalised argument names (e.g. mlir-frontend uses
+        # %arg0, %arg1, ...) the caller's kwargs may use the original source
+        # names.  Remap positionally when none of the supplied keys appear in
+        # the declared arg list but the counts match.
+        declared = func.arg_names  # list without leading %
+        if kwargs and declared and not any(k in declared for k in kwargs):
+            if len(kwargs) == len(declared):
+                kwargs = dict(zip(declared, kwargs.values()))
+
         # Allocate input tensors in HBM
         input_ptrs = {}
         input_dtypes = {}
