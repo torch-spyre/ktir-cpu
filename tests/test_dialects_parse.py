@@ -378,18 +378,15 @@ class TestTensorParsers(ParseTestMixin):
 
 class TestKtdpParsers(ParseTestMixin):
     def test_get_compute_tile_id_single(self):
-        # single-result form records num_dims=1 and a scalar result
         op = self._parse("%id = ktdp.get_compute_tile_id : index")
         self.assert_op_type(op, "ktdp.get_compute_tile_id")
-        self.assert_attribute(op, "num_dims", 1)
         assert isinstance(op.result, str)
 
     def test_get_compute_tile_id_multi(self):
-        # multi-result form records num_dims=2 and a list result
         op = self._parse("%x, %y = ktdp.get_compute_tile_id : index, index")
         self.assert_op_type(op, "ktdp.get_compute_tile_id")
-        self.assert_attribute(op, "num_dims", 2)
         assert isinstance(op.result, list)
+        assert len(op.result) == 2
 
     def test_construct_memory_view(self):
         # construct_memory_view records shape, strides, dtype, memory_space, and pointer operand

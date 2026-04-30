@@ -28,12 +28,9 @@ from .registry import ParseContext, register, register_parser
 
 @register("ktdp.get_compute_tile_id")
 def ktdp__get_compute_tile_id(op, context, env):
-    if "num_dims" not in op.attributes:
-        raise ValueError("get_compute_tile_id: missing required attribute 'num_dims'")
-    num_dims = op.attributes["num_dims"]
+    num_dims = 1 if isinstance(op.result, str) else len(op.result)
     if num_dims == 1:
-        dim = op.attributes.get("dim", 0)
-        return GridOps.gridid(context, dim)
+        return GridOps.gridid(context, 0)
     return tuple(GridOps.gridid(context, d) for d in range(num_dims))
 
 
@@ -124,47 +121,19 @@ def ktdp__store(op, context, env):
 
 @register_parser("ktdp.get_compute_tile_id")
 def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
-    # Two forms:
-    #   %a, %b = ktdp.get_compute_tile_id : index, index   (multi-result, no dim attr)
-    #   %a = ktdp.get_compute_tile_id { dim = N } : index  (single-result, explicit dim)
     multi_match = re.match(
-        r'((?:%\w+,\s*)*%\w+)\s*=\s*ktdp\.get_compute_tile_id'
-        r'(?:\s*\{([^}]*)\})?\s*:\s*(.*)', op_text
+        r'((?:%\w+,\s*)*%\w+)\s*=\s*ktdp\.get_compute_tile_id\s*:\s*(.*)', op_text
     )
     if not multi_match:
         return None
 
-    results_str = multi_match.group(1)
-    attrs_str = multi_match.group(2)  # None when no { } block
-    type_str = multi_match.group(3).strip()
-    result_names = [r.strip() for r in results_str.split(',')]
-    num_dims = type_str.count('index')
-
-    # Extract explicit dim = N from { dim = N } if present
-    dim = None
-    if attrs_str:
-        dim_match = re.search(r'dim\s*=\s*(\d+)', attrs_str)
-        if dim_match:
-            dim = int(dim_match.group(1))
-
-    if num_dims == 1:
-        attrs = {"num_dims": 1}
-        if dim is not None:
-            attrs["dim"] = dim
-        return Operation(
-            result=result_names[0],
-            op_type="ktdp.get_compute_tile_id",
-            operands=[],
-            attributes=attrs,
-            result_type="index"
-        )
-
-    # Multi-result: store all result names for the interpreter to unpack
+    result_names = [r.strip() for r in multi_match.group(1).split(',')]
+    result = result_names[0] if len(result_names) == 1 else result_names
     return Operation(
-        result=result_names,
+        result=result,
         op_type="ktdp.get_compute_tile_id",
         operands=[],
-        attributes={"num_dims": num_dims},
+        attributes={},
         result_type="index"
     )
 

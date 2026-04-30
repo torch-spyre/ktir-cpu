@@ -584,13 +584,13 @@ class TestKtdp:
         # single-dim returns the x coordinate as a scalar
         ctx = _make_ctx(grid_pos=(3, 0, 0), core_id=3)
         assert _call("ktdp.get_compute_tile_id", ctx, _make_env(),
-                     attributes={"num_dims": 1}) == 3
+                     result="%id") == 3
 
     def test_get_compute_tile_id_multi(self):
         # multi-dim returns a tuple of coordinates
         ctx = _make_ctx(grid_pos=(2, 1, 0), core_id=2)
         assert _call("ktdp.get_compute_tile_id", ctx, _make_env(),
-                     attributes={"num_dims": 2}) == (2, 1)
+                     result=["%x", "%y"]) == (2, 1)
 
     def test_construct_memory_view(self):
         # creates a TileRef pointing at the given pointer with the given shape
