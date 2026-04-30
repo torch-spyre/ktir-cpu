@@ -2,11 +2,11 @@ module {
   func.func @add_kernel(
       %x_ptr: index,
       %y_ptr: index,
-      %output_ptr: index,
-      %BLOCK_SIZE: index
-  ) attributes {grid = [32, 1]} {
+      %output_ptr: index
+  ) attributes {grid = [32]} {
+    %c128 = arith.constant 128 : index
     %core_id = ktdp.get_compute_tile_id : index
-    %offset = arith.muli %core_id, %BLOCK_SIZE : index
+    %offset = arith.muli %core_id, %c128 : index
 
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [4096], strides: [1] {
       coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 4095 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>

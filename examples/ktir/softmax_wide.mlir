@@ -2,7 +2,7 @@ module {
   func.func @softmax_kernel(
       %output_ptr: index,
       %input_ptr: index
-  ) attributes {grid = [1, 1]} {
+  ) attributes {grid = [1]} {
     %core_id = ktdp.get_compute_tile_id : index
     %c_chunk = arith.constant 2 : index  // chunk = ceil(R/K) = ceil(2/1)
     %c_R = arith.constant 2 : index  // R = total rows
