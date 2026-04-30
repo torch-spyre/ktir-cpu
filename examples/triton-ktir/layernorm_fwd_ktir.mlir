@@ -7,7 +7,7 @@ module {
       %Mean: index, // mean 1152xf16
       %Rstd: index, // rstd 1152xf16
       %eps: f16
-  ) attributes {grid = [32, 1]} {
+  ) attributes {grid = [32]} {
     %core_id = ktdp.get_compute_tile_id : index
 
     %c0 = arith.constant 0 : index

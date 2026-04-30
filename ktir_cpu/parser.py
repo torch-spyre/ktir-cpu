@@ -194,11 +194,11 @@ class KTIRParser(KTIRParserBase):
         Returns:
             (x, y, z) grid dimensions
         """
-        # Pattern: grid = [X, Y, Z] or grid = [X, Y]
-        grid_match = re.search(r'grid\s*=\s*\[(\d+),\s*(\d+)(?:,\s*(\d+))?\]', func_header)
+        # Pattern: grid = [X, Y, Z] or grid = [X, Y] or grid = [X]
+        grid_match = re.search(r'grid\s*=\s*\[(\d+)(?:,\s*(\d+)(?:,\s*(\d+))?)?\]', func_header)
         if grid_match:
             x = int(grid_match.group(1))
-            y = int(grid_match.group(2))
+            y = int(grid_match.group(2)) if grid_match.group(2) else 1
             z = int(grid_match.group(3)) if grid_match.group(3) else 1
             return (x, y, z)
         return (1, 1, 1)  # Default: single-core when no grid attribute is present

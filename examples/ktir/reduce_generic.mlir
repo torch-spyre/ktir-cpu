@@ -1,5 +1,5 @@
 module {
-  func.func @reduce_explicit_region(%arg0: index) attributes {grid = [1, 1]} {
+  func.func @reduce_explicit_region(%arg0: index) attributes {grid = [1]} {
     %c0 = arith.constant 0 : index
     %cst = arith.constant 0.000000e+00 : f16
     %view = ktdp.construct_memory_view %arg0, sizes : [1, 4], strides : [4, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x4xf16>

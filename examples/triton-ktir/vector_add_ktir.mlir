@@ -3,7 +3,7 @@ module {
       %x_ptr: index,
       %y_ptr: index,
       %output_ptr: index
-  ) attributes {grid = [32, 1]} {
+  ) attributes {grid = [32]} {
     %c128 = arith.constant 128 : index
     %core_id = ktdp.get_compute_tile_id : index
     %offset = arith.muli %core_id, %c128 : index

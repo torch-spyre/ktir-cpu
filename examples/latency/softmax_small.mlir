@@ -2,7 +2,7 @@ module {
   func.func @softmax_kernel_small(
       %output_ptr: index,
       %input_ptr: index
-  ) attributes {grid = [32, 1]} {
+  ) attributes {grid = [32]} {
     %core_id = ktdp.get_compute_tile_id : index
 
     %c0 = arith.constant 0 : index
