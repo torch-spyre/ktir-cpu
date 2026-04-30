@@ -247,16 +247,19 @@ class ArithOps:
     def truncf(value):
         """Narrow float (e.g. f32 to f16).
 
-        For CPU simulation, this is essentially a no-op since Spyre
-        only has f16, so type conversions are cosmetic.
-
         Args:
             value: Tile or scalar
 
         Returns:
-            Same value (passthrough for simulation)
+            Value converted to f16, or passthrough if already f16
         """
-        return value
+        if isinstance(value, Tile):
+            if value.data.dtype == np.float16:
+                return value
+            return Tile(value.data.astype(np.float16), "f16", value.shape)
+        if isinstance(value, np.float16):
+            return value
+        return np.float16(value)
 
     @staticmethod
     def maxf(tile1: Tile, tile2: Tile) -> Tile:
