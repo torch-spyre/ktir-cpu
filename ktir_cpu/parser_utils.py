@@ -41,16 +41,28 @@ def parse_tensor_type(type_str: str) -> Optional[Dict]:
             return {"shape": shape, "dtype": dtype}
     return None
 
-def parse_numeric(s: str) -> Any:
+def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to int or float.
 
-    Handles: integers, floats, scientific notation, hex floats (0xFC00).
+    Handles: integers, floats, scientific notation, hex constants.
+    When *dtype* is a float type (f16, f32, bf16) and the literal is hex,
+    the value is reinterpreted as an IEEE 754 bit pattern.
     """
+    import numpy as np
+
     s = s.strip()
 
-    # Hex float like 0xFC00
     if s.startswith('0x') or s.startswith('0X'):
-        return int(s, 16)
+        bits = int(s, 16)
+        # Float types: reinterpret hex as IEEE 754 bit pattern (e.g. 0xFC00 : f16 → -inf)
+        # Integer/index types: keep as plain int (e.g. 0xFF800000 : i32 → 4286578688)
+        if dtype == 'f32':
+            return float(np.array([bits & 0xFFFFFFFF], dtype=np.uint32).view(np.float32)[0])
+        elif dtype == 'f16':
+            return float(np.array([bits & 0xFFFF], dtype=np.uint16).view(np.float16)[0])
+        elif dtype == 'bf16':
+            return float(np.array([bits & 0xFFFF], dtype=np.uint16).view(np.float16)[0])
+        return bits
 
     try:
         return int(s)
