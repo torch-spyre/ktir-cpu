@@ -197,22 +197,6 @@ class ArithOps:
             return int(val1) * int(val2)
 
     @staticmethod
-    def maxnumf(tile1: Tile, tile2: Tile) -> Tile:
-        """Element-wise max, NaN-aware (NaN is treated as missing).
-
-        For CPU simulation this is identical to maxf since we use
-        np.maximum which already handles NaN correctly.
-
-        Args:
-            tile1, tile2: Input tiles
-
-        Returns:
-            Result tile
-        """
-        result_data = np.maximum(tile1.data, tile2.data)
-        return Tile(result_data, tile1.dtype, tile1.shape)
-
-    @staticmethod
     def cmpi(val1, val2, predicate: str = "slt"):
         """Integer comparison. Works on both scalars and Tiles.
 
@@ -306,6 +290,21 @@ class ArithOps:
         return Tile(result_data, tile1.dtype, tile1.shape)
 
     @staticmethod
+    def maxnumf(tile1: Tile, tile2: Tile) -> Tile:
+        """Element-wise max, NaN non-propagating (NaN is treated as missing).
+
+        Uses np.fmax which ignores NaN when the other operand is non-NaN.
+
+        Args:
+            tile1, tile2: Input tiles
+
+        Returns:
+            Result tile
+        """
+        result_data = np.fmax(tile1.data, tile2.data)
+        return Tile(result_data, tile1.dtype, tile1.shape)
+
+    @staticmethod
     def minf(tile1: Tile, tile2: Tile) -> Tile:
         """Element-wise minimum.
 
@@ -316,6 +315,21 @@ class ArithOps:
             Result tile
         """
         result_data = np.minimum(tile1.data, tile2.data)
+        return Tile(result_data, tile1.dtype, tile1.shape)
+
+    @staticmethod
+    def minnumf(tile1: Tile, tile2: Tile) -> Tile:
+        """Element-wise min, NaN non-propagating (NaN is treated as missing).
+
+        Uses np.fmin which ignores NaN when the other operand is non-NaN.
+
+        Args:
+            tile1, tile2: Input tiles
+
+        Returns:
+            Result tile
+        """
+        result_data = np.fmin(tile1.data, tile2.data)
         return Tile(result_data, tile1.dtype, tile1.shape)
 
     @staticmethod

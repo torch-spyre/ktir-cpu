@@ -156,6 +156,8 @@ def arith__constant(op, context, env):
     return value
 
 
+# TODO: consider deprecating arith.maxf / arith.minf aliases — these were
+# renamed to arith.maximumf / arith.minimumf in upstream MLIR.
 @register("arith.maxf", "arith.maximumf", latency_category=LC.COMPUTE_FLOAT)
 def arith__maxf(op, context, env):
     tile1 = context.get_value(op.operands[0])
@@ -168,6 +170,20 @@ def arith__maxnumf(op, context, env):
     tile1 = context.get_value(op.operands[0])
     tile2 = context.get_value(op.operands[1])
     return ArithOps.maxnumf(tile1, tile2)
+
+
+@register("arith.minf", "arith.minimumf", latency_category=LC.COMPUTE_FLOAT)
+def arith__minf(op, context, env):
+    tile1 = context.get_value(op.operands[0])
+    tile2 = context.get_value(op.operands[1])
+    return ArithOps.minf(tile1, tile2)
+
+
+@register("arith.minnumf", latency_category=LC.COMPUTE_FLOAT)
+def arith__minnumf(op, context, env):
+    tile1 = context.get_value(op.operands[0])
+    tile2 = context.get_value(op.operands[1])
+    return ArithOps.minnumf(tile1, tile2)
 
 
 @register("arith.extf")

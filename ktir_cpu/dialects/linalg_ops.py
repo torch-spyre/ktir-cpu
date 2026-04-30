@@ -51,6 +51,8 @@ def linalg__reduce(op, context, env):
         "arith.maxnumf": np.max,
         "arith.maximumf": np.maximum.reduce,
         "arith.minf": np.min,
+        "arith.minimumf": np.minimum.reduce,
+        "arith.minnumf": np.min,
         "arith.mulf": np.prod,
     }.get(reduce_fn)
 
