@@ -75,38 +75,19 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
     "add_kernel": [
         {
             "path": "triton-ktir/vector_add_ktir.mlir",
-            # n_elements matches construct_memory_view sizes: [4096]
-            # BLOCK_SIZE matches access tile: !ktdp.access_tile<128xindex>
-            "execute_kwargs": {"n_elements": 4096, "BLOCK_SIZE": 128},
+            "execute_kwargs": {},
         },
     ],
     "softmax_kernel_small": [
         {
             "path": "latency/softmax_small.mlir",
-            # sizes match construct_memory_view: [64, 64]
-            # grid = [32, 1], n_cols filled dynamically at call site
-            "execute_kwargs": {
-                "input_row_stride": 64,
-                "output_row_stride": 64,
-                "n_rows": 64,
-                "BLOCK_SIZE": 64,
-                "n_cols": None,  # filled from sizes at call site
-            },
+            "execute_kwargs": {},
         },
     ],
     "softmax_kernel": [
         {
             "path": "triton-ktir/softmax_fwd_ktir.mlir",
-            # row_stride matches construct_memory_view strides: [1024, 1]
-            # n_rows and BLOCK_SIZE match the MLIR constants
-            # n_cols is filled dynamically at call site (varies per test)
-            "execute_kwargs": {
-                "input_row_stride": 1024,
-                "output_row_stride": 1024,
-                "n_rows": 4096,
-                "BLOCK_SIZE": 1024,
-                "n_cols": None,  # filled from sizes at call site
-            },
+            "execute_kwargs": {},
         },
         {
             "path": "ktir/softmax_wide.mlir",
@@ -121,22 +102,21 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
     "_layer_norm_fwd_fused": [
         {
             "path": "triton-ktir/layernorm_fwd_ktir.mlir",
-            # stride and N match construct_memory_view sizes: [1151, 8192]
-            # BLOCK_SIZE matches the MLIR constant
-            "execute_kwargs": {"stride": 8192, "N": 8192, "eps": 1e-5, "BLOCK_SIZE": 1024},
+            # sizes match construct_memory_view: [1152, 8192]
+            # TODO: 1151→1152 change papers over non-divisible grid partition;
+            # see torch-spyre/ktir-cpu#15 review point 2.
+            "execute_kwargs": {"eps": 1e-5},
         },
     ],
     "matmul_kernel": [
         {
             "path": "triton-ktir/matmul_fwd_ktir.mlir",
-            # M, N, K match construct_memory_view sizes: [64,2048], [2048,8192], [64,8192]
-            # strides match the memory view strides
-            # BLOCK_SIZE_* match the MLIR tile constants
+            # M, N, K, BLOCK_SIZE_* are not function args in this MLIR (baked as
+            # constants), but _run_matmul passes them as dead kwargs because it
+            # also serves matmul_kernel_small which takes them as function args.
+            # test_matmul_flops and test_work_splitting_matmul read these values.
             "execute_kwargs": {
                 "M": 64, "N": 8192, "K": 2048,
-                "stride_am": 2048, "stride_ak": 1,
-                "stride_bk": 8192, "stride_bn": 1,
-                "stride_cm": 8192, "stride_cn": 1,
                 "BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 512, "BLOCK_SIZE_K": 128,
             },
         },
@@ -144,13 +124,10 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
     "matmul_kernel_small": [
         {
             "path": "latency/matmul_small.mlir",
-            # M, N, K match construct_memory_view sizes: [16,64], [64,64], [16,64]
-            # grid = [2, 2], BLOCK_SIZE_* match the MLIR tile constants
+            # M=16, N=64, K=64 match construct_memory_view sizes
+            # grid = [2, 2], BLOCK_SIZE_* match the MLIR function args
             "execute_kwargs": {
                 "M": 16, "N": 64, "K": 64,
-                "stride_am": 64, "stride_ak": 1,
-                "stride_bk": 64, "stride_bn": 1,
-                "stride_cm": 64, "stride_cn": 1,
                 "BLOCK_SIZE_M": 8, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32,
             },
         },
