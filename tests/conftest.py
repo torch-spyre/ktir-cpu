@@ -102,9 +102,8 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
     "_layer_norm_fwd_fused": [
         {
             "path": "triton-ktir/layernorm_fwd_ktir.mlir",
-            # sizes match construct_memory_view: [1152, 8192]
-            # TODO: 1151→1152 change papers over non-divisible grid partition;
-            # see torch-spyre/ktir-cpu#15 review point 2.
+            # sizes match construct_memory_view: [1151, 8192]
+            # 1151 is not divisible by 32 cores; the MLIR uses a min-clamp on end_row.
             "execute_kwargs": {"eps": 1e-5},
         },
     ],
