@@ -393,8 +393,11 @@ class KTIRParser(KTIRParserBase):
         text = accumulated.rstrip()
         if not text:
             return False
-        # Void terminators
-        if text == 'return' or text.startswith('return ') or text.startswith('scf.yield'):
+        # Block labels: ^name(%arg: type):
+        if text.startswith('^') and text.endswith(':'):
+            return True
+        # Void terminators (return, *.yield)
+        if 'return' in text or '.yield' in text:
             return True
         # Type annotation: `: <type>` or `-> <type>` at end
         if self._TYPE_TERMINAL_RE.search(text):

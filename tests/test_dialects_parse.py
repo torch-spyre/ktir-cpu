@@ -392,21 +392,34 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_attribute(op, "target_shape", (1, 1024))
 
     def test_generate(self):
-        op = self._parse("%mask = tensor.generate : tensor<16x16xf16>")
+        op = self._parse(
+            "%mask = tensor.generate {\n"
+            "    ^bb0(%i: index, %j: index):\n"
+            "      tensor.yield %val : f16\n"
+            "    } : tensor<16x16xf16>",
+            args={"%val": "f16"},
+        )
         self.assert_op_type(op, "tensor.generate")
         self.assert_attribute(op, "shape", (16, 16))
         self.assert_attribute(op, "dtype", "f16")
-        assert op.result == "%mask"
+        assert op.result is not None
+        assert len(op.regions) == 1
 
-    def test_yield(self):
+    def test_generate_yield(self):
+        # tensor.yield is a terminator inside tensor.generate — test via region
         op = self._parse(
-            "tensor.yield %val : f16",
+            "%t = tensor.generate {\n"
+            "    ^bb0(%i: index):\n"
+            "      tensor.yield %val : f16\n"
+            "    } : tensor<4xf16>",
             args={"%val": "f16"},
         )
-        self.assert_op_type(op, "tensor.yield")
-        self.assert_num_operands(op, 1)
-        self.assert_operand_names(op, "%val")
-        assert op.result is None
+        yield_ops = [o for o in op.regions[0] if o.op_type == "tensor.yield"]
+        assert len(yield_ops) == 1
+        yield_op = yield_ops[0]
+        self.assert_num_operands(yield_op, 1)
+        self.assert_operand_names(yield_op, "%val")
+        assert yield_op.result is None
 
 
 # ---------------------------------------------------------------------------

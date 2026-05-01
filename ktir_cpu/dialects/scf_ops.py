@@ -119,7 +119,9 @@ def parse_bb0_block_args(op_text, parse_ctx):
     (linalg.generic, tensor.generate, etc.) can bind block-argument
     names to their values.
     """
-    arg_names = re.findall(r'%\w+', op_text)
+    paren_match = re.search(r'\(([^)]*)\)', op_text)
+    arg_text = paren_match.group(1) if paren_match else op_text
+    arg_names = re.findall(r'%\w+', arg_text)
     return Operation(
         result=None,
         op_type="region.bb0_args",
