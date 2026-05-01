@@ -283,6 +283,26 @@ class TestArithParsers(ParseTestMixin):
         self.assert_operand_names(op, "%i")
         self.assert_result_type(op, "f16")
 
+    def test_cmpf_olt(self):
+        op = self._parse(
+            "%r = arith.cmpf olt, %a, %b : f16",
+            args={"%a": "f16", "%b": "f16"},
+        )
+        self.assert_op_type(op, "arith.cmpf")
+        self.assert_attribute(op, "predicate", "olt")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%b")
+
+    def test_cmpf_uge(self):
+        op = self._parse(
+            "%r = arith.cmpf uge, %x, %y : f32",
+            args={"%x": "f32", "%y": "f32"},
+        )
+        self.assert_op_type(op, "arith.cmpf")
+        self.assert_attribute(op, "predicate", "uge")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%x", "%y")
+
 
 # ---------------------------------------------------------------------------
 # linalg dialect parsers
@@ -370,6 +390,23 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_num_operands(op, 1)
         self.assert_operand_names(op, "%in")
         self.assert_attribute(op, "target_shape", (1, 1024))
+
+    def test_generate(self):
+        op = self._parse("%mask = tensor.generate : tensor<16x16xf16>")
+        self.assert_op_type(op, "tensor.generate")
+        self.assert_attribute(op, "shape", (16, 16))
+        self.assert_attribute(op, "dtype", "f16")
+        assert op.result == "%mask"
+
+    def test_yield(self):
+        op = self._parse(
+            "tensor.yield %val : f16",
+            args={"%val": "f16"},
+        )
+        self.assert_op_type(op, "tensor.yield")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%val")
+        assert op.result is None
 
 
 # ---------------------------------------------------------------------------

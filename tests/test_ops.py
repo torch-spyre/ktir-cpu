@@ -95,6 +95,26 @@ class TestArithOpsFloat:
         t1, t2 = _tile([1, 5]), _tile([4, 2])
         assert np.array_equal(ArithOps.maxnumf(t1, t2).data, np.maximum(t1.data, t2.data))
 
+    def test_maxnumf_nan(self):
+        t1 = _tile([float('nan'), 3, float('nan')])
+        t2 = _tile([2, float('nan'), float('nan')])
+        result = ArithOps.maxnumf(t1, t2)
+        assert result.data[0] == 2.0
+        assert result.data[1] == 3.0
+        assert np.isnan(result.data[2])
+
+    def test_minnumf(self):
+        t1, t2 = _tile([1, 5, 3, 8]), _tile([4, 2, 6, 7])
+        assert np.array_equal(ArithOps.minnumf(t1, t2).data, np.fmin(t1.data, t2.data))
+
+    def test_minnumf_nan(self):
+        t1 = _tile([float('nan'), 3, float('nan')])
+        t2 = _tile([2, float('nan'), float('nan')])
+        result = ArithOps.minnumf(t1, t2)
+        assert result.data[0] == 2.0
+        assert result.data[1] == 3.0
+        assert np.isnan(result.data[2])
+
     def test_addf_2d_tiles(self):
         # element-wise addf on 4x4 float16 tensors
         data1 = np.arange(16, dtype=np.float16).reshape(4, 4)

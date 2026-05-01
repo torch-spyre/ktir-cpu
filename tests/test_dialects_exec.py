@@ -163,6 +163,24 @@ class TestArithFloat:
         result = _call("arith.maximumf", ctx, _make_env(), operands=["%a", "%b"])
         assert np.array_equal(result.data, np.array([4, 5, 6], dtype=np.float16))
 
+    def test_minimumf(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([4, 2, 6])})
+        result = _call("arith.minimumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([1, 2, 3], dtype=np.float16))
+
+    def test_minnumf(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5]), "%b": _tile([4, 2])})
+        result = _call("arith.minnumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([1, 2], dtype=np.float16))
+
+    def test_minnumf_nan(self):
+        a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, float('nan')], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("arith.minnumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert result.data[0] == 2.0
+        assert result.data[1] == 3.0
+
     def test_extf_promotes_to_f32(self):
         # extf widens f16 → f32
         t = _tile([1, 2])  # f16 tile
@@ -324,6 +342,52 @@ class TestArithCmpiSelect:
         ctx = _ctx_with(**{"%cond": cond, "%t": _tile([1, 2, 3]), "%f": _tile([4, 5, 6])})
         result = _call("arith.select", ctx, _make_env(), operands=["%cond", "%t", "%f"])
         assert np.array_equal(result.data, np.array([1, 5, 3], dtype=np.float16))
+
+# ---------------------------------------------------------------------------
+# arith.cmpf dialect exec
+# ---------------------------------------------------------------------------
+
+class TestArithCmpf:
+    def test_cmpf_olt(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([2, 4, 3])})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "olt"})
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([True, False, False]))
+
+    def test_cmpf_oge(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([2, 4, 3])})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "oge"})
+        assert np.array_equal(result.data, np.array([False, True, True]))
+
+    def test_cmpf_olt_nan(self):
+        a = Tile(np.array([float('nan'), 1], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, float('nan')], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "olt"})
+        assert np.array_equal(result.data, np.array([False, False]))
+
+    def test_cmpf_ueq_nan(self):
+        a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, 3], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "ueq"})
+        assert np.array_equal(result.data, np.array([True, True]))
+
+    def test_cmpf_ord_uno(self):
+        a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, 4], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result_ord = _call("arith.cmpf", ctx, _make_env(),
+                           operands=["%a", "%b"], attributes={"predicate": "ord"})
+        assert np.array_equal(result_ord.data, np.array([False, True]))
+        result_uno = _call("arith.cmpf", ctx, _make_env(),
+                           operands=["%a", "%b"], attributes={"predicate": "uno"})
+        assert np.array_equal(result_uno.data, np.array([True, False]))
+
 
 # ---------------------------------------------------------------------------
 # math dialect exec
@@ -530,6 +594,59 @@ class TestTensor:
                        operands=["%t"], attributes={"target_shape": (4,)})
         assert result.shape == (4,)
         assert np.array_equal(result.data, [1, 2, 3, 4])
+
+# ---------------------------------------------------------------------------
+# tensor.generate exec
+# ---------------------------------------------------------------------------
+
+class TestTensorGenerate:
+    def _exec_env(self):
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+        return env
+
+    def test_generate_1d(self):
+        ctx = _make_ctx()
+        ctx.set_value("%c2", 2)
+        env = self._exec_env()
+        region = [
+            _op("region.bb0_args", operands=[], attributes={"names": ["%i"]}),
+            _op("arith.muli", operands=["%i", "%c2"], result="%val"),
+            _op("tensor.yield", operands=["%val"]),
+        ]
+        op = _op("tensor.generate", operands=[],
+                 attributes={"shape": (4,), "dtype": "f16"},
+                 regions=[region])
+        result = dispatch("tensor.generate")(op, ctx, env)
+        assert isinstance(result, Tile)
+        assert result.shape == (4,)
+        assert np.array_equal(result.data, np.array([0, 2, 4, 6], dtype=np.float16))
+
+    def test_generate_2d(self):
+        ctx = _make_ctx()
+        env = self._exec_env()
+        region = [
+            _op("region.bb0_args", operands=[], attributes={"names": ["%i", "%j"]}),
+            _op("arith.cmpi", operands=["%i", "%j"],
+                attributes={"predicate": "sge"}, result="%cmp"),
+            _op("tensor.yield", operands=["%cmp"]),
+        ]
+        op = _op("tensor.generate", operands=[],
+                 attributes={"shape": (3, 3), "dtype": "f16"},
+                 regions=[region])
+        result = dispatch("tensor.generate")(op, ctx, env)
+        assert result.shape == (3, 3)
+        expected = np.array([[1, 0, 0], [1, 1, 0], [1, 1, 1]], dtype=np.float16)
+        assert np.array_equal(result.data, expected)
+
 
 # ---------------------------------------------------------------------------
 # scf dialect exec
