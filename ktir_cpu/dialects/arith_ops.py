@@ -21,7 +21,7 @@ import numpy as np
 from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
-from ..ops.arith_ops import ArithOps
+from ..ops.arith_ops import ArithOps, arith_cast
 from .registry import register, register_parser
 
 
@@ -210,12 +210,18 @@ def arith__extsi(op, context, env):
 
 @register("arith.index_cast")
 def arith__index_cast(op, context, env):
-    return int(context.get_value(op.operands[0]))
+    return arith_cast(
+        context.get_value(op.operands[0]), np.int32,
+        expect_floating=False, op_name="index_cast",
+    )
 
 
 @register("arith.sitofp")
 def arith__sitofp(op, context, env):
-    return np.float16(context.get_value(op.operands[0]))
+    return arith_cast(
+        context.get_value(op.operands[0]), np.float16,
+        expect_floating=False, op_name="sitofp",
+    )
 
 
 @register("arith.cmpi", latency_category=LC.COMPUTE_FLOAT)
@@ -287,67 +293,79 @@ def parse_arith_constant(op_text, parse_ctx):
     result_type = None
     attributes = {}
 
+    # Three syntax forms for arith.constant:
+    #
+    # Form 1 (braced):   {dense<val> : inner_type} : result_type
+    #                     {val : inner_type} : result_type
+    # Form 2 (dense):    dense<val> : tensor<NxMxdtype>
+    # Form 3 (scalar):   val : dtype
+    #                     e.g. 0xFF800000 : f32, 42 : index, 0.0 : f16
+    #
+    # All forms pass dtype to parse_numeric so hex literals are correctly
+    # interpreted as IEEE 754 bit patterns for float types.
+
     braced_match = re.match(r'\{([^}]+)\}\s*:\s*(.+)$', rest)
     if braced_match:
+        # Form 1: {inner} : result_type
         inner = braced_match.group(1).strip()
         result_type = braced_match.group(2).strip()
 
+        # Resolve element dtype from result_type (could be "f32" or "tensor<4xf32>")
+        _type_info = parse_tensor_type(result_type)
+        elem_dtype = _type_info.get("dtype") if _type_info else result_type
+
         dense_match = re.match(r'dense<([^>]+)>', inner)
         if dense_match:
-            value = parse_numeric(dense_match.group(1))
+            value = parse_numeric(dense_match.group(1), dtype=elem_dtype)
         else:
             typed_val = re.match(r'(.+?)\s*:\s*\S+', inner)
             if typed_val:
-                value = parse_numeric(typed_val.group(1).strip())
+                value = parse_numeric(typed_val.group(1).strip(), dtype=elem_dtype)
             else:
-                value = parse_numeric(inner)
+                value = parse_numeric(inner, dtype=elem_dtype)
 
-        # If result_type is a tensor, mark as tensor constant
-        if result_type and 'tensor<' in result_type:
-            type_info = parse_tensor_type(result_type)
-            if type_info:
-                attributes["shape"] = type_info["shape"]
-                attributes["dtype"] = type_info.get("dtype", "f16")
-                attributes["is_tensor"] = True
+        if _type_info and 'tensor<' in result_type:
+            attributes["shape"] = _type_info["shape"]
+            attributes["dtype"] = _type_info.get("dtype", "f16")
+            attributes["is_tensor"] = True
     else:
-        # Match unbraced dense<value> followed by `: type`.  Covers:
+        # Form 2: dense<value> : type.  Covers:
         #   dense<0.0> : tensor<4xf16>       (splat tensor constant)
         #   dense<42> : tensor<1xi32>         (scalar tensor constant)
         dense_match = re.match(r'dense<([^>]+)>\s*:\s*(.+)$', rest)
-        # Match a scalar value followed by `: type`.  Covers:
+        # Form 3: scalar value : type.  Covers:
         #   42 : index              (decimal integer)
         #   0.0 : f32               (float)
         #   -1.5e-3 : f16           (scientific notation)
-        #   0xFF800000 : i32        (hex integer, e.g. -inf bit pattern)
+        #   0xFF800000 : f32        (hex float — IEEE 754 bit pattern for -inf)
+        #   0xFF800000 : i32        (hex integer — kept as plain int)
         simple_match = re.match(r'(-?(?:0[xX][0-9a-fA-F]+|[\d.eE+\-]+))\s*:\s*(.+)$', rest)
         if dense_match:
-            value = parse_numeric(dense_match.group(1))
             result_type = dense_match.group(2).strip()
             type_info = parse_tensor_type(result_type)
+            elem_dtype = type_info.get("dtype") if type_info else None
+            value = parse_numeric(dense_match.group(1), dtype=elem_dtype)
             attributes["shape"] = type_info["shape"]
             attributes["dtype"] = type_info["dtype"]
             attributes["is_tensor"] = True
         elif simple_match:
-            value = parse_numeric(simple_match.group(1))
             result_type = simple_match.group(2).strip()
+            value = parse_numeric(simple_match.group(1), dtype=result_type)
         else:
+            # Defensive fallback: type-only with no parseable value — defaults to 0.
+            # No known MLIR examples hit this path; kept for robustness.
+            #   : tensor<1x64xf16>     (zero-initialized tensor)
+            #   : index                (zero scalar)
+
             type_only_match = re.match(r':\s*(.+)$', rest)
             if type_only_match:
                 result_type = type_only_match.group(1).strip()
                 if result_type and 'tensor<' in result_type:
                     type_info = parse_tensor_type(result_type)
                     if type_info:
-                        shape = type_info["shape"]
-                        dtype_str = type_info.get("dtype", "f16")
-                        value = 0
-                        attributes["shape"] = shape
-                        attributes["dtype"] = dtype_str
+                        attributes["shape"] = type_info["shape"]
+                        attributes["dtype"] = type_info.get("dtype", "f16")
                         attributes["is_tensor"] = True
-                else:
-                    value = 0
-            else:
-                value = 0
-                result_type = "unknown"
 
     if value is None:
         value = 0
