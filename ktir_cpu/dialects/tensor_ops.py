@@ -120,6 +120,63 @@ def tensor__collapse_shape(op, context, env):
     return src
 
 
+@register("tensor.yield")
+def tensor__yield(op, context, env):
+    """Yield a value from a tensor.generate body — same semantics as scf.yield."""
+    from ..ops.control_ops import ControlOps
+    values = [context.get_value(name) for name in op.operands]
+    return ControlOps.yield_op(values)
+
+
+@register("tensor.generate")
+def tensor__generate(op, context, env):
+    """Generate a tensor by evaluating a region body at each index.
+
+    MLIR syntax:
+        %mask = tensor.generate {
+        ^bb0(%i: index, %j: index):
+          %cmp = arith.cmpi sge, %i, %j : index
+          %val = arith.select %cmp, %zero, %neg_inf : f16
+          tensor.yield %val : f16
+        } : tensor<16x16xf16>
+
+    The body receives one block argument per dimension (the indices),
+    computes a scalar, and yields it via tensor.yield.  This handler
+    iterates over all index combinations, executes the body each time,
+    and assembles the results into a Tile.
+
+    Used by prefill_attention to build the causal mask on-chip:
+        mask[i, j] = 0.0 if i >= j else -10000.0
+    """
+    shape = tuple(op.attributes.get("shape", ()))
+    dtype_str = op.attributes.get("dtype", "f16")
+    np_dtype = to_np_dtype(dtype_str)
+    region = op.regions[0] if op.regions else []
+
+    # Extract block arg names from the ^bb0 label (parsed as region.bb0_args)
+    bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
+    block_args = bb0_op.attributes["names"] if bb0_op else []
+    body = [o for o in region if o.op_type != "region.bb0_args"]
+
+    data = np.empty(shape, dtype=np_dtype)
+    import itertools
+    for idx in itertools.product(*(range(s) for s in shape)):
+        context.push_scope()
+        for arg_name, val in zip(block_args, idx):
+            context.set_value(arg_name, val)
+        result = env.execute_region(context, body)
+        if hasattr(result, 'values'):
+            scalar = result.values[0]
+        else:
+            scalar = result
+        if isinstance(scalar, Tile):
+            scalar = scalar.data.flat[0]
+        data[idx] = scalar
+        context.pop_scope()
+
+    return Tile(data, dtype_str, shape)
+
+
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
@@ -246,6 +303,85 @@ def _parse_reshape_op(op_text, op_name):
         operands=[operand],
         attributes=attributes,
         result_type=f"tensor<{'x'.join(str(s) for s in target_shape)}x{target_dtype}>" if target_shape else "unknown"
+    )
+
+
+@register_parser("tensor.yield")
+def parse_tensor_yield(op_text, parse_ctx):
+    """Parse tensor.yield — terminates a tensor.generate body.
+
+    Syntax:
+        tensor.yield %val : f16
+
+    Extracts the yielded operand (%val) from the text before the `:` type
+    annotation.  Mirrors the scf.yield parser structure.
+    """
+    # Strip the op name prefix to get "%val : f16"
+    rest = op_text
+    yield_match = re.match(r'tensor\.yield\s*(.*)', op_text)
+    if yield_match:
+        rest = yield_match.group(1)
+    # Operands are before the `:` type annotation
+    operand_text = rest.split(':')[0] if ':' in rest else rest
+    operands = re.findall(r'%\w+', operand_text)
+    return Operation(
+        result=None,
+        op_type="tensor.yield",
+        operands=operands,
+        attributes={},
+        result_type=None,
+    )
+
+
+@register_parser("tensor.generate")
+def parse_tensor_generate(op_text, parse_ctx):
+    """Parse tensor.generate.
+
+    Full syntax:
+        %mask = tensor.generate {
+        ^bb0(%i: index, %j: index):
+          %cmp = arith.cmpi sge, %i, %j : index
+          %val = arith.select %cmp, %zero, %neg_inf : f16
+          tensor.yield %val : f16
+        } : tensor<16x16xf16>
+
+    The parser only handles the outer op line (after region extraction):
+        %mask = tensor.generate : tensor<16x16xf16>
+
+    The region body (^bb0 + ops + tensor.yield) is automatically extracted
+    by _tokenize_operations and attached as op.regions[0].  The ^bb0 line
+    becomes a synthetic region.bb0_args op containing the block arg names.
+
+    We extract:
+      - result_name: %mask
+      - shape/dtype from the trailing `: tensor<16x16xf16>` type annotation
+    """
+    from ..parser_utils import parse_tensor_type
+
+    # Match: %result = tensor.generate ...
+    result_match = re.match(r'(%\w+)\s*=\s*tensor\.generate', op_text)
+    if not result_match:
+        return None
+
+    result_name = result_match.group(1)
+    attributes = {}
+
+    # Extract shape and dtype from trailing `: tensor<16x16xf16>`
+    # (required — without it we don't know what size tensor to generate)
+    type_match = re.search(r':\s*(tensor<[^>]+>)\s*$', op_text)
+    if not type_match:
+        raise ValueError(f"tensor.generate: missing result type in '{op_text}'")
+    type_info = parse_tensor_type(type_match.group(1))
+    if type_info:
+        attributes["shape"] = type_info["shape"]
+        attributes["dtype"] = type_info.get("dtype", "f16")
+
+    return Operation(
+        result=result_name,
+        op_type="tensor.generate",
+        operands=[],
+        attributes=attributes,
+        result_type=type_match.group(1),
     )
 
 

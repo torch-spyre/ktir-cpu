@@ -102,6 +102,33 @@ def ktdp__reduce(op, context, env):
 # Parsers
 # ---------------------------------------------------------------------------
 
+@register("region.bb0_args")
+def region__bb0_args(op, context, env):
+    """No-op at execution time — bb0 args are bound by the enclosing op handler."""
+    return None
+
+
+@register_parser("^bb0")
+def parse_bb0_block_args(op_text, parse_ctx):
+    """Parse a ^bb0 block-argument label inside any region body.
+
+    Syntax:
+        ^bb0(%arg0: type, %arg1: type, ...):
+
+    Emitted as a synthetic region.bb0_args op so that handlers
+    (linalg.generic, tensor.generate, etc.) can bind block-argument
+    names to their values.
+    """
+    arg_names = re.findall(r'%\w+', op_text)
+    return Operation(
+        result=None,
+        op_type="region.bb0_args",
+        operands=[],
+        attributes={"names": arg_names},
+        result_type=None,
+    )
+
+
 @register_parser("scf.for ")
 def parse_scf_for(op_text, parse_ctx):
     # Detect optional outer result variable(s): %a, %b, %c = scf.for ...

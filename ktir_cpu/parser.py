@@ -356,9 +356,11 @@ class KTIRParser(KTIRParserBase):
                     current_op_lines.pop()
 
                 # Extract region body from subsequent lines
-                region_body, end_line = self._extract_region_from_lines(lines, i)
+                region_body, end_line, trailing = self._extract_region_from_lines(lines, i)
                 if region_body is not None:
                     current_regions.append(region_body)
+                    if trailing:
+                        current_op_lines.append(trailing)
                     i = end_line + 1
                     continue
                 # If extraction failed, just continue
@@ -426,16 +428,19 @@ class KTIRParser(KTIRParserBase):
                 break
         return False
 
-    def _extract_region_from_lines(self, lines: List[str], open_brace_line: int) -> Tuple[Optional[str], int]:
+    def _extract_region_from_lines(self, lines: List[str], open_brace_line: int) -> Tuple[Optional[str], int, str]:
         """Extract a region body starting from the line that has the opening '{'.
 
         The opening '{' is at the end of lines[open_brace_line].
         We scan forward to find the matching '}', tracking brace depth.
-        We return the text between the braces and the line index of the
-        closing '}'.
+
+        Text after the closing '}' on the same line (e.g. `: tensor<16x16xf16>`
+        in tensor.generate) is returned as *trailing* so the caller can append
+        it to the outer operation text.
 
         Returns:
-            (region_body_text, closing_brace_line_index) or (None, -1)
+            (region_body_text, closing_brace_line_index, trailing_text)
+            or (None, -1, "") on failure.
         """
         # The opening '{' is already accounted for (depth starts at 1)
         depth = 1
@@ -453,18 +458,21 @@ class KTIRParser(KTIRParserBase):
                 elif ch == '}':
                     depth -= 1
                     if depth == 0:
-                        # Found the closing brace. Everything before this
-                        # closing brace on this line is part of the body.
-                        # But typically the '}' is on its own line.
-                        before_close = stripped[:stripped.rfind('}')].strip()
+                        # Found the closing brace.
+                        close_pos = stripped.rfind('}')
+                        # Text before '}' is part of the body
+                        before_close = stripped[:close_pos].strip()
                         if before_close:
                             body_lines.append(before_close)
-                        return ('\n'.join(body_lines), i)
+                        # Text after '}' belongs to the outer op
+                        # (e.g. `: tensor<16x16xf16>` in tensor.generate)
+                        after_close = stripped[close_pos + 1:].strip()
+                        return ('\n'.join(body_lines), i, after_close)
 
             body_lines.append(line)
             i += 1
 
-        return (None, -1)
+        return (None, -1, "")
 
     # ------------------------------------------------------------------
     # Operation parsing

@@ -462,7 +462,7 @@ class TestLinalg:
                 "indexing_maps": [[0]],
             },
             regions=[[
-                Operation(op_type="linalg.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
             ] + region_ops],
         )
 
