@@ -21,7 +21,7 @@ import numpy as np
 from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
-from ..ops.arith_ops import ArithOps
+from ..ops.arith_ops import ArithOps, arith_cast
 from .registry import register, register_parser
 
 
@@ -210,12 +210,18 @@ def arith__extsi(op, context, env):
 
 @register("arith.index_cast")
 def arith__index_cast(op, context, env):
-    return int(context.get_value(op.operands[0]))
+    return arith_cast(
+        context.get_value(op.operands[0]), np.int32,
+        expect_floating=False, op_name="index_cast",
+    )
 
 
 @register("arith.sitofp")
 def arith__sitofp(op, context, env):
-    return np.float16(context.get_value(op.operands[0]))
+    return arith_cast(
+        context.get_value(op.operands[0]), np.float16,
+        expect_floating=False, op_name="sitofp",
+    )
 
 
 @register("arith.cmpi", latency_category=LC.COMPUTE_FLOAT)
