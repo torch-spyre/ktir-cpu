@@ -96,6 +96,8 @@ class TestArithOpsFloat:
         assert np.array_equal(ArithOps.maxnumf(t1, t2).data, np.maximum(t1.data, t2.data))
 
     def test_maxnumf_nan(self):
+        # NaN non-propagating (np.fmax): if one operand is NaN, return the other.
+        # fmax(NaN, 2) → 2;  fmax(3, NaN) → 3;  fmax(NaN, NaN) → NaN
         t1 = _tile([float('nan'), 3, float('nan')])
         t2 = _tile([2, float('nan'), float('nan')])
         result = ArithOps.maxnumf(t1, t2)
@@ -108,6 +110,8 @@ class TestArithOpsFloat:
         assert np.array_equal(ArithOps.minnumf(t1, t2).data, np.fmin(t1.data, t2.data))
 
     def test_minnumf_nan(self):
+        # NaN non-propagating (np.fmin): if one operand is NaN, return the other.
+        # fmin(NaN, 2) → 2;  fmin(3, NaN) → 3;  fmin(NaN, NaN) → NaN
         t1 = _tile([float('nan'), 3, float('nan')])
         t2 = _tile([2, float('nan'), float('nan')])
         result = ArithOps.minnumf(t1, t2)

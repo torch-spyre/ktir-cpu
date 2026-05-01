@@ -174,6 +174,7 @@ class TestArithFloat:
         assert np.array_equal(result.data, np.array([1, 2], dtype=np.float16))
 
     def test_minnumf_nan(self):
+        # NaN non-propagating: fmin(NaN, 2) → 2;  fmin(3, NaN) → 3
         a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
         b = Tile(np.array([2, float('nan')], dtype=np.float16), "f16", (2,))
         ctx = _ctx_with(**{"%a": a, "%b": b})
@@ -362,6 +363,8 @@ class TestArithCmpf:
         assert np.array_equal(result.data, np.array([False, True, True]))
 
     def test_cmpf_olt_nan(self):
+        # Ordered predicates always return False when either operand is NaN.
+        # olt(NaN, 2) → False;  olt(1, NaN) → False
         a = Tile(np.array([float('nan'), 1], dtype=np.float16), "f16", (2,))
         b = Tile(np.array([2, float('nan')], dtype=np.float16), "f16", (2,))
         ctx = _ctx_with(**{"%a": a, "%b": b})
@@ -370,6 +373,8 @@ class TestArithCmpf:
         assert np.array_equal(result.data, np.array([False, False]))
 
     def test_cmpf_ueq_nan(self):
+        # Unordered predicates return True when either operand is NaN.
+        # ueq(NaN, 2) → True (NaN present);  ueq(3, 3) → True (equal)
         a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
         b = Tile(np.array([2, 3], dtype=np.float16), "f16", (2,))
         ctx = _ctx_with(**{"%a": a, "%b": b})
@@ -378,6 +383,9 @@ class TestArithCmpf:
         assert np.array_equal(result.data, np.array([True, True]))
 
     def test_cmpf_ord_uno(self):
+        # ord: True iff neither operand is NaN.  uno: True iff either is NaN.
+        # ord(NaN, 2) → False;  ord(3, 4) → True
+        # uno(NaN, 2) → True;   uno(3, 4) → False
         a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
         b = Tile(np.array([2, 4], dtype=np.float16), "f16", (2,))
         ctx = _ctx_with(**{"%a": a, "%b": b})
@@ -601,6 +609,10 @@ class TestTensor:
 
 class TestTensorGenerate:
     def _exec_env(self):
+        # tensor.generate calls env.execute_region(context, body) for each index
+        # combination.  The default _make_env().execute_region expects callables,
+        # but we pass Operation objects.  Override it to dispatch each op through
+        # the real handler registry (same pattern as test_generic_reads_outs_arg).
         env = _make_env()
         def _exec_region(context, ops):
             result = None

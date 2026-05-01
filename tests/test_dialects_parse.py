@@ -627,6 +627,29 @@ class TestParserInfrastructure:
         assert len(generic_ops) == 1
         assert len(generic_ops[0].regions) == 1
 
+    def test_tensor_generate_trailing_type_preserved(self):
+        # The `: tensor<4xf16>` after the closing `}` must be appended back to
+        # the op text so that parse_tensor_generate can extract shape/dtype.
+        parser = KTIRParser()
+        module = parser.parse_module("""
+        module {
+          func.func @test() attributes { grid = [1, 1, 1] } {
+            %c0 = arith.constant 0 : index
+            %t = tensor.generate {
+            ^bb0(%i: index):
+              tensor.yield %c0 : index
+            } : tensor<4xf16>
+            return
+          }
+        }
+        """)
+        func = module.get_function("test")
+        gen_ops = [op for op in func.operations if op.op_type == "tensor.generate"]
+        assert len(gen_ops) == 1
+        assert gen_ops[0].attributes["shape"] == (4,)
+        assert gen_ops[0].attributes["dtype"] == "f16"
+        assert len(gen_ops[0].regions) == 1
+
 
 # ---------------------------------------------------------------------------
 # parser_utils: _extract_bracket_content, parse_attr_list
