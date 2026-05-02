@@ -28,20 +28,22 @@ Until a PyPI release is available, build from source:
 
 **Prerequisites:** CMake ≥ 3.20, Ninja, C++17 compiler.
 
+Resolve `MLIR_DIR` using one of:
+
 ```bash
-KTIR_MLIR_FRONTEND_COMMIT=55a8a7eaf3a3344d95c2e8793da0bc220c62d9c0
-LLVM_HASH=e9846648fd6183ee6d8cbdb4502213fcf902a211
+# Option 1: pin to the LLVM hash tested by ktir-mlir-frontend
+SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/scripts/setup_mlir.py"
+LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/cmake/llvm-hash.txt")
+MLIR_DIR=$(curl -fsSL "$SETUP_MLIR" | uv run python - --wheel --hash "$LLVM_HASH")
 
-# Fetch setup_mlir.py from the pinned commit
-curl -fsSL \
-  "https://raw.githubusercontent.com/fabianlim/ktir-mlir-frontend/$KTIR_MLIR_FRONTEND_COMMIT/scripts/setup_mlir.py" \
-  -o /tmp/setup_mlir.py
+# Option 2: use the latest mlir_wheel (simplest, no pinned hash)
+uv pip install mlir_wheel --find-links https://llvm.github.io/eudsl
+MLIR_DIR=$(uv run --no-project python -c "import mlir_wheel, pathlib; print(pathlib.Path(mlir_wheel.__file__).parent / 'lib/cmake/mlir')")
+```
 
-# Resolve MLIR — --wheel activates the mlir_wheel fallback (no GitHub token needed);
-# --hash records the targeted LLVM build (drop --wheel once artifacts are public)
-MLIR_DIR=$(uv run python /tmp/setup_mlir.py --wheel --hash "$LLVM_HASH")
+Then build and install:
 
-# Build and install
+```bash
 CMAKE_ARGS="-DMLIR_DIR=$MLIR_DIR" uv sync --extra mlir-frontend
 ```
 

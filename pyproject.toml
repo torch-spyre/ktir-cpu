@@ -29,9 +29,8 @@ dev = [
     "pytest-cov>=4.0",
 ]
 # No PyPI release yet; built from source via setup_mlir.py (see CONTRIBUTING.md).
-# Update this commit when torch-spyre/ktir-mlir-frontend#14 is merged.
 mlir-frontend = [
-    "ktir-mlir-frontend @ git+https://github.com/fabianlim/ktir-mlir-frontend@bad31fb7d8a34ed179f3eed47cf0f98765033373",
+    "ktir-mlir-frontend @ git+https://github.com/torch-spyre/ktir-mlir-frontend",
 ]
 
 [tool.setuptools_scm]
