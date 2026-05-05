@@ -438,6 +438,124 @@ class TestMath:
         ctx = _ctx_with(**{"%x": np.float16(1.0)})
         assert abs(float(_call("math.log", ctx, _make_env(), operands=["%x"])) - 0.0) < 0.01
 
+    def test_rsqrt_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1, 4, 16])})
+        result = _call("math.rsqrt", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.allclose(result.data, np.array([1.0, 0.5, 0.25], dtype=np.float16), rtol=1e-2)
+
+    def test_rsqrt_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(4.0)})
+        assert abs(float(_call("math.rsqrt", ctx, _make_env(), operands=["%x"])) - 0.5) < 0.01
+
+    def test_log2_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1, 2, 8])})
+        result = _call("math.log2", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.allclose(result.data, np.array([0, 1, 3], dtype=np.float16), rtol=1e-2)
+
+    def test_log2_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(8.0)})
+        assert abs(float(_call("math.log2", ctx, _make_env(), operands=["%x"])) - 3.0) < 0.01
+
+    def test_log1p_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1, 2])})
+        result = _call("math.log1p", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.log1p(np.array([0, 1, 2], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_log1p_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.log1p", ctx, _make_env(), operands=["%x"])) - 0.0) < 0.01
+
+    def test_tanh_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1, -1])})
+        result = _call("math.tanh", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.tanh(np.array([0, 1, -1], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_tanh_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.tanh", ctx, _make_env(), operands=["%x"])) - 0.0) < 0.01
+
+    def test_sin_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1.5708, 3.1416])})  # 0, pi/2, pi
+        result = _call("math.sin", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.sin(np.array([0, 1.5708, 3.1416], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, atol=1e-2)
+
+    def test_sin_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.sin", ctx, _make_env(), operands=["%x"]))) < 0.01
+
+    def test_cos_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1.5708, 3.1416])})
+        result = _call("math.cos", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.cos(np.array([0, 1.5708, 3.1416], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, atol=1e-2)
+
+    def test_cos_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.cos", ctx, _make_env(), operands=["%x"])) - 1.0) < 0.01
+
+    def test_absf_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([-2, 0, 3])})
+        result = _call("math.absf", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([2, 0, 3], dtype=np.float16))
+
+    def test_absf_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(-5.0)})
+        assert float(_call("math.absf", ctx, _make_env(), operands=["%x"])) == 5.0
+
+    def test_ceil_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1.2, 2.7, -0.5])})
+        result = _call("math.ceil", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([2, 3, 0], dtype=np.float16))
+
+    def test_ceil_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(1.3)})
+        assert float(_call("math.ceil", ctx, _make_env(), operands=["%x"])) == 2.0
+
+    def test_floor_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1.2, 2.7, -0.5])})
+        result = _call("math.floor", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([1, 2, -1], dtype=np.float16))
+
+    def test_floor_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(1.7)})
+        assert float(_call("math.floor", ctx, _make_env(), operands=["%x"])) == 1.0
+
+    def test_powf_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([2, 3, 4]), "%b": _tile([2, 2, 0.5])})
+        result = _call("math.powf", ctx, _make_env(), operands=["%a", "%b"])
+        assert isinstance(result, Tile)
+        assert np.allclose(result.data, np.array([4, 9, 2], dtype=np.float16), rtol=1e-2)
+
+    def test_fma_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([2, 3]), "%b": _tile([4, 5]), "%c": _tile([1, 1])})
+        result = _call("math.fma", ctx, _make_env(), operands=["%a", "%b", "%c"])
+        assert isinstance(result, Tile)
+        # 2*4+1=9, 3*5+1=16
+        assert np.array_equal(result.data, np.array([9, 16], dtype=np.float16))
+
+    def test_erf_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1, -1])})
+        result = _call("math.erf", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        # erf(0)=0, erf(1)≈0.8427, erf(-1)≈-0.8427
+        assert np.allclose(result.data, np.array([0, 0.8427, -0.8427], dtype=np.float16), atol=1e-2)
+
+    def test_erf_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.erf", ctx, _make_env(), operands=["%x"]))) < 0.01
+
 # ---------------------------------------------------------------------------
 # linalg dialect exec
 # ---------------------------------------------------------------------------

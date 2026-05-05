@@ -70,15 +70,15 @@ The spec references the [full Arith dialect](https://mlir.llvm.org/docs/Dialects
 
 ### Math dialect
 
-The spec references the [full Math dialect](https://mlir.llvm.org/docs/Dialects/MathOps/). Currently implemented: `math.exp`, `math.sqrt`, `math.log`.
+The spec references the [full Math dialect](https://mlir.llvm.org/docs/Dialects/MathOps/). Currently implemented: `math.exp`, `math.sqrt`, `math.log`, `math.rsqrt`, `math.log2`, `math.log1p`, `math.tanh`, `math.sin`, `math.cos`, `math.absf`, `math.ceil`, `math.floor`, `math.erf`, `math.powf`, `math.fma`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 20 | `math.log2`, `math.log1p` | ❌ | |
-| 21 | `math.tanh`, `math.sin`, `math.cos` | ❌ | |
-| 22 | `math.rsqrt` | ❌ | |
-| 23 | `math.abs`, `math.ceil`, `math.floor` | ❌ | |
-| 24 | `math.erf`, `math.powf`, `math.fma` | ❌ | |
+| 20 | `math.log2`, `math.log1p` | ✅ | |
+| 21 | `math.tanh`, `math.sin`, `math.cos` | ✅ | |
+| 22 | `math.rsqrt` | ✅ | |
+| 23 | `math.absf`, `math.ceil`, `math.floor` | ✅ | |
+| 24 | `math.erf`, `math.powf`, `math.fma` | ✅ | `math.erf` uses polynomial approximation (no scipy) |
 
 ### Linalg dialect
 
@@ -140,7 +140,7 @@ Limits dialect coverage for real-world kernels:
 
 - **#9–12**: ❌ SCF parallel/reduce operations
 - **#13–19**: ❌/🟡 Many standard arith ops (cmpf, negf, absf, minf, signed int ops)
-- **#20–24**: ❌ Many math ops (log2, tanh, sin, cos, rsqrt, abs, ceil, floor, erf, powf, fma)
+- **#20–24**: ✅ All math ops now implemented (log2, log1p, tanh, sin, cos, rsqrt, absf, ceil, floor, erf, powf, fma)
 - **#28, #30–31**: ❌ `tensor.extract_slice`, entire `memref` dialect
 - **#32**: 🟡 Dynamic sizes/strides not supported
 
@@ -154,6 +154,7 @@ Extensibility and completeness:
 ### Resolved
 - **#2**: ✅ `construct_indirect_access_tile`
 - **#6, #7, #8**: ✅ `access_tile_set`, `access_tile_order`, `base_map`
+- **#20–24**: ✅ All math ops (rsqrt, log2, log1p, tanh, sin, cos, absf, ceil, floor, erf, powf, fma)
 - **#26**: ✅ `linalg.generic`
 - **#33, #34, #35**: ✅ Access tile coordinate semantics
 - **#37, #38**: ✅ Affine expression evaluation and alias support
