@@ -39,14 +39,41 @@ class Tile:
     data: np.ndarray
     dtype: str  # see dtypes.SUPPORTED_DTYPES
     shape: Tuple[int, ...]
+    # Number of distinct 128-byte HBM sticks touched when this tile was
+    # produced by an indirect (gather) load.  None for contiguous loads
+    # and for tiles produced by compute ops.  Consumed by the latency
+    # tracker to model scatter penalty: actual HBM traffic is
+    # ``unique_sticks * 128`` rather than ``data.nbytes`` when set.
+    unique_sticks: Optional[int] = None
 
     def copy(self) -> 'Tile':
-        """Create a deep copy of this tile."""
+        """Create a deep copy of this tile.
+
+        ``unique_sticks`` is intentionally NOT propagated: the field marks
+        a freshly-gathered tile so latency can charge stick-granular HBM
+        traffic.  A copy lives in a different context (e.g. comm buffers)
+        and should not be re-charged as a gather result.
+        """
         return Tile(self.data.copy(), self.dtype, self.shape)
 
     def size_bytes(self) -> int:
         """Return size in bytes."""
         return self.data.nbytes
+
+    @property
+    def coalescing_efficiency(self) -> Optional[float]:
+        """Ratio of packed traffic to actual stick traffic for gather results.
+
+        Defined as ``data.nbytes / (unique_sticks * 128)``.  Ranges from
+        ``bytes_per_elem / 128`` (worst: every element on its own stick, no
+        sharing) to ``1.0`` (best: sticks fully packed).
+
+        Returns ``None`` when this tile is not a gather result
+        (``unique_sticks is None``) or has zero sticks.
+        """
+        if self.unique_sticks is None or self.unique_sticks == 0:
+            return None
+        return self.data.nbytes / (self.unique_sticks * 128)
 
 
 @dataclass
