@@ -231,6 +231,10 @@ class HBMSimulator:
         Returns:
             Pointer (memory address)
         """
+        assert self.next_ptr % self.STICK_BYTES == 0, (
+            f"next_ptr 0x{self.next_ptr:x} is not stick-aligned "
+            f"(STICK_BYTES={self.STICK_BYTES})"
+        )
         ptr = self.next_ptr
         self.next_ptr += size
         # Align to stick boundary
