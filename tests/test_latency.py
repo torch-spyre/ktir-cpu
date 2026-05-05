@@ -695,31 +695,28 @@ class TestIndirectAccessLatency:
     # directly, without standing up a full interpreter / HBM.
     # ---------------------------------------------------------------------
 
-    def test_count_unique_sticks_returns_n_when_every_element_lands_on_its_own_stick(self):
-        """_count_unique_sticks returns n_elements when gather fully scatters across sticks."""
-        from ktir_cpu.ir_types import TileRef
+    def test_flat_memory_offsets_returns_n_sticks_when_fully_scattered(self):
+        """_flat_memory_offsets returns n_elements sticks when every element lands on its own."""
         from ktir_cpu.ops.memory_ops import MemoryOps
 
         # f16 stick holds 64 elements; indices 0, 64, 128, 192 each land on
         # a different stick — no sharing.
-        parent = TileRef(base_ptr=0x10000, shape=(4096,), strides=[1],
-                         memory_space="HBM", dtype="f16")
         coords = [(i * 64,) for i in range(4)]
+        _, unique_sticks = MemoryOps._flat_memory_offsets(
+            base_ptr=0x10000, shape=(4096,), strides=[1], dtype="f16", coords=coords
+        )
+        assert unique_sticks == 4
 
-        assert MemoryOps._count_unique_sticks(parent, coords) == 4
-
-    def test_count_unique_sticks_dedups_sticks_shared_by_multiple_gather_reads(self):
-        """_count_unique_sticks collapses repeated coords into a set of distinct sticks."""
-        from ktir_cpu.ir_types import TileRef
+    def test_flat_memory_offsets_dedups_sticks_shared_by_multiple_reads(self):
+        """_flat_memory_offsets collapses repeated coords into distinct sticks."""
         from ktir_cpu.ops.memory_ops import MemoryOps
 
         # Six reads alternate between element 0 and element 64 — two sticks.
-        # A buggy implementation using a list instead of a set would return 6.
-        parent = TileRef(base_ptr=0x10000, shape=(4096,), strides=[1],
-                         memory_space="HBM", dtype="f16")
         coords = [(0,), (64,), (0,), (64,), (0,), (64,)]
-
-        assert MemoryOps._count_unique_sticks(parent, coords) == 2
+        _, unique_sticks = MemoryOps._flat_memory_offsets(
+            base_ptr=0x10000, shape=(4096,), strides=[1], dtype="f16", coords=coords
+        )
+        assert unique_sticks == 2
 
     def test_data_size_uses_unique_sticks_for_gather_result(self):
         """_data_size charges ``unique_sticks * 128`` when the field is set."""
@@ -750,11 +747,15 @@ class TestIndirectAccessLatency:
 
         assert tile.coalescing_efficiency is None
 
-    def test_copy_does_not_propagate_unique_sticks(self):
-        """Tile.copy() resets unique_sticks to None so copies are not charged as gathers."""
+    def test_copy_propagates_unique_sticks(self):
+        """Tile.copy() preserves unique_sticks — it's a property of the data layout.
+
+        This may change depending on the final implementation of comm_ops —
+        if copies land at a different base_ptr, unique_sticks may need to be
+        recomputed for the target device.
+        """
         from ktir_cpu.ir_types import Tile
 
-        # A freshly-gathered tile carrying a stick count.
         original = Tile(np.zeros(64, dtype=np.float16), "f16", (64,), unique_sticks=7)
 
-        assert original.copy().unique_sticks is None
+        assert original.copy().unique_sticks == 7

@@ -26,6 +26,7 @@ from ..dialects.ktdp_helpers import eval_subscript_expr
 from ..dtypes import bytes_per_elem as _bytes_per_elem
 from ..ir_types import Tile, TileRef
 from ..grid import CoreContext
+from ..memory import HBMSimulator
 
 
 class MemoryOps:
@@ -126,46 +127,34 @@ class MemoryOps:
         size = data.nbytes
         lx_ptr = context.lx.next_ptr
         context.lx.next_ptr += size
-        context.lx.next_ptr = (context.lx.next_ptr + 127) & ~127  # 128-byte align
+        context.lx.next_ptr = (context.lx.next_ptr + HBMSimulator.STICK_BYTES - 1) & ~(HBMSimulator.STICK_BYTES - 1)
         context.lx.write(lx_ptr, data)
 
     @staticmethod
-    def _gather_indices(
+    def _flat_memory_offsets(
+        base_ptr: int,
         shape: Tuple[int, ...],
         strides: List[int],
+        dtype: str,
         coords: Optional[List[Tuple[int, ...]]] = None,
-    ) -> List[int]:
-        """Compute flat element indices (offsets from base_ptr) for a gather/scatter.
+    ) -> Tuple[List[int], int]:
+        """Linearize N-d coordinates to flat element offsets and count unique HBM sticks.
 
-        When *coords* is provided, maps each coord tuple through *strides*.
-        Otherwise enumerates all nd-indices of *shape* through *strides*,
-        covering the full tile (contiguous or strided).
+        O(n) time, O(unique_sticks) memory for the stick set. For very large
+        coord sizes a more efficient implementation may be needed.
+
+        Returns:
+            (offsets, unique_sticks) — flat element offsets and number of
+            distinct HBM sticks touched.
         """
-        if coords is not None:
-            return [sum(c * s for c, s in zip(coord, strides)) for coord in coords]
-        return [
-            sum(i * s for i, s in zip(nd_idx, strides))
-            for nd_idx in np.ndindex(*shape)
-        ]
-
-    @staticmethod
-    def _count_unique_sticks(
-        parent_ref: TileRef,
-        coords: List[Tuple[int, ...]],
-    ) -> int:
-        """Count distinct 128-byte HBM sticks touched by a gather into *parent_ref*.
-
-        Used by :meth:`indirect_load` to model the HBM scatter penalty: real
-        hardware pulls a full 128-byte stick per access, so data traffic
-        depends on how many *distinct* sticks the gather coordinates land
-        in — not on the packed result size.
-        """
-        offsets = MemoryOps._gather_indices(parent_ref.shape, parent_ref.strides, coords)
-        bpe = _bytes_per_elem(parent_ref.dtype)
-        return len({
-            (parent_ref.base_ptr + offset * bpe) // 128
-            for offset in offsets
-        })
+        offsets = []
+        sticks = set()
+        bpe = _bytes_per_elem(dtype)
+        for coord in (coords if coords is not None else np.ndindex(*shape)):
+            o = sum(c * s for c, s in zip(coord, strides))
+            offsets.append(o)
+            sticks.add((base_ptr + o * bpe) // HBMSimulator.STICK_BYTES)
+        return offsets, len(sticks)
 
     @staticmethod
     def load(
@@ -192,16 +181,16 @@ class MemoryOps:
 
             # Parent 4×4 allocation at base_ptr=0x1000, values 0..15
             # tile_ref for column 2: base_ptr=0x1004, shape=(4,), strides=[4]
-            #   gather indices: [0*4, 1*4, 2*4, 3*4] = [0, 4, 8, 12]
-            #   span = 13  (max index + 1)
+            #   flat offsets: [0*4, 1*4, 2*4, 3*4] = [0, 4, 8, 12]
+            #   span = 13  (max offset + 1)
             #   mem.read(0x1004, 13) -> [2,3,4,5,6,7,8,9,10,11,12,13,14]
             #   gathered = flat[[0,4,8,12]] = [2, 6, 10, 14]  ✓
 
-        Example — upper-triangular gather from a 4×4 tile (coords provided)::
+        Example — upper-triangular load from a 4×4 tile (coords provided)::
 
             # tile_ref: base_ptr=0x1000, shape=(4,4), strides=[4,1]
             # coords = [(0,0),(0,1),...,(3,3)]  — 10 upper-tri tuples
-            #   indices = [0*4+0, 0*4+1, ..., 3*4+3] = [0,1,2,3,5,6,7,10,11,15]
+            #   flat offsets = [0*4+0, 0*4+1, ..., 3*4+3] = [0,1,2,3,5,6,7,10,11,15]
             #   span = 16
             #   mem.read(0x1000, 16) -> flat 0..15
             #   gathered = flat[[0,1,2,3,5,6,7,10,11,15]] = [0,1,2,3,5,6,7,10,11,15]
@@ -224,19 +213,27 @@ class MemoryOps:
             n = int(np.prod(tile_ref.shape))
             data = mem.read(tile_ref.base_ptr, n, tile_ref.dtype).reshape(tile_ref.shape)
             MemoryOps._write_to_lx(context, data)
-            return Tile(data, tile_ref.dtype, tile_ref.shape)
+            bpe = _bytes_per_elem(tile_ref.dtype)
+            end = tile_ref.base_ptr + n * bpe
+            unique_sticks = (
+                (end + HBMSimulator.STICK_BYTES - 1) // HBMSimulator.STICK_BYTES
+                - tile_ref.base_ptr // HBMSimulator.STICK_BYTES
+            )
+            return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
 
-        # Strided or coord-set path: build gather indices, single read, numpy gather.
-        indices = MemoryOps._gather_indices(tile_ref.shape, tile_ref.strides, coords)
-        span = max(indices) + 1 if indices else 1
+        # Strided or coord-set path: linearize coords, single read, numpy fancy-index.
+        offsets, unique_sticks = MemoryOps._flat_memory_offsets(
+            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
+        )
+        span = max(offsets) + 1 if offsets else 1
         flat = mem.read(tile_ref.base_ptr, span, tile_ref.dtype)
 
-        gathered = flat[indices]
+        gathered = flat[offsets]
         out_shape = result_shape if result_shape is not None else tile_ref.shape
         data = gathered.reshape(out_shape)
 
         MemoryOps._write_to_lx(context, data)
-        return Tile(data, tile_ref.dtype, out_shape)
+        return Tile(data, tile_ref.dtype, out_shape, unique_sticks)
 
     @staticmethod
     def store(
@@ -270,11 +267,13 @@ class MemoryOps:
             mem.write(tile_ref.base_ptr, tile.data.flatten())
             return
 
-        # Strided or coord-set path: read-modify-write via scatter indices.
-        indices = MemoryOps._gather_indices(tile_ref.shape, tile_ref.strides, coords)
-        span = max(indices) + 1 if indices else 1
+        # Strided or coord-set path: read-modify-write via scatter offsets.
+        offsets, _ = MemoryOps._flat_memory_offsets(
+            tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
+        )
+        span = max(offsets) + 1 if offsets else 1
         flat = mem.read(tile_ref.base_ptr, span, tile_ref.dtype)
-        flat[indices] = tile.data.flatten()
+        flat[offsets] = tile.data.flatten()
         mem.write(tile_ref.base_ptr, flat)
 
     @staticmethod
@@ -321,6 +320,4 @@ class MemoryOps:
             coords.append(tuple(coord))
 
         out_shape = result_shape if result_shape is not None else iat.shape
-        tile = MemoryOps.load(context, iat.parent_ref, coords=coords, result_shape=out_shape)
-        tile.unique_sticks = MemoryOps._count_unique_sticks(iat.parent_ref, coords)
-        return tile
+        return MemoryOps.load(context, iat.parent_ref, coords=coords, result_shape=out_shape)
