@@ -51,6 +51,8 @@ def linalg__reduce(op, context, env):
         "arith.maxnumf": np.max,
         "arith.maximumf": np.maximum.reduce,
         "arith.minf": np.min,
+        "arith.minimumf": np.minimum.reduce,
+        "arith.minnumf": np.min,
         "arith.mulf": np.prod,
     }.get(reduce_fn)
 
@@ -169,11 +171,10 @@ def linalg__generic(op, context, env):
     region = op.regions[0] if op.regions else []
 
     # Resolve bb0 block-argument names.
-    # Path 1: synthetic linalg.bb0_args op prepended to the region.
+    # Path 1: synthetic region.bb0_args op prepended to the region (from ^bb0 parser).
     # Path 2: names stored directly in op.attributes["bb0_names"].
-    # TODO: consider whether the synthetic op can be removed in favour of Path 2 only.
-    bb0_op = next((o for o in region if o.op_type == "linalg.bb0_args"), None)
-    body_ops = [o for o in region if o.op_type != "linalg.bb0_args"]
+    bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
+    body_ops = [o for o in region if o.op_type != "region.bb0_args"]
     if bb0_op is not None:
         bb0_names = bb0_op.attributes.get("names", [])
     elif "bb0_names" in op.attributes:
@@ -242,12 +243,6 @@ def linalg__yield(op, context, env):
     from ..ops.control_ops import _YieldResult
     values = [context.get_value(n) for n in op.operands]
     return _YieldResult(values)
-
-
-@register("linalg.bb0_args")
-def linalg__bb0_args(op, context, env):
-    """No-op at execution time — bb0 args are bound by linalg__generic."""
-    return None
 
 
 @register("linalg.transpose")
@@ -381,25 +376,9 @@ def parse_linalg_transpose(op_text, parse_ctx):
     )
 
 
-@register_parser("linalg.generic", "^bb0")
+@register_parser("linalg.generic")
 def parse_linalg_generic(op_text, parse_ctx):
-    """Parse linalg.generic header or ^bb0 block-argument label.
-
-    ^bb0(%arg : type, ...): lines are emitted as a synthetic linalg.bb0_args
-    op so the executor can bind block-argument names to the broadcasted inputs.
-    """
-    # --- block-argument label -------------------------------------------
-    if op_text.startswith('^bb0'):
-        arg_names = re.findall(r'%\w+', op_text)
-        return Operation(
-            result=None,
-            op_type="linalg.bb0_args",
-            operands=[],
-            attributes={"names": arg_names},
-            result_type=None,
-        )
-
-    # --- linalg.generic header ------------------------------------------
+    """Parse linalg.generic header."""
     result_match = re.match(r'(%\w+)\s*=\s*linalg\.generic\s+', op_text)
     if not result_match:
         return None

@@ -163,6 +163,25 @@ class TestArithFloat:
         result = _call("arith.maximumf", ctx, _make_env(), operands=["%a", "%b"])
         assert np.array_equal(result.data, np.array([4, 5, 6], dtype=np.float16))
 
+    def test_minimumf(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([4, 2, 6])})
+        result = _call("arith.minimumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([1, 2, 3], dtype=np.float16))
+
+    def test_minnumf(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5]), "%b": _tile([4, 2])})
+        result = _call("arith.minnumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([1, 2], dtype=np.float16))
+
+    def test_minnumf_nan(self):
+        # NaN non-propagating: fmin(NaN, 2) → 2;  fmin(3, NaN) → 3
+        a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, float('nan')], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("arith.minnumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert result.data[0] == 2.0
+        assert result.data[1] == 3.0
+
     def test_extf_promotes_to_f32(self):
         # extf widens f16 → f32
         t = _tile([1, 2])  # f16 tile
@@ -326,6 +345,59 @@ class TestArithCmpiSelect:
         assert np.array_equal(result.data, np.array([1, 5, 3], dtype=np.float16))
 
 # ---------------------------------------------------------------------------
+# arith.cmpf dialect exec
+# ---------------------------------------------------------------------------
+
+class TestArithCmpf:
+    def test_cmpf_olt(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([2, 4, 3])})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "olt"})
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([True, False, False]))
+
+    def test_cmpf_oge(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([2, 4, 3])})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "oge"})
+        assert np.array_equal(result.data, np.array([False, True, True]))
+
+    def test_cmpf_olt_nan(self):
+        # Ordered predicates always return False when either operand is NaN.
+        # olt(NaN, 2) → False;  olt(1, NaN) → False
+        a = Tile(np.array([float('nan'), 1], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, float('nan')], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "olt"})
+        assert np.array_equal(result.data, np.array([False, False]))
+
+    def test_cmpf_ueq_nan(self):
+        # Unordered predicates return True when either operand is NaN.
+        # ueq(NaN, 2) → True (NaN present);  ueq(3, 3) → True (equal)
+        a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, 3], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "ueq"})
+        assert np.array_equal(result.data, np.array([True, True]))
+
+    def test_cmpf_ord_uno(self):
+        # ord: True iff neither operand is NaN.  uno: True iff either is NaN.
+        # ord(NaN, 2) → False;  ord(3, 4) → True
+        # uno(NaN, 2) → True;   uno(3, 4) → False
+        a = Tile(np.array([float('nan'), 3], dtype=np.float16), "f16", (2,))
+        b = Tile(np.array([2, 4], dtype=np.float16), "f16", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result_ord = _call("arith.cmpf", ctx, _make_env(),
+                           operands=["%a", "%b"], attributes={"predicate": "ord"})
+        assert np.array_equal(result_ord.data, np.array([False, True]))
+        result_uno = _call("arith.cmpf", ctx, _make_env(),
+                           operands=["%a", "%b"], attributes={"predicate": "uno"})
+        assert np.array_equal(result_uno.data, np.array([True, False]))
+
+
+# ---------------------------------------------------------------------------
 # math dialect exec
 # ---------------------------------------------------------------------------
 
@@ -365,6 +437,124 @@ class TestMath:
         # scalar log returns scalar
         ctx = _ctx_with(**{"%x": np.float16(1.0)})
         assert abs(float(_call("math.log", ctx, _make_env(), operands=["%x"])) - 0.0) < 0.01
+
+    def test_rsqrt_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1, 4, 16])})
+        result = _call("math.rsqrt", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.allclose(result.data, np.array([1.0, 0.5, 0.25], dtype=np.float16), rtol=1e-2)
+
+    def test_rsqrt_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(4.0)})
+        assert abs(float(_call("math.rsqrt", ctx, _make_env(), operands=["%x"])) - 0.5) < 0.01
+
+    def test_log2_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1, 2, 8])})
+        result = _call("math.log2", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.allclose(result.data, np.array([0, 1, 3], dtype=np.float16), rtol=1e-2)
+
+    def test_log2_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(8.0)})
+        assert abs(float(_call("math.log2", ctx, _make_env(), operands=["%x"])) - 3.0) < 0.01
+
+    def test_log1p_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1, 2])})
+        result = _call("math.log1p", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.log1p(np.array([0, 1, 2], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_log1p_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.log1p", ctx, _make_env(), operands=["%x"])) - 0.0) < 0.01
+
+    def test_tanh_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1, -1])})
+        result = _call("math.tanh", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.tanh(np.array([0, 1, -1], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, rtol=1e-2)
+
+    def test_tanh_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.tanh", ctx, _make_env(), operands=["%x"])) - 0.0) < 0.01
+
+    def test_sin_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1.5708, 3.1416])})  # 0, pi/2, pi
+        result = _call("math.sin", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.sin(np.array([0, 1.5708, 3.1416], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, atol=1e-2)
+
+    def test_sin_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.sin", ctx, _make_env(), operands=["%x"]))) < 0.01
+
+    def test_cos_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1.5708, 3.1416])})
+        result = _call("math.cos", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        expected = np.cos(np.array([0, 1.5708, 3.1416], dtype=np.float32)).astype(np.float16)
+        assert np.allclose(result.data, expected, atol=1e-2)
+
+    def test_cos_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.cos", ctx, _make_env(), operands=["%x"])) - 1.0) < 0.01
+
+    def test_absf_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([-2, 0, 3])})
+        result = _call("math.absf", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([2, 0, 3], dtype=np.float16))
+
+    def test_absf_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(-5.0)})
+        assert float(_call("math.absf", ctx, _make_env(), operands=["%x"])) == 5.0
+
+    def test_ceil_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1.2, 2.7, -0.5])})
+        result = _call("math.ceil", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([2, 3, 0], dtype=np.float16))
+
+    def test_ceil_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(1.3)})
+        assert float(_call("math.ceil", ctx, _make_env(), operands=["%x"])) == 2.0
+
+    def test_floor_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1.2, 2.7, -0.5])})
+        result = _call("math.floor", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([1, 2, -1], dtype=np.float16))
+
+    def test_floor_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(1.7)})
+        assert float(_call("math.floor", ctx, _make_env(), operands=["%x"])) == 1.0
+
+    def test_powf_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([2, 3, 4]), "%b": _tile([2, 2, 0.5])})
+        result = _call("math.powf", ctx, _make_env(), operands=["%a", "%b"])
+        assert isinstance(result, Tile)
+        assert np.allclose(result.data, np.array([4, 9, 2], dtype=np.float16), rtol=1e-2)
+
+    def test_fma_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([2, 3]), "%b": _tile([4, 5]), "%c": _tile([1, 1])})
+        result = _call("math.fma", ctx, _make_env(), operands=["%a", "%b", "%c"])
+        assert isinstance(result, Tile)
+        # 2*4+1=9, 3*5+1=16
+        assert np.array_equal(result.data, np.array([9, 16], dtype=np.float16))
+
+    def test_erf_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([0, 1, -1])})
+        result = _call("math.erf", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        # erf(0)=0, erf(1)≈0.8427, erf(-1)≈-0.8427
+        assert np.allclose(result.data, np.array([0, 0.8427, -0.8427], dtype=np.float16), atol=1e-2)
+
+    def test_erf_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(0.0)})
+        assert abs(float(_call("math.erf", ctx, _make_env(), operands=["%x"]))) < 0.01
 
 # ---------------------------------------------------------------------------
 # linalg dialect exec
@@ -462,7 +652,7 @@ class TestLinalg:
                 "indexing_maps": [[0]],
             },
             regions=[[
-                Operation(op_type="linalg.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
             ] + region_ops],
         )
 
@@ -530,6 +720,63 @@ class TestTensor:
                        operands=["%t"], attributes={"target_shape": (4,)})
         assert result.shape == (4,)
         assert np.array_equal(result.data, [1, 2, 3, 4])
+
+# ---------------------------------------------------------------------------
+# tensor.generate exec
+# ---------------------------------------------------------------------------
+
+class TestTensorGenerate:
+    def _exec_env(self):
+        # tensor.generate calls env.execute_region(context, body) for each index
+        # combination.  The default _make_env().execute_region expects callables,
+        # but we pass Operation objects.  Override it to dispatch each op through
+        # the real handler registry (same pattern as test_generic_reads_outs_arg).
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+        return env
+
+    def test_generate_1d(self):
+        ctx = _make_ctx()
+        ctx.set_value("%c2", 2)
+        env = self._exec_env()
+        region = [
+            _op("region.bb0_args", operands=[], attributes={"names": ["%i"]}),
+            _op("arith.muli", operands=["%i", "%c2"], result="%val"),
+            _op("tensor.yield", operands=["%val"]),
+        ]
+        op = _op("tensor.generate", operands=[],
+                 attributes={"shape": (4,), "dtype": "f16"},
+                 regions=[region])
+        result = dispatch("tensor.generate")(op, ctx, env)
+        assert isinstance(result, Tile)
+        assert result.shape == (4,)
+        assert np.array_equal(result.data, np.array([0, 2, 4, 6], dtype=np.float16))
+
+    def test_generate_2d(self):
+        ctx = _make_ctx()
+        env = self._exec_env()
+        region = [
+            _op("region.bb0_args", operands=[], attributes={"names": ["%i", "%j"]}),
+            _op("arith.cmpi", operands=["%i", "%j"],
+                attributes={"predicate": "sge"}, result="%cmp"),
+            _op("tensor.yield", operands=["%cmp"]),
+        ]
+        op = _op("tensor.generate", operands=[],
+                 attributes={"shape": (3, 3), "dtype": "f16"},
+                 regions=[region])
+        result = dispatch("tensor.generate")(op, ctx, env)
+        assert result.shape == (3, 3)
+        expected = np.array([[1, 0, 0], [1, 1, 0], [1, 1, 1]], dtype=np.float16)
+        assert np.array_equal(result.data, expected)
+
 
 # ---------------------------------------------------------------------------
 # scf dialect exec

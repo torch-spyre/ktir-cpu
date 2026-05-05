@@ -167,6 +167,9 @@ MLIRTypeAdapter.install(
     "arith.index_cast",
     "arith.maxnumf",
     "arith.maximumf",
+    "arith.minimumf",
+    "arith.minnumf",
+    "tensor.yield",
     "arith.extf",
     "arith.truncf",
     "arith.bitcast",
@@ -174,7 +177,19 @@ MLIRTypeAdapter.install(
     "arith.select",
     "math.exp",
     "math.sqrt",
+    "math.rsqrt",
     "math.log",
+    "math.log2",
+    "math.log1p",
+    "math.tanh",
+    "math.sin",
+    "math.cos",
+    "math.absf",
+    "math.ceil",
+    "math.floor",
+    "math.erf",
+    "math.powf",
+    "math.fma",
     "tensor.extract",
     "ktdp.get_compute_tile_id",
     "ktdp.load",
@@ -481,6 +496,31 @@ def _adapt_arith_cmpi(mlir_op, attributes, result_type, operands):
     if pred_int not in _pred_map:
         raise ValueError(f"arith.cmpi: unknown predicate integer {pred_int}")
     attributes["predicate"] = _pred_map[pred_int]
+
+
+@MLIRTypeAdapter.install("arith.cmpf")
+def _adapt_arith_cmpf(mlir_op, attributes, result_type, operands):
+    """Normalize MLIR float predicate encoding → string the executor expects."""
+    _pred_map = {
+        0: "false", 1: "oeq", 2: "ogt", 3: "oge", 4: "olt", 5: "ole",
+        6: "one", 7: "ord", 8: "ueq", 9: "ugt", 10: "uge", 11: "ult",
+        12: "ule", 13: "une", 14: "uno", 15: "true",
+    }
+    pred_int = IntegerAttr(mlir_op.attributes["predicate"]).value
+    if pred_int not in _pred_map:
+        raise ValueError(f"arith.cmpf: unknown predicate integer {pred_int}")
+    attributes["predicate"] = _pred_map[pred_int]
+
+
+@MLIRTypeAdapter.install("tensor.generate")
+def _adapt_tensor_generate(mlir_op, attributes, result_type, operands):
+    """Synthesize shape/dtype from result type."""
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.generate: cannot parse result type {result_type!r}")
+    attributes["shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
 
 
 # ---------------------------------------------------------------------------

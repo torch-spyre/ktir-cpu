@@ -283,6 +283,26 @@ class TestArithParsers(ParseTestMixin):
         self.assert_operand_names(op, "%i")
         self.assert_result_type(op, "f16")
 
+    def test_cmpf_olt(self):
+        op = self._parse(
+            "%r = arith.cmpf olt, %a, %b : f16",
+            args={"%a": "f16", "%b": "f16"},
+        )
+        self.assert_op_type(op, "arith.cmpf")
+        self.assert_attribute(op, "predicate", "olt")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%b")
+
+    def test_cmpf_uge(self):
+        op = self._parse(
+            "%r = arith.cmpf uge, %x, %y : f32",
+            args={"%x": "f32", "%y": "f32"},
+        )
+        self.assert_op_type(op, "arith.cmpf")
+        self.assert_attribute(op, "predicate", "uge")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%x", "%y")
+
 
 # ---------------------------------------------------------------------------
 # linalg dialect parsers
@@ -370,6 +390,36 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_num_operands(op, 1)
         self.assert_operand_names(op, "%in")
         self.assert_attribute(op, "target_shape", (1, 1024))
+
+    def test_generate(self):
+        op = self._parse(
+            "%mask = tensor.generate {\n"
+            "    ^bb0(%i: index, %j: index):\n"
+            "      tensor.yield %val : f16\n"
+            "    } : tensor<16x16xf16>",
+            args={"%val": "f16"},
+        )
+        self.assert_op_type(op, "tensor.generate")
+        self.assert_attribute(op, "shape", (16, 16))
+        self.assert_attribute(op, "dtype", "f16")
+        assert op.result is not None
+        assert len(op.regions) == 1
+
+    def test_generate_yield(self):
+        # tensor.yield is a terminator inside tensor.generate — test via region
+        op = self._parse(
+            "%t = tensor.generate {\n"
+            "    ^bb0(%i: index):\n"
+            "      tensor.yield %val : f16\n"
+            "    } : tensor<4xf16>",
+            args={"%val": "f16"},
+        )
+        yield_ops = [o for o in op.regions[0] if o.op_type == "tensor.yield"]
+        assert len(yield_ops) == 1
+        yield_op = yield_ops[0]
+        self.assert_num_operands(yield_op, 1)
+        self.assert_operand_names(yield_op, "%val")
+        assert yield_op.result is None
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +591,48 @@ class TestScfParsers(ParseTestMixin):
 
 
 # ---------------------------------------------------------------------------
+# math dialect — all ops parse through the generic fallback parser
+# ---------------------------------------------------------------------------
+
+class TestMathParsers(ParseTestMixin):
+    """Verify math ops parse correctly via the fallback (no custom parser needed)."""
+
+    @pytest.mark.parametrize("op_name", [
+        "math.exp", "math.sqrt", "math.rsqrt", "math.log",
+        "math.log2", "math.log1p", "math.tanh", "math.sin", "math.cos",
+        "math.absf", "math.ceil", "math.floor", "math.erf",
+    ])
+    def test_unary_op(self, op_name):
+        op = self._parse(
+            f"%y = {op_name} %x : tensor<1024xf32>",
+            args={"%x": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+
+    def test_powf(self):
+        op = self._parse(
+            "%y = math.powf %a, %b : tensor<1024xf32>",
+            args={"%a": "tensor<1024xf32>", "%b": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, "math.powf")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%b")
+
+    def test_fma(self):
+        op = self._parse(
+            "%y = math.fma %a, %b, %c : tensor<1024xf32>",
+            args={"%a": "tensor<1024xf32>", "%b": "tensor<1024xf32>",
+                  "%c": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, "math.fma")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
+
+
+# ---------------------------------------------------------------------------
 # parser infrastructure (tokenizer, region detection, line joining)
 # ---------------------------------------------------------------------------
 
@@ -589,6 +681,29 @@ class TestParserInfrastructure:
         generic_ops = [op for op in func.operations if op.op_type == "linalg.generic"]
         assert len(generic_ops) == 1
         assert len(generic_ops[0].regions) == 1
+
+    def test_tensor_generate_trailing_type_preserved(self):
+        # The `: tensor<4xf16>` after the closing `}` must be appended back to
+        # the op text so that parse_tensor_generate can extract shape/dtype.
+        parser = KTIRParser()
+        module = parser.parse_module("""
+        module {
+          func.func @test() attributes { grid = [1, 1, 1] } {
+            %c0 = arith.constant 0 : index
+            %t = tensor.generate {
+            ^bb0(%i: index):
+              tensor.yield %c0 : index
+            } : tensor<4xf16>
+            return
+          }
+        }
+        """)
+        func = module.get_function("test")
+        gen_ops = [op for op in func.operations if op.op_type == "tensor.generate"]
+        assert len(gen_ops) == 1
+        assert gen_ops[0].attributes["shape"] == (4,)
+        assert gen_ops[0].attributes["dtype"] == "f16"
+        assert len(gen_ops[0].regions) == 1
 
 
 # ---------------------------------------------------------------------------
