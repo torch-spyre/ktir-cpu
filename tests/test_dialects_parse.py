@@ -591,6 +591,48 @@ class TestScfParsers(ParseTestMixin):
 
 
 # ---------------------------------------------------------------------------
+# math dialect — all ops parse through the generic fallback parser
+# ---------------------------------------------------------------------------
+
+class TestMathParsers(ParseTestMixin):
+    """Verify math ops parse correctly via the fallback (no custom parser needed)."""
+
+    @pytest.mark.parametrize("op_name", [
+        "math.exp", "math.sqrt", "math.rsqrt", "math.log",
+        "math.log2", "math.log1p", "math.tanh", "math.sin", "math.cos",
+        "math.absf", "math.ceil", "math.floor", "math.erf",
+    ])
+    def test_unary_op(self, op_name):
+        op = self._parse(
+            f"%y = {op_name} %x : tensor<1024xf32>",
+            args={"%x": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+
+    def test_powf(self):
+        op = self._parse(
+            "%y = math.powf %a, %b : tensor<1024xf32>",
+            args={"%a": "tensor<1024xf32>", "%b": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, "math.powf")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%b")
+
+    def test_fma(self):
+        op = self._parse(
+            "%y = math.fma %a, %b, %c : tensor<1024xf32>",
+            args={"%a": "tensor<1024xf32>", "%b": "tensor<1024xf32>",
+                  "%c": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, "math.fma")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
+
+
+# ---------------------------------------------------------------------------
 # parser infrastructure (tokenizer, region detection, line joining)
 # ---------------------------------------------------------------------------
 
