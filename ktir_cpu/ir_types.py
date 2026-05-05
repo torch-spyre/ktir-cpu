@@ -39,22 +39,21 @@ class Tile:
     data: np.ndarray
     dtype: str  # see dtypes.SUPPORTED_DTYPES
     shape: Tuple[int, ...]
-    # Number of distinct 128-byte HBM sticks touched when this tile was
-    # produced by an indirect (gather) load.  None for contiguous loads
-    # and for tiles produced by compute ops.  Consumed by the latency
-    # tracker to model scatter penalty: actual HBM traffic is
-    # ``unique_sticks * 128`` rather than ``data.nbytes`` when set.
+    # Number of distinct HBM sticks touched by the load that produced this
+    # tile.  Set by ``MemoryOps.load`` for all access patterns.  None only
+    # for tiles produced by compute ops (not loaded from memory).
     unique_sticks: Optional[int] = None
 
     def copy(self) -> 'Tile':
         """Create a deep copy of this tile.
 
-        ``unique_sticks`` is intentionally NOT propagated: the field marks
-        a freshly-gathered tile so latency can charge stick-granular HBM
-        traffic.  A copy lives in a different context (e.g. comm buffers)
-        and should not be re-charged as a gather result.
+        Used by comm ops for message buffers / reduce accumulators.
+        When cross-core communication is fixed (gap analysis K1/K2),
+        reconsider whether unique_sticks should be recomputed for the
+        target device's base_ptr — currently we propagate the source
+        value since the memory layout is abstracted away from Tile.
         """
-        return Tile(self.data.copy(), self.dtype, self.shape)
+        return Tile(self.data.copy(), self.dtype, self.shape, self.unique_sticks)
 
     def size_bytes(self) -> int:
         """Return size in bytes."""
@@ -62,18 +61,18 @@ class Tile:
 
     @property
     def coalescing_efficiency(self) -> Optional[float]:
-        """Ratio of packed traffic to actual stick traffic for gather results.
+        """Ratio of packed traffic to actual stick traffic.
 
-        Defined as ``data.nbytes / (unique_sticks * 128)``.  Ranges from
-        ``bytes_per_elem / 128`` (worst: every element on its own stick, no
-        sharing) to ``1.0`` (best: sticks fully packed).
+        Defined as ``data.nbytes / (unique_sticks * HBMSimulator.STICK_BYTES)``.
+        Ranges from ``bytes_per_elem / STICK_BYTES`` (worst: every
+        element on its own stick) to ``1.0`` (best: sticks fully packed).
 
-        Returns ``None`` when this tile is not a gather result
-        (``unique_sticks is None``) or has zero sticks.
+        Returns ``None`` when ``unique_sticks`` is not set (compute-produced tiles).
         """
         if self.unique_sticks is None or self.unique_sticks == 0:
             return None
-        return self.data.nbytes / (self.unique_sticks * 128)
+        from .memory import HBMSimulator
+        return self.data.nbytes / (self.unique_sticks * HBMSimulator.STICK_BYTES)
 
 
 @dataclass
