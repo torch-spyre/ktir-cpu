@@ -39,14 +39,40 @@ class Tile:
     data: np.ndarray
     dtype: str  # see dtypes.SUPPORTED_DTYPES
     shape: Tuple[int, ...]
+    # Number of distinct HBM sticks touched by the load that produced this
+    # tile.  Set by ``MemoryOps.load`` for all access patterns.  None only
+    # for tiles produced by compute ops (not loaded from memory).
+    unique_sticks: Optional[int] = None
 
     def copy(self) -> 'Tile':
-        """Create a deep copy of this tile."""
-        return Tile(self.data.copy(), self.dtype, self.shape)
+        """Create a deep copy of this tile.
+
+        Used by comm ops for message buffers / reduce accumulators.
+        When cross-core communication is fixed (gap analysis K1/K2),
+        reconsider whether unique_sticks should be recomputed for the
+        target device's base_ptr — currently we propagate the source
+        value since the memory layout is abstracted away from Tile.
+        """
+        return Tile(self.data.copy(), self.dtype, self.shape, self.unique_sticks)
 
     def size_bytes(self) -> int:
         """Return size in bytes."""
         return self.data.nbytes
+
+    @property
+    def coalescing_efficiency(self) -> Optional[float]:
+        """Ratio of packed traffic to actual stick traffic.
+
+        Defined as ``data.nbytes / (unique_sticks * HBMSimulator.STICK_BYTES)``.
+        Ranges from ``bytes_per_elem / STICK_BYTES`` (worst: every
+        element on its own stick) to ``1.0`` (best: sticks fully packed).
+
+        Returns ``None`` when ``unique_sticks`` is not set (compute-produced tiles).
+        """
+        if self.unique_sticks is None or self.unique_sticks == 0:
+            return None
+        from .memory import HBMSimulator
+        return self.data.nbytes / (self.unique_sticks * HBMSimulator.STICK_BYTES)
 
 
 @dataclass

@@ -211,6 +211,8 @@ class HBMSimulator:
     outside the scope of the KTIR interpreter.
     """
 
+    STICK_BYTES = 128
+
     def __init__(self, size_gb: int = 128):
         self.size_gb = size_gb
         self.size_bytes = size_gb * 1024 * 1024 * 1024
@@ -231,8 +233,8 @@ class HBMSimulator:
         """
         ptr = self.next_ptr
         self.next_ptr += size
-        # Align to 128-byte stick boundary
-        self.next_ptr = (self.next_ptr + 127) & ~127
+        # Align to stick boundary
+        self.next_ptr = (self.next_ptr + self.STICK_BYTES - 1) & ~(self.STICK_BYTES - 1)
         return ptr
 
     def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
