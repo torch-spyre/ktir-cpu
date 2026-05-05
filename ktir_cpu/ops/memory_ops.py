@@ -149,6 +149,25 @@ class MemoryOps:
         ]
 
     @staticmethod
+    def _count_unique_sticks(
+        parent_ref: TileRef,
+        coords: List[Tuple[int, ...]],
+    ) -> int:
+        """Count distinct 128-byte HBM sticks touched by a gather into *parent_ref*.
+
+        Used by :meth:`indirect_load` to model the HBM scatter penalty: real
+        hardware pulls a full 128-byte stick per access, so data traffic
+        depends on how many *distinct* sticks the gather coordinates land
+        in — not on the packed result size.
+        """
+        offsets = MemoryOps._gather_indices(parent_ref.shape, parent_ref.strides, coords)
+        bpe = _bytes_per_elem(parent_ref.dtype)
+        return len({
+            (parent_ref.base_ptr + offset * bpe) // 128
+            for offset in offsets
+        })
+
+    @staticmethod
     def load(
         context: CoreContext,
         tile_ref: TileRef,
@@ -302,4 +321,6 @@ class MemoryOps:
             coords.append(tuple(coord))
 
         out_shape = result_shape if result_shape is not None else iat.shape
-        return MemoryOps.load(context, iat.parent_ref, coords=coords, result_shape=out_shape)
+        tile = MemoryOps.load(context, iat.parent_ref, coords=coords, result_shape=out_shape)
+        tile.unique_sticks = MemoryOps._count_unique_sticks(iat.parent_ref, coords)
+        return tile

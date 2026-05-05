@@ -627,15 +627,18 @@ class TestIndirectAccessLatency:
         """memory_cycles should reflect index tensor reads, not just the result tile.
 
         indirect-access-copy.mlir does a 2-D gather: Y[m,k] = X[IDX1[m,k], IDX2[m,k]]
-        with 64x64 tiles. A single ktdp.load on the IndirectAccessTile should cost:
-          result (X gather):  64*64*2 (f16) =  8,192 bytes
-          IDX1:               64*64*4 (i32) = 16,384 bytes
-          IDX2:               64*64*4 (i32) = 16,384 bytes
-          total = 40,960 bytes
+        with 64x64 tiles.  Here IDX1/IDX2 are seeded with zeros (see
+        ``_prepare_and_seed`` below), so every gather element reads X[0,0] —
+        all 4096 reads land on a single 128-byte stick.  The single
+        ``ktdp.load`` on the IndirectAccessTile therefore costs:
+          result (X gather):  unique_sticks * 128 = 1 * 128 = 128 bytes
+          IDX1:               64*64*4 (i32)       = 16,384 bytes
+          IDX2:               64*64*4 (i32)       = 16,384 bytes
+        plus the Y store of 64*64*2 = 8,192 bytes.
 
-        With default HardwareConfig (1 core, 1 TB/s HBM BW):
-          hbm_bytes_per_cycle_per_core = 1e12 / 1e9 / 1 = 1000
-          expected memory_cycles for one load = 40,960 / 1000 = 40.96
+        The ``unique_sticks`` accounting (see ``Tile.unique_sticks``)
+        replaces the previous optimistic ``result.data.nbytes`` —
+        scattered gathers now charge the real per-stick HBM traffic.
         """
         cfg = HardwareConfig(num_cores=1)
         interp = KTIRInterpreter(latency_config=cfg)
@@ -673,7 +676,9 @@ class TestIndirectAccessLatency:
         def _nbytes(name):
             info = sizes[name]
             return int(np.prod(info["shape"])) * np.dtype(_dtype_map[info["dtype"]]).itemsize
-        expected_load_bytes = _nbytes("X_addr") + _nbytes("IDX1_addr") + _nbytes("IDX2_addr")
+        # Zero-seeded indices collapse every gather read to X[0,0] → 1 unique stick.
+        expected_gather_bytes = 1 * 128
+        expected_load_bytes = expected_gather_bytes + _nbytes("IDX1_addr") + _nbytes("IDX2_addr")
         expected_store_bytes = _nbytes("Y_addr")
         expected_total_bytes = expected_load_bytes + expected_store_bytes
         bw = cfg.hbm_bytes_per_cycle_per_core
@@ -683,3 +688,73 @@ class TestIndirectAccessLatency:
             f"total_bytes={counters.total_bytes}, expected={expected_total_bytes}"
         )
         assert counters.memory_cycles == pytest.approx(expected_memory_cycles, rel=1e-3)
+
+    # ---------------------------------------------------------------------
+    # Unit tests for the stick-counting formula used by gather latency.
+    # These exercise ``MemoryOps._count_unique_sticks`` and ``_data_size``
+    # directly, without standing up a full interpreter / HBM.
+    # ---------------------------------------------------------------------
+
+    def test_count_unique_sticks_returns_n_when_every_element_lands_on_its_own_stick(self):
+        """_count_unique_sticks returns n_elements when gather fully scatters across sticks."""
+        from ktir_cpu.ir_types import TileRef
+        from ktir_cpu.ops.memory_ops import MemoryOps
+
+        # f16 stick holds 64 elements; indices 0, 64, 128, 192 each land on
+        # a different stick — no sharing.
+        parent = TileRef(base_ptr=0x10000, shape=(4096,), strides=[1],
+                         memory_space="HBM", dtype="f16")
+        coords = [(i * 64,) for i in range(4)]
+
+        assert MemoryOps._count_unique_sticks(parent, coords) == 4
+
+    def test_count_unique_sticks_dedups_sticks_shared_by_multiple_gather_reads(self):
+        """_count_unique_sticks collapses repeated coords into a set of distinct sticks."""
+        from ktir_cpu.ir_types import TileRef
+        from ktir_cpu.ops.memory_ops import MemoryOps
+
+        # Six reads alternate between element 0 and element 64 — two sticks.
+        # A buggy implementation using a list instead of a set would return 6.
+        parent = TileRef(base_ptr=0x10000, shape=(4096,), strides=[1],
+                         memory_space="HBM", dtype="f16")
+        coords = [(0,), (64,), (0,), (64,), (0,), (64,)]
+
+        assert MemoryOps._count_unique_sticks(parent, coords) == 2
+
+    def test_data_size_uses_unique_sticks_for_gather_result(self):
+        """_data_size charges ``unique_sticks * 128`` when the field is set."""
+        from ktir_cpu.ir_types import Tile
+        from ktir_cpu.latency import LatencyTracker
+
+        # 64 f16 elements = 128 bytes packed, but scattered across 64 sticks
+        # (each element on its own stick): actual traffic = 64 * 128 = 8192.
+        result = Tile(np.zeros(64, dtype=np.float16), "f16", (64,),
+                      unique_sticks=64)
+
+        assert LatencyTracker._data_size(result, []) == 64 * 128
+
+    def test_coalescing_efficiency_returns_bpe_over_stick_for_worst_case(self):
+        """Tile.coalescing_efficiency drops to bpe/128 when each element owns a stick."""
+        from ktir_cpu.ir_types import Tile
+
+        # 64 f16 elements scattered across 64 sticks: efficiency = 2 / 128.
+        tile = Tile(np.zeros(64, dtype=np.float16), "f16", (64,), unique_sticks=64)
+
+        assert tile.coalescing_efficiency == 2 / 128
+
+    def test_coalescing_efficiency_is_none_for_non_gather_tile(self):
+        """Tile.coalescing_efficiency is None when unique_sticks is not set."""
+        from ktir_cpu.ir_types import Tile
+
+        tile = Tile(np.zeros(64, dtype=np.float16), "f16", (64,))  # default None
+
+        assert tile.coalescing_efficiency is None
+
+    def test_copy_does_not_propagate_unique_sticks(self):
+        """Tile.copy() resets unique_sticks to None so copies are not charged as gathers."""
+        from ktir_cpu.ir_types import Tile
+
+        # A freshly-gathered tile carrying a stick count.
+        original = Tile(np.zeros(64, dtype=np.float16), "f16", (64,), unique_sticks=7)
+
+        assert original.copy().unique_sticks is None

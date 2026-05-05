@@ -285,10 +285,19 @@ class LatencyTracker:
 
         Counts result bytes (loads), operand Tile bytes (stores), and
         index tensor bytes (indirect access loads and scatter stores).
+
+        For gather results (``Tile.unique_sticks`` set by
+        ``indirect_load``), the HBM traffic is charged as
+        ``unique_sticks * 128`` rather than ``data.nbytes`` — scattered
+        accesses pull full 128-byte sticks even if only a few bytes are
+        used per stick.
         """
         total = 0
         if isinstance(result, Tile):
-            total += result.data.nbytes
+            if result.unique_sticks is not None:
+                total += result.unique_sticks * 128
+            else:
+                total += result.data.nbytes
         for v in operands:
             if isinstance(v, IndirectAccessTile):
                 for iv in v.index_views:
