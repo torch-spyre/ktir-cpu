@@ -174,15 +174,26 @@ class MathOps:
         return type(value)(np.cos(float(value)))
 
     @staticmethod
-    def abs(tile: Tile) -> Tile:
-        """Element-wise absolute value."""
+    def absf(tile: Tile) -> Tile:
+        """Element-wise absolute value (float)."""
         result_data = np.abs(tile.data)
         return Tile(result_data, tile.dtype, tile.shape)
 
     @staticmethod
-    def abs_scalar(value: np.floating) -> np.floating:
-        """Scalar absolute value."""
+    def absf_scalar(value: np.floating) -> np.floating:
+        """Scalar absolute value (float)."""
         return type(value)(abs(float(value)))
+
+    @staticmethod
+    def absi(tile: Tile) -> Tile:
+        """Element-wise absolute value (integer)."""
+        result_data = np.abs(tile.data)
+        return Tile(result_data, tile.dtype, tile.shape)
+
+    @staticmethod
+    def absi_scalar(value: np.integer) -> np.integer:
+        """Scalar absolute value (integer)."""
+        return type(value)(abs(int(value)))
 
     @staticmethod
     def ceil(tile: Tile) -> Tile:

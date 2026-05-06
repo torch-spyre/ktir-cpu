@@ -182,6 +182,7 @@ MLIRTypeAdapter.install(
     "math.sin",
     "math.cos",
     "math.absf",
+    "math.absi",
     "math.ceil",
     "math.floor",
     "math.erf",

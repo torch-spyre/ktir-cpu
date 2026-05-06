@@ -96,8 +96,16 @@ def math__cos(op, context, env):
 def math__absf(op, context, env):
     operand = context.get_value(op.operands[0])
     if isinstance(operand, Tile):
-        return MathOps.abs(operand)
-    return MathOps.abs_scalar(operand)
+        return MathOps.absf(operand)
+    return MathOps.absf_scalar(operand)
+
+
+@register("math.absi", latency_category=LC.COMPUTE_FLOAT)
+def math__absi(op, context, env):
+    operand = context.get_value(op.operands[0])
+    if isinstance(operand, Tile):
+        return MathOps.absi(operand)
+    return MathOps.absi_scalar(operand)
 
 
 @register("math.ceil", latency_category=LC.COMPUTE_FLOAT)
