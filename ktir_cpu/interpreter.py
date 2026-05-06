@@ -24,7 +24,7 @@ import math
 
 from .ir_types import Operation, IRModule, Tile
 from .parser import KTIRParser, KTIRParserBase
-from .memory import SpyreMemoryHierarchy
+from .memory import HBMSimulator, SpyreMemoryHierarchy
 from .grid import GridExecutor, CoreContext
 from .ops.comm_ops import RingNetwork
 from .latency import HardwareConfig, LatencyTracker, LatencyReport
@@ -143,9 +143,10 @@ class KTIRInterpreter:
         input_dtypes = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = self.memory.hbm.allocate(tensor.nbytes)
-                self.memory.hbm.write(ptr, tensor)
-                input_ptrs[arg_name] = ptr
+                stick = self.memory.hbm.allocate(tensor.nbytes)
+                byte_ptr = stick * HBMSimulator.STICK_BYTES
+                self.memory.hbm.write(byte_ptr, tensor)
+                input_ptrs[arg_name] = byte_ptr
                 input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
             else:
                 # Scalar argument (like n)

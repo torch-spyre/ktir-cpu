@@ -220,7 +220,7 @@ class HBMSimulator:
         self.next_ptr = 0x10000  # Start allocations at 64KB
 
     def allocate(self, size: int) -> int:
-        """Allocate memory and return pointer.
+        """Allocate memory and return stick address.
 
         Called by ``KTIRInterpreter.execute_function`` to place host input
         tensors in HBM before kernel execution (interpreter.py).
@@ -229,7 +229,7 @@ class HBMSimulator:
             size: Size in bytes
 
         Returns:
-            Pointer (memory address)
+            HBM stick address (byte address // STICK_BYTES)
         """
         assert self.next_ptr % self.STICK_BYTES == 0, (
             f"next_ptr 0x{self.next_ptr:x} is not stick-aligned "
@@ -239,7 +239,7 @@ class HBMSimulator:
         self.next_ptr += size
         # Align to stick boundary
         self.next_ptr = (self.next_ptr + self.STICK_BYTES - 1) & ~(self.STICK_BYTES - 1)
-        return ptr
+        return ptr // self.STICK_BYTES
 
     def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
         """Read *n_elements* elements starting at byte address *ptr*.
