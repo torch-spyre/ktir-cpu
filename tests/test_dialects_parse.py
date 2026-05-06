@@ -550,12 +550,22 @@ class TestMathParsers(ParseTestMixin):
     @pytest.mark.parametrize("op_name", [
         "math.exp", "math.sqrt", "math.rsqrt", "math.log",
         "math.log2", "math.log1p", "math.tanh", "math.sin", "math.cos",
-        "math.absf", "math.absi", "math.ceil", "math.floor", "math.erf",
+        "math.absf", "math.ceil", "math.floor", "math.erf",
     ])
     def test_unary_op(self, op_name):
         op = self._parse(
             f"%y = {op_name} %x : tensor<1024xf32>",
             args={"%x": "tensor<1024xf32>"},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+
+    @pytest.mark.parametrize("op_name", ["math.absi"])
+    def test_unary_op_int(self, op_name):
+        op = self._parse(
+            f"%y = {op_name} %x : tensor<1024xi32>",
+            args={"%x": "tensor<1024xi32>"},
         )
         self.assert_op_type(op, op_name)
         self.assert_num_operands(op, 1)
