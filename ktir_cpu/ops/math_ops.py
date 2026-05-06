@@ -249,6 +249,11 @@ class MathOps:
         return Tile(result_data, tile.dtype, tile.shape)
 
     @staticmethod
+    def powf_scalar(base: np.floating, exponent: np.floating) -> np.floating:
+        """Scalar power."""
+        return type(base)(float(base) ** float(exponent))
+
+    @staticmethod
     def fma(a: Tile, b: Tile, c: Tile) -> Tile:
         """Fused multiply-add: a * b + c."""
         result_data = (
@@ -256,3 +261,8 @@ class MathOps:
             + c.data.astype(np.float32)
         ).astype(a.data.dtype)
         return Tile(result_data, a.dtype, a.shape)
+
+    @staticmethod
+    def fma_scalar(a: np.floating, b: np.floating, c: np.floating) -> np.floating:
+        """Scalar fused multiply-add: a * b + c."""
+        return type(a)(float(a) * float(b) + float(c))

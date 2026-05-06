@@ -136,7 +136,9 @@ def math__erf(op, context, env):
 def math__powf(op, context, env):
     base = context.get_value(op.operands[0])
     exponent = context.get_value(op.operands[1])
-    return MathOps.powf(base, exponent)
+    if isinstance(base, Tile):
+        return MathOps.powf(base, exponent)
+    return MathOps.powf_scalar(base, exponent)
 
 
 @register("math.fma", latency_category=LC.COMPUTE_FLOAT)
@@ -144,4 +146,6 @@ def math__fma(op, context, env):
     a = context.get_value(op.operands[0])
     b = context.get_value(op.operands[1])
     c = context.get_value(op.operands[2])
-    return MathOps.fma(a, b, c)
+    if isinstance(a, Tile):
+        return MathOps.fma(a, b, c)
+    return MathOps.fma_scalar(a, b, c)
