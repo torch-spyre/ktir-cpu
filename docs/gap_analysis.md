@@ -70,14 +70,14 @@ The spec references the [full Arith dialect](https://mlir.llvm.org/docs/Dialects
 
 ### Math dialect
 
-The spec references the [full Math dialect](https://mlir.llvm.org/docs/Dialects/MathOps/). Currently implemented: `math.exp`, `math.sqrt`, `math.log`, `math.rsqrt`, `math.log2`, `math.log1p`, `math.tanh`, `math.sin`, `math.cos`, `math.absf`, `math.ceil`, `math.floor`, `math.erf`, `math.powf`, `math.fma`.
+The spec references the [full Math dialect](https://mlir.llvm.org/docs/Dialects/MathOps/). Currently implemented: `math.exp`, `math.sqrt`, `math.log`, `math.rsqrt`, `math.log2`, `math.log1p`, `math.tanh`, `math.sin`, `math.cos`, `math.absf`, `math.absi`, `math.ceil`, `math.floor`, `math.erf`, `math.powf`, `math.fma`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
 | 20 | `math.log2`, `math.log1p` | ✅ | |
 | 21 | `math.tanh`, `math.sin`, `math.cos` | ✅ | |
 | 22 | `math.rsqrt` | ✅ | |
-| 23 | `math.absf`, `math.ceil`, `math.floor` | ✅ | |
+| 23 | `math.absf`, `math.absi`, `math.ceil`, `math.floor` | ✅ | |
 | 24 | `math.erf`, `math.powf`, `math.fma` | ✅ | `math.erf` uses polynomial approximation (no scipy) |
 
 ### Linalg dialect

@@ -484,6 +484,26 @@ class TestMath:
         ctx = _ctx_with(**{"%x": np.float16(0.0)})
         assert abs(float(_call("math.erf", ctx, _make_env(), operands=["%x"]))) < 0.01
 
+    def test_absi_tile(self):
+        data = np.array([-3, 0, 5], dtype=np.int32)
+        tile = Tile(data, "i32", data.shape)
+        ctx = _ctx_with(**{"%x": tile})
+        result = _call("math.absi", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([3, 0, 5], dtype=np.int32))
+
+    def test_absi_scalar(self):
+        ctx = _ctx_with(**{"%x": np.int32(-7)})
+        assert int(_call("math.absi", ctx, _make_env(), operands=["%x"])) == 7
+
+    def test_powf_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(2.0), "%b": np.float16(3.0)})
+        assert float(_call("math.powf", ctx, _make_env(), operands=["%a", "%b"])) == 8.0
+
+    def test_fma_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(3.0), "%b": np.float16(4.0), "%c": np.float16(1.0)})
+        assert float(_call("math.fma", ctx, _make_env(), operands=["%a", "%b", "%c"])) == 13.0
+
 # ---------------------------------------------------------------------------
 # linalg dialect exec
 # ---------------------------------------------------------------------------

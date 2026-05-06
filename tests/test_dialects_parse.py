@@ -550,7 +550,7 @@ class TestMathParsers(ParseTestMixin):
     @pytest.mark.parametrize("op_name", [
         "math.exp", "math.sqrt", "math.rsqrt", "math.log",
         "math.log2", "math.log1p", "math.tanh", "math.sin", "math.cos",
-        "math.absf", "math.ceil", "math.floor", "math.erf",
+        "math.absf", "math.absi", "math.ceil", "math.floor", "math.erf",
     ])
     def test_unary_op(self, op_name):
         op = self._parse(
