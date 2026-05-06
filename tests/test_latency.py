@@ -657,13 +657,15 @@ class TestIndirectAccessLatency:
         }
         _addr_map = {name: constants[name] for name in sizes}
 
+        from ktir_cpu.memory import HBMSimulator
         _orig = interp._prepare_execution
         def _prepare_and_seed(grid_shape):
             _orig(grid_shape)
             hbm = interp.memory.hbm
             for name, info in sizes.items():
                 n_elements = int(np.prod(info["shape"]))
-                hbm.write(_addr_map[name], np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
+                hbm.write(_addr_map[name] * HBMSimulator.STICK_BYTES,
+                          np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
         interp._prepare_execution = _prepare_and_seed
 
         interp.execute_function(func_name)

@@ -73,9 +73,9 @@ SMALL_INDIRECT_MLIR = """
 module {
   func.func @small_indirect_gather() attributes {grid = [1, 1]} {
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 64 : index
-    %IDX2_addr = arith.constant 128 : index
-    %Y_addr    = arith.constant 192 : index
+    %IDX1_addr = arith.constant 1 : index
+    %IDX2_addr = arith.constant 2 : index
+    %Y_addr    = arith.constant 3 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
@@ -131,18 +131,18 @@ def test_small_indirect_gather():
         hbm = interp.memory.hbm
         # X: 4x4, values 0..15 as f16
         hbm.write(0, np.arange(16, dtype=np.float16))
-        # IDX1: 4x4, each row = [3,2,1,0] as i32
-        hbm.write(64, np.tile(np.array([3, 2, 1, 0], dtype=np.int32), 4))
-        # IDX2: 4x4, each row = [0,1,2,3] as i32
-        hbm.write(128, np.tile(np.array([0, 1, 2, 3], dtype=np.int32), 4))
-        # Y: 4x4, zeros
-        hbm.write(192, np.zeros(16, dtype=np.float16))
+        # IDX1: 4x4, each row = [3,2,1,0] as i32  (stick 1 = byte 128)
+        hbm.write(128, np.tile(np.array([3, 2, 1, 0], dtype=np.int32), 4))
+        # IDX2: 4x4, each row = [0,1,2,3] as i32  (stick 2 = byte 256)
+        hbm.write(256, np.tile(np.array([0, 1, 2, 3], dtype=np.int32), 4))
+        # Y: 4x4, zeros  (stick 3 = byte 384)
+        hbm.write(384, np.zeros(16, dtype=np.float16))
     interp._prepare_execution = _prepare_and_seed
 
     interp.execute_function("small_indirect_gather")
 
     # Read Y output from HBM
-    y_data = interp.memory.hbm.read(192, 16, "f16").reshape(4, 4)
+    y_data = interp.memory.hbm.read(384, 16, "f16").reshape(4, 4)
 
     # Expected: Y[m,k] = X[IDX1[m,k], IDX2[m,k]] = X[3-k, k]
     expected = np.array([

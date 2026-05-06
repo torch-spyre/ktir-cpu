@@ -614,7 +614,7 @@ class TestKtdp:
         hbm = HBMSimulator()
         data = np.arange(8, dtype=np.float16)
         ptr = hbm.allocate(data.nbytes)
-        hbm.write(ptr, data)
+        hbm.write(ptr * HBMSimulator.STICK_BYTES, data)
 
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
@@ -636,4 +636,4 @@ class TestKtdp:
         ctx.set_value("%tile", modified)
         ctx.set_value("%acc2", access_tile)
         _call("ktdp.store", ctx, env, operands=["%tile", "%acc2"])
-        assert np.array_equal(hbm.read(ptr, 8, "f16"), data * 2)
+        assert np.array_equal(hbm.read(ptr * HBMSimulator.STICK_BYTES, 8, "f16"), data * 2)

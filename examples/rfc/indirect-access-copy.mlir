@@ -18,9 +18,9 @@ module {
   func.func @indirect_access_copy() {
         // In this example, all tensors X, IDX1, IDX2, Y are in a single memory space (HBM)
         %X_addr    = arith.constant 0 : index
-        %IDX1_addr = arith.constant 8192 : index
-        %IDX2_addr = arith.constant 16384 : index
-        %Y_addr    = arith.constant 24576 : index
+        %IDX1_addr = arith.constant 64 : index
+        %IDX2_addr = arith.constant 128 : index
+        %Y_addr    = arith.constant 192 : index
 
         // Accessing a tensor in KTIR follows a 3 step process:
         // Note1: Accesses are single-ended i.e.,

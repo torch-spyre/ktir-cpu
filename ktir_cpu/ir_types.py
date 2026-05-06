@@ -81,6 +81,11 @@ class TileRef:
 
     Describes a contiguous region of memory with base pointer, shape,
     strides, and dtype (corresponds to ``memref<...>`` in MLIR).
+
+    Address semantics:
+      ``base_ptr`` is always in stick units (byte_addr // STICK_BYTES) for both
+      HBM and LX.  ``intra_stick_byte_offset`` carries the remainder byte offset
+      within that stick.  Use ``byte_ptr`` to recover the raw byte address.
     """
     base_ptr: int
     shape: Tuple[int, ...]
@@ -88,6 +93,7 @@ class TileRef:
     memory_space: str  # "HBM" or "LX"
     dtype: str = "f16"
     coordinate_set: Optional[AffineSet] = None  # parsed; None if omitted in MLIR
+    intra_stick_byte_offset: int = 0  # byte offset within base_ptr stick (0..STICK_BYTES-1)
 
     def __post_init__(self):
         valid = ("HBM", "LX")
@@ -95,6 +101,12 @@ class TileRef:
             raise ValueError(
                 f"Invalid memory_space {self.memory_space!r}. Must be one of {valid}."
             )
+
+    @property
+    def byte_ptr(self) -> int:
+        """Byte address of this tile's start in its memory space."""
+        from .memory import HBMSimulator
+        return self.base_ptr * HBMSimulator.STICK_BYTES + self.intra_stick_byte_offset
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""
