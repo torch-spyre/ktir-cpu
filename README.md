@@ -32,8 +32,10 @@ Resolve `MLIR_DIR` using one of:
 
 ```bash
 # Option 1: pin to the LLVM hash tested by ktir-mlir-frontend
-SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/scripts/setup_mlir.py"
-LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/main/cmake/llvm-hash.txt")
+# Parse pinned commit from pyproject.toml (python one-liner for macOS/Linux portability)
+FRONTEND_COMMIT=$(python -c "import re, pathlib; print(re.search(r'ktir-mlir-frontend@([0-9a-f]{40})', pathlib.Path('pyproject.toml').read_text()).group(1))")
+SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/scripts/setup_mlir.py"
+LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/cmake/llvm-hash.txt")
 MLIR_DIR=$(curl -fsSL "$SETUP_MLIR" | uv run python - --wheel --hash "$LLVM_HASH")
 
 # Option 2: use the latest mlir_wheel (simplest, no pinned hash)
