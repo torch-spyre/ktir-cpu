@@ -31,6 +31,7 @@ import numpy as np
 
 from .ir_types import AccessTile, IndirectAccessTile, Tile, TileRef
 from .dtypes import bytes_per_elem
+from .memory import HBMSimulator
 
 
 from .dialects.registry import get_latency_category
@@ -285,10 +286,16 @@ class LatencyTracker:
 
         Counts result bytes (loads), operand Tile bytes (stores), and
         index tensor bytes (indirect access loads and scatter stores).
+
+        HBM traffic is always charged at stick granularity:
+        ``unique_sticks * HBMSimulator.STICK_BYTES``.
         """
         total = 0
         if isinstance(result, Tile):
-            total += result.data.nbytes
+            if result.unique_sticks is not None:
+                total += result.unique_sticks * HBMSimulator.STICK_BYTES
+            else:
+                total += result.data.nbytes
         for v in operands:
             if isinstance(v, IndirectAccessTile):
                 for iv in v.index_views:
