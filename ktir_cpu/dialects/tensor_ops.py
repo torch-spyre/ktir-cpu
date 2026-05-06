@@ -158,22 +158,33 @@ def tensor__generate(op, context, env):
     block_args = bb0_op.attributes["names"] if bb0_op else []
     body = [o for o in region if o.op_type != "region.bb0_args"]
 
-    data = np.empty(shape, dtype=np_dtype)
-    import itertools
-    for idx in itertools.product(*(range(s) for s in shape)):
-        context.push_scope()
-        for arg_name, val in zip(block_args, idx):
-            context.set_value(arg_name, val)
-        result = env.execute_region(context, body)
-        if hasattr(result, 'values'):
-            scalar = result.values[0]
-        else:
-            scalar = result
-        if isinstance(scalar, Tile):
-            scalar = scalar.data.flat[0]
-        data[idx] = scalar
-        context.pop_scope()
+    # Vectorized execution: instead of looping per-element, we pass full
+    # index grids as Tiles and execute the body once.  This works because:
+    #   - block_args (e.g. ["%i", "%j"]) are always index-typed (MLIR spec)
+    #   - arith/compute ops already handle Tile inputs element-wise
+    # The body therefore computes the entire output tensor in one pass.
+    #
+    # Example for shape=(3,3): grids gives two 3x3 arrays:
+    #   %i -> [[0,0,0],    %j -> [[0,1,2],
+    #          [1,1,1],           [0,1,2],
+    #          [2,2,2]]           [0,1,2]]
+    # Then `arith.cmpi sge, %i, %j` compares element-wise → lower-triangular:
+    #   [[1,0,0],
+    #    [1,1,0],
+    #    [1,1,1]]
+    grids = np.meshgrid(*(np.arange(s) for s in shape), indexing='ij')
+    context.push_scope()
+    for arg_name, grid in zip(block_args, grids):
+        context.set_value(arg_name, Tile(grid, "index", shape))
+    result = env.execute_region(context, body)
+    if hasattr(result, 'values'):
+        result = result.values[0]
+    context.pop_scope()
 
+    if isinstance(result, Tile):
+        data = result.data.astype(np_dtype)
+    else:
+        data = np.full(shape, result, dtype=np_dtype)
     return Tile(data, dtype_str, shape)
 
 
