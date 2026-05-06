@@ -396,8 +396,10 @@ class KTIRParser(KTIRParserBase):
         # Block labels: ^name(%arg: type):
         if text.startswith('^') and text.endswith(':'):
             return True
-        # Void terminators (return, *.yield)
-        if 'return' in text or '.yield' in text:
+        # Void terminators: bare `return` or dialect yields like `scf.yield`.
+        # Match as op names (start of line or after `= `) to avoid false hits
+        # on SSA names like `%sum_returned_val`.
+        if re.match(r'(?:%\w+\s*=\s*)?(?:return\b|\w+\.yield\b)', text):
             return True
         # Type annotation: `: <type>` or `-> <type>` at end
         if self._TYPE_TERMINAL_RE.search(text):

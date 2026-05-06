@@ -282,6 +282,7 @@ def arith__cmpf(op, context, env):
     # Ordered (o*): numpy default — returns False when NaN is involved.
     # Unordered (u*): same comparison, but OR with nan_either.
     cmp_ops = {
+        "false": lambda: np.zeros_like(lhs, dtype=bool) if is_tile else False,
         "oeq": lambda: lhs == rhs,  "one": lambda: (lhs != rhs) & ~(np.isnan(lhs) | np.isnan(rhs)),
         "olt": lambda: lhs < rhs,   "ole": lambda: lhs <= rhs,
         "ogt": lambda: lhs > rhs,   "oge": lambda: lhs >= rhs,
@@ -293,6 +294,7 @@ def arith__cmpf(op, context, env):
         "uge": lambda: (lhs >= rhs) | (np.isnan(lhs) | np.isnan(rhs)),
         "ord": lambda: ~(np.isnan(lhs) | np.isnan(rhs)),
         "uno": lambda: np.isnan(lhs) | np.isnan(rhs),
+        "true": lambda: np.ones_like(lhs, dtype=bool) if is_tile else True,
     }
     if predicate not in cmp_ops:
         raise NotImplementedError(f"arith.cmpf: unsupported predicate '{predicate}'")

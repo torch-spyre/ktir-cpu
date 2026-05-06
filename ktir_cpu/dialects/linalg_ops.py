@@ -48,11 +48,11 @@ def linalg__reduce(op, context, env):
     np_reduce = {
         "arith.addf": np.sum,
         "arith.maxf": np.max,
-        "arith.maxnumf": np.max,
+        "arith.maxnumf": np.fmax.reduce,
         "arith.maximumf": np.maximum.reduce,
         "arith.minf": np.min,
         "arith.minimumf": np.minimum.reduce,
-        "arith.minnumf": np.min,
+        "arith.minnumf": np.fmin.reduce,
         "arith.mulf": np.prod,
     }.get(reduce_fn)
 
