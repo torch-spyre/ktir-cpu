@@ -76,7 +76,7 @@ class CoreContext:
         self.hbm = hbm  # Shared HBM
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
-        self._lx_next_ptr_stack: List[int] = []  # watermarks saved on push_scope, restored on pop_scope (#26)
+        self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
 
     def get_grid_id(self, dim: int) -> int:
         """Get grid ID for dimension.
@@ -91,16 +91,38 @@ class CoreContext:
 
     # ------------------------------------------------------------------
     # Region scoping
+    # LX allocation model: scope-watermark bump allocator
+    # LX address space is managed as a bump allocator with scope-level watermarks.
+    # push_scope snapshots lx.next_ptr; pop_scope rewinds it. This is the
+    # most aggressive deallocation strategy the IR permits without liveness analysis:
+
+    # 1). SSA values are immutable bindings with scope-lifetime semantics. A value
+    # that is "in scope" is reachable — there is no point in the IR where a value
+    # is dead but still in scope. So scope-exit is the earliest safe deallocation
+    # point.
+
+    # 2). Intra-scope reuse is not possible because all tiles produced within a scope
+    # coexist simultaneously in LX until the scope pops. Peak LX usage within a
+    # scope equals the sum of all tiles produced in that scope, even if some are
+    # logically "consumed" by a downstream op and never read again.
+
+    # 3). A free-list or explicit dealloc op would require liveness analysis or
+    # last-use annotations, neither of which exist in KTIR's current model
+    # (compute uses standard MLIR dialects; SCF regions define lifetime).
+
+    # The watermark stack stays in lockstep with _scope_stack — the invariant
+    # len(_lx_next_ptr_stack) == len(_scope_stack) - 1 holds by construction.
     # ------------------------------------------------------------------
 
     def push_scope(self):
         """Enter a new region scope (scf.for body, scf.if branch).
 
         Snapshots ``lx.next_ptr`` so ``pop_scope`` can rewind it and
-        keep the bump-pointer in lockstep with ``lx.used`` (see #26).
+        keep the bump-pointer in lockstep with ``lx.used``.
         """
         self._lx_next_ptr_stack.append(self.lx.next_ptr)
         self._scope_stack.append({})
+        assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
 
     def pop_scope(self):
         """Exit the current region scope.
@@ -116,6 +138,7 @@ class CoreContext:
         for name in scope:
             self.untrack_lx(name)
         self.lx.next_ptr = self._lx_next_ptr_stack.pop()
+        assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
 
     # ------------------------------------------------------------------
     # SSA value access
