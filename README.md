@@ -31,21 +31,28 @@ Until a PyPI release is available, build from source:
 Resolve `MLIR_DIR` using one of:
 
 ```bash
-# Option 1: pin to the LLVM hash tested by ktir-mlir-frontend
 # Parse pinned commit from pyproject.toml (python one-liner for macOS/Linux portability)
 FRONTEND_COMMIT=$(python -c "import re, pathlib; print(re.search(r'ktir-mlir-frontend@([0-9a-f]{40})', pathlib.Path('pyproject.toml').read_text()).group(1))")
 SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/scripts/setup_mlir.py"
 LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/cmake/llvm-hash.txt")
-MLIR_DIR=$(curl -fsSL "$SETUP_MLIR" | uv run python - --wheel --hash "$LLVM_HASH")
-
-# Option 2: use the latest mlir_wheel (simplest, no pinned hash)
-uv pip install mlir_wheel --find-links https://llvm.github.io/eudsl
-MLIR_DIR=$(uv run --no-project python -c "import mlir_wheel, pathlib; print(pathlib.Path(mlir_wheel.__file__).parent / 'lib/cmake/mlir')")
+curl -fsSL "$SETUP_MLIR" -o /tmp/setup_mlir.py
 ```
 
-Then build and install:
+**Option 1 (recommended) — pinned LLVM artifact:**
+
+Requires a GitHub token with `actions:read` scope in `GIT_PAT` or `GITHUB_TOKEN`:
 
 ```bash
+MLIR_DIR=$(GIT_PAT=<your-token> uv run python /tmp/setup_mlir.py --hash "$LLVM_HASH")
+CMAKE_ARGS="-DMLIR_DIR=$MLIR_DIR" uv sync --extra mlir-frontend
+```
+
+**Option 2 (dev/testing only) — `mlir_wheel` fallback:**
+
+No token required, but uses a bleeding-edge `mlir_wheel` that may not match the pinned LLVM hash:
+
+```bash
+MLIR_DIR=$(uv run python /tmp/setup_mlir.py --wheel)
 CMAKE_ARGS="-DMLIR_DIR=$MLIR_DIR" uv sync --extra mlir-frontend
 ```
 
