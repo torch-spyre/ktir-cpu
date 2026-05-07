@@ -241,44 +241,35 @@ class HBMSimulator:
         self.next_ptr = (self.next_ptr + self.STICK_BYTES - 1) & ~(self.STICK_BYTES - 1)
         return ptr // self.STICK_BYTES
 
-    def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
-        """Read *n_elements* elements starting at byte address *ptr*.
+    def _resolve_addr(self, addr) -> int:
+        """Convert addr to byte address. Accepts stick index (int) or (stick, intra_byte_offset) tuple."""
+        if isinstance(addr, tuple):
+            stick, intra = addr
+            return stick * self.STICK_BYTES + intra
+        return addr * self.STICK_BYTES
 
-        Returns a flat array of length *n_elements*.  Raises ValueError if
-        *ptr* is unmapped.
-
-        Callers:
-        - ``MemoryOps.load`` — reads tile data from HBM (memory_ops.py)
-        - ``KTIRInterpreter.execute_function`` — reads output tensors back
-          after execution (interpreter.py)
+    def read(self, addr, n_elements: int, dtype: str) -> np.ndarray:
+        """Read *n_elements* elements from HBM.
 
         Args:
-            ptr: Memory address (byte offset)
-            n_elements: Number of elements to read
-            dtype: Data type
+            addr: Stick index (int) or (stick, intra_byte_offset) tuple.
+            n_elements: Number of elements to read.
+            dtype: Data type.
 
         Returns:
-            Flat NumPy array of length n_elements
+            Flat NumPy array of length n_elements.
         """
         np_dtype = to_np_dtype(dtype)
-        return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
+        return _read_flat(self.memory, self._resolve_addr(addr), n_elements, np_dtype, bytes_per_elem(dtype))
 
-    def write(self, ptr: int, data: np.ndarray):
-        """Write *data* (flat ndarray) starting at byte address *ptr*.
-
-        Patches an existing allocation in-place when *ptr* falls within one.
-        Creates a new allocation at *ptr* if unmapped.
-
-        Callers:
-        - ``KTIRInterpreter.execute_function`` — places host input tensors
-          in HBM before kernel execution (interpreter.py)
-        - ``MemoryOps.store`` — writes tile data to HBM (memory_ops.py)
+    def write(self, addr, data: np.ndarray):
+        """Write *data* (flat ndarray) to HBM.
 
         Args:
-            ptr: Memory address (byte offset)
-            data: Flat NumPy array to write
+            addr: Stick index (int) or (stick, intra_byte_offset) tuple.
+            data: Flat NumPy array to write.
         """
-        _write_flat(self.memory, ptr, data)
+        _write_flat(self.memory, self._resolve_addr(addr), data)
 
     def read_element(self, addr: int, dtype: str = "f16"):
         """Read a single element by byte address.

@@ -76,24 +76,19 @@ class Tile:
 
 
 @dataclass
-class TileRef:
-    """Memory layout descriptor (does NOT contain data).
+class MemRef:
+    """Hardware-aware memory view (result of construct_memory_view).
 
-    Describes a contiguous region of memory with base pointer, shape,
-    strides, and dtype (corresponds to ``memref<...>`` in MLIR).
-
-    Address semantics:
-      ``base_ptr`` is always in stick units (byte_addr // STICK_BYTES) for both
-      HBM and LX.  ``intra_stick_byte_offset`` carries the remainder byte offset
-      within that stick.  Use ``byte_ptr`` to recover the raw byte address.
+    Represents a logical view over allocated memory.  ``base_ptr`` is a
+    stick index for HBM or a byte address for LX.  Use ``byte_address``
+    to get the absolute byte position regardless of memory space.
     """
-    base_ptr: int
+    base_ptr: int              # stick index (HBM) or byte address (LX)
     shape: Tuple[int, ...]
-    strides: List[int]
-    memory_space: str  # "HBM" or "LX"
+    strides: List[int]         # element counts
+    memory_space: str          # "HBM" or "LX"
     dtype: str = "f16"
-    coordinate_set: Optional[AffineSet] = None  # parsed; None if omitted in MLIR
-    intra_stick_byte_offset: int = 0  # byte offset within base_ptr stick (0..STICK_BYTES-1)
+    coordinate_set: Optional[AffineSet] = None
 
     def __post_init__(self):
         valid = ("HBM", "LX")
@@ -103,10 +98,54 @@ class TileRef:
             )
 
     @property
-    def byte_ptr(self) -> int:
-        """Byte address of this tile's start in its memory space."""
-        from .memory import HBMSimulator
-        return self.base_ptr * HBMSimulator.STICK_BYTES + self.intra_stick_byte_offset
+    def byte_address(self) -> int:
+        """Absolute byte address of this memref's base in its memory space."""
+        if self.memory_space == "HBM":
+            from .memory import HBMSimulator
+            return self.base_ptr * HBMSimulator.STICK_BYTES
+        return self.base_ptr
+
+    def mem_addr(self, byte_ptr: int):
+        """Convert a byte pointer to the address form expected by the memory backend.
+
+        HBM: returns (stick_index, intra_byte_offset) tuple.
+        LX: returns byte_ptr unchanged.
+        """
+        if self.memory_space == "HBM":
+            from .memory import HBMSimulator
+            return (byte_ptr // HBMSimulator.STICK_BYTES, byte_ptr % HBMSimulator.STICK_BYTES)
+        return byte_ptr
+
+    def to_tile_ref(self) -> 'TileRef':
+        """Convert to a byte-addressed TileRef for load/store operations."""
+        return TileRef(
+            base_ptr=self.byte_address,
+            shape=self.shape,
+            strides=self.strides,
+            dtype=self.dtype,
+            memref=self,
+        )
+
+    def size_bytes(self) -> int:
+        """Calculate size in bytes."""
+        from .dtypes import bytes_per_elem
+        return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
+
+
+@dataclass
+class TileRef:
+    """Byte-addressed tile view for load/store operations.
+
+    Produced by ``tile_access()`` from a parent MemRef.  ``base_ptr`` is
+    always an absolute byte address regardless of memory space.  Holds a
+    reference to the parent ``memref`` for memory-space-aware queries
+    (e.g. ``unique_sticks``).
+    """
+    base_ptr: int              # always byte address
+    shape: Tuple[int, ...]
+    strides: List[int]         # element counts
+    dtype: str = "f16"
+    memref: Optional['MemRef'] = None
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""
@@ -116,7 +155,7 @@ class TileRef:
 
 @dataclass
 class AccessTile:
-    """Coordinate access tile referencing a sub-region of a TileRef.
+    """Coordinate access tile referencing a sub-region of a MemRef.
 
     Holds the affine attributes that describe which coordinates of the
     parent memref to access.  Load and store operations use these to
@@ -137,10 +176,10 @@ class IndirectAccessTile:
     - Directly via an intermediate variable value, or
     - Indirectly via a lookup into an index memory view.
     """
-    parent_ref: TileRef                         # primary memory view (e.g. X)
+    parent_ref: MemRef                          # primary memory view (e.g. X)
     shape: Tuple[int, ...]                      # output access tile shape
     dim_subscripts: List[Dict[str, Any]]        # per-dim descriptor (kind, var_indices, etc.)
-    index_views: List[TileRef]                  # index memrefs for indirect dims
+    index_views: List[MemRef]                   # index memrefs for indirect dims (used for byte_address)
     variables_space_set: AffineSet              # domain of intermediate variables
     variables_space_order: Optional[AffineMap]  # iteration order; None = default
 

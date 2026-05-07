@@ -26,7 +26,7 @@ from pathlib import Path
 
 from ktir_cpu.memory import HBMSimulator, LXScratchpad
 from ktir_cpu.grid import GridExecutor
-from ktir_cpu.ir_types import Tile, TileRef
+from ktir_cpu.ir_types import MemRef, Tile, TileRef
 from ktir_cpu.interpreter import _ktir_dtype
 
 
@@ -71,8 +71,8 @@ def test_hbm_read_subarray_partial_padding():
     hbm.write(ptr, data)
 
     # Read starting 2 elements in, requesting 4 elements (only 2 available)
-    offset_ptr = ptr + 2 * 2  # skip 2 f16 elements (2 bytes each)
-    result = hbm.read(offset_ptr, 4, "f16")
+    byte_offset = 2 * 2  # skip 2 f16 elements (2 bytes each)
+    result = hbm.read((ptr, byte_offset), 4, "f16")
     assert result.shape == (4,), f"Expected shape (4,), got {result.shape}"
     assert result[0] == np.float16(30), f"Expected 30, got {result[0]}"
     assert result[1] == np.float16(40), f"Expected 40, got {result[1]}"
@@ -393,8 +393,8 @@ def test_tile_operations():
     assert tile1.data[0] == 1, "Copy should be independent"
     print("  ✓ Tile copy works")
 
-    # Test TileRef
-    ref = TileRef(
+    # Test MemRef
+    ref = MemRef(
         base_ptr=0x1000,
         shape=(4,),
         strides=[1],
@@ -402,8 +402,8 @@ def test_tile_operations():
         dtype="f16"
     )
 
-    assert ref.size_bytes() == 8, "TileRef size calculation wrong"
-    print("  ✓ TileRef works")
+    assert ref.size_bytes() == 8, "MemRef size calculation wrong"
+    print("  ✓ MemRef works")
 
 
 @pytest.mark.parametrize("dtype, shape, expected_bytes", [
@@ -413,8 +413,8 @@ def test_tile_operations():
     ("i64", (4,), 32),
 ])
 def test_tileref_size_bytes(dtype, shape, expected_bytes):
-    """TileRef.size_bytes: correct byte count for each supported dtype."""
-    ref = TileRef(base_ptr=0, shape=shape, strides=[1], memory_space="HBM", dtype=dtype)
+    """MemRef.size_bytes: correct byte count for each supported dtype."""
+    ref = MemRef(base_ptr=0, shape=shape, strides=[1], memory_space="HBM", dtype=dtype)
     assert ref.size_bytes() == expected_bytes
 
 

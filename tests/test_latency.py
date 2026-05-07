@@ -592,14 +592,14 @@ class TestLatencyEdgeCases:
     def test_lx_index_views_excluded_from_hbm_bytes(self):
         """_data_size() ignores LX index views; _memory_space() falls back to parent."""
         from ktir_cpu.latency import LatencyTracker
-        from ktir_cpu.ir_types import IndirectAccessTile, Tile, TileRef
+        from ktir_cpu.ir_types import IndirectAccessTile, MemRef, Tile
         from ktir_cpu.parser_ast import parse_affine_set
 
         vss = parse_affine_set("(d0, d1) : (d0 >= 0, d1 >= 0)")
-        lx_idx = TileRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
-                         memory_space="LX", dtype="i32")
-        parent = TileRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
-                         memory_space="HBM", dtype="f16")
+        lx_idx = MemRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
+                        memory_space="LX", dtype="i32")
+        parent = MemRef(base_ptr=0, shape=(4, 4), strides=[4, 1],
+                        memory_space="HBM", dtype="f16")
         iat = IndirectAccessTile(
             parent_ref=parent, shape=(4, 4), dim_subscripts=[],
             index_views=[lx_idx, lx_idx],
@@ -664,7 +664,7 @@ class TestIndirectAccessLatency:
             hbm = interp.memory.hbm
             for name, info in sizes.items():
                 n_elements = int(np.prod(info["shape"]))
-                hbm.write(_addr_map[name] * HBMSimulator.STICK_BYTES,
+                hbm.write(_addr_map[name],
                           np.zeros(n_elements, dtype=_dtype_map[info["dtype"]]))
         interp._prepare_execution = _prepare_and_seed
 
@@ -705,7 +705,8 @@ class TestIndirectAccessLatency:
         # a different stick — no sharing.
         coords = [(i * 64,) for i in range(4)]
         _, unique_sticks = MemoryOps._flat_memory_offsets(
-            base_ptr=0x10000, shape=(4096,), strides=[1], dtype="f16", coords=coords
+            base_ptr=0x10000, shape=(4096,), strides=[1], dtype="f16",
+            coords=coords, stick_bytes=128
         )
         assert unique_sticks == 4
 
@@ -716,7 +717,8 @@ class TestIndirectAccessLatency:
         # Six reads alternate between element 0 and element 64 — two sticks.
         coords = [(0,), (64,), (0,), (64,), (0,), (64,)]
         _, unique_sticks = MemoryOps._flat_memory_offsets(
-            base_ptr=0x10000, shape=(4096,), strides=[1], dtype="f16", coords=coords
+            base_ptr=0x10000, shape=(4096,), strides=[1], dtype="f16",
+            coords=coords, stick_bytes=128
         )
         assert unique_sticks == 2
 

@@ -38,10 +38,10 @@ def test_indirect_access_tile_rfc(path, func_name, entry):
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        hbm.write(0, np.zeros(64 * 64, dtype=np.float16))       # X
-        hbm.write(8192, np.zeros(64 * 64, dtype=np.int32))      # IDX1
-        hbm.write(16384, np.zeros(64 * 64, dtype=np.int32))     # IDX2
-        hbm.write(24576, np.zeros(64 * 64, dtype=np.float16))   # Y
+        hbm.write(0, np.zeros(64 * 64, dtype=np.float16))       # X (stick 0)
+        hbm.write(64, np.zeros(64 * 64, dtype=np.int32))        # IDX1 (stick 64)
+        hbm.write(128, np.zeros(64 * 64, dtype=np.int32))       # IDX2 (stick 128)
+        hbm.write(192, np.zeros(64 * 64, dtype=np.float16))     # Y (stick 192)
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
@@ -49,10 +49,10 @@ def test_indirect_access_tile_rfc(path, func_name, entry):
 # ---------------------------------------------------------------------------
 # Small 4x4 indirect gather with data verification
 # ---------------------------------------------------------------------------
-# X  = 4x4 matrix at addr 0,   values X[i,j] = i*4+j  (0..15)
-# IDX1 = 4x4 matrix at addr 64,  each row = [3, 2, 1, 0]  (reversed row indices)
-# IDX2 = 4x4 matrix at addr 128, each row = [0, 1, 2, 3]  (identity col indices)
-# Y  = 4x4 matrix at addr 192
+# X  = 4x4 matrix at stick 0, values X[i,j] = i*4+j  (0..15)
+# IDX1 = 4x4 matrix at stick 1, each row = [3, 2, 1, 0]  (reversed row indices)
+# IDX2 = 4x4 matrix at stick 2, each row = [0, 1, 2, 3]  (identity col indices)
+# Y  = 4x4 matrix at stick 3
 #
 # Kernel: Y[m,k] = X[ IDX1[m,k], IDX2[m,k] ]
 # Expected: Y[m,k] = X[3-k, k] ... wait, IDX1[m,k] = 3-k for each row.
@@ -129,20 +129,20 @@ def test_small_indirect_gather():
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        # X: 4x4, values 0..15 as f16
+        # X: 4x4, values 0..15 as f16 (stick 0)
         hbm.write(0, np.arange(16, dtype=np.float16))
-        # IDX1: 4x4, each row = [3,2,1,0] as i32  (stick 1 = byte 128)
-        hbm.write(128, np.tile(np.array([3, 2, 1, 0], dtype=np.int32), 4))
-        # IDX2: 4x4, each row = [0,1,2,3] as i32  (stick 2 = byte 256)
-        hbm.write(256, np.tile(np.array([0, 1, 2, 3], dtype=np.int32), 4))
-        # Y: 4x4, zeros  (stick 3 = byte 384)
-        hbm.write(384, np.zeros(16, dtype=np.float16))
+        # IDX1: 4x4, each row = [3,2,1,0] as i32 (stick 1)
+        hbm.write(1, np.tile(np.array([3, 2, 1, 0], dtype=np.int32), 4))
+        # IDX2: 4x4, each row = [0,1,2,3] as i32 (stick 2)
+        hbm.write(2, np.tile(np.array([0, 1, 2, 3], dtype=np.int32), 4))
+        # Y: 4x4, zeros (stick 3)
+        hbm.write(3, np.zeros(16, dtype=np.float16))
     interp._prepare_execution = _prepare_and_seed
 
     interp.execute_function("small_indirect_gather")
 
-    # Read Y output from HBM
-    y_data = interp.memory.hbm.read(384, 16, "f16").reshape(4, 4)
+    # Read Y output from HBM (stick 3)
+    y_data = interp.memory.hbm.read(3, 16, "f16").reshape(4, 4)
 
     # Expected: Y[m,k] = X[IDX1[m,k], IDX2[m,k]] = X[3-k, k]
     expected = np.array([
