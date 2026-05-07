@@ -25,6 +25,10 @@ from ..ops.arith_ops import ArithOps, arith_cast
 from .registry import register, register_parser
 
 
+def _bool_not(x):
+    return ~x if isinstance(x, np.ndarray) else not x
+
+
 def _is_scalar(v):
     """Return True if *v* is a scalar numeric value (not a Tile)."""
     return isinstance(v, (int, float, np.integer, np.floating))
@@ -265,7 +269,7 @@ def arith__cmpi(op, context, env):
     if predicate not in cmp_ops:
         raise NotImplementedError(f"arith.cmpi: unsupported predicate '{predicate}'")
     result = cmp_ops[predicate]()
-    return Tile(result, (a if isinstance(a, Tile) else b).dtype, result.shape) if is_tile else result
+    return Tile(result, "i1", result.shape) if is_tile else result
 
 
 @register("arith.cmpf", latency_category=LC.COMPUTE_FLOAT)
@@ -283,7 +287,7 @@ def arith__cmpf(op, context, env):
     # Unordered (u*): same comparison, but OR with nan_either.
     cmp_ops = {
         "false": lambda: np.zeros_like(lhs, dtype=bool) if is_tile else False,
-        "oeq": lambda: lhs == rhs,  "one": lambda: (lhs != rhs) & ~(np.isnan(lhs) | np.isnan(rhs)),
+        "oeq": lambda: lhs == rhs,  "one": lambda: (lhs != rhs) & _bool_not(np.isnan(lhs) | np.isnan(rhs)),
         "olt": lambda: lhs < rhs,   "ole": lambda: lhs <= rhs,
         "ogt": lambda: lhs > rhs,   "oge": lambda: lhs >= rhs,
         "ueq": lambda: (lhs == rhs) | (np.isnan(lhs) | np.isnan(rhs)),
@@ -292,14 +296,14 @@ def arith__cmpf(op, context, env):
         "ule": lambda: (lhs <= rhs) | (np.isnan(lhs) | np.isnan(rhs)),
         "ugt": lambda: (lhs > rhs)  | (np.isnan(lhs) | np.isnan(rhs)),
         "uge": lambda: (lhs >= rhs) | (np.isnan(lhs) | np.isnan(rhs)),
-        "ord": lambda: ~(np.isnan(lhs) | np.isnan(rhs)),
+        "ord": lambda: _bool_not(np.isnan(lhs) | np.isnan(rhs)),
         "uno": lambda: np.isnan(lhs) | np.isnan(rhs),
         "true": lambda: np.ones_like(lhs, dtype=bool) if is_tile else True,
     }
     if predicate not in cmp_ops:
         raise NotImplementedError(f"arith.cmpf: unsupported predicate '{predicate}'")
     result = cmp_ops[predicate]()
-    return Tile(result, (a if isinstance(a, Tile) else b).dtype, result.shape) if is_tile else result
+    return Tile(result, "i1", result.shape) if is_tile else result
 
 
 @register("arith.select", latency_category=LC.COMPUTE_FLOAT)
