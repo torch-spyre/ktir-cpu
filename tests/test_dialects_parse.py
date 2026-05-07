@@ -303,6 +303,22 @@ class TestArithParsers(ParseTestMixin):
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%y")
 
+    def test_cmpf_missing_predicate_raises(self):
+        # regex parser raises ValueError; MLIR frontend raises MLIRError
+        with pytest.raises(Exception, match=r"no valid predicate found|expected string or keyword"):
+            self._parse(
+                "%r = arith.cmpf , %x, %y : f32",
+                args={"%x": "f32", "%y": "f32"},
+            )
+
+    def test_cmpi_missing_predicate_raises(self):
+        # regex parser raises ValueError; MLIR frontend raises MLIRError
+        with pytest.raises(Exception, match=r"no valid predicate found|expected string or keyword"):
+            self._parse(
+                "%b = arith.cmpi , %a, %c0 : index",
+                args={"%a": "index", "%c0": "index"},
+            )
+
 
 # ---------------------------------------------------------------------------
 # linalg dialect parsers

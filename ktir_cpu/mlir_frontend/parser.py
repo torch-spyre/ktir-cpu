@@ -502,6 +502,7 @@ def _adapt_arith_cmpi(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("arith.cmpf")
 def _adapt_arith_cmpf(mlir_op, attributes, result_type, operands):
     """Normalize MLIR float predicate encoding → string the executor expects."""
+    # MLIR CmpFPredicateAttr integer encoding (matches mlir::arith::CmpFPredicate)
     _pred_map = {
         0: "false", 1: "oeq", 2: "ogt", 3: "oge", 4: "olt", 5: "ole",
         6: "one", 7: "ord", 8: "ueq", 9: "ugt", 10: "uge", 11: "ult",

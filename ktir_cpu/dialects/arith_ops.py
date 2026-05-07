@@ -248,7 +248,7 @@ def arith__sitofp(op, context, env):
 def arith__cmpi(op, context, env):
     a = context.get_value(op.operands[0])
     b = context.get_value(op.operands[1])
-    predicate = op.attributes.get("predicate", "slt")
+    predicate = op.attributes["predicate"]
     is_tile = isinstance(a, Tile) or isinstance(b, Tile)
     if is_tile:
         lhs = a.data if isinstance(a, Tile) else np.full(b.shape, a, dtype=b.data.dtype)
@@ -276,7 +276,7 @@ def arith__cmpi(op, context, env):
 def arith__cmpf(op, context, env):
     a = context.get_value(op.operands[0])
     b = context.get_value(op.operands[1])
-    predicate = op.attributes.get("predicate", "olt")
+    predicate = op.attributes["predicate"]
     is_tile = isinstance(a, Tile) or isinstance(b, Tile)
     if is_tile:
         lhs = a.data if isinstance(a, Tile) else np.full(b.shape, a, dtype=b.data.dtype)
@@ -443,10 +443,10 @@ def parse_arith_cmpi(op_text, parse_ctx):
 
     result_name = result_match.group(1)
 
-    predicate = "slt"
     pred_match = re.search(r'arith\.cmpi\s+(eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge)', op_text)
-    if pred_match:
-        predicate = pred_match.group(1)
+    if not pred_match:
+        raise ValueError(f"arith.cmpi: no valid predicate found in: {op_text!r}")
+    predicate = pred_match.group(1)
 
     operands = re.findall(r'%\w+', op_text)
     operands = [o for o in operands if o != result_name]
@@ -473,11 +473,11 @@ def parse_arith_cmpf(op_text, parse_ctx):
 
     result_name = result_match.group(1)
 
-    predicate = "olt"
     pred_match = re.search(
         r'arith\.cmpf\s+(oeq|one|olt|ole|ogt|oge|ueq|une|ult|ule|ugt|uge|ord|uno)', op_text)
-    if pred_match:
-        predicate = pred_match.group(1)
+    if not pred_match:
+        raise ValueError(f"arith.cmpf: no valid predicate found in: {op_text!r}")
+    predicate = pred_match.group(1)
 
     operands = re.findall(r'%\w+', op_text)
     operands = [o for o in operands if o != result_name]
