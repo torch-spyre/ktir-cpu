@@ -28,6 +28,8 @@ SUPPORTED_DTYPES: dict[str, np.dtype] = {
     "float16": np.dtype(np.float16),
     "f32":     np.dtype(np.float32),
     "float32": np.dtype(np.float32),
+    # boolean
+    "i1":      np.dtype(np.bool_),
     # integer
     "i32":     np.dtype(np.int32),
     "si32":    np.dtype(np.int32),

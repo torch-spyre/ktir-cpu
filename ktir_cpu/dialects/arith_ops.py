@@ -25,6 +25,10 @@ from ..ops.arith_ops import ArithOps, arith_cast
 from .registry import register, register_parser
 
 
+def _bool_not(x):
+    return ~x if isinstance(x, np.ndarray) else not x
+
+
 def _is_scalar(v):
     """Return True if *v* is a scalar numeric value (not a Tile)."""
     return isinstance(v, (int, float, np.integer, np.floating))
@@ -156,6 +160,8 @@ def arith__constant(op, context, env):
     return value
 
 
+# TODO: consider deprecating arith.maxf / arith.minf aliases — these were
+# renamed to arith.maximumf / arith.minimumf in upstream MLIR.
 @register("arith.maxf", "arith.maximumf", latency_category=LC.COMPUTE_FLOAT)
 def arith__maxf(op, context, env):
     tile1 = context.get_value(op.operands[0])
@@ -168,6 +174,20 @@ def arith__maxnumf(op, context, env):
     tile1 = context.get_value(op.operands[0])
     tile2 = context.get_value(op.operands[1])
     return ArithOps.maxnumf(tile1, tile2)
+
+
+@register("arith.minf", "arith.minimumf", latency_category=LC.COMPUTE_FLOAT)
+def arith__minf(op, context, env):
+    tile1 = context.get_value(op.operands[0])
+    tile2 = context.get_value(op.operands[1])
+    return ArithOps.minf(tile1, tile2)
+
+
+@register("arith.minnumf", latency_category=LC.COMPUTE_FLOAT)
+def arith__minnumf(op, context, env):
+    tile1 = context.get_value(op.operands[0])
+    tile2 = context.get_value(op.operands[1])
+    return ArithOps.minnumf(tile1, tile2)
 
 
 @register("arith.extf")
@@ -228,7 +248,7 @@ def arith__sitofp(op, context, env):
 def arith__cmpi(op, context, env):
     a = context.get_value(op.operands[0])
     b = context.get_value(op.operands[1])
-    predicate = op.attributes.get("predicate", "slt")
+    predicate = op.attributes["predicate"]
     is_tile = isinstance(a, Tile) or isinstance(b, Tile)
     if is_tile:
         lhs = a.data if isinstance(a, Tile) else np.full(b.shape, a, dtype=b.data.dtype)
@@ -249,7 +269,41 @@ def arith__cmpi(op, context, env):
     if predicate not in cmp_ops:
         raise NotImplementedError(f"arith.cmpi: unsupported predicate '{predicate}'")
     result = cmp_ops[predicate]()
-    return Tile(result, (a if isinstance(a, Tile) else b).dtype, result.shape) if is_tile else result
+    return Tile(result, "i1", result.shape) if is_tile else result
+
+
+@register("arith.cmpf", latency_category=LC.COMPUTE_FLOAT)
+def arith__cmpf(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    predicate = op.attributes["predicate"]
+    is_tile = isinstance(a, Tile) or isinstance(b, Tile)
+    if is_tile:
+        lhs = a.data if isinstance(a, Tile) else np.full(b.shape, a, dtype=b.data.dtype)
+        rhs = b.data if isinstance(b, Tile) else np.full(a.shape, b, dtype=a.data.dtype)
+    else:
+        lhs, rhs = float(a), float(b)
+    # Ordered (o*): numpy default — returns False when NaN is involved.
+    # Unordered (u*): same comparison, but OR with nan_either.
+    cmp_ops = {
+        "false": lambda: np.zeros_like(lhs, dtype=bool) if is_tile else False,
+        "oeq": lambda: lhs == rhs,  "one": lambda: (lhs != rhs) & _bool_not(np.isnan(lhs) | np.isnan(rhs)),
+        "olt": lambda: lhs < rhs,   "ole": lambda: lhs <= rhs,
+        "ogt": lambda: lhs > rhs,   "oge": lambda: lhs >= rhs,
+        "ueq": lambda: (lhs == rhs) | (np.isnan(lhs) | np.isnan(rhs)),
+        "une": lambda: lhs != rhs,
+        "ult": lambda: (lhs < rhs)  | (np.isnan(lhs) | np.isnan(rhs)),
+        "ule": lambda: (lhs <= rhs) | (np.isnan(lhs) | np.isnan(rhs)),
+        "ugt": lambda: (lhs > rhs)  | (np.isnan(lhs) | np.isnan(rhs)),
+        "uge": lambda: (lhs >= rhs) | (np.isnan(lhs) | np.isnan(rhs)),
+        "ord": lambda: _bool_not(np.isnan(lhs) | np.isnan(rhs)),
+        "uno": lambda: np.isnan(lhs) | np.isnan(rhs),
+        "true": lambda: np.ones_like(lhs, dtype=bool) if is_tile else True,
+    }
+    if predicate not in cmp_ops:
+        raise NotImplementedError(f"arith.cmpf: unsupported predicate '{predicate}'")
+    result = cmp_ops[predicate]()
+    return Tile(result, "i1", result.shape) if is_tile else result
 
 
 @register("arith.select", latency_category=LC.COMPUTE_FLOAT)
@@ -389,10 +443,10 @@ def parse_arith_cmpi(op_text, parse_ctx):
 
     result_name = result_match.group(1)
 
-    predicate = "slt"
     pred_match = re.search(r'arith\.cmpi\s+(eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge)', op_text)
-    if pred_match:
-        predicate = pred_match.group(1)
+    if not pred_match:
+        raise ValueError(f"arith.cmpi: no valid predicate found in: {op_text!r}")
+    predicate = pred_match.group(1)
 
     operands = re.findall(r'%\w+', op_text)
     operands = [o for o in operands if o != result_name]
@@ -405,6 +459,37 @@ def parse_arith_cmpi(op_text, parse_ctx):
     return Operation(
         result=result_name,
         op_type="arith.cmpi",
+        operands=operands,
+        attributes={"predicate": predicate},
+        result_type=result_type
+    )
+
+
+@register_parser("arith.cmpf")
+def parse_arith_cmpf(op_text, parse_ctx):
+    result_match = re.match(r'(%\w+)\s*=\s*arith\.cmpf\s+', op_text)
+    if not result_match:
+        return None
+
+    result_name = result_match.group(1)
+
+    pred_match = re.search(
+        r'arith\.cmpf\s+(oeq|one|olt|ole|ogt|oge|ueq|une|ult|ule|ugt|uge|ord|uno)', op_text)
+    if not pred_match:
+        raise ValueError(f"arith.cmpf: no valid predicate found in: {op_text!r}")
+    predicate = pred_match.group(1)
+
+    operands = re.findall(r'%\w+', op_text)
+    operands = [o for o in operands if o != result_name]
+
+    result_type = "unknown"
+    type_match = re.search(r':\s*(.+)$', op_text)
+    if type_match:
+        result_type = type_match.group(1).strip()
+
+    return Operation(
+        result=result_name,
+        op_type="arith.cmpf",
         operands=operands,
         attributes={"predicate": predicate},
         result_type=result_type

@@ -393,6 +393,15 @@ def test_type_terminal_void_terminators():
     assert parser._is_op_complete("return %c0 : index")
     assert parser._is_op_complete("scf.yield")
     assert parser._is_op_complete("scf.yield %acc : tensor<8xf32>")
+    assert parser._is_op_complete("tensor.yield %val : f16")
+    assert parser._is_op_complete("linalg.yield %res : f16")
+
+
+def test_type_terminal_no_false_match_on_ssa_names():
+    """_is_op_complete must not falsely trigger on SSA names containing 'return' or 'yield'."""
+    parser = KTIRParser()
+    assert not parser._is_op_complete("%sum_returned_val = arith.addf %a, %b")
+    assert not parser._is_op_complete("%yield_mask = arith.constant")
 
 
 def test_type_terminal_no_match():
