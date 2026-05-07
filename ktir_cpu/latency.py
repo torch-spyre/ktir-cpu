@@ -273,12 +273,9 @@ class LatencyTracker:
             if isinstance(v, MemRef):
                 return v.memory_space
             if isinstance(v, TileRef):
-                return v.memref.memory_space if v.memref else "HBM"
+                return v.memref.memory_space
             if isinstance(v, AccessTile):
-                ref = v.parent_ref
-                if isinstance(ref, TileRef):
-                    return ref.memref.memory_space if ref.memref else "HBM"
-                return ref.memory_space
+                return v.parent_ref.memref.memory_space
             if isinstance(v, IndirectAccessTile):
                 all_lx = (v.parent_ref.memory_space == "LX" and
                           all(iv.memory_space == "LX" for iv in v.index_views))

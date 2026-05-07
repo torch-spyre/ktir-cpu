@@ -133,8 +133,8 @@ class TileRef:
     base_ptr: int              # always byte address
     shape: Tuple[int, ...]
     strides: List[int]         # element counts
+    memref: 'MemRef'           # parent MemRef — always set; owns memory_space and hw address conversion
     dtype: str = "f16"
-    memref: Optional['MemRef'] = None
 
     @property
     def hw_addr(self) -> Tuple[int, int]:
