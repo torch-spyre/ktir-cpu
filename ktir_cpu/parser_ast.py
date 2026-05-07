@@ -83,10 +83,10 @@ _Node = tuple
 
 _TOKEN_RE = re.compile(
     r'\s*(?:'
-    r'(%[a-zA-Z_]\w*)'             # named reference %name (group 1)
-    r'|([a-zA-Z_]\w*)'             # bare identifier  (group 2)
-    r'|(-?\d+)'                    # integer literal, possibly negative (group 3)
-    r'|(>=|<=|->|[+\-*(),:])'      # operator / punctuation  (group 4)
+    r'(%[a-zA-Z_]\w*)'               # named reference %name (group 1)
+    r'|([a-zA-Z_]\w*)'               # bare identifier  (group 2)
+    r'|(-?\d+)'                      # integer literal, possibly negative (group 3)
+    r'|(>=|<=|->|[+\-*(),:[\]])'     # operator / punctuation incl. [ ]  (group 4)
     r')'
 )
 
@@ -125,6 +125,9 @@ class _Parser:
         # Set by callers after parsing the dim list so that _atom can resolve
         # arbitrary identifiers used as dimension variables.
         self.dim_index: dict = {}
+        # Maps symbol name (e.g. "s0", "n") to its positional index.
+        # Set by callers after parsing the optional symbol list in affine sets.
+        self.sym_index: dict = {}
 
     # --- helpers ---
 
@@ -149,6 +152,19 @@ class _Parser:
             if self.peek() == ",":
                 self.consume(",")
         self.consume(")")
+        return names
+
+    def parse_sym_list(self) -> List[str]:
+        """Parse optional ``[s0, s1, ...]`` symbol list and return names."""
+        if self.peek() != "[":
+            return []
+        self.consume("[")
+        names: List[str] = []
+        while self.peek() != "]":
+            names.append(self.consume())
+            if self.peek() == ",":
+                self.consume(",")
+        self.consume("]")
         return names
 
     def parse_expr(self) -> _Node:
@@ -225,6 +241,15 @@ class _Parser:
         if re.fullmatch(r'd\d+', tok) and not self.dim_index:
             self.consume()
             return ("dim", int(tok[1:]))
+
+        # Symbol variable — any identifier that appears in the symbol list.
+        if tok in self.sym_index:
+            self.consume()
+            return ("sym", self.sym_index[tok])
+        # Fallback for canonical sN names when sym_index is empty.
+        if re.fullmatch(r's\d+', tok) and not self.sym_index:
+            self.consume()
+            return ("sym", int(tok[1:]))
 
         # Positive integer constant (negative handled in _term)
         if re.fullmatch(r'\d+', tok):
@@ -329,9 +354,9 @@ def parse_affine_map(s: str) -> AffineMap:
 
 
 def parse_affine_set(s: str) -> AffineSet:
-    """Parse ``affine_set<(d0,...) : (c0 >= 0, ...)>`` into an :class:`AffineSet`.
+    """Parse ``affine_set<(d0,...)[s0,...] : (c0 >= 0, ...)>`` into an :class:`AffineSet`.
 
-    The ``affine_set<...>`` wrapper is optional.
+    The ``affine_set<...>`` wrapper and the ``[s0, ...]`` symbol list are optional.
 
     Raises:
         ValueError: on any parse error.
@@ -342,19 +367,22 @@ def parse_affine_set(s: str) -> AffineSet:
     dim_part = inner[:colon].strip()
     con_part = inner[colon + 1:].strip()
 
+    # Parse dim list and optional symbol list from dim_part, e.g. "(d0)[s0]"
     dim_tokens = _tokenise(dim_part)
     p1 = _Parser(dim_tokens)
     dim_names = p1.parse_dim_list()
+    sym_names = p1.parse_sym_list()
 
     con_tokens = _tokenise(con_part)
     p2 = _Parser(con_tokens)
-    # Share the same name→index map so constraint expressions can reference
-    # the same dim names as the dim list.
+    # Share name→index maps so constraint expressions can reference dims and syms.
     p2.dim_index = {name: idx for idx, name in enumerate(dim_names)}
+    p2.sym_index = {name: idx for idx, name in enumerate(sym_names)}
     constraints = p2.parse_constraint_list()
 
     return AffineSet(
         n_dims=len(dim_names),
+        n_syms=len(sym_names),
         constraints=tuple(constraints),
         source=source,
     )
@@ -364,21 +392,23 @@ def parse_affine_set(s: str) -> AffineSet:
 # Evaluation functions (called by AffineMap / AffineSet convenience methods)
 # ---------------------------------------------------------------------------
 
-def _eval_node(node: _Node, dims: List[int]) -> int:
-    """Recursively evaluate an AST node given concrete dimension values."""
+def _eval_node(node: _Node, dims: List[int], syms: Optional[List[int]] = None) -> int:
+    """Recursively evaluate an AST node given concrete dimension and symbol values."""
     tag = node[0]
     if tag == "const":
         return node[1]
     if tag == "dim":
         return dims[node[1]]
+    if tag == "sym":
+        return (syms or [])[node[1]]
     if tag == "add":
-        return _eval_node(node[1], dims) + _eval_node(node[2], dims)
+        return _eval_node(node[1], dims, syms) + _eval_node(node[2], dims, syms)
     if tag == "sub":
-        return _eval_node(node[1], dims) - _eval_node(node[2], dims)
+        return _eval_node(node[1], dims, syms) - _eval_node(node[2], dims, syms)
     if tag == "neg":
-        return -_eval_node(node[1], dims)
+        return -_eval_node(node[1], dims, syms)
     if tag == "mul":
-        return node[1] * _eval_node(node[2], dims)
+        return node[1] * _eval_node(node[2], dims, syms)
     raise ValueError(f"Unknown AST node tag: {tag!r}")  # pragma: no cover
 
 
@@ -403,18 +433,20 @@ def eval_affine_map(amap: AffineMap, dims: Sequence[int]) -> Tuple[int, ...]:
     return tuple(_eval_node(e, env) for e in amap.exprs)
 
 
-def affine_set_contains(aset: AffineSet, point: Sequence[int]) -> bool:
+def affine_set_contains(aset: AffineSet, point: Sequence[int], symbols: Sequence[int] = ()) -> bool:
     """Return True if *point* satisfies all constraints in *aset*."""
     env = list(point)
-    return all(_eval_node(c, env) >= 0 for c in aset.constraints)
+    syms = list(symbols)
+    return all(_eval_node(c, env, syms) >= 0 for c in aset.constraints)
 
 
-def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...], symbols: Sequence[int] = ()) -> List[Tuple[int, ...]]:
     """Return all integer points in ``[0, shape)`` satisfying *aset*.
 
     Args:
-        aset:  Parsed AffineSet.
-        shape: Bounding box — one upper bound (exclusive) per dimension.
+        aset:    Parsed AffineSet.
+        shape:   Bounding box — one upper bound (exclusive) per dimension.
+        symbols: Concrete values for symbol variables s0, s1, ...
 
     Returns:
         List of coordinate tuples in row-major order.
@@ -427,7 +459,7 @@ def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...]) -> List[Tuple[
             f"AffineSet has {aset.n_dims} dim(s), got shape with {len(shape)}: {aset.source!r}"
         )
     ranges = [range(s) for s in shape]
-    return [pt for pt in itertools.product(*ranges) if affine_set_contains(aset, pt)]
+    return [pt for pt in itertools.product(*ranges) if affine_set_contains(aset, pt, symbols)]
 
 
 # ---------------------------------------------------------------------------

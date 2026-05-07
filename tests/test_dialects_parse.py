@@ -514,6 +514,75 @@ class TestKtdpParsers(ParseTestMixin):
                 args={"%view": "memref<1024xf16>", "%c0": "index"},
             )
 
+    # -- Dynamic-size tests (currently failing) --------------------------------
+    # These document the three gaps that need to be fixed:
+    #   (1) affine_set with symbolic dims [s0] crashes the parser
+    #   (2) memref<?xf32> (dynamic dimension '?') crashes memref type parsing
+    #   (3) SSA sizes like sizes: [%n_idx] are stored as None and never
+    #       registered as operands, so context.get_value() cannot resolve them
+    #
+    # See: https://github.com/torch-spyre/ktir-cpu/issues/30
+
+    def test_affine_set_with_symbolic_dim(self):
+        # affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)> uses a symbolic
+        # dimension s0 whose value is only known at runtime (the tensor size).
+        # The current parser raises ValueError on the unknown token 's0'.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
+            " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            args={"%ptr": "index", "%n_idx": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "dtype", "f32")
+        self.assert_attribute(op, "memory_space", "HBM")
+        # shape should be dynamic (None or -1 convention TBD)
+        # operands must include both %ptr and %n_idx
+        self.assert_num_operands(op, 2)
+
+    def test_construct_memory_view_dynamic_memref_type(self):
+        # memref<?xf32> uses '?' for a dimension whose size is an SSA value.
+        # coordinate_set with symbolic dim is required by the MLIR verifier
+        # when the memref has a dynamic dimension.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
+            " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            args={"%ptr": "index", "%n_idx": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "dtype", "f32")
+
+    def test_construct_memory_view_ssa_size_as_operand(self):
+        # When sizes: [%n_idx] appears, %n_idx must be added to the op's
+        # operand list (like SSA strides already are) so the executor can
+        # call context.get_value("%n_idx") to resolve the runtime size.
+        # coordinate_set with symbolic dim is required by the MLIR verifier
+        # when the memref has a dynamic dimension.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
+            " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            args={"%ptr": "index", "%n_idx": "index"},
+        )
+        # %ptr + %n_idx = 2 operands
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%ptr", "%n_idx")
+
+    def test_construct_access_tile_dynamic_memref(self):
+        # construct_access_tile already handles memref<?xf32> correctly:
+        # it reads shape only from the !ktdp.access_tile<...> result type,
+        # never from the memref type, so '?' passes through without issue.
+        op = self._parse(
+            "%x_tile = ktdp.construct_access_tile %x_mem[%off_idx]"
+            " { access_tile_order = affine_map<(d0) -> (d0)>,"
+            "   access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 1023 >= 0)> }"
+            " : memref<?xf32> -> !ktdp.access_tile<1024xindex>",
+            args={"%x_mem": "memref<?xf32>", "%off_idx": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_access_tile")
+        self.assert_attribute(op, "shape", (1024,))
+
 
 # ---------------------------------------------------------------------------
 # scf dialect parsers

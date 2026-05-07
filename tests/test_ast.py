@@ -231,6 +231,35 @@ class TestParseAffineSet:
         assert s.constraints[0] == ("sub", ("dim", 0), ("dim", 1))
         assert s.constraints[1] == ("sub", ("const", 63), ("dim", 0))
 
+    def test_symbolic_dim_parsed(self):
+        # (d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0) — s0 is a runtime symbol
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        assert s.n_dims == 1
+        assert s.n_syms == 1
+        assert len(s.constraints) == 2
+        # Second constraint: -d0 + s0 - 1 >= 0, normalised to sub(lhs, 0)
+        # The s0 token should appear as ("sym", 0) in the AST
+        def _find_sym(node):
+            if isinstance(node, tuple):
+                if node[0] == "sym":
+                    return node
+                for child in node[1:]:
+                    found = _find_sym(child)
+                    if found:
+                        return found
+            return None
+        assert _find_sym(s.constraints[1]) == ("sym", 0)
+
+    def test_symbolic_dim_multiple_syms(self):
+        # Two symbols: (d0)[s0, s1]
+        s = parse_affine_set("affine_set<(d0)[s0, s1] : (d0 >= 0, -d0 + s0 - 1 >= 0, s1 >= 0)>")
+        assert s.n_syms == 2
+
+    def test_no_symbol_list_n_syms_zero(self):
+        # A set with no [sN] list has n_syms == 0
+        s = parse_affine_set("affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>")
+        assert s.n_syms == 0
+
 
 # ===========================================================================
 # eval_affine_map
@@ -305,6 +334,14 @@ class TestAffineSetContains:
         assert not affine_set_contains(s, [2, 5])  # 2 < 5
         assert not affine_set_contains(s, [64, 0]) # 64 > 63
 
+    def test_symbolic_contains_with_symbol(self):
+        # (d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0) → 0 <= d0 <= s0-1
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        assert affine_set_contains(s, [0], symbols=[8])
+        assert affine_set_contains(s, [7], symbols=[8])
+        assert not affine_set_contains(s, [8], symbols=[8])
+        assert not affine_set_contains(s, [-1], symbols=[8])
+
 
 # ===========================================================================
 # enumerate_affine_set
@@ -345,6 +382,18 @@ class TestEnumerateAffineSet:
         s = parse_affine_set("affine_set<(d0, d1) : (d0 >= 0, d1 >= 0)>")
         with pytest.raises(ValueError, match="2 dim"):
             enumerate_affine_set(s, (4,))
+
+    def test_symbolic_enumerate_with_symbol(self):
+        # (d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0) enumerates [0, s0)
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        pts = enumerate_affine_set(s, (16,), symbols=[5])
+        assert pts == [(0,), (1,), (2,), (3,), (4,)]
+
+    def test_symbolic_enumerate_symbol_larger_than_shape(self):
+        # When s0 > shape bound, shape acts as the cap
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        pts = enumerate_affine_set(s, (4,), symbols=[100])
+        assert len(pts) == 4  # capped by shape
 
 
 # ===========================================================================

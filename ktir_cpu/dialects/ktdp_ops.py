@@ -48,7 +48,11 @@ def ktdp__construct_memory_view(op, context, env):
     for attr in ("shape", "strides", "memory_space", "dtype"):
         if attr not in op.attributes:
             raise ValueError(f"construct_memory_view: missing required attribute '{attr}'")
-    shape = tuple(op.attributes["shape"])
+    # SSA size names are stored as strings by the parser; resolve them at runtime.
+    shape = tuple(
+        context.get_value(s) if isinstance(s, str) else s
+        for s in op.attributes["shape"]
+    )
     # SSA stride names are stored as strings by the parser; resolve them at runtime.
     strides = [context.get_value(s) if isinstance(s, str) else s for s in op.attributes["strides"]]
     memory_space = op.attributes["memory_space"]
@@ -147,8 +151,10 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     result_name = result_match.group(1)
     ptr_operand = result_match.group(2)
 
-    # Parse sizes — int values validated against memref dims; SSA names stored as None.
+    # Parse sizes — int values validated against memref dims; SSA names stored as strings
+    # and collected in ssa_size_operands so the executor can resolve them at runtime.
     sizes = None
+    ssa_size_operands = []
     sizes_match = re.search(r'sizes\s*:\s*\[([^\]]+)\]', op_text)
     if sizes_match:
         sizes = []
@@ -157,7 +163,9 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
             try:
                 sizes.append(int(token))
             except ValueError:
-                sizes.append(None)  # SSA name
+                sizes.append(token)  # SSA name — resolved at runtime
+                if token not in ssa_size_operands:
+                    ssa_size_operands.append(token)
 
     # SSA stride operands: when a stride is a runtime SSA value (not a literal),
     # the parser stores the name as a string and appends it to ssa_stride_operands
@@ -194,16 +202,25 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         raise ValueError(
             f"construct_memory_view: memref<{memref_match.group(1)}> has no dimensions"
         )
-    memref_dims = [int(p) for p in parts[:-1]]
-    shape = tuple(memref_dims)
-    # If sizes is None, no checking is performed.
+    memref_dims = [None if p == "?" else int(p) for p in parts[:-1]]
+    # Build shape: prefer SSA size tokens for dynamic dims, fall back to memref_dims.
+    # SSA size strings are resolved at runtime by the executor via context.get_value().
     if sizes is not None:
+        resolved = []
         for i, s in enumerate(sizes):
-            if s is not None and s != memref_dims[i]:
+            mem_d = memref_dims[i] if i < len(memref_dims) else None
+            if isinstance(s, str):
+                resolved.append(s)  # SSA name — runtime value
+            elif s is not None and mem_d is not None and s != mem_d:
                 raise ValueError(
                     f"construct_memory_view: sizes[{i}]={s} does not match "
-                    f"memref dimension {memref_dims[i]}"
+                    f"memref dimension {mem_d}"
                 )
+            else:
+                resolved.append(s if s is not None else mem_d)
+        shape = tuple(resolved)
+    else:
+        shape = tuple(memref_dims)
 
     attrs = parse_attr_block(op_text, parse_ctx.aliases)
     coordinate_set_str = attrs.get('coordinate_set')
@@ -221,9 +238,9 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     return Operation(
         result=result_name,
         op_type="ktdp.construct_memory_view",
-        operands=[ptr_operand] + ssa_stride_operands,
+        operands=[ptr_operand] + ssa_size_operands + ssa_stride_operands,
         attributes=attributes,
-        result_type=f"memref<{'x'.join(str(s) for s in shape)}x{dtype}>"
+        result_type=f"memref<{'x'.join('?' if (s is None or isinstance(s, str)) else str(s) for s in shape)}x{dtype}>"
     )
 
 

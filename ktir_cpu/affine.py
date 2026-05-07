@@ -79,32 +79,34 @@ class AffineMap:
 
 @dataclass(frozen=True)
 class AffineSet:
-    """Parsed affine_set<(d0,...) : (c0 >= 0, ...)>.
+    """Parsed affine_set<(d0,...)[s0,...] : (c0 >= 0, ...)>.
 
     Attributes:
         n_dims:       number of dimension variables
+        n_syms:       number of symbol variables (s0, s1, ...)
         constraints:  tuple of AST nodes; each node is the LHS of ``expr >= 0``
         source:       original verbatim string (for debugging / round-trip)
     """
     n_dims: int
     constraints: Tuple["_Node", ...]
     source: str
+    n_syms: int = 0
 
-    def contains(self, point: Sequence[int]) -> bool:
+    def contains(self, point: Sequence[int], symbols: Sequence[int] = ()) -> bool:
         """Return True if *point* satisfies all constraints.
 
         Delegates to ``parser_ast.affine_set_contains``.
         """
         from .parser_ast import affine_set_contains
-        return affine_set_contains(self, point)
+        return affine_set_contains(self, point, symbols)
 
-    def enumerate(self, shape: Tuple[int, ...]) -> List[Tuple[int, ...]]:
+    def enumerate(self, shape: Tuple[int, ...], symbols: Sequence[int] = ()) -> List[Tuple[int, ...]]:
         """Return all integer points in ``[0, shape)`` satisfying all constraints.
 
         Delegates to ``parser_ast.enumerate_affine_set``.
         """
         from .parser_ast import enumerate_affine_set
-        return enumerate_affine_set(self, shape)
+        return enumerate_affine_set(self, shape, symbols)
 
     def is_full(self, shape: Tuple[int, ...]) -> bool:
         """Return True if this set covers every coordinate in *shape*.

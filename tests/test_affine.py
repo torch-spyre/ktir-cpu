@@ -75,3 +75,20 @@ class TestAffineSetObject:
         s = parse_affine_set("affine_set<(d0) : (d0 >= 0)>")
         with pytest.raises((AttributeError, TypeError)):
             s.n_dims = 99  # type: ignore[misc]
+
+    def test_n_syms_default_zero(self):
+        s = parse_affine_set("affine_set<(d0) : (d0 >= 0)>")
+        assert s.n_syms == 0
+
+    def test_n_syms_parsed(self):
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        assert s.n_syms == 1
+
+    def test_contains_with_symbol(self):
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        assert s.contains([3], symbols=[8])
+        assert not s.contains([8], symbols=[8])
+
+    def test_enumerate_with_symbol(self):
+        s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
+        assert s.enumerate((10,), symbols=[4]) == [(0,), (1,), (2,), (3,)]
