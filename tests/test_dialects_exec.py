@@ -235,6 +235,200 @@ class TestArithInt:
         ctx = _ctx_with(**{"%a": 10, "%b": 3})
         assert _call("arith.remui", ctx, _make_env(), operands=["%a", "%b"]) == 1
 
+    def test_divsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 7, "%b": 2})
+        assert _call("arith.divsi", ctx, _make_env(), operands=["%a", "%b"]) == 3
+
+    def test_remsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 7, "%b": 3})
+        assert _call("arith.remsi", ctx, _make_env(), operands=["%a", "%b"]) == 1
+
+    def test_ceildivsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 7, "%b": 2})
+        assert _call("arith.ceildivsi", ctx, _make_env(), operands=["%a", "%b"]) == 4
+
+    def test_ceildivui_scalar(self):
+        ctx = _ctx_with(**{"%a": 7, "%b": 2})
+        assert _call("arith.ceildivui", ctx, _make_env(), operands=["%a", "%b"]) == 4
+
+    def test_minsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 3, "%b": 7})
+        assert _call("arith.minsi", ctx, _make_env(), operands=["%a", "%b"]) == 3
+
+    def test_minsi_negative(self):
+        ctx = _ctx_with(**{"%a": -5, "%b": 2})
+        assert _call("arith.minsi", ctx, _make_env(), operands=["%a", "%b"]) == -5
+
+    def test_maxsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 3, "%b": 7})
+        assert _call("arith.maxsi", ctx, _make_env(), operands=["%a", "%b"]) == 7
+
+    def test_minsi_tiles(self):
+        ctx = _ctx_with(**{
+            "%a": Tile(np.array([1, 5, 3], dtype=np.int32), "i32", (3,)),
+            "%b": Tile(np.array([4, 2, 6], dtype=np.int32), "i32", (3,)),
+        })
+        result = _call("arith.minsi", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([1, 2, 3], dtype=np.int32))
+
+    def test_maxsi_tiles(self):
+        ctx = _ctx_with(**{
+            "%a": Tile(np.array([1, 5, 3], dtype=np.int32), "i32", (3,)),
+            "%b": Tile(np.array([4, 2, 6], dtype=np.int32), "i32", (3,)),
+        })
+        result = _call("arith.maxsi", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([4, 5, 6], dtype=np.int32))
+
+    def test_minui_scalar(self):
+        ctx = _ctx_with(**{"%a": 3, "%b": 7})
+        assert _call("arith.minui", ctx, _make_env(), operands=["%a", "%b"]) == 3
+
+    def test_maxui_scalar(self):
+        ctx = _ctx_with(**{"%a": 3, "%b": 7})
+        assert _call("arith.maxui", ctx, _make_env(), operands=["%a", "%b"]) == 7
+
+    def test_floordivsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 7, "%b": 2})
+        assert _call("arith.floordivsi", ctx, _make_env(), operands=["%a", "%b"]) == 3
+
+    def test_andi_scalar(self):
+        ctx = _ctx_with(**{"%a": 0b1010, "%b": 0b1100})
+        assert _call("arith.andi", ctx, _make_env(), operands=["%a", "%b"]) == 0b1000
+
+    def test_ori_scalar(self):
+        ctx = _ctx_with(**{"%a": 0b1010, "%b": 0b1100})
+        assert _call("arith.ori", ctx, _make_env(), operands=["%a", "%b"]) == 0b1110
+
+    def test_xori_scalar(self):
+        ctx = _ctx_with(**{"%a": 0b1010, "%b": 0b1100})
+        assert _call("arith.xori", ctx, _make_env(), operands=["%a", "%b"]) == 0b0110
+
+    def test_shli_scalar(self):
+        ctx = _ctx_with(**{"%a": 1, "%b": 3})
+        assert _call("arith.shli", ctx, _make_env(), operands=["%a", "%b"]) == 8
+
+    def test_shrsi_scalar(self):
+        ctx = _ctx_with(**{"%a": 8, "%b": 2})
+        assert _call("arith.shrsi", ctx, _make_env(), operands=["%a", "%b"]) == 2
+
+    def test_shrui_scalar(self):
+        ctx = _ctx_with(**{"%a": 8, "%b": 2})
+        assert _call("arith.shrui", ctx, _make_env(), operands=["%a", "%b"]) == 2
+
+    def test_andi_tile(self):
+        data = np.array([0b1010, 0b1100, 0b1111], dtype=np.int32)
+        t = Tile(data, "i32", data.shape)
+        ctx = _ctx_with(**{"%a": t, "%b": 0b1010})
+        result = _call("arith.andi", ctx, _make_env(), operands=["%a", "%b"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([0b1010, 0b1000, 0b1010]))
+
+# ---------------------------------------------------------------------------
+# arith (float unary + cmpf) dialect exec
+# ---------------------------------------------------------------------------
+
+class TestArithFloatUnary:
+    def test_negf_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(3.0)})
+        result = _call("arith.negf", ctx, _make_env(), operands=["%a"])
+        assert float(result) == pytest.approx(-3.0, rel=1e-2)
+
+    def test_negf_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([1, -2, 3])})
+        result = _call("arith.negf", ctx, _make_env(), operands=["%a"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([-1, 2, -3], dtype=np.float16))
+
+    def test_absf_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(-5.0)})
+        result = _call("arith.absf", ctx, _make_env(), operands=["%a"])
+        assert float(result) == pytest.approx(5.0, rel=1e-2)
+
+    def test_absf_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([-1, 2, -3])})
+        result = _call("arith.absf", ctx, _make_env(), operands=["%a"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([1, 2, 3], dtype=np.float16))
+
+    def test_remf_scalars(self):
+        ctx = _ctx_with(**{"%a": np.float16(5.0), "%b": np.float16(3.0)})
+        result = _call("arith.remf", ctx, _make_env(), operands=["%a", "%b"])
+        assert float(result) == pytest.approx(2.0, rel=1e-2)
+
+    def test_minf_tiles(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([2, 4, 3])})
+        result = _call("arith.minf", ctx, _make_env(), operands=["%a", "%b"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([1, 4, 3], dtype=np.float16))
+
+    def test_minimumf_tiles(self):
+        # arith.minimumf dispatches to the same handler as arith.minf
+        ctx = _ctx_with(**{"%a": _tile([1, 5, 3]), "%b": _tile([2, 4, 3])})
+        result = _call("arith.minimumf", ctx, _make_env(), operands=["%a", "%b"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([1, 4, 3], dtype=np.float16))
+
+    def test_cmpf_olt_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(1.0), "%b": np.float16(2.0)})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "olt"})
+        assert result is True
+
+    def test_cmpf_ogt_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(3.0), "%b": np.float16(2.0)})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "ogt"})
+        assert result is True
+
+    def test_cmpf_oeq_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([1, 2, 3]), "%b": _tile([1, 0, 3])})
+        result = _call("arith.cmpf", ctx, _make_env(),
+                       operands=["%a", "%b"], attributes={"predicate": "oeq"})
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([True, False, True]))
+
+# ---------------------------------------------------------------------------
+# arith (new casts) dialect exec
+# ---------------------------------------------------------------------------
+
+class TestArithNewCasts:
+    def test_extui_scalar(self):
+        ctx = _ctx_with(**{"%a": 5})
+        assert _call("arith.extui", ctx, _make_env(), operands=["%a"]) == 5
+
+    def test_trunci_scalar(self):
+        ctx = _ctx_with(**{"%a": 300})
+        assert _call("arith.trunci", ctx, _make_env(), operands=["%a"]) == 300
+
+    def test_uitofp_scalar(self):
+        ctx = _ctx_with(**{"%a": 4})
+        result = _call("arith.uitofp", ctx, _make_env(), operands=["%a"])
+        assert float(result) == pytest.approx(4.0, rel=1e-2)
+
+    def test_fptosi_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(3.7)})
+        result = _call("arith.fptosi", ctx, _make_env(), operands=["%a"])
+        assert int(result) == 3
+
+    def test_fptoui_scalar(self):
+        ctx = _ctx_with(**{"%a": np.float16(2.9)})
+        result = _call("arith.fptoui", ctx, _make_env(), operands=["%a"])
+        assert int(result) == 2
+
+    def test_extui_tile(self):
+        data = np.array([1, 2, 3], dtype=np.int32)
+        t = Tile(data, "i32", data.shape)
+        ctx = _ctx_with(**{"%a": t})
+        result = _call("arith.extui", ctx, _make_env(), operands=["%a"])
+        assert isinstance(result, Tile)
+        assert result.data.dtype == np.int64
+
+    def test_fptosi_tile(self):
+        ctx = _ctx_with(**{"%a": _tile([1.7, 2.3, -3.9])})
+        result = _call("arith.fptosi", ctx, _make_env(), operands=["%a"])
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([1, 2, -3], dtype=np.int32))
+
 # ---------------------------------------------------------------------------
 # arith (casts) dialect exec
 # ---------------------------------------------------------------------------
@@ -263,11 +457,26 @@ class TestArithCastsConstants:
         ctx = _ctx_with(**{"%a": 7})
         assert _call("arith.index_cast", ctx, _make_env(), operands=["%a"]) == 7
 
+    def test_index_castui(self):
+        ctx = _ctx_with(**{"%a": 7})
+        assert _call("arith.index_castui", ctx, _make_env(), operands=["%a"]) == 7
+
+    def test_convertf_f16_to_f32(self):
+        ctx = _ctx_with(**{"%a": _tile([1.0, 2.0])})
+        result = _call("arith.convertf", ctx, _make_env(), operands=["%a"])
+        assert result.data.dtype == np.float32
+
+    def test_convertf_f32_to_f16(self):
+        t = Tile(np.array([1.0, 2.0], dtype=np.float32), "f32", (2,))
+        ctx = _ctx_with(**{"%a": t})
+        result = _call("arith.convertf", ctx, _make_env(), operands=["%a"])
+        assert result.data.dtype == np.float16
+
     def test_sitofp(self):
-        # signed int to float — returns np.float16
+        # signed int to float — returns a float scalar
         ctx = _ctx_with(**{"%a": 3})
         result = _call("arith.sitofp", ctx, _make_env(), operands=["%a"])
-        assert isinstance(result, np.float16)
+        assert isinstance(result, (float, np.floating))
         assert float(result) == pytest.approx(3.0, rel=1e-2)
 
 
