@@ -137,18 +137,20 @@ class TileRef:
     dtype: str = "f16"
 
     @property
-    def hw_addr(self) -> Tuple[int, int]:
-        """Address in the form (main_addr, intra_byte) for ``mem.read/write``.
+    def hbm_addr(self) -> Tuple[int, int]:
+        """HBM hardware address as ``(stick_index, intra_byte_offset)``.
 
-        HBM: ``(stick_index, intra_byte_offset)`` — unpack and pass as
-             ``hbm.read(stick, n, dtype, intra_byte=intra)``.
-        LX:  ``(byte_ptr, 0)`` — ``lx.read(byte_ptr, n, dtype)`` (intra always 0).
+        Only valid when ``memref.memory_space == "HBM"``.  Pass to
+        ``HBMSimulator.read/write`` as ``hbm.read(stick, n, dtype, intra_byte=intra)``.
+        For LX tiles use ``base_ptr`` directly (byte address).
         """
-        if self.memref.memory_space == "HBM":
-            from .memory import HBMSimulator
-            return (self.base_ptr // HBMSimulator.STICK_BYTES,
-                    self.base_ptr % HBMSimulator.STICK_BYTES)
-        return (self.base_ptr, 0)
+        assert self.memref.memory_space == "HBM", (
+            "hbm_addr is only valid for HBM tiles; "
+            f"this TileRef is in {self.memref.memory_space!r}"
+        )
+        from .memory import HBMSimulator
+        return (self.base_ptr // HBMSimulator.STICK_BYTES,
+                self.base_ptr % HBMSimulator.STICK_BYTES)
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""

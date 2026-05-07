@@ -213,14 +213,19 @@ class MemoryOps:
             Tile value (tensor) loaded into LX
         """
         memref = tile_ref.memref
-        stick_bytes = HBMSimulator.STICK_BYTES if memref.memory_space == "HBM" else None
-        mem = context.hbm if memref.memory_space == "HBM" else context.lx
-        hw_main, hw_intra = tile_ref.hw_addr
+        is_hbm = memref.memory_space == "HBM"
+        stick_bytes = HBMSimulator.STICK_BYTES if is_hbm else None
+        if is_hbm:
+            stick, intra = tile_ref.hbm_addr
+            def _read(n, dtype): return context.hbm.read(stick, n, dtype, intra_byte=intra)
+        else:
+            ptr = tile_ref.base_ptr
+            def _read(n, dtype): return context.lx.read(ptr, n, dtype)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
             n = int(np.prod(tile_ref.shape))
-            data = mem.read(hw_main, n, tile_ref.dtype, intra_byte=hw_intra).reshape(tile_ref.shape)
+            data = _read(n, tile_ref.dtype).reshape(tile_ref.shape)
             MemoryOps._write_to_lx(context, data)
             if stick_bytes:
                 bpe = _bytes_per_elem(tile_ref.dtype)
@@ -239,7 +244,7 @@ class MemoryOps:
             coords, stick_bytes=stick_bytes
         )
         span = max(offsets) + 1 if offsets else 1
-        flat = mem.read(hw_main, span, tile_ref.dtype, intra_byte=hw_intra)
+        flat = _read(span, tile_ref.dtype)
 
         gathered = flat[offsets]
         out_shape = result_shape if result_shape is not None else tile_ref.shape
@@ -274,12 +279,18 @@ class MemoryOps:
             coords: Optional list of local coordinate tuples to scatter into.
         """
         memref = tile_ref.memref
-        mem = context.hbm if memref.memory_space == "HBM" else context.lx
-        hw_main, hw_intra = tile_ref.hw_addr
+        if memref.memory_space == "HBM":
+            stick, intra = tile_ref.hbm_addr
+            def _read(n, dtype): return context.hbm.read(stick, n, dtype, intra_byte=intra)
+            def _write(data):    context.hbm.write(stick, data, intra_byte=intra)
+        else:
+            ptr = tile_ref.base_ptr
+            def _read(n, dtype): return context.lx.read(ptr, n, dtype)
+            def _write(data):    context.lx.write(ptr, data)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            mem.write(hw_main, tile.data.flatten(), intra_byte=hw_intra)
+            _write(tile.data.flatten())
             return
 
         # Strided or coord-set path: read-modify-write via scatter offsets.
@@ -287,9 +298,9 @@ class MemoryOps:
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
         )
         span = max(offsets) + 1 if offsets else 1
-        flat = mem.read(hw_main, span, tile_ref.dtype, intra_byte=hw_intra)
+        flat = _read(span, tile_ref.dtype)
         flat[offsets] = tile.data.flatten()
-        mem.write(hw_main, flat, intra_byte=hw_intra)
+        _write(flat)
 
     @staticmethod
     def indirect_load(
@@ -325,12 +336,12 @@ class MemoryOps:
                     )
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
                     addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
-                    idx_mem = context.hbm if idx_view.memory_space == "HBM" else context.lx
-                    idx_tile_ref = TileRef(
-                        base_ptr=addr, shape=(1,), strides=[1],
-                        dtype=idx_view.dtype, memref=idx_view)
-                    hw_main, hw_intra = idx_tile_ref.hw_addr
-                    raw = idx_mem.read(hw_main, 1, idx_view.dtype, intra_byte=hw_intra)
+                    if idx_view.memory_space == "HBM":
+                        stick = addr // HBMSimulator.STICK_BYTES
+                        intra = addr % HBMSimulator.STICK_BYTES
+                        raw = context.hbm.read(stick, 1, idx_view.dtype, intra_byte=intra)
+                    else:
+                        raw = context.lx.read(addr, 1, idx_view.dtype)
                     coord.append(int(raw[0]))
                 elif sub["kind"] == "direct":
                     coord.append(pt[sub["var_index"]])

@@ -301,7 +301,7 @@ class LXScratchpad:
         self.memory: Dict[int, np.ndarray] = {}
         self.next_ptr = 0  # Local address space
 
-    def read(self, ptr: int, n_elements: int, dtype: str, *, intra_byte: int = 0) -> np.ndarray:
+    def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
         """Read *n_elements* elements starting at byte address *ptr*.
 
         Returns a flat array of length *n_elements*.  Raises ValueError if
@@ -311,17 +311,14 @@ class LXScratchpad:
             ptr: Local address (byte offset)
             n_elements: Number of elements to read
             dtype: Data type
-            intra_byte: Always 0 for LX (no sub-stick concept); accepted for
-                call-site symmetry with ``HBMSimulator.read``.
 
         Returns:
             Flat NumPy array of length n_elements
         """
-        assert intra_byte == 0, "LX has no sub-byte addressing; intra_byte must be 0"
         np_dtype = to_np_dtype(dtype)
         return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
 
-    def write(self, ptr: int, data: np.ndarray, *, intra_byte: int = 0):
+    def write(self, ptr: int, data: np.ndarray):
         """Write *data* (flat ndarray) starting at byte address *ptr*.
 
         Patches an existing allocation in-place when *ptr* falls within one.
@@ -330,10 +327,7 @@ class LXScratchpad:
         Args:
             ptr: Local address (byte offset)
             data: Flat NumPy array to write
-            intra_byte: Always 0 for LX; accepted for call-site symmetry with
-                ``HBMSimulator.write``.
         """
-        assert intra_byte == 0, "LX has no sub-byte addressing; intra_byte must be 0"
         _write_flat(self.memory, ptr, data)
 
     def clear(self):
