@@ -245,6 +245,9 @@ class HBMSimulator:
         """Convert addr to byte address. Accepts stick index (int) or (stick, intra_byte_offset) tuple."""
         if isinstance(addr, tuple):
             stick, intra = addr
+            assert 0 <= intra < self.STICK_BYTES, (
+                f"intra_byte_offset {intra} out of range [0, {self.STICK_BYTES})"
+            )
             return stick * self.STICK_BYTES + intra
         return addr * self.STICK_BYTES
 
