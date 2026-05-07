@@ -514,12 +514,11 @@ class TestKtdpParsers(ParseTestMixin):
                 args={"%view": "memref<1024xf16>", "%c0": "index"},
             )
 
-    # -- Dynamic-size tests (currently failing) --------------------------------
-    # These document the three gaps that need to be fixed:
-    #   (1) affine_set with symbolic dims [s0] crashes the parser
-    #   (2) memref<?xf32> (dynamic dimension '?') crashes memref type parsing
-    #   (3) SSA sizes like sizes: [%n_idx] are stored as None and never
-    #       registered as operands, so context.get_value() cannot resolve them
+    # -- Dynamic-size tests ----------------------------------------------------
+    # These cover the three gaps fixed in issue #30:
+    #   (1) affine_set with symbolic dims [s0]
+    #   (2) memref<?xf32> (dynamic dimension '?')
+    #   (3) SSA sizes like sizes: [%n_idx] registered as operands
     #
     # See: https://github.com/torch-spyre/ktir-cpu/issues/30
 
