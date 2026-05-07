@@ -241,38 +241,37 @@ class HBMSimulator:
         self.next_ptr = (self.next_ptr + self.STICK_BYTES - 1) & ~(self.STICK_BYTES - 1)
         return ptr // self.STICK_BYTES
 
-    def _resolve_addr(self, addr) -> int:
-        """Convert addr to byte address. Accepts stick index (int) or (stick, intra_byte_offset) tuple."""
-        if isinstance(addr, tuple):
-            stick, intra = addr
-            assert 0 <= intra < self.STICK_BYTES, (
-                f"intra_byte_offset {intra} out of range [0, {self.STICK_BYTES})"
-            )
-            return stick * self.STICK_BYTES + intra
-        return addr * self.STICK_BYTES
-
-    def read(self, addr, n_elements: int, dtype: str) -> np.ndarray:
+    def read(self, stick: int, n_elements: int, dtype: str, *, intra_byte: int = 0) -> np.ndarray:
         """Read *n_elements* elements from HBM.
 
         Args:
-            addr: Stick index (int) or (stick, intra_byte_offset) tuple.
+            stick: HBM stick index (from ``allocate()`` or ``TileRef.hw_addr``).
             n_elements: Number of elements to read.
             dtype: Data type.
+            intra_byte: Byte offset within the stick (default 0).
 
         Returns:
             Flat NumPy array of length n_elements.
         """
+        assert 0 <= intra_byte < self.STICK_BYTES, (
+            f"intra_byte {intra_byte} out of range [0, {self.STICK_BYTES})"
+        )
         np_dtype = to_np_dtype(dtype)
-        return _read_flat(self.memory, self._resolve_addr(addr), n_elements, np_dtype, bytes_per_elem(dtype))
+        return _read_flat(self.memory, stick * self.STICK_BYTES + intra_byte,
+                          n_elements, np_dtype, bytes_per_elem(dtype))
 
-    def write(self, addr, data: np.ndarray):
+    def write(self, stick: int, data: np.ndarray, *, intra_byte: int = 0):
         """Write *data* (flat ndarray) to HBM.
 
         Args:
-            addr: Stick index (int) or (stick, intra_byte_offset) tuple.
+            stick: HBM stick index (from ``allocate()`` or ``TileRef.hw_addr``).
             data: Flat NumPy array to write.
+            intra_byte: Byte offset within the stick (default 0).
         """
-        _write_flat(self.memory, self._resolve_addr(addr), data)
+        assert 0 <= intra_byte < self.STICK_BYTES, (
+            f"intra_byte {intra_byte} out of range [0, {self.STICK_BYTES})"
+        )
+        _write_flat(self.memory, stick * self.STICK_BYTES + intra_byte, data)
 
     def read_element(self, addr: int, dtype: str = "f16"):
         """Read a single element by byte address.
@@ -302,7 +301,7 @@ class LXScratchpad:
         self.memory: Dict[int, np.ndarray] = {}
         self.next_ptr = 0  # Local address space
 
-    def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
+    def read(self, ptr: int, n_elements: int, dtype: str, *, intra_byte: int = 0) -> np.ndarray:
         """Read *n_elements* elements starting at byte address *ptr*.
 
         Returns a flat array of length *n_elements*.  Raises ValueError if
@@ -312,14 +311,17 @@ class LXScratchpad:
             ptr: Local address (byte offset)
             n_elements: Number of elements to read
             dtype: Data type
+            intra_byte: Always 0 for LX (no sub-stick concept); accepted for
+                call-site symmetry with ``HBMSimulator.read``.
 
         Returns:
             Flat NumPy array of length n_elements
         """
+        assert intra_byte == 0, "LX has no sub-byte addressing; intra_byte must be 0"
         np_dtype = to_np_dtype(dtype)
         return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
 
-    def write(self, ptr: int, data: np.ndarray):
+    def write(self, ptr: int, data: np.ndarray, *, intra_byte: int = 0):
         """Write *data* (flat ndarray) starting at byte address *ptr*.
 
         Patches an existing allocation in-place when *ptr* falls within one.
@@ -328,7 +330,10 @@ class LXScratchpad:
         Args:
             ptr: Local address (byte offset)
             data: Flat NumPy array to write
+            intra_byte: Always 0 for LX; accepted for call-site symmetry with
+                ``HBMSimulator.write``.
         """
+        assert intra_byte == 0, "LX has no sub-byte addressing; intra_byte must be 0"
         _write_flat(self.memory, ptr, data)
 
     def clear(self):

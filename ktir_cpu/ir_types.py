@@ -105,17 +105,6 @@ class MemRef:
             return self.base_ptr * HBMSimulator.STICK_BYTES
         return self.base_ptr
 
-    def mem_addr(self, byte_ptr: int):
-        """Convert a byte pointer to the address form expected by the memory backend.
-
-        HBM: returns (stick_index, intra_byte_offset) tuple.
-        LX: returns byte_ptr unchanged.
-        """
-        if self.memory_space == "HBM":
-            from .memory import HBMSimulator
-            return (byte_ptr // HBMSimulator.STICK_BYTES, byte_ptr % HBMSimulator.STICK_BYTES)
-        return byte_ptr
-
     def to_tile_ref(self) -> 'TileRef':
         """Convert to a byte-addressed TileRef for load/store operations."""
         return TileRef(
@@ -146,6 +135,20 @@ class TileRef:
     strides: List[int]         # element counts
     dtype: str = "f16"
     memref: Optional['MemRef'] = None
+
+    @property
+    def hw_addr(self) -> Tuple[int, int]:
+        """Address in the form (main_addr, intra_byte) for ``mem.read/write``.
+
+        HBM: ``(stick_index, intra_byte_offset)`` — unpack and pass as
+             ``hbm.read(stick, n, dtype, intra_byte=intra)``.
+        LX:  ``(byte_ptr, 0)`` — ``lx.read(byte_ptr, n, dtype)`` (intra always 0).
+        """
+        if self.memref.memory_space == "HBM":
+            from .memory import HBMSimulator
+            return (self.base_ptr // HBMSimulator.STICK_BYTES,
+                    self.base_ptr % HBMSimulator.STICK_BYTES)
+        return (self.base_ptr, 0)
 
     def size_bytes(self) -> int:
         """Calculate size in bytes."""

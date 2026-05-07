@@ -210,7 +210,7 @@ class TestMemorySimulator:
         """Read a single element from the middle of an existing HBM allocation."""
         hbm, ptr = self._make_hbm()
         # Element [1, 2] is at flat offset 6, byte offset 12
-        result = hbm.read((ptr, 12), 1, "f16")
+        result = hbm.read(ptr, 1, "f16", intra_byte=12)
         assert result[0] == np.float16(6.0)
 
     def test_lx_sub_allocation_read(self):
@@ -224,7 +224,7 @@ class TestMemorySimulator:
         """Read a full row from the middle of an HBM allocation."""
         hbm, ptr = self._make_hbm()
         # Row 2 starts at flat offset 8, byte offset 16
-        result = hbm.read((ptr, 16), 4, "f16")
+        result = hbm.read(ptr, 4, "f16", intra_byte=16)
         assert np.array_equal(result, np.array([8, 9, 10, 11], dtype=np.float16))
 
     def test_lx_sub_allocation_read_row(self):
@@ -238,7 +238,7 @@ class TestMemorySimulator:
     def test_hbm_sub_allocation_write(self):
         """Write a single element into the middle of an HBM allocation."""
         hbm, ptr = self._make_hbm()
-        hbm.write((ptr, 12), np.array([99.0], dtype=np.float16))
+        hbm.write(ptr, np.array([99.0], dtype=np.float16), intra_byte=12)
         result = hbm.read(ptr, 16, "f16").reshape(4, 4)
         assert result[1, 2] == np.float16(99.0)
         expected = np.arange(16, dtype=np.float16).reshape(4, 4)
@@ -275,7 +275,7 @@ class TestMemorySimulator:
         hbm, hbm_ptr = self._make_hbm()
         lx, lx_ptr = self._make_lx()
         for byte_offset in [0, 2, 12, 24, 30]:
-            hbm_val = hbm.read((hbm_ptr, byte_offset), 1, "f16")
+            hbm_val = hbm.read(hbm_ptr, 1, "f16", intra_byte=byte_offset)
             lx_val = lx.read(lx_ptr + byte_offset, 1, "f16")
             assert np.array_equal(hbm_val, lx_val), (
                 f"Mismatch at byte_offset={byte_offset}: HBM={hbm_val}, LX={lx_val}"
@@ -285,7 +285,7 @@ class TestMemorySimulator:
         hbm, hbm_ptr = self._make_hbm()
         lx, lx_ptr = self._make_lx()
         patch = np.array([77.0], dtype=np.float16)
-        hbm.write((hbm_ptr, 12), patch)
+        hbm.write(hbm_ptr, patch, intra_byte=12)
         lx.write(lx_ptr + 12, patch)
         assert np.array_equal(
             hbm.read(hbm_ptr, 16, "f16"),

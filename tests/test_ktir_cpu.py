@@ -72,7 +72,7 @@ def test_hbm_read_subarray_partial_padding():
 
     # Read starting 2 elements in, requesting 4 elements (only 2 available)
     byte_offset = 2 * 2  # skip 2 f16 elements (2 bytes each)
-    result = hbm.read((ptr, byte_offset), 4, "f16")
+    result = hbm.read(ptr, 4, "f16", intra_byte=byte_offset)
     assert result.shape == (4,), f"Expected shape (4,), got {result.shape}"
     assert result[0] == np.float16(30), f"Expected 30, got {result[0]}"
     assert result[1] == np.float16(40), f"Expected 40, got {result[1]}"
