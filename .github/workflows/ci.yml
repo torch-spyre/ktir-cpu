@@ -36,7 +36,7 @@ jobs:
           SETUP_MLIR="https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/scripts/setup_mlir.py"
           LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/cmake/llvm-hash.txt")
           curl -fsSL "$SETUP_MLIR" -o /tmp/setup_mlir.py
-          MLIR_DIR=$(GIT_PAT="${{ secrets.GITHUB_TOKEN }}" uv run python /tmp/setup_mlir.py --hash "$LLVM_HASH")
+          MLIR_DIR=$(GIT_PAT="${{ secrets.GITHUB_TOKEN }}" uv run python /tmp/setup_mlir.py --hash "$LLVM_HASH" --repo torch-spyre/ktir-mlir-frontend)
           uv pip install scikit-build-core "nanobind>=2.12.0"
           echo "CMAKE_ARGS=-DMLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
 
