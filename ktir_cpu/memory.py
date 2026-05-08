@@ -245,7 +245,7 @@ class HBMSimulator:
         """Read *n_elements* elements from HBM.
 
         Args:
-            stick: HBM stick index (from ``allocate()`` or ``TileRef.hw_addr``).
+            stick: HBM stick index (from \`\`allocate()\`\` or \`\`MemRef.split_addr\`\`).
             n_elements: Number of elements to read.
             dtype: Data type.
             intra_byte: Byte offset within the stick (default 0).
@@ -264,7 +264,7 @@ class HBMSimulator:
         """Write *data* (flat ndarray) to HBM.
 
         Args:
-            stick: HBM stick index (from ``allocate()`` or ``TileRef.hw_addr``).
+            stick: HBM stick index (from \`\`allocate()\`\` or \`\`MemRef.split_addr\`\`).
             data: Flat NumPy array to write.
             intra_byte: Byte offset within the stick (default 0).
         """

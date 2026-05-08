@@ -29,6 +29,38 @@ from ..grid import CoreContext
 from ..memory import HBMSimulator
 
 
+class _MemAccessor:
+    """Resolves a (context, memref, byte_addr) triple into simulator read/write calls.
+
+    This is the single place in the codebase that manages the intra-stick byte
+    offset abstraction: HBMSimulator requires a (stick, intra_byte) address pair
+    while LXScratchpad uses a plain byte address.  ``MemRef.split_addr`` produces
+    the pair; this class captures it and forwards any extra address kwargs to the
+    underlying simulator so callers never handle them directly.
+
+    ``stick_bytes`` is exposed for callers that need to count distinct HBM sticks
+    touched by an access (latency accounting); it is None for LX.
+
+    To extend to a new memory space, add a branch in ``__init__`` that populates
+    ``_args`` and ``_kwargs`` appropriately — ``read`` and ``write`` require no
+    changes.
+    """
+
+    def __init__(self, context: CoreContext, memref: MemRef, byte_addr: int):
+        _main, _intra = memref.split_addr(byte_addr)
+        self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES if memref.memory_space == "HBM" else None
+        self._sim = context.hbm if memref.memory_space == "HBM" else context.lx
+        self._args = (_main,)
+        self._kwargs = {}
+        if memref.memory_space == "HBM":
+            self._kwargs["intra_byte"] = _intra
+
+    def read(self, n: int, dtype: str) -> np.ndarray:
+        return self._sim.read(*self._args, n, dtype, **self._kwargs)
+
+    def write(self, data: np.ndarray) -> None:
+        self._sim.write(*self._args, data, **self._kwargs)
+
 class MemoryOps:
     """Tile memory helpers — view, access, load, store."""
 
@@ -212,20 +244,13 @@ class MemoryOps:
         Returns:
             Tile value (tensor) loaded into LX
         """
-        memref = tile_ref.memref
-        is_hbm = memref.memory_space == "HBM"
-        stick_bytes = HBMSimulator.STICK_BYTES if is_hbm else None
-        if is_hbm:
-            stick, intra = tile_ref.hbm_addr
-            def _read(n, dtype): return context.hbm.read(stick, n, dtype, intra_byte=intra)
-        else:
-            ptr = tile_ref.base_ptr
-            def _read(n, dtype): return context.lx.read(ptr, n, dtype)
+        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
+        stick_bytes = mgr.stick_bytes
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
             n = int(np.prod(tile_ref.shape))
-            data = _read(n, tile_ref.dtype).reshape(tile_ref.shape)
+            data = mgr.read(n, tile_ref.dtype).reshape(tile_ref.shape)
             MemoryOps._write_to_lx(context, data)
             if stick_bytes:
                 bpe = _bytes_per_elem(tile_ref.dtype)
@@ -244,7 +269,7 @@ class MemoryOps:
             coords, stick_bytes=stick_bytes
         )
         span = max(offsets) + 1 if offsets else 1
-        flat = _read(span, tile_ref.dtype)
+        flat = mgr.read(span, tile_ref.dtype)
 
         gathered = flat[offsets]
         out_shape = result_shape if result_shape is not None else tile_ref.shape
@@ -278,19 +303,11 @@ class MemoryOps:
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
         """
-        memref = tile_ref.memref
-        if memref.memory_space == "HBM":
-            stick, intra = tile_ref.hbm_addr
-            def _read(n, dtype): return context.hbm.read(stick, n, dtype, intra_byte=intra)
-            def _write(data):    context.hbm.write(stick, data, intra_byte=intra)
-        else:
-            ptr = tile_ref.base_ptr
-            def _read(n, dtype): return context.lx.read(ptr, n, dtype)
-            def _write(data):    context.lx.write(ptr, data)
+        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            _write(tile.data.flatten())
+            mgr.write(tile.data.flatten())
             return
 
         # Strided or coord-set path: read-modify-write via scatter offsets.
@@ -298,9 +315,9 @@ class MemoryOps:
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype, coords
         )
         span = max(offsets) + 1 if offsets else 1
-        flat = _read(span, tile_ref.dtype)
+        flat = mgr.read(span, tile_ref.dtype)
         flat[offsets] = tile.data.flatten()
-        _write(flat)
+        mgr.write(flat)
 
     @staticmethod
     def indirect_load(
@@ -336,12 +353,7 @@ class MemoryOps:
                     )
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
                     addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
-                    if idx_view.memory_space == "HBM":
-                        stick = addr // HBMSimulator.STICK_BYTES
-                        intra = addr % HBMSimulator.STICK_BYTES
-                        raw = context.hbm.read(stick, 1, idx_view.dtype, intra_byte=intra)
-                    else:
-                        raw = context.lx.read(addr, 1, idx_view.dtype)
+                    raw = _MemAccessor(context, idx_view, addr).read(1, idx_view.dtype)
                     coord.append(int(raw[0]))
                 elif sub["kind"] == "direct":
                     coord.append(pt[sub["var_index"]])
