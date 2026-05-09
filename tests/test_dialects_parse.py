@@ -200,6 +200,18 @@ class TestModuleParser:
         assert func.grid == (1, 1, 1)
         assert len(func.operations) >= 2
 
+    def test_parser_1d_grid(self):
+        # grid = [X] — single element; Y and Z should default to 1
+        parser = KTIRParser()
+        module = parser.parse_module("""
+        module {
+          func.func @single() attributes { grid = [4] } {
+            return
+          }
+        }
+        """)
+        assert module.get_function("single").grid == (4, 1, 1)
+
     def test_parser_multiple_functions(self):
         # module with two functions each gets its own grid shape
         parser = KTIRParser()
