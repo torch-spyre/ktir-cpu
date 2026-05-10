@@ -109,33 +109,43 @@ class _TraceEntry:
     """Single operation trace entry."""
     op_type: str
     cycles: float
-    category: str  # "compute", "memory", "comm", "zero"
+    category: str
 
 
 @dataclass
 class CoreLatencyCounters:
     """Per-core cycle counters."""
-    compute_cycles: float = 0.0
     memory_cycles: float = 0.0
     comm_cycles: float = 0.0
-    total_flops: float = 0.0
     total_bytes: int = 0
+    # Per-category flops and cycles — keys are LatencyCategory string values.
+    # Compute categories: "compute_matmul", "compute_float", "compute_transcendental", "compute_int".
+    flops_by_category: Dict[str, float] = field(default_factory=dict)
+    cycles_by_category: Dict[str, float] = field(default_factory=dict)
     trace: Optional[List[_TraceEntry]] = None
 
     @property
     def total_cycles(self) -> float:
         return self.compute_cycles + self.memory_cycles + self.comm_cycles
 
+    @property
+    def compute_cycles(self) -> float:
+        return sum(self.cycles_by_category.values())
+
+    @property
+    def total_flops(self) -> float:
+        return sum(self.flops_by_category.values())
+
     def record(self, category: str, cycles: float, op_type: str = "",
                flops: float = 0.0, nbytes: int = 0):
-        if category == "compute":
-            self.compute_cycles += cycles
+        if category == "compute" or category.startswith("compute_"):
+            self.cycles_by_category[category] = self.cycles_by_category.get(category, 0.0) + cycles
+            self.flops_by_category[category] = self.flops_by_category.get(category, 0.0) + flops
         elif category == "memory":
             self.memory_cycles += cycles
         elif category == "comm":
             self.comm_cycles += cycles
 
-        self.total_flops += flops
         self.total_bytes += nbytes
 
         if self.trace is not None:
@@ -215,7 +225,7 @@ class LatencyTracker:
             m, n, k = self._matmul_dims(operands)
             flops = 2.0 * m * n * k
             cycles = flops / self.config.systolic_flops_per_cycle
-            return ("compute", cycles, flops, 0)
+            return (str(LC.COMPUTE_MATMUL), cycles, flops, 0)
 
         if category == LC.COMPUTE_TRANSCENDENTAL:
             # Transcendentals (exp, log, …): 1 FLOP per element, same
@@ -224,14 +234,14 @@ class LatencyTracker:
             # increase the FLOP count.
             n_elems = self._num_elements(result, operands)
             cycles = (n_elems / self.config.simd_elements_per_cycle) * self.config.transcendental_penalty
-            return ("compute", cycles, float(n_elems), 0)
+            return (str(LC.COMPUTE_TRANSCENDENTAL), cycles, float(n_elems), 0)
 
         if category == LC.COMPUTE_FLOAT:
             # Elementwise float (addf, mulf, …): 1 FLOP per element,
             # one SIMD-width per cycle.  No memory traffic.
             n_elems = self._num_elements(result, operands)
             cycles = n_elems / self.config.simd_elements_per_cycle
-            return ("compute", cycles, float(n_elems), 0)
+            return (str(LC.COMPUTE_FLOAT), cycles, float(n_elems), 0)
 
         if category == LC.COMPUTE_INT:
             # Integer ops (addi, muli, index casts, …): 1 FLOP per element.
@@ -239,9 +249,9 @@ class LatencyTracker:
             if n_elems <= 1:
                 # Scalar index arithmetic (e.g. address/offset computation) is
                 # resolved at compile time and has no runtime cost.
-                return ("compute", 0.0, 0.0, 0)
+                return (str(LC.COMPUTE_INT), 0.0, 0.0, 0)
             cycles = n_elems / self.config.simd_elements_per_cycle
-            return ("compute", cycles, float(n_elems), 0)
+            return (str(LC.COMPUTE_INT), cycles, float(n_elems), 0)
 
         if category == LC.COMM:
             # Ring communication (allgather, reduce, …): bytes over
@@ -428,19 +438,19 @@ class LatencyReport:
             })
         return summaries
 
-    def roofline(self) -> Dict[str, float]:
-        """Compute roofline metrics for the critical-path core.
+    def roofline(self) -> Dict[str, Any]:
+        """Compute per-unit roofline metrics for the critical-path core.
 
-        The roofline model shows the maximum achievable performance as a
-        function of a kernel's arithmetic intensity (AI = FLOPs / bytes
-        transferred).  Two hardware limits form a "roof"::
+        Two compute units are modelled (systolic for matmul, SIMD for everything
+        else).  The dominant unit — whichever accumulated the most FLOPs — sets
+        the compute ceiling.  The chart shows one roof::
 
             GFLOP/s
               ^
-              |         peak_gflops
-              |        .-----------——————————  compute ceiling
+              |         peak (dominant unit)
+              |        .----------------------------  compute ceiling
               |       /
-              |      /    * achieved (kernel)
+              |      /    * kernel dot
               |     /
               |    /
               |   /  BW ceiling = peak_bw × AI
@@ -448,76 +458,86 @@ class LatencyReport:
               | /
               +-----------------------------------> AI (FLOP/B)
                        ^
-                  ridge_point
+                  ridge point
 
-        - **BW ceiling** (the slope): ``peak_bw × AI``.  When a kernel
-          has low AI it cannot feed the compute units fast enough and
-          performance is limited by memory bandwidth.
-        - **Compute ceiling** (the flat top): ``peak_gflops``.  Once AI
-          is high enough the compute units are fully utilized.
-        - **Ridge point**: the AI where the two ceilings meet,
-          ``peak_gflops / peak_bw``.  Left of it the kernel is
-          memory-bound; right of it, compute-bound.
-        - **Efficiency**: ``achieved / ceiling`` — how close the kernel
-          gets to the roofline at its operating point.
 
-        .. note:: The roofline model only covers compute and HBM bandwidth.
+
+        - **systolic**: ``linalg.matmul`` ops, peak = ``systolic_flops_per_cycle × clock``
+        - **simd**: all other compute ops (float, transcendental, int),
+          peak = ``simd_elements_per_cycle × clock``
+
+        The **dominant unit** is whichever accumulated the most FLOPs in the
+        kernel trace — it reflects which unit did the real work.  The summary
+        ``efficiency`` is reported for the dominant unit.
+
+        For each unit, ``achieved_gflops`` is ``unit_flops / total_wall_time``
+        (not unit_flops / unit_cycles) so the achieved rate reflects true
+        end-to-end throughput including memory stalls.
+
+        .. note:: The roofline covers compute and HBM bandwidth only.
            Communication cycles (ring allgather/reduce) are not modelled.
-           For comm-dominated kernels the ``bottleneck`` property may
-           report ``"comm"`` while the roofline classifies the kernel
-           based on the compute-vs-HBM ratio alone.  For kernels where
-           the bottleneck is ``"compute"`` or ``"memory"``, the roofline
-           bound (AI vs ridge point) will always agree with ``bottleneck``.
 
         Returns a dict with:
-            arithmetic_intensity: FLOPs / byte transferred (FLOP/B).
-            achieved_gflops: Actual throughput of the critical-path core.
-            peak_gflops: Hardware peak compute throughput.
+            arithmetic_intensity: total FLOPs / total bytes (FLOP/B).
             peak_bw_gb_s: Per-core HBM bandwidth in GB/s.
-            ridge_point: AI where BW ceiling meets compute ceiling.
-            ceiling_gflops: Roofline ceiling at this kernel's AI.
-            efficiency: achieved / ceiling (0..1).
+            dominant_unit: ``"systolic"`` or ``"simd"`` (most FLOPs).
+            efficiency: achieved / ceiling for the dominant unit (0..1).
+            units: per-unit dict, each with:
+                achieved_gflops, ceiling_gflops, ridge_point, efficiency.
         """
         if not self.counters:
             return {}
         critical = max(self.counters.values(), key=lambda c: c.total_cycles)
 
-        # Clock in Hz (e.g. 1.0 GHz → 1e9 cycles/s)
         clock = self.config.clock_ghz * 1e9
-
-        # The flat top of the roof: how many FLOPs/s the SIMD pipe can
-        # sustain if it never stalls on memory.
-        peak_flops = self.config.simd_elements_per_cycle * clock
-
-        # The slope of the roof: how many bytes/s HBM can deliver to
-        # this core.  Multiplied by AI this gives the BW ceiling.
+        elapsed_s = critical.total_cycles / clock
         peak_bw = self.config.hbm_bytes_per_cycle_per_core * clock
 
-        # Where the slope meets the flat top (FLOP/B).  Kernels with
-        # AI < ridge_point are memory-bound; AI > ridge_point are
-        # compute-bound.
-        ridge_point = peak_flops / peak_bw
+        ai = (critical.total_flops / critical.total_bytes
+              if critical.total_bytes > 0 else float('inf'))
 
-        # Achieved throughput: total FLOPs the kernel executed divided
-        # by wall-clock time on this core.
-        elapsed_s = critical.total_cycles / clock
-        achieved_flops = critical.total_flops / elapsed_s if elapsed_s > 0 else 0
+        # Per-unit hardware ceilings (hardware constants, not kernel-derived).
+        unit_ceilings = {
+            "systolic": self.config.systolic_flops_per_cycle * clock,
+            "simd": self.config.simd_elements_per_cycle * clock,
+        }
 
-        # Arithmetic intensity: how many FLOPs per byte of HBM traffic.
-        # Higher AI means more reuse of each byte loaded.
-        ai = critical.total_flops / critical.total_bytes if critical.total_bytes > 0 else float('inf')
+        # Which LatencyCategory strings belong to each unit.
+        _LC = LatencyCategory
+        unit_categories = {
+            "systolic": {str(_LC.COMPUTE_MATMUL)},
+            "simd": {str(_LC.COMPUTE_FLOAT), str(_LC.COMPUTE_TRANSCENDENTAL), str(_LC.COMPUTE_INT)},
+        }
 
-        # The roofline ceiling at this kernel's AI: the lower of the
-        # two ceilings (BW slope vs compute flat top).
-        ceiling = min(peak_flops, peak_bw * ai)
+        units: Dict[str, Any] = {}
+        for unit_name, peak in unit_ceilings.items():
+            cats = unit_categories[unit_name]
+            flops = sum(critical.flops_by_category.get(c, 0.0) for c in cats)
+            achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
+            # Roofline ceiling at this kernel's AI for this unit.
+            ceiling = min(peak, peak_bw * ai)
+            units[unit_name] = {
+                "achieved_gflops": achieved / 1e9,
+                "ceiling_gflops": ceiling / 1e9,
+                "ridge_point": peak / peak_bw,
+                "efficiency": achieved / ceiling if ceiling > 0 else 0.0,
+            }
+
+        # Dominant unit = most FLOPs. Fall back to "simd" when no compute.
+        dominant = max(
+            unit_ceilings,
+            key=lambda u: sum(critical.flops_by_category.get(c, 0.0)
+                              for c in unit_categories[u]),
+        )
+        if all(units[u]["achieved_gflops"] == 0.0 for u in units):
+            dominant = "simd"
+
         return {
             "arithmetic_intensity": ai,
-            "achieved_gflops": achieved_flops / 1e9,
-            "peak_gflops": peak_flops / 1e9,
             "peak_bw_gb_s": peak_bw / 1e9,
-            "ridge_point": ridge_point,
-            "ceiling_gflops": ceiling / 1e9,
-            "efficiency": achieved_flops / ceiling if ceiling > 0 else 0,
+            "dominant_unit": dominant,
+            "efficiency": units[dominant]["efficiency"],
+            "units": units,
         }
 
     def summary_dict(self) -> Dict[str, Any]:
@@ -561,12 +581,21 @@ class LatencyReport:
             ai = rf["arithmetic_intensity"]
             ai_str = f"{ai:.2f} FLOP/B" if ai != float('inf') else "inf (no memory traffic)"
             lines.append(f"  Arithmetic intensity : {ai_str}")
-            lines.append(f"  Achieved             : {rf['achieved_gflops']:.2f} GFLOP/s")
-            lines.append(f"  Roofline ceiling     : {rf['ceiling_gflops']:.2f} GFLOP/s")
-            lines.append(f"  Peak compute         : {rf['peak_gflops']:.2f} GFLOP/s")
             lines.append(f"  Peak bandwidth       : {rf['peak_bw_gb_s']:.2f} GB/s")
-            lines.append(f"  Ridge point          : {rf['ridge_point']:.2f} FLOP/B")
-            lines.append(f"  Efficiency           : {rf['efficiency']:.1%}")
+            lines.append(f"  Dominant unit        : {rf['dominant_unit']}")
+            lines.append(f"  Efficiency           : {rf['efficiency']:.1%}  (dominant unit)")
+            lines.append("")
+            lines.append(f"  {'Unit':>10}  {'Achieved':>12}  {'Ceiling':>12}  {'Ridge':>10}  {'Eff':>7}")
+            lines.append(f"  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*7}")
+            for unit_name, u in rf["units"].items():
+                marker = " *" if unit_name == rf["dominant_unit"] else "  "
+                lines.append(
+                    f"{marker} {unit_name:>10}  "
+                    f"{u['achieved_gflops']:>10.2f} G  "
+                    f"{u['ceiling_gflops']:>10.2f} G  "
+                    f"{u['ridge_point']:>8.1f} F/B  "
+                    f"{u['efficiency']:>6.1%}"
+                )
             lines.append("=" * 60)
 
         return "\n".join(lines)
