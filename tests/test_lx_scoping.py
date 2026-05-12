@@ -24,6 +24,7 @@ import pytest
 from ktir_cpu.grid import CoreContext
 from ktir_cpu.memory import LXScratchpad, HBMSimulator
 from ktir_cpu.ir_types import Tile
+from ktir_cpu.ops.memory_ops import MemoryOps
 
 
 def _make_context(lx_size_mb: int = 2) -> CoreContext:
@@ -235,3 +236,121 @@ class TestIterArgsPersistence:
             ctx.set_value("%acc", new_acc)
             ctx.track_lx("%acc", new_acc.size_bytes())
             assert ctx.lx.used == 8  # back to steady state
+
+
+# ---------------------------------------------------------------------------
+# next_ptr rewind on pop_scope (issue #26)
+# ---------------------------------------------------------------------------
+
+class TestNextPtrRewind:
+    """Regression tests for issue #26: lx.next_ptr must be rewound on
+    pop_scope so it stays in lockstep with lx.used.
+    """
+
+    def test_issue_26_reproducer_next_ptr_bounded_in_loop(self):
+        """The exact failure mode from issue #26.
+
+        Before the fix, next_ptr advanced by 2048 (tile size, stick-aligned)
+        every iteration and crossed the 128 KB LX capacity at iter 64 while
+        lx.used stayed 0. After the fix, both return to 0 on every pop.
+        """
+        lx = LXScratchpad(size_mb=0.125, core_id=0)  # 128 KB
+        hbm = HBMSimulator()
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=hbm)
+
+        for i in range(100):
+            ctx.push_scope()
+
+            # Mirrors the interpreter's _execute_operation sequence for a
+            # load op: write into LX, set the SSA value in the scope, track
+            # its bytes. pop_scope then frees it via untrack_lx.
+            tile_data = np.zeros((4, 256), dtype=np.float16)  # 2 KB
+            MemoryOps._write_to_lx(ctx, tile_data)
+            name = f"%tile_iter{i}"
+            ctx.set_value(name, Tile(tile_data, "f16", tile_data.shape))
+            ctx.track_lx(name, tile_data.nbytes)
+
+            ctx.pop_scope()
+
+            # Strong invariant: both accountants return to their pre-push
+            # values. Catches divergence at iter 0, not just overflow at 64.
+            assert ctx.lx.used == 0, f"iter {i}: lx.used={ctx.lx.used}"
+            assert ctx.lx.next_ptr == 0, (
+                f"iter {i}: lx.next_ptr={ctx.lx.next_ptr}"
+            )
+
+    def test_next_ptr_restored_on_pop_single_level(self):
+        """A single push/allocate/pop cycle restores next_ptr exactly."""
+        ctx = _make_context()
+        assert ctx.lx.next_ptr == 0
+
+        ctx.push_scope()
+        MemoryOps._write_to_lx(ctx, np.zeros((128,), dtype=np.float16))  # 256 B
+        assert ctx.lx.next_ptr == 256
+        ctx.pop_scope()
+        assert ctx.lx.next_ptr == 0
+
+    def test_next_ptr_restored_on_pop_with_outer_allocation(self):
+        """Outer-scope allocations are preserved; only inner ones are reclaimed.
+
+        This is the nested-scope discipline: push saves the current watermark,
+        pop restores to it, so whatever the outer scope allocated survives.
+        """
+        ctx = _make_context()
+
+        # Outer-scope allocation at the function level.
+        MemoryOps._write_to_lx(ctx, np.zeros((128,), dtype=np.float16))  # 256 B
+        outer_ptr = ctx.lx.next_ptr
+        assert outer_ptr == 256
+
+        ctx.push_scope()
+        MemoryOps._write_to_lx(ctx, np.zeros((1024,), dtype=np.float16))  # 2 KB
+        assert ctx.lx.next_ptr == 256 + 2048
+        ctx.pop_scope()
+
+        # Inner allocation reclaimed; outer watermark preserved.
+        assert ctx.lx.next_ptr == outer_ptr
+
+    def test_nested_scopes_rewind_lifo(self):
+        """Three-level nesting (fn / for-body / if-body) restores each level."""
+        ctx = _make_context()
+
+        # Function-level allocation.
+        MemoryOps._write_to_lx(ctx, np.zeros((128,), dtype=np.float16))  # A
+        wm_fn = ctx.lx.next_ptr
+
+        ctx.push_scope()                                                   # for-body
+        MemoryOps._write_to_lx(ctx, np.zeros((512,), dtype=np.float16))   # B
+        wm_for = ctx.lx.next_ptr
+
+        ctx.push_scope()                                                   # if-body
+        MemoryOps._write_to_lx(ctx, np.zeros((1024,), dtype=np.float16))  # C
+        assert ctx.lx.next_ptr > wm_for
+
+        ctx.pop_scope()                                                    # pop if
+        assert ctx.lx.next_ptr == wm_for   # C reclaimed, B/A live
+
+        ctx.pop_scope()                                                    # pop for
+        assert ctx.lx.next_ptr == wm_fn    # B reclaimed, A live
+
+    def test_legitimate_overflow_still_raises(self):
+        """The fix must not hide genuine LX exhaustion within a single scope."""
+        ctx = _make_context(lx_size_mb=0.125)  # 128 KB cap
+
+        # Try to track more than capacity in one scope — track_lx should raise.
+        with pytest.raises(MemoryError, match="LX scratchpad overflow"):
+            for i in range(100):
+                data = np.zeros((1024,), dtype=np.float16)  # 2 KB each
+                MemoryOps._write_to_lx(ctx, data)
+                ctx.track_lx(f"%t{i}", data.nbytes)  # eventually exceeds 128 KB
+
+    def test_clear_values_resets_watermark_stack(self):
+        """clear_values must also clear the watermark stack."""
+        ctx = _make_context()
+        ctx.push_scope()
+        ctx.push_scope()
+        assert len(ctx._lx_next_ptr_stack) == 2
+        ctx.clear_values()
+        assert ctx._lx_next_ptr_stack == []
+        assert ctx.lx.next_ptr == 0
+        assert ctx.lx.used == 0

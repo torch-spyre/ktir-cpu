@@ -21,6 +21,59 @@ used by dialect handlers in ``ktir_cpu.dialects``.
 
 import numpy as np
 from ..ir_types import Tile
+from ..dtypes import _REVERSE_MAP
+
+
+def arith_cast(value, target_np_dtype, expect_floating, op_name):
+    """Shared implementation for arith dialect type-conversion ops.
+
+    Type-conversion ops (truncf, extf, sitofp, fptosi, trunci, exti) need
+    input validation that compute ops don't — compute ops rely on MLIR's type
+    system to guarantee correct input types, but the simulator receives
+    untyped Python values, so conversion ops must check themselves.
+
+    Args:
+        value: Tile or scalar to convert.
+        target_np_dtype: NumPy dtype to cast to (e.g. np.float16).
+        expect_floating: If True, input must be a float type; if False, integer.
+        op_name: Name for error messages (e.g. "truncf").
+
+    Returns:
+        Converted Tile (new dtype label inferred) or numpy scalar.
+    """
+    _category_check = np.floating if expect_floating else np.integer
+    _category_name = "float" if expect_floating else "integer"
+
+    # Derive the KTIR dtype string for the Tile constructor
+    target_dtype_str = _REVERSE_MAP.get(np.dtype(target_np_dtype))
+
+    if isinstance(value, Tile):
+        if value.data.dtype == target_np_dtype:
+            return value
+        if not np.issubdtype(value.data.dtype, _category_check):
+            raise TypeError(
+                f"{op_name} expects {_category_name} Tile, got dtype={value.data.dtype}"
+            )
+        return Tile(value.data.astype(target_np_dtype), target_dtype_str, value.shape)
+
+    # Scalar path
+    if isinstance(value, (int, float, np.number)):
+        # Already the target type — no-op (preserves object identity)
+        if isinstance(value, target_np_dtype):
+            return value
+        result = target_np_dtype(value)
+        # Overflow: value was finite but cast produced inf
+        if np.issubdtype(np.dtype(target_np_dtype), np.floating):
+            if np.isinf(result) and not np.isinf(float(value)):
+                raise OverflowError(
+                    f"{op_name}: {value} overflows {target_np_dtype.__name__} "
+                    f"[{np.finfo(target_np_dtype).min}, {np.finfo(target_np_dtype).max}]"
+                )
+        return result
+
+    raise TypeError(
+        f"{op_name} expects Tile or numeric scalar, got {type(value).__name__}"
+    )
 
 
 class ArithOps:
@@ -144,22 +197,6 @@ class ArithOps:
             return int(val1) * int(val2)
 
     @staticmethod
-    def maxnumf(tile1: Tile, tile2: Tile) -> Tile:
-        """Element-wise max, NaN-aware (NaN is treated as missing).
-
-        For CPU simulation this is identical to maxf since we use
-        np.maximum which already handles NaN correctly.
-
-        Args:
-            tile1, tile2: Input tiles
-
-        Returns:
-            Result tile
-        """
-        result_data = np.maximum(tile1.data, tile2.data)
-        return Tile(result_data, tile1.dtype, tile1.shape)
-
-    @staticmethod
     def cmpi(val1, val2, predicate: str = "slt"):
         """Integer comparison. Works on both scalars and Tiles.
 
@@ -231,32 +268,13 @@ class ArithOps:
 
     @staticmethod
     def extf(value):
-        """Widen float (e.g. f16 to f32).
-
-        Args:
-            value: Tile or scalar
-
-        Returns:
-            Value promoted to f32.
-        """
-        if isinstance(value, Tile):
-            return Tile(value.data.astype(np.float32), "f32", value.shape)
-        return np.float32(value)
+        """Widen float (e.g. f16 to f32)."""
+        return arith_cast(value, np.float32, expect_floating=True, op_name="extf")
 
     @staticmethod
     def truncf(value):
-        """Narrow float (e.g. f32 to f16).
-
-        For CPU simulation, this is essentially a no-op since Spyre
-        only has f16, so type conversions are cosmetic.
-
-        Args:
-            value: Tile or scalar
-
-        Returns:
-            Same value (passthrough for simulation)
-        """
-        return value
+        """Narrow float (e.g. f32 to f16)."""
+        return arith_cast(value, np.float16, expect_floating=True, op_name="truncf")
 
     @staticmethod
     def maxf(tile1: Tile, tile2: Tile) -> Tile:
@@ -272,6 +290,21 @@ class ArithOps:
         return Tile(result_data, tile1.dtype, tile1.shape)
 
     @staticmethod
+    def maxnumf(tile1: Tile, tile2: Tile) -> Tile:
+        """Element-wise max, NaN non-propagating (NaN is treated as missing).
+
+        Uses np.fmax which ignores NaN when the other operand is non-NaN.
+
+        Args:
+            tile1, tile2: Input tiles
+
+        Returns:
+            Result tile
+        """
+        result_data = np.fmax(tile1.data, tile2.data)
+        return Tile(result_data, tile1.dtype, tile1.shape)
+
+    @staticmethod
     def minf(tile1: Tile, tile2: Tile) -> Tile:
         """Element-wise minimum.
 
@@ -282,6 +315,21 @@ class ArithOps:
             Result tile
         """
         result_data = np.minimum(tile1.data, tile2.data)
+        return Tile(result_data, tile1.dtype, tile1.shape)
+
+    @staticmethod
+    def minnumf(tile1: Tile, tile2: Tile) -> Tile:
+        """Element-wise min, NaN non-propagating (NaN is treated as missing).
+
+        Uses np.fmin which ignores NaN when the other operand is non-NaN.
+
+        Args:
+            tile1, tile2: Input tiles
+
+        Returns:
+            Result tile
+        """
+        result_data = np.fmin(tile1.data, tile2.data)
         return Tile(result_data, tile1.dtype, tile1.shape)
 
     @staticmethod
