@@ -118,23 +118,81 @@ def ktdp__store(op, context, env):
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------
-
-@register_parser("ktdp.get_compute_tile_id")
-def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
-    multi_match = re.match(
-        r'((?:%\w+,\s*)*%\w+)\s*=\s*ktdp\.get_compute_tile_id\s*:\s*(.*)', op_text
+# A multi-result op has two MLIR surface forms:
+#   Comma   : "%x, %y = op : index, index"     — referenced as %x, %y
+#   Bundled : "%g:2  = op : index, index"      — referenced as %g#0, %g#1
+#
+# Comma form keeps result names verbatim ("%x", "%y").
+# Bundled form synthesizes "%g#0", "%g#1" so downstream operand lookup
+# finds distinct keys.
+_GET_COMPUTE_TILE_ID_RE = re.compile(
+    r"""
+    ^\s*
+    (?:
+        (?P<comma> %\w+ (?: \s*,\s* %\w+ )* )                # %x  or  %x, %y, ...
+      |
+        (?P<base>  %\w+ ) : (?P<result_count> [1-9]\d* )     # %g:N  (N >= 1)
     )
-    if not multi_match:
-        return None
+    \s*=\s*
+    ktdp\.get_compute_tile_id
+    \s*:\s*
+    (?P<types> [^{(]* )                                      # trailing type list
+    \s*$
+    """,
+    re.VERBOSE,
+)
 
-    result_names = [r.strip() for r in multi_match.group(1).split(',')]
-    result = result_names[0] if len(result_names) == 1 else result_names
+
+def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
     return Operation(
         result=result,
         op_type="ktdp.get_compute_tile_id",
         operands=[],
         attributes={},
-        result_type="index"
+        result_type="index",
+    )
+
+
+@register_parser("ktdp.get_compute_tile_id")
+def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
+    match = _GET_COMPUTE_TILE_ID_RE.match(op_text)
+    if not match:
+        return None
+
+    # Trailing ": index, index, ..." must agree with the result
+    # name count. A mismatch is malformed will fail at parse time rather than
+    # silently store the wrong number of names.
+    type_count = sum(1 for t in match["types"].split(",") if t.strip())
+
+    if match["comma"] is not None:
+        names = [r.strip() for r in match["comma"].split(",")]
+        if len(names) != type_count:
+            raise ValueError(
+                f"ktdp.get_compute_tile_id: {len(names)} result name(s) but "
+                f"{type_count} result type(s) in: {op_text!r}"
+            )
+        result = names[0] if len(names) == 1 else names
+        return _make_compute_tile_id_op(result)
+
+    # Bundled form — synthesize the use-site reference names.
+    declared_result_count = int(match["result_count"])
+    if declared_result_count != type_count:
+        raise ValueError(
+            f"ktdp.get_compute_tile_id: bundled form declares "
+            f"{declared_result_count} result(s) but {type_count} result type(s) "
+            f"in: {op_text!r}"
+        )
+    base = match["base"]
+    # Honor the codebase-wide invariant: single result ⇔ bare string,
+    # multi-result ⇔ list[≥2]. The "%base#0" suffix is preserved so that
+    # downstream operands written as "%base#0" still resolve via env lookup.
+    # The MLIR-frontend backend collapses bundled N=1 to a single SSA value
+    # at parse time; emitting a string here keeps both backends consistent
+    # and avoids a list[1] shape that no other producer/consumer expects.
+    if declared_result_count == 1:
+        return _make_compute_tile_id_op(f"{base}#0")
+    return _make_compute_tile_id_op(
+        [f"{base}#{i}" for i in range(declared_result_count)]
     )
 
 

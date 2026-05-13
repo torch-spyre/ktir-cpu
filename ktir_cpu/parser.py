@@ -598,7 +598,9 @@ class KTIRParser(KTIRParserBase):
         # attribute blocks.
         cleaned = re.sub(r'\{[^}]*\}', '', text)
 
-        operands = re.findall(r'%\w+', cleaned)
+        # "%name#N" is MLIR's multi-result of N ops defined as 
+        # "%base:N = ..." — keep the "#N" attached so results are distinct keys.
+        operands = re.findall(r'%\w+(?:#\d+)?', cleaned)
 
         # Remove result name if present
         if result:

@@ -454,6 +454,85 @@ class TestKtdpParsers(ParseTestMixin):
         assert isinstance(op.result, list)
         assert len(op.result) == 2
 
+    def test_get_compute_tile_id_bundled(self):
+        # One base name with a ":N" suffix declaring N results. The parser
+        # must canonicalize this into N distinct SSA result names — backends
+        # disagree on the exact spelling (regex preserves "%pid#0/#1";
+        # MLIR-frontend rewrites to canonical "%N"), so we only assert
+        # structural shape: N entries, each a non-empty "%..." SSA name.
+        op = self._parse("%pid:2 = ktdp.get_compute_tile_id : index, index")
+        self.assert_op_type(op, "ktdp.get_compute_tile_id")
+        assert isinstance(op.result, list)
+        assert len(op.result) == 2
+        assert all(isinstance(r, str) and r.startswith("%") and len(r) > 1
+                   for r in op.result)
+        # The N names must be distinct.
+        assert len(set(op.result)) == 2
+
+    def test_get_compute_tile_id_bundled_single_result(self):
+        # N=1 is the lower endpoint of the bundled grammar — the regex
+        # admits "%x:1" via [1-9]\d*, and "%x:1 = op : index" is valid
+        # MLIR. Both backends collapse bundled-N=1 to the bare-string
+        # form (regex emits "%base#0"; MLIR-frontend emits the SSA value
+        # the C++ parser produces, e.g. "%0"), honoring the codebase-
+        # wide convention: single result ⇔ str; multi-result ⇔ list[≥2].
+        op = self._parse("%x:1 = ktdp.get_compute_tile_id : index")
+        self.assert_op_type(op, "ktdp.get_compute_tile_id")
+        assert isinstance(op.result, str)
+        assert op.result.startswith("%")
+        assert len(op.result) > 1
+
+    def test_get_compute_tile_id_bundled_three_results(self):
+        # Bundled form works for N > 2, not just N == 2.
+        op = self._parse(
+            "%g:3 = ktdp.get_compute_tile_id : index, index, index"
+        )
+        assert isinstance(op.result, list)
+        assert len(op.result) == 3
+        assert all(isinstance(r, str) and r.startswith("%") and len(r) > 1
+                   for r in op.result)
+        assert len(set(op.result)) == 3
+
+    def test_get_compute_tile_id_bundled_count_mismatch_rejected(self):
+        # Regex parser raises ValueError("result type ..."); MLIR frontend
+        # raises MLIRError("operation defines N results but was provided M
+        # to bind"). Both pinpoint the same defect (result-count mismatch),
+        # so accept either by widening to Exception and matching either
+        # message.
+        with pytest.raises(Exception, match="result type|results but was provided"):
+            self._parse("%pid:2 = ktdp.get_compute_tile_id : index")
+
+    def test_get_compute_tile_id_comma_count_mismatch_rejected(self):
+        # Two names, one type — must fail at parse. Same dual-backend
+        # message handling as above.
+        with pytest.raises(Exception, match="result type|results but was provided"):
+            self._parse("%x, %y = ktdp.get_compute_tile_id : index")
+
+    def test_bundled_result_referenced_via_hash_index(self):
+        # Regression for bundled definition + "%base#N" references.
+        #
+        # Regex backend: the op parses; verify the "#0" suffix is preserved
+        # as part of operand identity (operand string is "%pid#0", not "%pid").
+        #
+        # MLIR-frontend backend: the adapter wraps op_text in a func.func
+        # and declares each ``args`` entry as a function parameter — but
+        # MLIR's grammar reserves "%name#N" for *references* to multi-
+        # result ops, so it can't appear in an argument list. That parse
+        # rejection is itself proof that "#N" is a structural part of the
+        # SSA name, not a stripped suffix — which is exactly what this
+        # test guards.
+        op_text = "%c = arith.index_cast %pid#0 : index to i32"
+        try:
+            op = self._parse(op_text, args={"%pid#0": "index"})
+        except Exception as e:
+            assert "result number not allowed in argument list" in str(e)
+            return
+        self.assert_op_type(op, "arith.index_cast")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%pid#0")
+        # And the un-suffixed base name must NOT appear as an operand.
+        assert "%pid" not in op.operands
+
     def test_construct_memory_view(self):
         # construct_memory_view records shape, strides, dtype, memory_space, and pointer operand
         op = self._parse(
