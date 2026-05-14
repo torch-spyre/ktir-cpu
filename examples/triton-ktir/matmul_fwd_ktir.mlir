@@ -2,16 +2,16 @@ module {
   func.func @matmul_kernel(
       %a_ptr: index, // [M, K]
       %b_ptr: index, // [K, N]
-      %c_ptr: index, // [M, N]
-      %K: index, // 2048
-      %BLOCK_SIZE_M: index, // 32
-      %BLOCK_SIZE_N: index, // 512
-      %BLOCK_SIZE_K: index  // 128
+      %c_ptr: index  // [M, N]
   ) attributes {grid = [2, 16]} {
     %pid_m, %pid_n = ktdp.get_compute_tile_id : index, index
   
-    %c0_i32 = arith.constant 0 : i32
     %c0 = arith.constant 0 : index
+    %c0_i32 = arith.constant 0 : i32
+    %K = arith.constant 2048 : index
+    %BLOCK_SIZE_M = arith.constant 32 : index
+    %BLOCK_SIZE_N = arith.constant 512 : index
+    %BLOCK_SIZE_K = arith.constant 128 : index
 
     %a_view = ktdp.construct_memory_view %a_ptr, sizes: [64, 2048], strides: [2048, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 2047 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>

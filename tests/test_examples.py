@@ -151,7 +151,7 @@ class TestVectorAddExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        x_ptr, y_ptr, output_ptr, BLOCK_SIZE = interp.arg_names(func_name)
+        x_ptr, y_ptr, output_ptr = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
         (n,) = sizes[x_ptr]["shape"]
         rng = np.random.default_rng(42)
@@ -161,7 +161,6 @@ class TestVectorAddExecution(InterpreterTestMixin):
 
         outputs = interp.execute_function(func_name, **{
             x_ptr: x, y_ptr: y, output_ptr: output,
-            BLOCK_SIZE: entry["execute_kwargs"]["BLOCK_SIZE"],
         })
 
         result = outputs[output_ptr]
@@ -174,7 +173,7 @@ class TestVectorAddExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        x_ptr, y_ptr, output_ptr, BLOCK_SIZE = interp.arg_names(func_name)
+        x_ptr, y_ptr, output_ptr = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
         (n,) = sizes[x_ptr]["shape"]
         x = np.zeros(n, dtype=np.float16)
@@ -183,7 +182,6 @@ class TestVectorAddExecution(InterpreterTestMixin):
 
         outputs = interp.execute_function(func_name, **{
             x_ptr: x, y_ptr: y, output_ptr: output,
-            BLOCK_SIZE: entry["execute_kwargs"]["BLOCK_SIZE"],
         })
 
         result = outputs[output_ptr]
@@ -200,7 +198,7 @@ class TestSoftmaxExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        output_ptr, input_ptr, n_rows = interp.arg_names(func_name)
+        output_ptr, input_ptr = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
         n_rows_val, n_padded_cols = sizes[input_ptr]["shape"]
         rng = np.random.default_rng(42)
@@ -215,7 +213,6 @@ class TestSoftmaxExecution(InterpreterTestMixin):
 
         outputs = interp.execute_function(func_name, **{
             output_ptr: out, input_ptr: inp,
-            n_rows: entry["execute_kwargs"]["n_rows"],
         })
         result = outputs[output_ptr]
 
@@ -262,7 +259,7 @@ class TestLayerNormExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        X, Y, W, B, Mean, Rstd, N, eps, BLOCK_SIZE = interp.arg_names(func_name)
+        X, Y, W, B, Mean, Rstd, eps = interp.arg_names(func_name)
         sizes = interp.tensor_input_output_sizes(func_name)
         n_rows, n_cols = sizes[X]["shape"]
         rng = np.random.default_rng(42)
@@ -281,7 +278,7 @@ class TestLayerNormExecution(InterpreterTestMixin):
         outputs = interp.execute_function(func_name, **{
             X: X_data, Y: Y_data, W: W_data, B: B_data,
             Mean: Mean_data, Rstd: Rstd_data,
-            N: ek["N"], eps: ek["eps"], BLOCK_SIZE: ek["BLOCK_SIZE"],
+            eps: ek["eps"],
         })
         result_Y = outputs[Y]
         result_Mean = outputs[Mean]
@@ -352,7 +349,7 @@ class TestMatMulExecution(InterpreterTestMixin):
         interp = self._make_interp()
         interp.load(path)
 
-        a_ptr, b_ptr, c_ptr, K, BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K = interp.arg_names(func_name)
+        a_ptr, b_ptr, c_ptr = interp.arg_names(func_name)
         ek = entry["execute_kwargs"]
         M, N, K_val = ek["M"], ek["N"], ek["K"]
         rng = np.random.default_rng(42)
@@ -362,10 +359,6 @@ class TestMatMulExecution(InterpreterTestMixin):
 
         outputs = interp.execute_function(func_name, **{
             a_ptr: A, b_ptr: B, c_ptr: C,
-            K: ek["K"],
-            BLOCK_SIZE_M: ek["BLOCK_SIZE_M"],
-            BLOCK_SIZE_N: ek["BLOCK_SIZE_N"],
-            BLOCK_SIZE_K: ek["BLOCK_SIZE_K"],
         })
         result_C = outputs[c_ptr]
 

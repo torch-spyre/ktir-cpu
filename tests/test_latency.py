@@ -41,9 +41,8 @@ def _run_vector_add(path, func_name, entry, cfg, trace=False):
     x = rng.standard_normal(n).astype(np.float16)
     y = rng.standard_normal(n).astype(np.float16)
     out = np.zeros(n, dtype=np.float16)
-    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
     outputs = interp.execute_function(
-        func_name, x_ptr=x, y_ptr=y, output_ptr=out, **kwargs
+        func_name, x_ptr=x, y_ptr=y, output_ptr=out,
     )
     return interp.get_latency_report(), outputs
 
@@ -63,12 +62,9 @@ def _run_softmax(path, func_name, entry, cfg, trace=False):
         (n_rows, n_real_cols)
     ).astype(np.float16)
     out = np.zeros((n_rows, n_padded_cols), dtype=np.float16)
-    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-    kwargs["n_cols"] = n_real_cols  # fill dynamic kwarg from actual sizes
     interp.execute_function(
         func_name,
         output_ptr=out, input_ptr=inp,
-        **kwargs,
     )
     return interp.get_latency_report()
 
@@ -78,16 +74,18 @@ def _run_matmul(path, func_name, entry, cfg, trace=False):
     interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
     interp.load(path)
 
-    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
-    M, N, K = kwargs["M"], kwargs["N"], kwargs["K"]
+    ek = entry["execute_kwargs"]
+    M, N, K = ek["M"], ek["N"], ek["K"]
     rng = np.random.default_rng(42)
     A = rng.standard_normal((M, K)).astype(np.float16)
     B = rng.standard_normal((K, N)).astype(np.float16)
     C = np.zeros((M, N), dtype=np.float16)
+    scalar_kwargs = {k: v for k, v in ek.items()
+                     if not isinstance(v, np.ndarray) and v is not None}
     interp.execute_function(
         func_name,
         a_ptr=A, b_ptr=B, c_ptr=C,
-        **kwargs,
+        **scalar_kwargs,
     )
     return interp.get_latency_report()
 
