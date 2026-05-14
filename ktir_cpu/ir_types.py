@@ -56,12 +56,21 @@ class MemRef:
     memory_space: str          # "HBM" or "LX"
     dtype: str = "f16"
     coordinate_set: Optional[AffineSet] = None
+    # Set when memory_space="LX" and a core index was specified via
+    # #ktdp.spyre_memory_space<LX, core = N>.  None means "the executing
+    # core's own LX scratchpad" (default routing).
+    lx_core_id: Optional[int] = None
 
     def __post_init__(self):
         valid = ("HBM", "LX")
         if self.memory_space not in valid:
             raise ValueError(
                 f"Invalid memory_space {self.memory_space!r}. Must be one of {valid}."
+            )
+        if self.lx_core_id is not None and self.memory_space != "LX":
+            raise ValueError(
+                f"lx_core_id may only be set when memory_space is 'LX', "
+                f"got memory_space={self.memory_space!r}"
             )
 
     @property

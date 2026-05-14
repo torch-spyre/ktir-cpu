@@ -29,7 +29,6 @@ from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
 from ktir_cpu.dialects.registry import dispatch, ExecutionEnv
-from ktir_cpu.ops.comm_ops import RingNetwork
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -58,7 +57,6 @@ def _make_ctx(grid_pos=(0, 0, 0), core_id=0):
 def _make_env(grid_shape=(1, 1, 1)):
     memory = SpyreMemoryHierarchy(num_cores=1)
     grid = GridExecutor(grid_shape=grid_shape, memory=memory)
-    ring = RingNetwork(num_cores=1)
 
     def execute_region(context, ops):
         result = None
@@ -66,7 +64,7 @@ def _make_env(grid_shape=(1, 1, 1)):
             result = op(context)
         return result
 
-    return ExecutionEnv(grid_executor=grid, ring=ring, execute_region=execute_region)
+    return ExecutionEnv(grid_executor=grid, ring_backend=None, execute_region=execute_region)
 
 
 def _call(op_type, context, env, **op_kwargs):

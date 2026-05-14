@@ -27,6 +27,8 @@ from ..ir_types import (
     Tile,
 )
 from ..latency import LatencyCategory as LC
+from ..ops.arith_ops import ArithOps
+from ..ops.comm_ops import CommOps
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
@@ -66,7 +68,8 @@ def ktdp__construct_memory_view(op, context, env):
     memory_space = op.attributes["memory_space"]
     dtype = op.attributes["dtype"]
     coordinate_set = op.attributes.get("coordinate_set")
-    return MemoryOps.tile_view(context, ptr, shape, strides, memory_space, dtype, coordinate_set)
+    lx_core_id = op.attributes.get("lx_core_id") if memory_space == "LX" else None
+    return MemoryOps.tile_view(context, ptr, shape, strides, memory_space, dtype, coordinate_set, lx_core_id)
 
 
 @register("ktdp.construct_distributed_memory_view")
@@ -245,9 +248,19 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         strides = parsed
 
     memory_space = "HBM"
-    mem_match = re.search(r'#ktdp\.spyre_memory_space<(\w+)>', op_text)
+    lx_core_id = None
+    # Accept both `<HBM>`/`<LX>` and the RFC's per-core LX form
+    # `<LX, core = N>`.  On real hardware each compute core has its own
+    # private LX SRAM, so a partition tagged `core = N` lives in core N's
+    # scratchpad — captured into lx_core_id and used at load/store time.
+    mem_match = re.search(
+        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
+        op_text,
+    )
     if mem_match:
         memory_space = mem_match.group(1)
+        if mem_match.group(2) is not None:
+            lx_core_id = int(mem_match.group(2))
 
     # dtype and shape are parsed from the memref result type.
     # Validate sizes against memref dimensions when both are concrete.
@@ -306,6 +319,8 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         "memory_space": memory_space,
         "dtype": dtype,
     }
+    if lx_core_id is not None:
+        attributes["lx_core_id"] = lx_core_id
     if coordinate_set is not None:
         attributes["coordinate_set"] = coordinate_set
 
@@ -736,3 +751,23 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# Communication ops (moved from scf_ops.py)
+# ---------------------------------------------------------------------------
+
+@register("ktdp.transfer", latency_category=LC.COMM)
+def ktdp__transfer(op, context, env):
+    tile = context.get_value(op.operands[0])
+    dst_cores = context.get_value(op.operands[1])
+    CommOps.transfer(context, tile, dst_cores, env.ring_backend)
+    return None
+
+
+@register("ktdp.reduce", latency_category=LC.COMM)
+def ktdp__reduce(op, context, env):
+    tile = context.get_value(op.operands[0])
+    core_group = context.get_value(op.operands[1])
+    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
+    return CommOps.reduce(context, tile, core_group, reduce_fn, env.ring_backend)

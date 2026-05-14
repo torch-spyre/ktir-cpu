@@ -50,7 +50,13 @@ class _MemAccessor:
     require no changes.
     """
 
-    def __init__(self, context: CoreContext, memory_space: str, byte_addr: int):
+    def __init__(
+        self,
+        context: CoreContext,
+        memory_space: str,
+        byte_addr: int,
+        lx_core_id: Optional[int] = None,
+    ):
         if memory_space == "HBM":
             self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES
             self._sim = context.hbm
@@ -59,7 +65,10 @@ class _MemAccessor:
             self._kwargs = {"intra_byte": intra}
         else:
             self.stick_bytes = None
-            self._sim = context.lx
+            # Per-core routing: when lx_core_id is None or matches the
+            # executing core, context.lx is used directly; otherwise we
+            # route to a remote LX scratchpad via the ring backend.
+            self._sim = context.get_lx(lx_core_id)
             self._args = (byte_addr,)
             self._kwargs = {}
 
@@ -81,22 +90,14 @@ class MemoryOps:
         memory_space: str,
         dtype: str = "f16",
         coordinate_set: Optional[str] = None,
+        lx_core_id: Optional[int] = None,
     ) -> MemRef:
         """Create a hardware-aware memory view (MemRef).
 
         Builds a MemRef describing a contiguous region in HBM or LX.
-
-        Args:
-            context: Core execution context
-            ptr: Base pointer (stick index for HBM, byte address for LX)
-            shape: Tile shape
-            strides: Memory strides (element counts)
-            memory_space: "HBM" or "LX"
-            dtype: Data type
-            coordinate_set: Verbatim affine_set string, no evaluation
-
-        Returns:
-            MemRef describing the memory layout
+        ``lx_core_id``, when set, identifies which core's LX scratchpad
+        the data lives in (parsed from #ktdp.spyre_memory_space<LX, core=N>);
+        load/store use it to route via context.get_lx().
         """
         return MemRef(
             base_ptr=ptr,
@@ -105,6 +106,7 @@ class MemoryOps:
             memory_space=memory_space,
             dtype=dtype,
             coordinate_set=coordinate_set,
+            lx_core_id=lx_core_id,
         )
 
     @staticmethod
@@ -252,7 +254,7 @@ class MemoryOps:
         Returns:
             Tile value (tensor) loaded into LX
         """
-        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr)
+        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
         stick_bytes = mgr.stick_bytes
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
@@ -311,7 +313,7 @@ class MemoryOps:
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
         """
-        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr)
+        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
@@ -361,7 +363,7 @@ class MemoryOps:
                     )
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
                     addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
-                    raw = _MemAccessor(context, idx_view.memory_space, addr).read(1, idx_view.dtype)
+                    raw = _MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)
                     coord.append(int(raw[0]))
                 elif sub["kind"] == "direct":
                     coord.append(pt[sub["var_index"]])
@@ -554,7 +556,7 @@ class MemoryOps:
             access_coords = [
                 tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
             ]
-            mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr)
+            mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr, survivor.memref.lx_core_id)
             offsets, unique_sticks = MemoryOps._flat_memory_offsets(
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords, stick_bytes=mgr.stick_bytes,
@@ -613,7 +615,7 @@ class MemoryOps:
             access_coords = [
                 tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
             ]
-            mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr)
+            mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr, survivor.memref.lx_core_id)
             offsets, _ = MemoryOps._flat_memory_offsets(
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords,
