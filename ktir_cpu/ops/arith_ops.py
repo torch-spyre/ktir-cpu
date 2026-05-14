@@ -21,7 +21,7 @@ used by dialect handlers in ``ktir_cpu.dialects``.
 
 import numpy as np
 from ..ir_types import Tile
-from ..dtypes import _REVERSE_MAP
+from ..dtypes import _REVERSE_MAP, to_np_dtype
 
 
 def arith_cast(value, target_np_dtype, expect_floating, op_name):
@@ -483,6 +483,15 @@ class ArithOps:
         if isinstance(value, Tile):
             return Tile(value.data.astype(np.int32), "i32", value.shape)
         return int(value)
+
+    @staticmethod
+    def sitofp(value, dtype: str = "f32"):
+        """Convert signed integer to float, respecting the target dtype."""
+        np_dtype = to_np_dtype(dtype)
+        scalar_type = np.dtype(np_dtype).type
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np_dtype), dtype, value.shape)
+        return scalar_type(value)
 
     @staticmethod
     def uitofp(value):

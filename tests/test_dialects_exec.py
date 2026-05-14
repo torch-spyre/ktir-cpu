@@ -35,13 +35,13 @@ from ktir_cpu.ops.comm_ops import RingNetwork
 # Fixtures
 # ---------------------------------------------------------------------------
 
-def _op(op_type, operands=None, attributes=None, result=None, regions=None):
+def _op(op_type, operands=None, attributes=None, result=None, regions=None, result_type=None):
     return Operation(
         op_type=op_type,
         operands=operands or [],
         attributes=attributes or {},
         result=result,
-        result_type=None,
+        result_type=result_type,
         regions=regions or [],
     )
 
@@ -239,9 +239,20 @@ class TestArithInt:
         ctx = _ctx_with(**{"%a": 7, "%b": 2})
         assert _call("arith.divsi", ctx, _make_env(), operands=["%a", "%b"]) == 3
 
+    def test_divsi_truncates_toward_zero(self):
+        # -7 / 2 = -3 (truncate), not -4 (floor)
+        ctx = _ctx_with(**{"%a": -7, "%b": 2})
+        assert _call("arith.divsi", ctx, _make_env(), operands=["%a", "%b"]) == -3
+
     def test_remsi_scalar(self):
         ctx = _ctx_with(**{"%a": 7, "%b": 3})
         assert _call("arith.remsi", ctx, _make_env(), operands=["%a", "%b"]) == 1
+
+    def test_remsi_negative(self):
+        # MLIR remsi: remainder matches sign of dividend
+        # -7 % 3 = -1 (truncating), not 2 (Python %)
+        ctx = _ctx_with(**{"%a": -7, "%b": 3})
+        assert _call("arith.remsi", ctx, _make_env(), operands=["%a", "%b"]) == -1
 
     def test_ceildivsi_scalar(self):
         ctx = _ctx_with(**{"%a": 7, "%b": 2})
@@ -478,6 +489,20 @@ class TestArithCastsConstants:
         result = _call("arith.sitofp", ctx, _make_env(), operands=["%a"])
         assert isinstance(result, (float, np.floating))
         assert float(result) == pytest.approx(3.0, rel=1e-2)
+
+    def test_sitofp_respects_result_type_f16(self):
+        ctx = _ctx_with(**{"%a": 3})
+        result = _call("arith.sitofp", ctx, _make_env(), operands=["%a"],
+                       result_type="f16")
+        assert result.dtype == np.float16
+
+    def test_sitofp_respects_result_type_f32(self):
+        t = Tile(np.array([1, -2], dtype=np.int32), "i32", (2,))
+        ctx = _ctx_with(**{"%a": t})
+        result = _call("arith.sitofp", ctx, _make_env(), operands=["%a"],
+                       result_type="f32")
+        assert result.data.dtype == np.float32
+        np.testing.assert_array_equal(result.data, [1.0, -2.0])
 
 
 class TestArithBitcast:

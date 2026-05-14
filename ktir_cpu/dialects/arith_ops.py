@@ -145,9 +145,19 @@ def arith__divui(op, context, env):
     return _int_binop(op, context, operator.floordiv)
 
 
+def _truncdiv(a, b):
+    # MLIR divsi truncates toward zero; Python // floors toward -inf.
+    return np.trunc(a / b).astype(np.asarray(a).dtype)
+
+
+def _truncrem(a, b):
+    # MLIR remsi is remainder after truncating division: a - (a/b)*b.
+    return np.asarray(a) - _truncdiv(a, b) * np.asarray(b)
+
+
 @register("arith.divsi", latency_category=LC.COMPUTE_INT)
 def arith__divsi(op, context, env):
-    return _int_binop(op, context, operator.floordiv)
+    return _int_binop(op, context, _truncdiv)
 
 
 @register("arith.ceildivsi", latency_category=LC.COMPUTE_INT)
@@ -169,7 +179,7 @@ def arith__remui(op, context, env):
 
 @register("arith.remsi", latency_category=LC.COMPUTE_INT)
 def arith__remsi(op, context, env):
-    return _int_binop(op, context, operator.mod)
+    return _int_binop(op, context, _truncrem)
 
 
 @register("arith.minsi", latency_category=LC.COMPUTE_INT)
@@ -351,9 +361,8 @@ def arith__trunci(op, context, env):
 
 @register("arith.sitofp")
 def arith__sitofp(op, context, env):
-    return _unary(op, context,
-                  lambda t: Tile(t.data.astype(np.float32), "f32", t.shape),
-                  np.float32)
+    dtype = op.result_type or "f32"
+    return _unary(op, context, lambda v: ArithOps.sitofp(v, dtype))
 
 
 @register("arith.uitofp")
