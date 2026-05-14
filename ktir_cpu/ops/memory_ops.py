@@ -19,12 +19,14 @@ Tile view construction, sub-tile access, and HBM/LX load/store
 primitives used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
-from ..affine import AffineMap, AffineSet
+from ..affine import AffineMap, AffineSet, BoxSet
 from ..dialects.ktdp_helpers import eval_subscript_expr
 from ..dtypes import bytes_per_elem as _bytes_per_elem, to_np_dtype as _to_np_dtype
-from ..ir_types import DistributedMemRef, DistributedTileRef, MemRef, Tile, TileRef
+from ..ir_types import (
+    CoordinateSet, DistributedMemRef, DistributedTileRef, MemRef, Tile, TileRef,
+)
 from ..grid import CoreContext
 from ..memory import HBMSimulator
 
@@ -395,48 +397,73 @@ class MemoryOps:
         access_shape: Tuple[int, ...],
         base_map: AffineMap,
         indices: List[int],
-        access_tile_set: Optional[AffineSet] = None,
+        access_tile_set: Optional[Union[BoxSet, AffineSet]] = None,
     ) -> DistributedTileRef:
         """Resolve partition routing once, return a DistributedTileRef.
 
-        For each partition i:
-          1. Enumerate B_i over the global view shape; skip if empty.
-          2. Compute p_i = min(B_i) (per-dim minimum).
-          3. Filter to C_i = points of B_i that lie within x + A.
-             - access_tile_set None ⇒ A is the full box [0, access_shape).
-             - access_tile_set AffineSet ⇒ membership tested point-by-point.
-          4. Drop the partition if C_i is empty.
-          5. Otherwise emit a survivor TileRef with
-             ``coordinate_set = C_i`` (List[Tuple[int,...]]),
-             ``partition_origin = p_i``, ``memref = P_i``,
-             ``base_ptr = P_i.byte_address`` (full partition base; load/
-             store will translate per-coord via C_i - p_i).
+        Fast path (BoxSet): when both ``B_i`` and the access set ``A``
+        (or the implicit full-box A) are :class:`BoxSet`, compute
+        ``C_i = B_i ∩ (x + A)`` in O(ndim) via ``translate`` +
+        ``intersect`` and store ``C_i`` as a ``BoxSet``.  Skip empty
+        intersections.
+
+        Slow path (AffineSet on either side): enumerate B_i over the
+        global shape, filter by membership in ``x + A``, store C_i as
+        a ``List[Tuple[int, ...]]``.
+
+        Each survivor inherits ``memref = P_i``, ``base_ptr =
+        P_i.byte_address``, and ``strides = P_i.strides``.  Load/store
+        translate per-coord via ``C_i - p_i``.
         """
         global_base = tuple(base_map.eval(indices))
         x = global_base
         ndim = len(dist_ref.shape)
 
+        # Pre-compute (x + A) as a BoxSet when possible.  None ⇒ A is
+        # the implicit full box [0, access_shape).
+        xA_box: Optional[BoxSet] = None
+        if access_tile_set is None:
+            xA_box = BoxSet(
+                lo=tuple(x),
+                hi=tuple(x[d] + access_shape[d] for d in range(ndim)),
+            )
+        elif isinstance(access_tile_set, BoxSet):
+            xA_box = access_tile_set.translate(x)
+
         def _in_xA(p: Tuple[int, ...]) -> bool:
+            """Slow-path membership test: point ∈ x + A."""
             if access_tile_set is None:
                 return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
             return access_tile_set.contains(tuple(p[d] - x[d] for d in range(ndim)))
 
         survivors: List[TileRef] = []
         for part in dist_ref.partitions:
-            B_i_pts = part.coordinate_set.enumerate(dist_ref.shape)
-            if not B_i_pts:
-                continue
-            p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
-            C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
-            if not C_i_pts:
-                continue
+            B_i = part.coordinate_set
+            if isinstance(B_i, BoxSet) and xA_box is not None:
+                # Fast path: O(ndim) intersect
+                C_i = B_i.intersect(xA_box)
+                if C_i.is_empty():
+                    continue
+                p_i = B_i.lower_bounds()
+                coordinate_set_out: CoordinateSet = C_i
+            else:
+                # Slow path: brute-force enumerate + filter
+                B_i_pts = B_i.enumerate(dist_ref.shape)
+                if not B_i_pts:
+                    continue
+                p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
+                C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
+                if not C_i_pts:
+                    continue
+                coordinate_set_out = C_i_pts
+
             survivors.append(TileRef(
                 base_ptr=part.byte_address,
                 shape=part.shape,
                 strides=list(part.strides),
                 memref=part,
                 dtype=part.dtype,
-                coordinate_set=C_i_pts,
+                coordinate_set=coordinate_set_out,
                 partition_origin=p_i,
             ))
 
@@ -453,6 +480,32 @@ class MemoryOps:
         )
 
     @staticmethod
+    def _subtile_ref(survivor: TileRef, box: BoxSet) -> TileRef:
+        """Build a TileRef covering exactly *box* (in global coords) within *survivor*.
+
+        Inherits the survivor's strides verbatim; only ``shape`` shrinks
+        to the box extent and ``base_ptr`` shifts to the box's local
+        origin (``box.lo - p_i``, in element units, scaled by bpe).  The
+        resulting sub-TileRef plugs into :meth:`load` / :meth:`store`,
+        whose strided iteration lands each element at the byte offset
+        the parent layout dictates — row-major and column-packed
+        partitions both work uniformly without caller-side transposes.
+        """
+        ndim = len(survivor.shape)
+        p_i = survivor.partition_origin or (0,) * ndim
+        local_lo = tuple(box.lo[d] - p_i[d] for d in range(ndim))
+        sub_shape = tuple(box.hi[d] - box.lo[d] for d in range(ndim))
+        bpe = _bytes_per_elem(survivor.dtype)
+        byte_offset = sum(local_lo[d] * survivor.strides[d] for d in range(ndim)) * bpe
+        return TileRef(
+            base_ptr=survivor.base_ptr + byte_offset,
+            shape=sub_shape,
+            strides=list(survivor.strides),
+            memref=survivor.memref,
+            dtype=survivor.dtype,
+        )
+
+    @staticmethod
     def distributed_load(
         context: CoreContext,
         dist_tile_ref: DistributedTileRef,
@@ -460,9 +513,14 @@ class MemoryOps:
     ) -> Tile:
         """Gather elements across surviving partitions into a single LX-resident Tile.
 
-        Per survivor: translate C_i to partition-local coords (C_i - p_i),
-        issue one batched read, scatter into the access-local positions
-        (C_i - x) of the output buffer.
+        Fast path (BoxSet C_i): build a sub-TileRef of the partition
+        covering exactly C_i, delegate the read to :meth:`load`, and
+        slot the returned tile into a rectangular slice of the output
+        buffer.  One NumPy slice assignment per partition.
+
+        Slow path (List[Tuple] C_i): per-coord scatter — translate C_i
+        to partition-local coords, issue one batched read, write each
+        element into the access-local position of the output buffer.
         """
         x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
         ndim = len(dist_tile_ref.shape)
@@ -473,7 +531,22 @@ class MemoryOps:
 
         total_unique_sticks = 0
         for survivor in dist_tile_ref.partitions:
-            C_i = survivor.coordinate_set or []
+            cs = survivor.coordinate_set
+            if isinstance(cs, BoxSet):
+                # Fast path: rectangular sub-tile.
+                sub = MemoryOps._subtile_ref(survivor, cs)
+                tile = MemoryOps.load(context, sub)
+                # access-local rectangle = C_i - x
+                slc = tuple(
+                    slice(cs.lo[d] - x[d], cs.hi[d] - x[d]) for d in range(ndim)
+                )
+                out[slc] = tile.data
+                if tile.unique_sticks is not None:
+                    total_unique_sticks += tile.unique_sticks
+                continue
+
+            # Slow path: List[Tuple[int, ...]] enumeration.
+            C_i = cs or []
             p_i = survivor.partition_origin or (0,) * ndim
             local_coords = [
                 tuple(c[d] - p_i[d] for d in range(ndim)) for c in C_i
@@ -509,15 +582,30 @@ class MemoryOps:
     ) -> None:
         """Scatter a tile to surviving partitions, symmetric to :meth:`distributed_load`.
 
-        Per survivor: select tile elements at access-local positions
-        (C_i - x), write them to partition-local positions (C_i - p_i)
-        via one read-modify-write.
+        Fast path (BoxSet C_i): slice the source tile rectangularly at
+        ``C_i - x``, wrap in a Tile, write through a sub-TileRef built
+        on C_i.  np.ascontiguousarray covers the case where the slice
+        is a non-contiguous view.
+
+        Slow path (List[Tuple] C_i): per-coord gather/write via one
+        read-modify-write.
         """
         x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
         ndim = len(dist_tile_ref.shape)
 
         for survivor in dist_tile_ref.partitions:
-            C_i = survivor.coordinate_set or []
+            cs = survivor.coordinate_set
+            if isinstance(cs, BoxSet):
+                sub = MemoryOps._subtile_ref(survivor, cs)
+                slc = tuple(
+                    slice(cs.lo[d] - x[d], cs.hi[d] - x[d]) for d in range(ndim)
+                )
+                src = np.ascontiguousarray(tile.data[slc])
+                sub_tile = Tile(src, survivor.dtype, src.shape)
+                MemoryOps.store(context, sub_tile, sub)
+                continue
+
+            C_i = cs or []
             p_i = survivor.partition_origin or (0,) * ndim
             local_coords = [
                 tuple(c[d] - p_i[d] for d in range(ndim)) for c in C_i

@@ -25,7 +25,7 @@ from ktir_cpu.parser_ast import (
     parse_expr,
     eval_expr,
     parse_affine_map,
-    parse_affine_set,
+    parse_affine_set_raw as parse_affine_set,
     eval_affine_map,
     affine_set_contains,
     enumerate_affine_set,

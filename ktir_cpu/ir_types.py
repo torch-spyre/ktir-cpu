@@ -33,7 +33,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
-from .affine import AffineMap, AffineSet
+from .affine import AffineMap, AffineSet, BoxSet
+
+# Type alias for TileRef.coordinate_set: parsed affine sets lower to BoxSet
+# at parse time when axis-aligned; non-box sets stay as AffineSet; the
+# distributed slow path stores a pre-enumerated list of points; None means
+# the field hasn't been set (ordinary single-allocation TileRefs).
+CoordinateSet = Union[BoxSet, AffineSet, List[Tuple[int, ...]]]
 
 
 @dataclass
@@ -159,9 +165,13 @@ class TileRef:
     strides: List[int]         # element counts
     memref: 'MemRef'           # parent MemRef — always set; owns memory_space and hw address conversion
     dtype: str = "f16"
-    # Per-survivor metadata set by distributed_tile_access; None on
-    # ordinary single-allocation TileRefs.
-    coordinate_set: Optional[List[Tuple[int, ...]]] = None  # C_i in global coords (slow path)
+    # Per-survivor metadata set by distributed_tile_access (None on
+    # ordinary single-allocation TileRefs).  ``coordinate_set`` is one of:
+    #   - BoxSet: axis-aligned C_i, produced by the BoxSet fast path in
+    #     distributed_tile_access (B_i and A both BoxSet).  O(ndim) ops.
+    #   - List[Tuple[int,...]]: pre-enumerated C_i points from the slow
+    #     path (B_i or A is AffineSet — non-box).
+    coordinate_set: Optional[CoordinateSet] = None
     partition_origin: Optional[Tuple[int, ...]] = None      # p_i = min(B_i) in global coords
 
     def size_bytes(self) -> int:
