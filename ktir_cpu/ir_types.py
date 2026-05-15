@@ -55,6 +55,12 @@ class MemRef:
     strides: List[int]         # element counts
     memory_space: str          # "HBM" or "LX"
     dtype: str = "f16"
+    # ``coordinate_set`` is the set of global coords this MemRef owns.
+    # Per-axis ``strides`` only describes a strided rectangle, so a
+    # non-rectangular set is stored BB-padded inside ``shape`` (slots
+    # outside the set are unused but addressable).  Hence the partition
+    # origin in global coords is ``min(coordinate_set)`` (= BB lower
+    # corner) — relied on by ``distributed_tile_access`` for ``p_i``.
     coordinate_set: Optional[AffineSet] = None
     # Set when memory_space="LX" and a core index was specified via
     # #ktdp.spyre_memory_space<LX, core = N>.  None means "the executing

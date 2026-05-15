@@ -416,6 +416,12 @@ class MemoryOps:
         Each survivor inherits ``memref = P_i``, ``base_ptr =
         P_i.byte_address``, and ``strides = P_i.strides``.  Load/store
         translate per-coord via ``C_i - p_i``.
+
+        ``p_i = min(B_i)`` (per-axis) is the partition's origin in
+        global coords.  This is correct because per-axis ``strides`` on
+        ``MemRef`` can only describe a strided rectangle, so any
+        non-rectangular ``B_i`` is stored BB-padded inside the
+        partition's ``shape`` (see ``MemRef.coordinate_set``).
         """
         global_base = tuple(base_map.eval(indices))
         x = global_base
