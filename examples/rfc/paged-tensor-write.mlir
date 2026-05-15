@@ -7,17 +7,17 @@
 // Idx input = 2D tensor, shape {Nb, Ntkv/Ptkv} = {4, 32} i32
 // Y output = paged 4D tensor, shape {Npages, Nh, Ptkv, Ndkv} = {10000, 8, 64, 128} f16
 //
-// Affine declarations are kept verbatim from paged-tensor-copy.mlir; the
-// `var_space` qualifier refers to the iteration variable layout, not to which
-// tensor the IAT acts on. So `#X_var_space_*` continues to describe the
+// The `var_space` declarations are kept verbatim from paged-tensor-copy.mlir;
+// the `var_space` qualifier refers to the iteration variable layout, not to
+// which tensor the IAT acts on. So `#X_var_space_*` continues to describe the
 // indirect-access (b, h, tkv, dkv) iteration even though X is now the
 // (contiguous) source.
 
-#X_coord_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 9999 >= 0,
+#paged_coord_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 9999 >= 0,
                                               d1 >= 0, -d1 + 7 >=0,
                                               d2 >= 0, -d2 + 63 >= 0,
                                               d3 >= 0, -d3 + 127>= 0)>
-#Y_coord_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 3 >= 0,
+#contiguous_coord_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 3 >= 0,
                                               d1 >= 0, -d1 + 2047 >=0,
                                               d2 >= 0, -d2 + 7 >= 0,
                                               d3 >= 0, -d3 + 127>= 0)>
@@ -65,7 +65,7 @@ module {
         %X_str_Nb = arith.muli %X_str_Ntkv, %Ntkv : index
         %X_mem_view = ktdp.construct_memory_view %X_start_address,
                         sizes: [%Nb, %Ntkv, %Nhkv, %Ndkv], strides: [%X_str_Nb, %X_str_Ntkv, %Ndkv, 1] {
-                        coordinate_set = #Y_coord_set,
+                        coordinate_set = #contiguous_coord_set,
                         memory_space = #ktdp.spyre_memory_space<HBM>
         } : memref<4x2048x8x128xf16>
 
@@ -73,7 +73,7 @@ module {
         // dim order (outermost to innermost) {Npages, Nh, Ptkv, Ndkv}
         %Y_mem_view = ktdp.construct_memory_view %Y_start_address,
                         sizes: [%Npages, %Nhkv, %Ptkv, %Ndkv], strides: [65536, 8192, %Ndkv, 1] {
-                        coordinate_set = #X_coord_set,
+                        coordinate_set = #paged_coord_set,
                         memory_space = #ktdp.spyre_memory_space<HBM>
         } : memref<10000x8x64x128xf16>
 

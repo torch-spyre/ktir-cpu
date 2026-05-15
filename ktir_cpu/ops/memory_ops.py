@@ -347,19 +347,15 @@ class MemoryOps:
         (direct dims use the variable value, indirect dims look up the
         index in an index memref), then delegates to :meth:`load`.
 
-        Raises NotImplementedError if ``variables_space_order`` is non-identity
-        (rebinding intermediate variables under a permutation is unimplemented).
+        Raises NotImplementedError if ``variables_space_order`` is non-identity.
         """
         vss = iat.variables_space_set
         vso = iat.variables_space_order
 
-        # Reject permuted vso: applying it in-place would corrupt the variable
-        # bindings consumed below and would not reorder the enumeration anyway.
         if vso is not None and not vso.is_identity():
             raise NotImplementedError(
-                "indirect_load: non-identity variables_space_order is not yet "
-                "supported (rebinding intermediate variables under a permutation "
-                "is unimplemented)"
+                "indirect_load: output tile permutation via non-identity "
+                "variables_space_order is not yet implemented"
             )
 
         # Pre-compile per-dim resolvers so branch dispatch and constant lookups
@@ -394,7 +390,15 @@ class MemoryOps:
                     idx_coords = tuple(eval_subscript_expr(e, pt) for e in idx_exprs)
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
                     addr = idx_view.byte_address + offset * bpe
-                    coord.append(int(_MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)[0]))
+                    raw_idx = int(_MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)[0])
+                    # NumPy fancy-index reads silently wrap negative
+                    # indices; reject them here. Use raise so the check
+                    # survives python -O.
+                    if raw_idx < 0:
+                        raise IndexError(
+                            f"indirect index {raw_idx} from {idx_view} is negative"
+                        )
+                    coord.append(raw_idx)
             coords.append(tuple(coord))
 
         out_shape = result_shape if result_shape is not None else iat.shape
@@ -686,12 +690,10 @@ class MemoryOps:
         vss = iat.variables_space_set
         vso = iat.variables_space_order
 
-        # See indirect_load for the rationale on rejecting permuted vso.
         if vso is not None and not vso.is_identity():
             raise NotImplementedError(
-                "indirect_store: non-identity variables_space_order is not yet "
-                "supported (rebinding intermediate variables under a permutation "
-                "is unimplemented)"
+                "indirect_store: output tile permutation via non-identity "
+                "variables_space_order is not yet implemented"
             )
 
         # Pre-compile per-dim resolvers (loop-invariant hoisting): branch
