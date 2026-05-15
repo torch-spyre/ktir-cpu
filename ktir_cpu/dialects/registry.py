@@ -25,7 +25,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..grid import CoreContext, GridExecutor
 from ..ir_types import Operation
-from ..ops.comm_ops import RingBackend
 
 # ---------------------------------------------------------------------------
 # Execution handler registry
@@ -136,5 +135,4 @@ class ExecutionEnv:
     """Lightweight bag of core-external resources passed to handlers."""
 
     grid_executor: GridExecutor
-    ring_backend: RingBackend
     execute_region: Callable[[CoreContext, List[Operation]], Any]

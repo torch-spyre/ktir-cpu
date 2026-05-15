@@ -19,10 +19,10 @@ Inter-core tile transfer and ring-based reduction primitives used by
 dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import Dict, List, Tuple, Callable, Optional
+from typing import Dict, Generator, List, Tuple, Callable, Optional
 import numpy as np
 from ..ir_types import Tile
-from ..grid import CoreContext
+from ..grid import CoreContext, RecvRequest
 from ..memory import LXScratchpad, SpyreMemoryHierarchy
 
 
@@ -179,11 +179,18 @@ class CommOps:
         context: CoreContext,
         tile: Tile,
         dst_cores: List[int],
-        ring_backend: RingBackend,
-    ):
-        """Transfer a tile to destination cores via the ring backend."""
+    ) -> Generator:
+        """Send *tile* to each core in *dst_cores*, then return.
+
+        Yields nothing — fire-and-forget: the sender does not block.
+        The caller (scheduler) wraps sync returns in a one-shot iterator.
+
+        Spec: the receiver blocks on its own recv; the sender is free
+        to continue.
+        """
         for dst_core in dst_cores:
-            ring_backend.send(context.core_id, dst_core, tile)
+            context.send_to(dst_core, tile)
+        return tile  # result value (non-generator; scheduler wraps it)
 
     @staticmethod
     def reduce(
@@ -191,72 +198,34 @@ class CommOps:
         tile: Tile,
         core_group: List[int],
         reduce_fn: Callable[[Tile, Tile], Tile],
-        ring_backend: RingBackend,
-    ) -> Tuple[Tile, bool]:
-        """Reduce a tile across a core group using the ring network.
+    ) -> Generator:
+        """Reduce *tile* across *core_group* via N-1 ring rounds.
 
-        Args:
-            context: Core execution context
-            tile: Local tile value to reduce
-            core_group: List of core IDs participating in reduction
-            reduce_fn: Reduction function (e.g., add, max)
-            ring: Ring network
+        This is a **generator** — callers must drive it with `.send()`.
+        Blocking receive points suspend via ``yield ('recv', src_core_id)``;
+        the scheduler resumes with the received tile as the send value.
 
-        Returns:
-            (reduced_result, has_result) tuple
-            - reduced_result: The reduced tile
-            - has_result: True if this core has the final result
-
-        Note:
-            Only cores in core_group participate. Others return dummy result.
+        Only cores in *core_group* participate.  The first core in the group
+        (rank 0) holds the final result; others return their last partial.
         """
-        # Check if this core participates
         if context.core_id not in core_group:
-            # Not participating, return dummy
-            dummy_data = np.zeros_like(tile.data)
-            return (Tile(dummy_data, tile.dtype, tile.shape), False)
+            # Non-participant: return tile unchanged, no communication.
+            return tile
 
-        # Participating in reduction
         n_cores = len(core_group)
         my_idx = core_group.index(context.core_id)
-
-        # Ring reduction algorithm
-        # Each round, send to next in ring and receive from previous
         result = tile.copy()
 
-        num_rounds = int(np.ceil(np.log2(n_cores))) if n_cores > 1 else 0
-
-        for round_num in range(num_rounds):
-            # Send to next core in ring
+        for _ in range(n_cores - 1):
             next_idx = (my_idx + 1) % n_cores
-            next_core = core_group[next_idx]
-            ring_backend.send(context.core_id, next_core, result)
-
-            # Receive from previous core in ring
             prev_idx = (my_idx - 1) % n_cores
-            prev_core = core_group[prev_idx]
+            context.send_to(core_group[next_idx], result)
+            received = yield RecvRequest(src=core_group[prev_idx])
+            result = reduce_fn(result, received)
 
-            # In sequential simulation, message is immediately available
-            received = ring_backend.recv(prev_core, context.core_id)
-
-            # Apply reduction
-            if received is not None:
-                result = reduce_fn(result, received)
-
-        # Determine if this core has final result
-        # Typically, first core in group gets the final result
-        has_result = (my_idx == 0)
-
-        return (result, has_result)
+        return result
 
     @staticmethod
     def reduce_return(value: Tile) -> Tile:
-        """Return a value from a reduction block (identity passthrough).
-
-        Args:
-            value: Value to return
-
-        Returns:
-            The value
-        """
+        """Return a value from a reduction block (identity passthrough)."""
         return value

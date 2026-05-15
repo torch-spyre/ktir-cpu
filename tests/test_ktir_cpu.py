@@ -271,65 +271,6 @@ def test_grid_boundary_max_position():
     assert grid._grid_to_linear(*core.grid_pos) == last_id
 
 
-@pytest.mark.xfail(reason="BSP multi-round execution removed; RingTransferBackend not yet implemented (gap_analysis.md K1/K2)")
-def test_execute_with_communication_multi_round():
-    """execute_with_communication runs multiple rounds and converges once all messages are consumed.
-
-    NOTE: The BSP replay model in execute_with_communication has a known correctness problem
-    described in docs/gap_analysis.md section K1 ("Multi-round communication re-execution").
-    Re-execution inflates latency tracking and breaks cyclic communication patterns.
-    This test only exercises the simple forward-propagation case (core 0 → core 1) which
-    converges correctly; it does not imply cyclic or bidirectional communication works.
-    """
-    from ktir_cpu.memory import SpyreMemoryHierarchy
-    from ktir_cpu.ops.comm_ops import RingNetwork
-    from ktir_cpu.ir_types import Tile
-
-    memory = SpyreMemoryHierarchy(num_cores=2)
-    grid = GridExecutor(grid_shape=(2, 1, 1), memory=memory)
-    ring = RingNetwork(num_cores=2)
-
-    round_num = [0]
-    call_counts = [0]
-
-    def execute_fn(core, ring_net):
-        call_counts[0] += 1
-        # Round 0 (call 0 and 1): core 0 sends to core 1.
-        # Round 1 (call 2 and 3): core 1 consumes the message — no pending after this round.
-        if round_num[0] == 0 and core.core_id == 0:
-            tile = Tile(np.array([42.0], dtype=np.float16), "f16", (1,))
-            ring_net.send(src_core=0, dst_core=1, tile=tile)
-        elif round_num[0] == 1 and core.core_id == 1:
-            ring_net.recv_from(src_core=0, dst_core=1)
-        # Track which round we're in based on call count parity.
-        if call_counts[0] % 2 == 0:
-            round_num[0] += 1
-
-    grid.execute_with_communication(execute_fn, ring)
-    # Two rounds × two cores = 4 calls
-    assert call_counts[0] == 4
-
-
-@pytest.mark.xfail(reason="BSP multi-round execution removed; RingTransferBackend not yet implemented (gap_analysis.md K1/K2)")
-def test_execute_with_communication_exceeds_max_rounds():
-    """execute_with_communication raises RuntimeError when messages never drain."""
-    from ktir_cpu.memory import SpyreMemoryHierarchy
-    from ktir_cpu.ops.comm_ops import RingNetwork
-    from ktir_cpu.ir_types import Tile
-
-    memory = SpyreMemoryHierarchy(num_cores=2)
-    grid = GridExecutor(grid_shape=(2, 1, 1), memory=memory)
-    ring = RingNetwork(num_cores=2)
-
-    def always_send(core, ring_net):
-        # Accumulate messages that are never consumed — network never drains.
-        tile = Tile(np.array([1.0], dtype=np.float16), "f16", (1,))
-        ring_net.send(src_core=core.core_id, dst_core=(core.core_id + 1) % 2, tile=tile)
-
-    with pytest.raises(RuntimeError, match="Communication didn't converge"):
-        grid.execute_with_communication(always_send, ring, max_rounds=2)
-
-
 def test_hbm_allocate_f32():
     """HBMSimulator.allocate followed by write/read round-trips f32 data."""
     hbm = HBMSimulator()

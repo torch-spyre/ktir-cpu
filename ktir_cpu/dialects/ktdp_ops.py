@@ -761,8 +761,7 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
 def ktdp__transfer(op, context, env):
     tile = context.get_value(op.operands[0])
     dst_cores = context.get_value(op.operands[1])
-    CommOps.transfer(context, tile, dst_cores, env.ring_backend)
-    return None
+    return CommOps.transfer(context, tile, dst_cores)
 
 
 @register("ktdp.reduce", latency_category=LC.COMM)
@@ -770,4 +769,4 @@ def ktdp__reduce(op, context, env):
     tile = context.get_value(op.operands[0])
     core_group = context.get_value(op.operands[1])
     reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
-    return CommOps.reduce(context, tile, core_group, reduce_fn, env.ring_backend)
+    return CommOps.reduce(context, tile, core_group, reduce_fn)

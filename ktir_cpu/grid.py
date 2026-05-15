@@ -18,9 +18,22 @@ Grid and core execution management for KTIR CPU backend.
 Simulates multi-core grid execution with per-core execution contexts.
 """
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Any
+import inspect
+from collections import deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Set, Tuple, Any
 from .ir_types import Tile
 from .memory import LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
+
+
+@dataclass(frozen=True)
+class RecvRequest:
+    """Yielded by a comm generator to signal a blocking recv.
+
+    The scheduler parks the core until a tile from *src* is available,
+    then resumes the generator via ``gen.send(tile)``.
+    """
+    src: int  # core ID to receive from
 
 if TYPE_CHECKING:
     from .ops.comm_ops import RingBackend
@@ -84,6 +97,9 @@ class CoreContext:
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
+        # Set by the scheduler before running a generator — routes send_to()
+        # calls to the scheduler's message queue.
+        self._send_fn: Optional[Callable[[int, "Tile"], None]] = None
 
     def get_lx(self, core_id: Optional[int] = None) -> LXScratchpad:
         """Return the LXScratchpad for *core_id*.
@@ -165,6 +181,20 @@ class CoreContext:
         self.lx.next_ptr = self._lx_next_ptr_stack.pop()
         assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
 
+    def send_to(self, dst_core: int, tile: "Tile") -> None:
+        """Enqueue *tile* for delivery to *dst_core*.
+
+        Wired by the scheduler before stepping this core's generator.
+        Raises if called outside a scheduler-managed execution (e.g. in
+        single-core tests that never set _send_fn).
+        """
+        if self._send_fn is None:
+            raise RuntimeError(
+                f"CoreContext(core_id={self.core_id}).send_to called without "
+                "a scheduler — construct via GridExecutor._run_scheduler"
+            )
+        self._send_fn(dst_core, tile)
+
     # ------------------------------------------------------------------
     # SSA value access
     # ------------------------------------------------------------------
@@ -232,6 +262,73 @@ class CoreContext:
         """Free LX for SSA value *name*.  Decrements ``lx.used``."""
         if name in self._lx_bytes:
             self.lx.used -= self._lx_bytes.pop(name)
+
+
+class CoreExecutionStack:
+    """Represents one core's execution state as a resumable generator.
+
+    ``execute_until_block`` runs ops via *execute_op* until either all ops
+    complete (done) or a comm op returns a generator that yields
+    ``('recv', src)`` (blocked).  Generator-awareness is contained here —
+    callers and dialect handlers never see generators.
+
+    After ``resume()`` returns, check ``is_blocked()`` to know whether the
+    core is waiting on a recv or has finished.  If blocked, ``waiting_on``
+    holds the src core ID to wait for.
+    """
+
+    def __init__(
+        self,
+        core: "CoreContext",
+        operations: List["Operation"],
+        input_ptrs: Dict[str, Any],
+        execute_op: Callable[["Operation", "CoreContext"], Any],
+    ):
+        self.core = core
+        self.waiting_on: Optional[int] = None
+        self._gen = self._execute_until_block(operations, input_ptrs, execute_op)
+
+    def _execute_until_block(self, operations, input_ptrs, execute_op):
+        for k, v in input_ptrs.items():
+            self.core.set_value("%" + k, v)
+        result = None
+        for op in operations:
+            result = execute_op(op, self.core)
+            if inspect.isgenerator(result):
+                # Comm op returned a generator — drive it, yielding recv
+                # requests up to the scheduler one at a time.
+                result = yield from result
+                # Post-resume: store the final result (execute_op couldn't,
+                # it returned the generator before the value was known).
+                self._store(op, result, self.core)
+        return result
+
+    def _store(self, op: "Operation", result: Any, context: "CoreContext") -> None:
+        """Bind *result* into *context* for *op* (mirrors interpreter logic)."""
+        if op.result and result is not None:
+            if isinstance(op.result, list) and isinstance(result, tuple):
+                for name, val in zip(op.result, result):
+                    context.set_value(name, val)
+            else:
+                context.set_value(op.result, result)
+                from .ir_types import Tile as _Tile
+                if isinstance(result, _Tile):
+                    context.track_lx(op.result, result.size_bytes())
+
+    def resume(self, send_val: Any = None) -> Any:
+        """Step the generator.  Returns the final value when done."""
+        self.waiting_on = None
+        try:
+            request = self._gen.send(send_val) if send_val is not None else next(self._gen)
+            if not isinstance(request, RecvRequest):
+                raise TypeError(f"Comm op yielded unexpected type {type(request)!r}; expected RecvRequest")
+            self.waiting_on = request.src
+            return None
+        except StopIteration as e:
+            return e.value
+
+    def is_blocked(self) -> bool:
+        return self.waiting_on is not None
 
 
 class GridExecutor:
@@ -322,27 +419,68 @@ class GridExecutor:
 
         return core_ids
 
-    def execute_with_communication(self, execute_fn, max_rounds=10, *args, **kwargs):
-        """Execute function on all cores with communication support.
+    def execute_with_communication(
+        self,
+        operations: List["Operation"],
+        input_ptrs: Dict[str, Any],
+        execute_op: Callable[["Operation", "CoreContext"], Any],
+    ) -> List[Any]:
+        """Drive all cores to completion via the generator scheduler.
 
-        Uses single-pass execution under DirectLXBackend (no ring messages
-        actually flow).  When RingTransferBackend lands, this method will
-        need access to the ring backend (via ExecutionEnv or a direct
-        parameter) to drive message delivery between rounds — calling
-        ring_backend.deliver_all() and checking for pending messages
-        before deciding whether to continue or raise on non-convergence.
-
-        Args:
-            execute_fn: Function(core: CoreContext) to execute per core
-            max_rounds: Maximum communication rounds
-            *args, **kwargs: Additional arguments
-
-        Returns:
-            List of results from each core
+        Each core is represented by a ``CoreExecutionStack``.  The stack
+        runs ops synchronously until a comm op returns a generator (a
+        blocking recv).  The scheduler parks that core, delivers the
+        message when it arrives, and resumes.  Unresolvable waits raise
+        ``RuntimeError('Deadlock detected: ...')``.
         """
-        for round_num in range(max_rounds):
-            results = []
-            for core in self.cores:
-                result = execute_fn(core, *args, **kwargs)
-                results.append(result)
-            return results
+        messages: Dict[Tuple[int, int], deque] = {}
+        stacks: Dict[int, "CoreExecutionStack"] = {}
+        waiting: Dict[int, int] = {}   # core_id -> src_core it is waiting on
+        results: Dict[int, Any] = {}
+
+        def _enqueue(src: int, dst: int, tile: "Tile") -> None:
+            messages.setdefault((src, dst), deque()).append(tile)
+
+        def _pop(src: int, dst: int) -> Optional["Tile"]:
+            q = messages.get((src, dst))
+            if not q:
+                return None
+            tile = q.popleft()
+            if not q:
+                del messages[(src, dst)]
+            return tile
+
+        def _advance(core_id: int, send_val: Any = None) -> None:
+            stack = stacks[core_id]
+            result = stack.resume(send_val)
+            if stack.is_blocked():
+                waiting[core_id] = stack.waiting_on
+            else:
+                results[core_id] = result
+                del stacks[core_id]
+
+        def _try_deliver(core_id: int) -> bool:
+            src = waiting.get(core_id)
+            if src is None:
+                return False
+            tile = _pop(src, core_id)
+            if tile is None:
+                return False
+            del waiting[core_id]
+            _advance(core_id, tile)
+            return True
+
+        for core in self.cores:
+            core._send_fn = lambda dst, tile, _src=core.core_id: _enqueue(_src, dst, tile)
+            stacks[core.core_id] = CoreExecutionStack(core, operations, input_ptrs, execute_op)
+            _advance(core.core_id)
+
+        while stacks:
+            if not any(_try_deliver(c) for c in list(stacks)):
+                wait_desc = "; ".join(
+                    f"core {c} waiting on recv from core {s}"
+                    for c, s in waiting.items()
+                )
+                raise RuntimeError(f"Deadlock detected: {wait_desc}")
+
+        return [results[i] for i in range(self.num_cores)]

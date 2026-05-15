@@ -231,44 +231,25 @@ spec surface.
 
 ### K1. Multi-round communication re-execution
 
-**Status**: ❌ Not yet fixed. Does not affect current example kernels.
+**Status**: ✅ Fixed in PR-B (grid-network branch, issue #50).
 
-`execute_with_communication` in `grid.py` re-executes the entire function body
-on every core for each communication round. The latency tracker accumulates
-costs from every round, so kernels using `ktdp.transfer` or `ktdp.reduce`
-would have inflated latency — all operations (loads, compute, stores) counted
-N times instead of once, where N is the number of communication rounds.
+`execute_with_communication` now uses a generator-based cooperative scheduler.
+Each core runs as a Python generator via `CoreExecutionStack`; blocking `recv`
+operations suspend the generator (`yield RecvRequest(src)`) until the expected
+tile is delivered. No BSP replay — each core executes exactly once.
 
-Current example kernels (vector_add, softmax, layernorm, matmul) are all
-embarrassingly parallel — no comm ops — so `execute_with_communication`
-completes in 1 round and latency is counted exactly once.
-
-The multi-round replay exists because the simulator executes cores
-sequentially. When core 0 calls `ktdp.transfer` to send data to core 5,
-core 5 may have already executed in this round and missed the message.
-BSP-style replay re-runs all cores so core 5 picks up the message on the
-next round.
-
-**Proposed fix**: Replace the BSP replay loop with a single-pass execution
-model where each core executes at most once, scheduled in dependency order.
-Cores blocked on a `recv_from` are retried after other cores complete. Cyclic
-dependencies are detected and raised as errors.
+See `docs/cross_core_scheduling.md` for the full design.
 
 ### K2. Cyclic communication correctness
 
-**Status**: ❌ Functional correctness problem.
+**Status**: ✅ Fixed in PR-B (grid-network branch, issue #50).
 
-The BSP replay model breaks for bidirectional exchanges and `ktdp.reduce`
-(which does its own internal ring loop within a single call):
-
-- `CommOps.reduce` calls `ring.recv_from()` with `pop(0)`, consuming messages.
-  On the next round the consumed messages are gone, producing different
-  intermediate results.
-- `CommOps.transfer` calls `ring.send()` every round, so duplicate messages
-  accumulate in the buffer.
-- Neither `ring_network` nor `core.values` are reset between rounds.
-
-The single-pass execution fix in K1 would also resolve this.
+`CommOps.reduce` is now a generator that yields `RecvRequest` per ring round.
+The scheduler drives it to completion via `gen.send(tile)`, consuming each
+message exactly once in order. No duplicate sends, no message loss.
+Bidirectional exchanges (both cores send then recv) are handled correctly
+because `send_to` is fire-and-forget — the sender enqueues and continues
+without blocking, so symmetric patterns never deadlock.
 
 ### K3. Multi-cast load modeling
 

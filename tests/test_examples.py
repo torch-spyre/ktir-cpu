@@ -557,3 +557,44 @@ class TestSdpaExecution(InterpreterTestMixin):
         expected = (P_norm.astype(np.float32) @ V.astype(np.float32)).astype(np.float16)
 
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Requires parser support for #ktdp.reduce_kind / reduce_mode / grid_axis "
+        "attributes (torch-spyre/ktir-mlir-frontend#21)."
+    )
+)
+class TestRingReduceExecution:
+    """End-to-end execution of ring_reduce.mlir (xfail until parser updated)."""
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce"))
+    def test_ring_reduce_sum(self, path, func_name, entry):
+        """4-core ring reduce: core 0's output equals element-wise sum of all 4 input rows."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        n_cols = entry["n_cols"]
+        in_ptr = entry["execute_kwargs"]["in_ptr"]
+        out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+        rng = np.random.default_rng(42)
+        rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(in_ptr, rows.flatten())
+            interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **entry["execute_kwargs"])
+
+        result = interp.memory.hbm.read(out_ptr, n_cols, "f16")
+        expected = rows.sum(axis=0)
+        np.testing.assert_allclose(result, expected, rtol=1e-2,
+                                   err_msg="Core 0 output does not match element-wise sum")

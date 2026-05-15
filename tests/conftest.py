@@ -240,6 +240,21 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    # ---------------------------------------------------------------------------
+    # Cross-core communication examples
+    # ---------------------------------------------------------------------------
+    "ring_reduce": [
+        {
+            "path": "ktir/ring_reduce.mlir",
+            # 4-core ring reduce: ktdp.reduce (reduce_to_core<0>, sum, grid_axis<0>)
+            # grid = [4, 1, 1] → 4 cores; n_cols = 128 (from construct_memory_view sizes)
+            # HBM layout: in_ptr=0 (4×128×2=1024 bytes), out_ptr=1024 (128×2=256 bytes)
+            # xfail: parser support for #ktdp.reduce_kind / reduce_mode / grid_axis
+            # attributes not yet upstream (torch-spyre/ktir-mlir-frontend#21).
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 1024},
+            "n_cols": 128,
+        },
+    ],
 }
 
 
