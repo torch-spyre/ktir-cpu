@@ -110,18 +110,8 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
 
 # ===========================================================================
 # ktdp.construct_distributed_memory_view
-# RFC §C.3: compose per-partition views (HBM + LX) into one logical view.
+# Implemented; positive coverage moved to tests/test_distributed_view.py.
 # ===========================================================================
-
-@pytest.mark.spec_gap
-@pytest.mark.xfail(strict=True, reason="ktdp.construct_distributed_memory_view not implemented")
-@pytest.mark.parametrize("path,func_name,entry", get_test_params("distributed_view_copy"))
-def test_distributed_memory_view(path, func_name, entry):
-    """construct_distributed_memory_view is not yet supported."""
-    interp = KTIRInterpreter()
-    interp.load(path)
-    interp.execute_function(func_name)
-
 
 # ===========================================================================
 # RFC-explicit non-ktdp ops

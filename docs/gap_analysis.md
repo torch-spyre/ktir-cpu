@@ -11,7 +11,7 @@
 
 | # | Spec Operation | Status | Notes |
 |---|---------------|--------|-------|
-| 1 | `ktdp.construct_distributed_memory_view` | ❌ | No handler, no parser. Key primitive for composing multiple per-partition memory views into a single distributed logical view. Critical for modeling distributed scratchpads. |
+| 1 | `ktdp.construct_distributed_memory_view` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; produces `DistributedMemRef` (composition of N per-partition `MemRef`s). Per-partition routing at access time via `MemoryOps.distributed_tile_access` → `DistributedTileRef`. Tests in `tests/test_distributed_view.py`. |
 | 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. |
 
 ## B. `ktdp` Types & Attributes
@@ -131,7 +131,6 @@ The spec explicitly mentions `memref.subview` for view-based transformations. **
 ### High Priority
 Blocks running spec-compliant KTIR programs:
 
-- **#1**: ❌ `construct_distributed_memory_view`
 - **#25**: ❌ `linalg.add` — used in the spec's primary example and won't execute
 - **#5**: 🟡 `coordinate_set` on memory views preserved but not enforced
 
@@ -173,8 +172,6 @@ Significant progress since the original writeup:
 
 Remaining notable gaps:
 
-- `ktdp.construct_distributed_memory_view` (#1) is still the largest missing
-  ktdp op; it blocks distributed scratchpad modeling.
 - `linalg.add` (#25) is still missing — the RFC's canonical matrix-add example
   cannot execute without it.
 - `coordinate_set` on memory views (#5) is preserved in the IR but not used
@@ -191,7 +188,7 @@ The initial phases of this roadmap are complete. The conformance target was esta
 Goal: cover the RFC-defined `ktdp` surface.
 
 - ✅ Implement `ktdp.construct_indirect_access_tile`.
-- ❌ Implement `ktdp.construct_distributed_memory_view`.
+- ✅ Implement `ktdp.construct_distributed_memory_view`.
 - Add validation rules for:
   matching dimensionalities,
   allowed direct versus indirect dimensions,
@@ -294,7 +291,7 @@ If we want the fastest path to meaningful conformance progress:
 1. ✅ Build the first-class access-tile IR and affine evaluator.
 2. ✅ Rework `ktdp.load` / `ktdp.store` around that representation.
 3. ✅ Add `construct_indirect_access_tile`.
-4. ❌ Add `construct_distributed_memory_view`.
+4. ✅ Add `construct_distributed_memory_view`.
 5. ❌ Add `linalg.add`, `tensor.extract_slice`, and `memref.subview`.
 6. ❌ Fill in the missing RFC-listed SCF ops.
 7. ❌ Expand broader Arith/Math/Linalg coverage as compiler demand appears.
@@ -305,6 +302,6 @@ A strong first milestone would be:
 
 - ✅ affine attributes are preserved and exercised in tests
 - ✅ `ktdp.load` / `ktdp.store` operate over real coordinate collections
-- 🟡 all RFC-defined `ktdp` ops parse and execute (`construct_distributed_memory_view` still missing)
+- ✅ all RFC-defined `ktdp` ops parse and execute
 - ❌ the RFC matrix-add example can run with only mechanical syntax adaptation
 - ❌ the repo has explicit tests for unsupported versus supported RFC surface

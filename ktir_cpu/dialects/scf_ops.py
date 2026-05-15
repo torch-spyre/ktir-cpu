@@ -18,8 +18,6 @@ import re
 
 from ..ir_types import Operation
 from ..latency import LatencyCategory as LC
-from ..ops.comm_ops import CommOps
-from ..ops.arith_ops import ArithOps
 from ..ops.control_ops import ControlOps
 from .registry import register, register_parser
 
@@ -81,21 +79,7 @@ def _return_alias(op, context, env):
     return func__return(op, context, env)
 
 
-# Communication operations (bundled here since they're few)
-@register("ktdp.transfer", latency_category=LC.COMM)
-def ktdp__transfer(op, context, env):
-    tile = context.get_value(op.operands[0])
-    dst_cores = context.get_value(op.operands[1])
-    CommOps.transfer(context, tile, dst_cores, env.ring)
-    return None
-
-
-@register("ktdp.reduce", latency_category=LC.COMM)
-def ktdp__reduce(op, context, env):
-    tile = context.get_value(op.operands[0])
-    core_group = context.get_value(op.operands[1])
-    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
-    return CommOps.reduce(context, tile, core_group, reduce_fn, env.ring)
+# ktdp.transfer / ktdp.reduce moved to ktdp_ops.py (alongside other ktdp.* ops).
 
 
 # ---------------------------------------------------------------------------

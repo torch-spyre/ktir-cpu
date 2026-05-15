@@ -58,7 +58,7 @@ import itertools
 import re
 from typing import List, Optional, Sequence, Tuple
 
-from .affine import AffineMap, AffineSet
+from .affine import AffineMap, AffineSet, BoxSet
 
 
 # ---------------------------------------------------------------------------
@@ -362,8 +362,13 @@ def parse_affine_map(s: str) -> AffineMap:
     )
 
 
-def parse_affine_set(s: str) -> AffineSet:
-    """Parse ``affine_set<(d0,...)[s0,...] : (c0 >= 0, ...)>`` into an :class:`AffineSet`.
+def parse_affine_set_raw(s: str) -> AffineSet:
+    """Parse ``affine_set<...>`` into an :class:`AffineSet` without lowering.
+
+    Unlike :func:`parse_affine_set`, this always returns an ``AffineSet`` —
+    no parse-time lowering to :class:`BoxSet`.  Used by tests that
+    validate the constraint AST structure, and as a building block for
+    :func:`parse_affine_set`.
 
     The ``affine_set<...>`` wrapper and the ``[s0, ...]`` symbol list are optional.
 
@@ -395,6 +400,26 @@ def parse_affine_set(s: str) -> AffineSet:
         constraints=tuple(constraints),
         source=source,
     )
+
+
+def parse_affine_set(s: str):
+    """Parse ``affine_set<(d0,...)[s0,...] : (c0 >= 0, ...)>``.
+
+    Returns a :class:`BoxSet` when the set is axis-aligned and both lo/hi
+    are pinned on every axis; otherwise returns the :class:`AffineSet`
+    fallback.  The ``affine_set<...>`` wrapper is optional.  For tests
+    that need the raw ``AffineSet`` regardless of lowerability, call
+    :func:`parse_affine_set_raw`.
+
+    Symbolic sets (``n_syms > 0``) currently stay on the ``AffineSet``
+    branch — see ``BoxSet.try_from_affine_set``'s TODO.
+
+    Raises:
+        ValueError: on any parse error.
+    """
+    aset = parse_affine_set_raw(s)
+    box = BoxSet.try_from_affine_set(aset)
+    return box if box is not None else aset
 
 
 # ---------------------------------------------------------------------------

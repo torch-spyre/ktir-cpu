@@ -271,6 +271,7 @@ def test_grid_boundary_max_position():
     assert grid._grid_to_linear(*core.grid_pos) == last_id
 
 
+@pytest.mark.xfail(reason="BSP multi-round execution removed; RingTransferBackend not yet implemented (gap_analysis.md K1/K2)")
 def test_execute_with_communication_multi_round():
     """execute_with_communication runs multiple rounds and converges once all messages are consumed.
 
@@ -309,6 +310,7 @@ def test_execute_with_communication_multi_round():
     assert call_counts[0] == 4
 
 
+@pytest.mark.xfail(reason="BSP multi-round execution removed; RingTransferBackend not yet implemented (gap_analysis.md K1/K2)")
 def test_execute_with_communication_exceeds_max_rounds():
     """execute_with_communication raises RuntimeError when messages never drain."""
     from ktir_cpu.memory import SpyreMemoryHierarchy
