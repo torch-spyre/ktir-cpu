@@ -28,7 +28,12 @@ from ..ir_types import (
 )
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
-from ..ops.comm_ops import CommOps, RingReduceBackend
+from ..ops.comm_ops import (
+    CommOps,
+    RingReduceBackend,
+    get_reduce_backend,
+    register_reduce_backend,
+)
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
@@ -787,8 +792,10 @@ def ktdp__transfer(op, context, env):
 
 
 @register("ktdp.reduce", latency_category=LC.COMM)
+@register_reduce_backend("ktdp.reduce", RingReduceBackend)
 def ktdp__reduce(op, context, env):
     tile = context.get_value(op.operands[0])
     core_group = context.get_value(op.operands[1])
-    backend = RingReduceBackend(lambda t1, t2: ArithOps.addf(t1, t2))
-    return CommOps.reduce(context, tile, core_group, backend)
+    backend_cls = get_reduce_backend(op.op_type)
+    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
+    return CommOps.reduce(context, tile, core_group, backend_cls(reduce_fn))
