@@ -96,11 +96,10 @@ class KTIRInterpreter:
         """
         num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
         self.memory = SpyreMemoryHierarchy(num_cores)
-        # DirectLXBackend gives each core direct access to remote LX
-        # scratchpads via context.get_lx(N).  RingNetwork is held alongside
-        # ring_backend is kept for get_lx() (remote LX access in distributed views).
-        # RingNetwork is no longer needed for CommOps — the scheduler message
-        # queue handles delivery. Kept here for PR-C (RingTransferBackend).
+        # ring_backend serves CoreContext.get_lx() — remote LX peeks for
+        # distributed memory views. Cross-core comm goes through the
+        # scheduler protocol (CoreContext.send_to + RecvRequest), not
+        # through a backend. See docs/cross_core_scheduling.md.
         self.ring_network = RingNetwork(num_cores)
         self.ring_backend = DirectLXBackend(self.memory)
         self.grid_executor = GridExecutor(grid_shape, self.memory, ring_backend=self.ring_backend)
