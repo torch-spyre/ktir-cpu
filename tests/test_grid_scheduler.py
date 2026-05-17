@@ -127,7 +127,7 @@ import pytest
 from ktir_cpu.grid import GridExecutor
 from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.memory import SpyreMemoryHierarchy
-from ktir_cpu.ops.comm_ops import CommOps
+from ktir_cpu.ops.comm_ops import CommOps, RingReduceBackend
 
 
 # ---------------------------------------------------------------------------
@@ -178,15 +178,16 @@ def _sum_tiles(a: Tile, b: Tile) -> Tile:
 # ---------------------------------------------------------------------------
 
 def _h_reduce(op: Operation, ctx) -> Any:
-    """test.reduce — wraps CommOps.reduce (ring reduction, per-core view).
+    """test.reduce — wraps CommOps.reduce with a RingReduceBackend.
 
-    Returns the generator produced by ``CommOps.reduce``. The scheduler
-    drives ``N-1`` ``RecvRequest`` yields per core; the final accumulator
-    is bound to ``op.result``.
+    Returns the generator produced by ``RingReduceBackend.run`` (via
+    ``CommOps.reduce``). The scheduler drives ``N-1`` ``RecvRequest``
+    yields per core; the final accumulator is bound to ``op.result``.
     """
     tile = ctx.get_value(op.operands[0])
     group = op.attributes["group"]
-    return CommOps.reduce(ctx, tile, group, _sum_tiles)
+    backend = RingReduceBackend(_sum_tiles)
+    return CommOps.reduce(ctx, tile, group, backend)
 
 
 _STUB_HANDLERS: Dict[str, Callable[[Operation, Any], Any]] = {
