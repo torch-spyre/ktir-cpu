@@ -26,38 +26,44 @@ from ..grid import CoreContext, RecvRequest
 from ..memory import LXScratchpad, SpyreMemoryHierarchy
 
 
-class RingBackend:
+class TransferBackend:
     """Abstract backend for remote LX scratchpad access.
 
     The single seam between memory ops that need a remote core's LX
-    data and the model used to obtain it. Cross-core comm is *not* on
-    this path — it goes through the scheduler protocol
-    (``CoreContext.send_to`` + ``RecvRequest``); see
-    ``docs/cross_core_scheduling.md``.
+    data and the model used to obtain it. ``run`` returns the
+    LXScratchpad for the requested core; future variants (e.g. a
+    ring-hop transport) may be generator-shaped and yield
+    ``RecvRequest`` while data crosses the ring.
+
+    Synchronous today (see :class:`InstantTransferBackend`). When a
+    yielding variant lands, callers of ``CoreContext.get_lx`` will need
+    to drive the resulting generator through the scheduler protocol —
+    same machinery as :class:`ReduceBackend` already uses.
     """
 
-    def get_lx(self, core_id: int) -> LXScratchpad:
-        """Return the LXScratchpad for *core_id*."""
+    def run(self, ctx: "CoreContext", core_id: int) -> LXScratchpad:
+        """Return the LXScratchpad for *core_id* (remote case only)."""
         raise NotImplementedError
 
 
-class DirectLXBackend(RingBackend):
-    """Direct scratchpad access — no ring messages, no latency model.
+class InstantTransferBackend(TransferBackend):
+    """Synchronous lookup — no ring messages, no latency model.
 
     Returns ``memory.lx_scratchpads[N]`` by index. Valid for the
-    distributed-view use case where LX partitions are pre-seeded by the
-    host and no cross-core data movement occurs at runtime.
+    distributed-view use case where LX partitions are pre-seeded by
+    the host and no cross-core data movement occurs at runtime.
     """
 
     def __init__(self, memory: SpyreMemoryHierarchy):
         self._memory = memory
 
-    def get_lx(self, core_id: int) -> LXScratchpad:
+    def run(self, ctx: "CoreContext", core_id: int) -> LXScratchpad:
         """Return the LXScratchpad for *core_id* via direct lookup."""
         num = self._memory.num_cores
         if core_id < 0 or core_id >= num:
             raise ValueError(
-                f"get_lx: core_id={core_id} is out of range [0, {num}) for this grid"
+                f"InstantTransferBackend.run: core_id={core_id} is out of "
+                f"range [0, {num}) for this grid"
             )
         return self._memory.get_lx(core_id)
 

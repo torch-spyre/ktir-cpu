@@ -27,7 +27,7 @@ from .ir_types import Operation, IRModule, Tile
 from .parser import KTIRParser, KTIRParserBase
 from .memory import SpyreMemoryHierarchy
 from .grid import GridExecutor, CoreContext
-from .ops.comm_ops import DirectLXBackend, RingBackend
+from .ops.comm_ops import InstantTransferBackend, TransferBackend
 from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
@@ -65,7 +65,9 @@ class KTIRInterpreter:
         self.module: Optional[IRModule] = None
         self.memory: Optional[SpyreMemoryHierarchy] = None
         self.grid_executor: Optional[GridExecutor] = None
-        self.ring_backend: Optional[RingBackend] = None
+        # TODO: rename ring_backend → transfer_backend across the codebase.
+        # Keeping the old name for now; the type is TransferBackend.
+        self.ring_backend: Optional[TransferBackend] = None
         self._env: Optional[ExecutionEnv] = None
         self._parser: Optional[KTIRParserBase] = parser
         self._latency_tracker: Optional[LatencyTracker] = (
@@ -95,12 +97,15 @@ class KTIRInterpreter:
         """
         num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
         self.memory = SpyreMemoryHierarchy(num_cores)
-        # ring_backend serves CoreContext.get_lx() — remote LX peeks for
-        # distributed memory views. Cross-core comm goes through the
-        # scheduler protocol (CoreContext.send_to + RecvRequest), not
-        # through a backend. See docs/cross_core_scheduling.md.
-        self.ring_backend = DirectLXBackend(self.memory)
-        self.grid_executor = GridExecutor(grid_shape, self.memory, ring_backend=self.ring_backend)
+        # ring_backend (a TransferBackend) serves CoreContext.get_lx() —
+        # remote LX peeks for distributed memory views. Passed directly
+        # to GridExecutor.execute_with_communication; the scheduler
+        # curries it into a per-core transfer_fn via attach_scheduler.
+        # Cross-core comm goes through the scheduler protocol
+        # (CoreContext.send_to + RecvRequest), not through a backend.
+        # See docs/cross_core_scheduling.md.
+        self.ring_backend = InstantTransferBackend(self.memory)
+        self.grid_executor = GridExecutor(grid_shape, self.memory)
         self._env = ExecutionEnv(
             grid_executor=self.grid_executor,
             execute_region=self.execute_region,
@@ -155,7 +160,10 @@ class KTIRInterpreter:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
 
-        self.grid_executor.execute_with_communication(func.operations, input_ptrs, self._execute_op)
+        self.grid_executor.execute_with_communication(
+            func.operations, input_ptrs, self._execute_op,
+            transfer_backend=self.ring_backend,
+        )
 
         # Read output tensors from HBM
         outputs = {}

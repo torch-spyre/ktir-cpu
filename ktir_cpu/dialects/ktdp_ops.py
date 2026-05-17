@@ -784,13 +784,6 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
 # Communication ops (moved from scf_ops.py)
 # ---------------------------------------------------------------------------
 
-@register("ktdp.transfer", latency_category=LC.COMM)
-def ktdp__transfer(op, context, env):
-    tile = context.get_value(op.operands[0])
-    dst_cores = context.get_value(op.operands[1])
-    return CommOps.transfer(context, tile, dst_cores)
-
-
 @register("ktdp.reduce", latency_category=LC.COMM)
 @register_reduce_backend("ktdp.reduce", RingReduceBackend)
 def ktdp__reduce(op, context, env):
