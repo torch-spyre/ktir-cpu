@@ -20,7 +20,7 @@ dialect handlers in ``ktir_cpu.dialects``.
 """
 
 from abc import ABC, abstractmethod
-from typing import Callable, Generator, List
+from typing import Callable, Dict, Generator, List, Type
 from ..ir_types import Tile
 from ..grid import CoreContext, RecvRequest
 from ..memory import LXScratchpad, SpyreMemoryHierarchy
@@ -178,6 +178,55 @@ class RingReduceBackend(ReduceBackend):
             to_forward = received  # pass received tile onward unchanged
 
         return result
+
+
+# ---------------------------------------------------------------------------
+# Backend registry — explicit lookup keyed by op_name
+# ---------------------------------------------------------------------------
+# Dialect handlers declare which ReduceBackend to use via
+# @register_reduce_backend(op_name, backend_cls). Lookup is explicit:
+# the handler reads ``op.op_type`` and calls ``get_reduce_backend(...)``.
+# Same pattern as the parser/handler registries in
+# ``ktir_cpu.dialects.registry`` — explicit keys, no introspection.
+# ---------------------------------------------------------------------------
+
+_REDUCE_BACKENDS: Dict[str, Type[ReduceBackend]] = {}
+
+
+def register_reduce_backend(op_name: str, backend_cls: Type[ReduceBackend]):
+    """Decorator: declare *backend_cls* as the ReduceBackend for *op_name*.
+
+    Used alongside ``@register(...)`` on a dialect handler::
+
+        @register("ktdp.reduce", latency_category=LC.COMM)
+        @register_reduce_backend("ktdp.reduce", RingReduceBackend)
+        def ktdp__reduce(op, ctx, env):
+            backend_cls = get_reduce_backend(op.op_type)
+            return CommOps.reduce(ctx, tile, group, backend_cls(reduce_fn))
+
+    Single op_name per call — keep registrations explicit. Re-registration
+    silently overwrites (matches the parser/handler registries).
+    """
+    def deco(fn):
+        _REDUCE_BACKENDS[op_name] = backend_cls
+        return fn
+    return deco
+
+
+def get_reduce_backend(op_name: str) -> Type[ReduceBackend]:
+    """Look up the ReduceBackend class registered for *op_name*.
+
+    Raises ``RuntimeError`` if no backend is registered — the message
+    points at the missing decorator.
+    """
+    backend_cls = _REDUCE_BACKENDS.get(op_name)
+    if backend_cls is None:
+        raise RuntimeError(
+            f"No reduce backend registered for op_name {op_name!r}. "
+            f"Add @register_reduce_backend({op_name!r}, <BackendCls>) "
+            f"above the dialect handler."
+        )
+    return backend_cls
 
 
 # ---------------------------------------------------------------------------
