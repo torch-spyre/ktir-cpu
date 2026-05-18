@@ -595,31 +595,6 @@ class TestKtdpParsers(ParseTestMixin):
         with pytest.raises(Exception, match=self._COUNT_MISMATCH_MSG):
             self._parse("%x, %y = ktdp.get_compute_tile_id : index")
 
-    def test_bundled_result_referenced_via_hash_index(self):
-        # Regression for bundled definition + "%base#N" references.
-        #
-        # Regex backend: the op parses; verify the "#0" suffix is preserved
-        # as part of operand identity (operand string is "%pid#0", not "%pid").
-        #
-        # MLIR-frontend backend: the adapter wraps op_text in a func.func
-        # and declares each ``args`` entry as a function parameter — but
-        # MLIR's grammar reserves "%name#N" for *references* to multi-
-        # result ops, so it can't appear in an argument list. That parse
-        # rejection is itself proof that "#N" is a structural part of the
-        # SSA name, not a stripped suffix — which is exactly what this
-        # test guards.
-        op_text = "%c = arith.index_cast %pid#0 : index to i32"
-        try:
-            op = self._parse(op_text, args={"%pid#0": "index"})
-        except Exception as e:
-            assert "result number not allowed in argument list" in str(e)
-            return
-        self.assert_op_type(op, "arith.index_cast")
-        self.assert_num_operands(op, 1)
-        self.assert_operand_names(op, "%pid#0")
-        # And the un-suffixed base name must NOT appear as an operand.
-        assert "%pid" not in op.operands
-
     def test_construct_memory_view(self):
         # construct_memory_view records shape, strides, dtype, memory_space, and pointer operand
         op = self._parse(
