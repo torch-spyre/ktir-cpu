@@ -17,8 +17,18 @@
 import re
 
 from .ktdp_helpers import parse_subscript_expr
-from ..ir_types import AccessTile, IndirectAccessTile, Operation, Tile
+from ..ir_types import (
+    AccessTile,
+    DistributedMemRef,
+    DistributedTileRef,
+    IndirectAccessTile,
+    MemRef,
+    Operation,
+    Tile,
+)
 from ..latency import LatencyCategory as LC
+from ..ops.arith_ops import ArithOps
+from ..ops.comm_ops import CommOps
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
@@ -48,13 +58,45 @@ def ktdp__construct_memory_view(op, context, env):
     for attr in ("shape", "strides", "memory_space", "dtype"):
         if attr not in op.attributes:
             raise ValueError(f"construct_memory_view: missing required attribute '{attr}'")
-    shape = tuple(op.attributes["shape"])
+    # SSA size names are stored as strings by the parser; resolve them at runtime.
+    shape = tuple(
+        context.get_value(s) if isinstance(s, str) else s
+        for s in op.attributes["shape"]
+    )
     # SSA stride names are stored as strings by the parser; resolve them at runtime.
     strides = [context.get_value(s) if isinstance(s, str) else s for s in op.attributes["strides"]]
     memory_space = op.attributes["memory_space"]
     dtype = op.attributes["dtype"]
     coordinate_set = op.attributes.get("coordinate_set")
-    return MemoryOps.tile_view(context, ptr, shape, strides, memory_space, dtype, coordinate_set)
+    lx_core_id = op.attributes.get("lx_core_id") if memory_space == "LX" else None
+    return MemoryOps.tile_view(context, ptr, shape, strides, memory_space, dtype, coordinate_set, lx_core_id)
+
+
+@register("ktdp.construct_distributed_memory_view")
+def ktdp__construct_distributed_memory_view(op, context, env):
+    """Compose N per-partition memory views into one distributed view.
+
+    Each operand must resolve to a :class:`MemRef` carrying its own
+    ``coordinate_set`` (= B_i in global coords).  The op does not allocate
+    or move data — partition resolution at access time is performed by
+    ``MemoryOps.distributed_tile_access``.
+    """
+    partitions = [context.get_value(name) for name in op.operands]
+    for i, p in enumerate(partitions):
+        if not isinstance(p, MemRef):
+            raise ValueError(
+                f"construct_distributed_memory_view: operand {i} "
+                f"is {type(p).__name__}, expected MemRef"
+            )
+    if "shape" not in op.attributes or "dtype" not in op.attributes:
+        raise ValueError(
+            "construct_distributed_memory_view: missing required attributes 'shape'/'dtype'"
+        )
+    return DistributedMemRef(
+        partitions=partitions,
+        shape=tuple(op.attributes["shape"]),
+        dtype=op.attributes["dtype"],
+    )
 
 
 @register("ktdp.construct_access_tile")
@@ -68,12 +110,27 @@ def ktdp__construct_access_tile(op, context, env):
     # Pass it to tile_access so the offset is computed via affine evaluation rather than
     # the old rectangular sum(idx * stride) shortcut.
     base_map = op.attributes["base_map"]
+    coordinate_set = op.attributes.get("coordinate_set")
+    if isinstance(parent_ref, DistributedMemRef):
+        # Distributed parent: resolve partition routing now and produce a
+        # DistributedTileRef carrying surviving partitions.  Load/store
+        # consume it directly.
+        dist_tile_ref = MemoryOps.distributed_tile_access(
+            parent_ref, access_shape, base_map, indices, access_tile_set=coordinate_set
+        )
+        return AccessTile(
+            parent_ref=dist_tile_ref,
+            shape=access_shape,
+            base_map=base_map,
+            coordinate_set=coordinate_set,
+            coordinate_order=op.attributes.get("coordinate_order"),
+        )
     tile_ref = MemoryOps.tile_access(context, parent_ref, indices, access_shape, base_map)
     return AccessTile(
         parent_ref=tile_ref,
         shape=access_shape,
         base_map=base_map,
-        coordinate_set=op.attributes.get("coordinate_set"),
+        coordinate_set=coordinate_set,
         coordinate_order=op.attributes.get("coordinate_order"),
     )
 
@@ -84,6 +141,11 @@ def ktdp__load(op, context, env):
     if isinstance(access_tile, IndirectAccessTile):
         result_shape = op.attributes.get("_result_shape", access_tile.shape)
         return MemoryOps.indirect_load(context, access_tile, result_shape=result_shape)
+    if isinstance(access_tile.parent_ref, DistributedTileRef):
+        result_shape = op.attributes.get("_result_shape", access_tile.shape)
+        return MemoryOps.distributed_load(
+            context, access_tile.parent_ref, result_shape=result_shape
+        )
     css = access_tile.coordinate_set    # AffineSet | None
     cso = access_tile.coordinate_order  # AffineMap | None
     if css is not None:
@@ -101,7 +163,11 @@ def ktdp__store(op, context, env):
     assert isinstance(value, Tile), f"ktdp.store expects a Tile, got {type(value)}"
     access_tile = context.get_value(op.operands[1])
     if isinstance(access_tile, IndirectAccessTile):
-        raise NotImplementedError("ktdp.store with IndirectAccessTile is not yet supported")
+        MemoryOps.indirect_store(context, value, access_tile)
+        return None
+    if isinstance(access_tile.parent_ref, DistributedTileRef):
+        MemoryOps.distributed_store(context, value, access_tile.parent_ref)
+        return None
     tile_ref = access_tile.parent_ref
     css = access_tile.coordinate_set
     cso = access_tile.coordinate_order
@@ -162,8 +228,10 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     result_name = result_match.group(1)
     ptr_operand = result_match.group(2)
 
-    # Parse sizes — int values validated against memref dims; SSA names stored as None.
+    # Parse sizes — int values validated against memref dims; SSA names stored as strings
+    # and collected in ssa_size_operands so the executor can resolve them at runtime.
     sizes = None
+    ssa_size_operands = []
     sizes_match = re.search(r'sizes\s*:\s*\[([^\]]+)\]', op_text)
     if sizes_match:
         sizes = []
@@ -172,7 +240,9 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
             try:
                 sizes.append(int(token))
             except ValueError:
-                sizes.append(None)  # SSA name
+                sizes.append(token)  # SSA name — resolved at runtime
+                if token not in ssa_size_operands:
+                    ssa_size_operands.append(token)
 
     # SSA stride operands: when a stride is a runtime SSA value (not a literal),
     # the parser stores the name as a string and appends it to ssa_stride_operands
@@ -194,9 +264,19 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         strides = parsed
 
     memory_space = "HBM"
-    mem_match = re.search(r'#ktdp\.spyre_memory_space<(\w+)>', op_text)
+    lx_core_id = None
+    # Accept both `<HBM>`/`<LX>` and the RFC's per-core LX form
+    # `<LX, core = N>`.  On real hardware each compute core has its own
+    # private LX SRAM, so a partition tagged `core = N` lives in core N's
+    # scratchpad — captured into lx_core_id and used at load/store time.
+    mem_match = re.search(
+        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
+        op_text,
+    )
     if mem_match:
         memory_space = mem_match.group(1)
+        if mem_match.group(2) is not None:
+            lx_core_id = int(mem_match.group(2))
 
     # dtype and shape are parsed from the memref result type.
     # Validate sizes against memref dimensions when both are concrete.
@@ -209,16 +289,41 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         raise ValueError(
             f"construct_memory_view: memref<{memref_match.group(1)}> has no dimensions"
         )
-    memref_dims = [int(p) for p in parts[:-1]]
-    shape = tuple(memref_dims)
-    # If sizes is None, no checking is performed.
+    # '?' in the memref type means the dimension is dynamic (value only known at
+    # runtime).  We keep it as None until we can substitute the SSA size below.
+    memref_dims = [None if p == "?" else int(p) for p in parts[:-1]]
     if sizes is not None:
-        for i, s in enumerate(sizes):
-            if s is not None and s != memref_dims[i]:
-                raise ValueError(
-                    f"construct_memory_view: sizes[{i}]={s} does not match "
-                    f"memref dimension {memref_dims[i]}"
-                )
+        if len(sizes) != len(memref_dims):
+            raise ValueError(
+                f"construct_memory_view: sizes count {len(sizes)} does not match "
+                f"memref dimension count {len(memref_dims)}"
+            )
+        resolved = []
+        for i, (s, mem_d) in enumerate(zip(sizes, memref_dims)):
+            if mem_d is not None:
+                # concrete dim — s must equal it
+                if not isinstance(s, str) and s != mem_d:
+                    raise ValueError(
+                        f"construct_memory_view: sizes[{i}]={s} does not match "
+                        f"memref dimension {mem_d}"
+                    )
+                resolved.append(s)
+            else:
+                # dynamic dim ('?') — s must be an SSA name
+                if not isinstance(s, str):
+                    raise ValueError(
+                        f"construct_memory_view: sizes[{i}]={s} given for a '?' dim; "
+                        f"dynamic dim requires an SSA name, not a literal"
+                    )
+                resolved.append(s)
+        shape = tuple(resolved)
+    else:
+        if any(d is None for d in memref_dims):
+            raise ValueError(
+                "construct_memory_view: memref has dynamic '?' dim(s) but no sizes: "
+                "attribute was provided; dynamic dims require SSA sizes"
+            )
+        shape = tuple(memref_dims)
 
     attrs = parse_attr_block(op_text, parse_ctx.aliases)
     coordinate_set_str = attrs.get('coordinate_set')
@@ -230,14 +335,90 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
         "memory_space": memory_space,
         "dtype": dtype,
     }
+    if lx_core_id is not None:
+        attributes["lx_core_id"] = lx_core_id
     if coordinate_set is not None:
         attributes["coordinate_set"] = coordinate_set
 
     return Operation(
         result=result_name,
         op_type="ktdp.construct_memory_view",
-        operands=[ptr_operand] + ssa_stride_operands,
+        operands=[ptr_operand] + ssa_size_operands + ssa_stride_operands,
         attributes=attributes,
+        result_type=f"memref<{'x'.join(str(s) if isinstance(s, int) else '?' for s in shape)}x{dtype}>"
+    )
+
+
+@register_parser("ktdp.construct_distributed_memory_view")
+def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
+    """Parse ``%R = ktdp.construct_distributed_memory_view (%a, %b, ... : types) : memref<...>``.
+
+    Variadic memref operands, no required attributes — each input carries
+    its own ``coordinate_set`` (on the input's ``construct_memory_view``).
+    Result type encodes the global logical shape and dtype.
+    """
+    result_match = re.match(
+        r'(%\w+)\s*=\s*ktdp\.construct_distributed_memory_view', op_text
+    )
+    if not result_match:
+        return None
+
+    result_name = result_match.group(1)
+
+    # Extract operand list from the first parenthesized block.  The block's
+    # content is "<%ops> : <types>"; we only need the %ops portion.
+    paren_start = op_text.find('(', result_match.end())
+    if paren_start == -1:
+        raise ValueError(
+            "construct_distributed_memory_view: missing operand parenthesis"
+        )
+    inner = _extract_bracket_content(op_text[paren_start:], '()')
+    if inner is None:
+        raise ValueError(
+            "construct_distributed_memory_view: unbalanced operand parenthesis"
+        )
+    # Split on the first top-level ':' to separate operands from types.
+    colon_idx = None
+    depth = 0
+    for i, ch in enumerate(inner):
+        if ch in '([<':
+            depth += 1
+        elif ch in ')]>':
+            depth -= 1
+        elif ch == ':' and depth == 0:
+            colon_idx = i
+            break
+    ops_section = inner if colon_idx is None else inner[:colon_idx]
+    operands = [
+        t.strip() for t in split_top_level(ops_section) if t.strip().startswith('%')
+    ]
+    if not operands:
+        raise ValueError(
+            "construct_distributed_memory_view: no memref operands found"
+        )
+
+    # Parse the result memref type: same pattern as construct_memory_view.
+    memref_match = re.search(
+        r'(?:}\s*)?:\s*memref<([^>]+)>\s*$', op_text.rstrip()
+    )
+    if not memref_match:
+        raise ValueError(
+            "construct_distributed_memory_view: could not parse result memref<> type"
+        )
+    parts = memref_match.group(1).split('x')
+    if len(parts) <= 1:
+        raise ValueError(
+            f"construct_distributed_memory_view: memref<{memref_match.group(1)}> "
+            "has no dimensions"
+        )
+    dtype = parts[-1]
+    shape = tuple(int(p) for p in parts[:-1])
+
+    return Operation(
+        result=result_name,
+        op_type="ktdp.construct_distributed_memory_view",
+        operands=operands,
+        attributes={"shape": shape, "dtype": dtype},
         result_type=f"memref<{'x'.join(str(s) for s in shape)}x{dtype}>"
     )
 
@@ -586,3 +767,23 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
     )
 
 
+
+
+# ---------------------------------------------------------------------------
+# Communication ops (moved from scf_ops.py)
+# ---------------------------------------------------------------------------
+
+@register("ktdp.transfer", latency_category=LC.COMM)
+def ktdp__transfer(op, context, env):
+    tile = context.get_value(op.operands[0])
+    dst_cores = context.get_value(op.operands[1])
+    CommOps.transfer(context, tile, dst_cores, env.ring_backend)
+    return None
+
+
+@register("ktdp.reduce", latency_category=LC.COMM)
+def ktdp__reduce(op, context, env):
+    tile = context.get_value(op.operands[0])
+    core_group = context.get_value(op.operands[1])
+    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
+    return CommOps.reduce(context, tile, core_group, reduce_fn, env.ring_backend)

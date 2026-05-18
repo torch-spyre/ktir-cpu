@@ -21,7 +21,7 @@ used by dialect handlers in ``ktir_cpu.dialects``.
 
 import numpy as np
 from ..ir_types import Tile
-from ..dtypes import _REVERSE_MAP
+from ..dtypes import _REVERSE_MAP, to_np_dtype
 
 
 def arith_cast(value, target_np_dtype, expect_floating, op_name):
@@ -333,6 +333,43 @@ class ArithOps:
         return Tile(result_data, tile1.dtype, tile1.shape)
 
     @staticmethod
+    def divsi(val1, val2):
+        """Signed integer floor division. Works on both scalars and Tiles."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            result_data = val1.data // val2.data
+            return Tile(result_data, val1.dtype, result_data.shape)
+        elif isinstance(val1, Tile):
+            result_data = val1.data // int(val2)
+            return Tile(result_data, val1.dtype, result_data.shape)
+        elif isinstance(val2, Tile):
+            result_data = int(val1) // val2.data
+            return Tile(result_data, val2.dtype, result_data.shape)
+        else:
+            return int(val1) // int(val2)
+
+    @staticmethod
+    def remsi(val1, val2):
+        """Signed integer remainder. Works on both scalars and Tiles."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            result_data = val1.data % val2.data
+            return Tile(result_data, val1.dtype, result_data.shape)
+        elif isinstance(val1, Tile):
+            result_data = val1.data % int(val2)
+            return Tile(result_data, val1.dtype, result_data.shape)
+        elif isinstance(val2, Tile):
+            result_data = int(val1) % val2.data
+            return Tile(result_data, val2.dtype, result_data.shape)
+        else:
+            return int(val1) % int(val2)
+
+    @staticmethod
+    def fptosi(value):
+        """Convert float to signed integer (truncation toward zero)."""
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np.int32), "i32", value.shape)
+        return int(value)
+
+    @staticmethod
     def divui(val1, val2):
         """Unsigned integer floor division. Works on both scalars and Tiles."""
         if isinstance(val1, Tile) and isinstance(val2, Tile):
@@ -380,3 +417,252 @@ class ArithOps:
         result_data = np.matmul(tile_a.data, tile_b.data).astype(tile_a.data.dtype)
         result_shape = (tile_a.shape[0], tile_b.shape[1])
         return Tile(result_data, tile_a.dtype, result_shape)
+
+    # -----------------------------------------------------------------------
+    # Float unary
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def negf(value):
+        """Element-wise float negation."""
+        if isinstance(value, Tile):
+            return Tile(-value.data, value.dtype, value.shape)
+        return -value
+
+    @staticmethod
+    def absf(value):
+        """Element-wise float absolute value."""
+        if isinstance(value, Tile):
+            return Tile(np.abs(value.data), value.dtype, value.shape)
+        return abs(value)
+
+    @staticmethod
+    def cmpf(val1, val2, predicate: str = "oeq"):
+        """Floating-point comparison. Returns bool scalar or i1 Tile."""
+        cmp_ops = {
+            "oeq": lambda a, b: a == b,
+            "ogt": lambda a, b: a > b,
+            "oge": lambda a, b: a >= b,
+            "olt": lambda a, b: a < b,
+            "ole": lambda a, b: a <= b,
+            "one": lambda a, b: a != b,
+            "ord": lambda a, b: ~(np.isnan(a) | np.isnan(b)),
+            "ueq": lambda a, b: a == b,
+            "ugt": lambda a, b: a > b,
+            "uge": lambda a, b: a >= b,
+            "ult": lambda a, b: a < b,
+            "ule": lambda a, b: a <= b,
+            "une": lambda a, b: a != b,
+            "uno": lambda a, b: np.isnan(a) | np.isnan(b),
+        }
+        fn = cmp_ops.get(predicate)
+        if fn is None:
+            raise NotImplementedError(f"arith.cmpf: unsupported predicate '{predicate}'")
+        if isinstance(val1, Tile) or isinstance(val2, Tile):
+            lhs = val1.data if isinstance(val1, Tile) else val1
+            rhs = val2.data if isinstance(val2, Tile) else val2
+            result = fn(lhs, rhs)
+            ref = val1 if isinstance(val1, Tile) else val2
+            return Tile(result, ref.dtype, result.shape)
+        return bool(fn(val1, val2))
+
+    # -----------------------------------------------------------------------
+    # Integer unary / cast
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def extui(value):
+        """Zero-extend integer (e.g. i32 -> i64). Python ints are arbitrary-precision."""
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np.int64), "i64", value.shape)
+        return int(value)
+
+    @staticmethod
+    def trunci(value):
+        """Truncate integer to a narrower type (e.g. i64 -> i32)."""
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np.int32), "i32", value.shape)
+        return int(value)
+
+    @staticmethod
+    def sitofp(value, dtype: str = "f32"):
+        """Convert signed integer to float, respecting the target dtype."""
+        np_dtype = to_np_dtype(dtype)
+        scalar_type = np.dtype(np_dtype).type
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np_dtype), dtype, value.shape)
+        return scalar_type(value)
+
+    @staticmethod
+    def uitofp(value):
+        """Convert unsigned integer to float."""
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np.float32), "f32", value.shape)
+        return float(value)
+
+    @staticmethod
+    def fptoui(value):
+        """Convert float to unsigned integer (truncation toward zero)."""
+        if isinstance(value, Tile):
+            return Tile(value.data.astype(np.uint32), "ui32", value.shape)
+        return int(value)
+
+    # -----------------------------------------------------------------------
+    # Integer binary — signed and bitwise
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def ceildivsi(val1, val2):
+        """Signed integer ceiling division."""
+        import math
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(np.ceil(val1.data / val2.data).astype(val1.data.dtype), val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(np.ceil(val1.data / int(val2)).astype(val1.data.dtype), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.ceil(int(val1) / val2.data).astype(val2.data.dtype), val2.dtype, val2.shape)
+        return math.ceil(val1 / val2)
+
+    @staticmethod
+    def floordivsi(val1, val2):
+        """Signed integer floor division (same as divsi for negative numbers in Python)."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data // val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data // int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(int(val1) // val2.data, val2.dtype, val2.shape)
+        return val1 // val2
+
+    @staticmethod
+    def andi(val1, val2):
+        """Bitwise AND."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data & val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data & int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(int(val1) & val2.data, val2.dtype, val2.shape)
+        return int(val1) & int(val2)
+
+    @staticmethod
+    def ori(val1, val2):
+        """Bitwise OR."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data | val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data | int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(int(val1) | val2.data, val2.dtype, val2.shape)
+        return int(val1) | int(val2)
+
+    @staticmethod
+    def xori(val1, val2):
+        """Bitwise XOR."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data ^ val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data ^ int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(int(val1) ^ val2.data, val2.dtype, val2.shape)
+        return int(val1) ^ int(val2)
+
+    @staticmethod
+    def shli(val1, val2):
+        """Left shift."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data << val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data << int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(int(val1) << val2.data, val2.dtype, val2.shape)
+        return int(val1) << int(val2)
+
+    @staticmethod
+    def shrsi(val1, val2):
+        """Arithmetic (signed) right shift."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data >> val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data >> int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(int(val1) >> val2.data, val2.dtype, val2.shape)
+        return int(val1) >> int(val2)
+
+    @staticmethod
+    def shrui(val1, val2):
+        """Logical (unsigned) right shift."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(val1.data.view(np.uint32) >> val2.data, val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(val1.data.view(np.uint32) >> int(val2), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.uint32(val1) >> val2.data, val2.dtype, val2.shape)
+        return int(np.uint32(val1) >> np.uint32(val2))
+
+    @staticmethod
+    def minsi(val1, val2):
+        """Signed integer minimum."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(np.minimum(val1.data, val2.data), val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(np.minimum(val1.data, int(val2)), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.minimum(int(val1), val2.data), val2.dtype, val2.shape)
+        return min(int(val1), int(val2))
+
+    @staticmethod
+    def maxsi(val1, val2):
+        """Signed integer maximum."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(np.maximum(val1.data, val2.data), val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(np.maximum(val1.data, int(val2)), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.maximum(int(val1), val2.data), val2.dtype, val2.shape)
+        return max(int(val1), int(val2))
+
+    @staticmethod
+    def minui(val1, val2):
+        """Unsigned integer minimum."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(np.minimum(val1.data, val2.data), val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(np.minimum(val1.data, int(val2)), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.minimum(int(val1), val2.data), val2.dtype, val2.shape)
+        return min(int(val1), int(val2))
+
+    @staticmethod
+    def maxui(val1, val2):
+        """Unsigned integer maximum."""
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(np.maximum(val1.data, val2.data), val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(np.maximum(val1.data, int(val2)), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.maximum(int(val1), val2.data), val2.dtype, val2.shape)
+        return max(int(val1), int(val2))
+
+    @staticmethod
+    def ceildivui(val1, val2):
+        """Unsigned integer ceiling division."""
+        import math
+        if isinstance(val1, Tile) and isinstance(val2, Tile):
+            return Tile(np.ceil(val1.data / val2.data).astype(val1.data.dtype), val1.dtype, val1.shape)
+        if isinstance(val1, Tile):
+            return Tile(np.ceil(val1.data / int(val2)).astype(val1.data.dtype), val1.dtype, val1.shape)
+        if isinstance(val2, Tile):
+            return Tile(np.ceil(int(val1) / val2.data).astype(val2.data.dtype), val2.dtype, val2.shape)
+        return math.ceil(int(val1) / int(val2))
+
+    @staticmethod
+    def convertf(value):
+        """Float-to-float conversion (direction inferred from input dtype)."""
+        if isinstance(value, Tile):
+            if np.issubdtype(value.data.dtype, np.float16):
+                return Tile(value.data.astype(np.float32), "f32", value.shape)
+            return Tile(value.data.astype(np.float16), "f16", value.shape)
+        if isinstance(value, np.float16):
+            return np.float32(value)
+        return np.float16(value)

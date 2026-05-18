@@ -17,21 +17,22 @@ Parser tests for the KTIR dialect layer and module-level parser.
 
 Covers:
 - Module/function-level parser (moved from test_ktir_cpu.py)
-- arith dialect parsers: arith.constant, arith.cmpi, arith.sitofp
+- arith dialect parsers: arith.constant, arith.cmpi, arith.cmpf, arith.sitofp
 - linalg dialect parsers: linalg.reduce, linalg.fill, linalg.broadcast
 - tensor dialect parsers: tensor.empty, tensor.splat, tensor.extract, tensor.expand_shape
 - ktdp dialect parsers: ktdp.get_compute_tile_id, ktdp.construct_memory_view,
                          ktdp.construct_access_tile
 - scf dialect parsers: scf.for, scf.yield
+- math dialect parsers: math.exp, math.sqrt, math.rsqrt, math.log, math.log2,
+                         math.log1p, math.tanh, math.sin, math.cos, math.absf,
+                         math.absi, math.ceil, math.floor, math.erf, math.powf,
+                         math.fma
 
 Design rule
 -----------
-The goal of the regex parser is to parse valid MLIR.  All op text examples
-in this file must therefore be valid MLIR.  Non-MLIR syntax forces the
-corresponding test_parse_adapt.py test to be skipped, which defeats the
-purpose of sharing tests between the two parser backends.
-
-All op text examples have been verified to parse with both backends.
+All op text examples in this file must be valid MLIR so that the tests are
+fully portable to the MLIRFrontendParser backend in test_parse_adapt.py.
+All op examples have been verified to parse with both backends.
 """
 
 import numpy as np
@@ -199,6 +200,18 @@ class TestModuleParser:
         assert func.grid == (1, 1, 1)
         assert len(func.operations) >= 2
 
+    def test_parser_1d_grid(self):
+        # grid = [X] — single element; Y and Z should default to 1
+        parser = KTIRParser()
+        module = parser.parse_module("""
+        module {
+          func.func @single() attributes { grid = [4] } {
+            return
+          }
+        }
+        """)
+        assert module.get_function("single").grid == (4, 1, 1)
+
     def test_parser_multiple_functions(self):
         # module with two functions each gets its own grid shape
         parser = KTIRParser()
@@ -252,6 +265,62 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "shape", (4,))
         self.assert_attribute(op, "dtype", "f16")
 
+    @pytest.mark.parametrize("op_name", [
+        "arith.addi", "arith.subi", "arith.muli",
+        "arith.divsi", "arith.divui",
+        "arith.remsi", "arith.remui",
+        "arith.ceildivsi", "arith.floordivsi",
+        "arith.minsi", "arith.maxsi",
+        "arith.minui", "arith.maxui",
+        "arith.andi", "arith.ori", "arith.xori",
+        "arith.shli", "arith.shrsi", "arith.shrui",
+    ])
+    def test_int_binop(self, op_name):
+        op = self._parse(
+            f"%r = {op_name} %a, %b : i32",
+            args={"%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 2)
+
+    @pytest.mark.parametrize("op_name", [
+        "arith.extsi", "arith.extui", "arith.trunci",
+        "arith.fptosi", "arith.fptoui",
+        "arith.uitofp",
+    ])
+    def test_int_cast(self, op_name):
+        type_map = {
+            "arith.extsi":  ("i16", "i32"),
+            "arith.extui":  ("i16", "i32"),
+            "arith.trunci": ("i32", "i16"),
+            "arith.fptosi": ("f32", "i32"),
+            "arith.fptoui": ("f32", "i32"),
+            "arith.uitofp": ("i32", "f32"),
+        }
+        src_type, dst_type = type_map[op_name]
+        op = self._parse(
+            f"%r = {op_name} %a : {src_type} to {dst_type}",
+            args={"%a": src_type},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+
+    def test_index_cast(self):
+        op = self._parse(
+            "%r = arith.index_cast %a : i32 to index",
+            args={"%a": "i32"},
+        )
+        self.assert_op_type(op, "arith.index_cast")
+        self.assert_num_operands(op, 1)
+
+    def test_select(self):
+        op = self._parse(
+            "%r = arith.select %cond, %a, %b : i32",
+            args={"%cond": "i1", "%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, "arith.select")
+        self.assert_num_operands(op, 3)
+
     def test_cmpi_basic(self):
         # cmpi records predicate and both operands
         op = self._parse(
@@ -283,7 +352,8 @@ class TestArithParsers(ParseTestMixin):
         self.assert_operand_names(op, "%i")
         self.assert_result_type(op, "f16")
 
-    def test_cmpf_olt(self):
+    def test_cmpf_basic(self):
+        # cmpf records predicate and both operands
         op = self._parse(
             "%r = arith.cmpf olt, %a, %b : f16",
             args={"%a": "f16", "%b": "f16"},
@@ -302,6 +372,16 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "predicate", "uge")
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%y")
+
+    def test_cmpf_all_ordered_predicates(self):
+        # all ordered, unordered, and always-true/false predicates are recognised
+        for pred in ("false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord",
+                     "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true"):
+            op = self._parse(
+                f"%b = arith.cmpf {pred}, %x, %y : f32",
+                args={"%x": "f32", "%y": "f32"},
+            )
+            self.assert_attribute(op, "predicate", pred)
 
     def test_cmpf_missing_predicate_raises(self):
         # regex parser raises ValueError; MLIR frontend raises MLIRError
@@ -592,6 +672,145 @@ class TestKtdpParsers(ParseTestMixin):
                 " : memref<1024xf16> -> !ktdp.access_tile<128>",
                 args={"%view": "memref<1024xf16>", "%c0": "index"},
             )
+
+    # -- Dynamic-size tests ----------------------------------------------------
+    # These cover the three gaps fixed in issue #30:
+    #   (1) affine_set with symbolic dims [s0]
+    #   (2) memref<?xf32> (dynamic dimension '?')
+    #   (3) SSA sizes like sizes: [%n_idx] registered as operands
+    #
+    # See: https://github.com/torch-spyre/ktir-cpu/issues/30
+
+    def test_affine_set_with_symbolic_dim(self):
+        # affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)> uses a symbolic
+        # dimension s0 whose value is only known at runtime (the tensor size).
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
+            " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            args={"%ptr": "index", "%n_idx": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "dtype", "f32")
+        self.assert_attribute(op, "memory_space", "HBM")
+        # dynamic dim stored as the SSA name string "%n_idx" in the shape tuple
+        self.assert_num_operands(op, 2)
+
+    def test_construct_memory_view_dynamic_memref_type(self):
+        # memref<?xf32> uses '?' for a dimension whose size is an SSA value.
+        # coordinate_set with symbolic dim is required by the MLIR verifier
+        # when the memref has a dynamic dimension.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
+            " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            args={"%ptr": "index", "%n_idx": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "dtype", "f32")
+
+    def test_construct_memory_view_ssa_size_as_operand(self):
+        # When sizes: [%n_idx] appears, %n_idx must be added to the op's
+        # operand list (like SSA strides already are) so the executor can
+        # call context.get_value("%n_idx") to resolve the runtime size.
+        # coordinate_set with symbolic dim is required by the MLIR verifier
+        # when the memref has a dynamic dimension.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
+            " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            args={"%ptr": "index", "%n_idx": "index"},
+        )
+        # %ptr + %n_idx = 2 operands
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%ptr", "%n_idx")
+
+    def test_construct_memory_view_multi_dim_mixed_static_dynamic(self):
+        # Multi-dim memref with one static and one dynamic dimension.
+        # sizes: [1024, %n] — first dim matches the concrete memref dim,
+        # second dim is an SSA name for the '?' dim.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [1024, %n], strides: [%n, 1]"
+            " { coordinate_set = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + 1023 >= 0,"
+            " d1 >= 0, -d1 + s0 - 1 >= 0)>,"
+            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024x?xf16>",
+            args={"%ptr": "index", "%n": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_memory_view")
+        self.assert_attribute(op, "dtype", "f16")
+        # Only assert the concrete dim — the dynamic dim is represented as the
+        # SSA name string "%n" by the regex parser, and as the ShapedType
+        # sentinel by the MLIR frontend.
+        shape = op.attributes["shape"]
+        assert shape[0] == 1024
+        assert len(shape) == 2
+
+    @pytest.mark.regex_only
+    def test_construct_memory_view_sizes_count_mismatch_rejected(self):
+        # sizes: has 2 entries but memref<1024xf16> has only 1 dimension.
+        with pytest.raises(ValueError, match=r"sizes count.*does not match|mismatch"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, sizes: [1024, 32], strides: [1]"
+                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+                args={"%ptr": "index"},
+            )
+
+    @pytest.mark.regex_only
+    def test_construct_memory_view_static_dim_mismatch_rejected(self):
+        # sizes: [512] disagrees with the concrete memref dim 1024.
+        with pytest.raises(ValueError, match=r"sizes\[0\]=512 does not match memref dimension 1024"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, sizes: [512], strides: [1]"
+                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+                args={"%ptr": "index"},
+            )
+
+    @pytest.mark.regex_only
+    @pytest.mark.parametrize("sizes_str,memref_type,strides_str,args", [
+        # 1-D: single dynamic dim given a concrete literal
+        ("[512]",      "memref<?xf16>",       "[1]",    {"%ptr": "index"}),
+        # 2-D: first dim dynamic, second static — literal given for the '?' dim
+        ("[512, 32]",  "memref<?x32xf16>",    "[32, 1]", {"%ptr": "index"}),
+        # 2-D: second dim dynamic, first static — literal given for the '?' dim
+        ("[1024, 32]", "memref<1024x?xf16>",  "[32, 1]", {"%ptr": "index"}),
+        # 2-D: both dims dynamic — literals given for both '?' dims
+        ("[512, 32]",  "memref<?x?xf16>",     "[32, 1]", {"%ptr": "index"}),
+    ])
+    def test_construct_memory_view_dynamic_dim_with_concrete_size_rejected(
+        self, sizes_str, memref_type, strides_str, args
+    ):
+        # A '?' dim must be given an SSA name in sizes:, not a concrete literal.
+        with pytest.raises(ValueError, match=r"dynamic dim.*requires.*SSA|'\\?' dim.*must be.*SSA"):
+            self._parse(
+                f"%view = ktdp.construct_memory_view %ptr, sizes: {sizes_str},"
+                f" strides: {strides_str}"
+                f" {{ memory_space = #ktdp.spyre_memory_space<HBM> }} : {memref_type}",
+                args=args,
+            )
+
+    @pytest.mark.regex_only
+    def test_construct_memory_view_dynamic_dim_no_sizes_rejected(self):
+        # No sizes: attribute at all, but memref has a '?' dim — unresolvable at parse time.
+        with pytest.raises(ValueError, match=r"dynamic dim|'\\?' dim|no sizes"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, strides: [1]"
+                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf16>",
+                args={"%ptr": "index"},
+            )
+
+    def test_construct_access_tile_dynamic_memref(self):
+        # construct_access_tile already handles memref<?xf32> correctly:
+        # it reads shape only from the !ktdp.access_tile<...> result type,
+        # never from the memref type, so '?' passes through without issue.
+        op = self._parse(
+            "%x_tile = ktdp.construct_access_tile %x_mem[%off_idx]"
+            " { access_tile_order = affine_map<(d0) -> (d0)>,"
+            "   access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 1023 >= 0)> }"
+            " : memref<?xf32> -> !ktdp.access_tile<1024xindex>",
+            args={"%x_mem": "memref<?xf32>", "%off_idx": "index"},
+        )
+        self.assert_op_type(op, "ktdp.construct_access_tile")
+        self.assert_attribute(op, "shape", (1024,))
 
 
 # ---------------------------------------------------------------------------

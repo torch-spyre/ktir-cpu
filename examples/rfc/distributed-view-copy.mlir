@@ -2,8 +2,19 @@
 // This is an example program to illustrate the use of ktdp.construct_distributed_memory_view.
 // The program copies a distributed tensor A (partitioned across HBM and two LX scratchpads)
 // into a contiguous output tensor B on HBM.
-// NOTE: Copied from KTIR-V1.ppt slide 9 - construct distributed memory view
-// NOTE: Minor correction #ktpd.spyre_memory_space<LX0> -> LX
+// NOTE: Copied from KTIR-V1.ppt slide 9 - construct distributed memory view.
+// NOTE: Minor correction #ktpd.spyre_memory_space<LX0> -> LX.
+// NOTE: The two LX partitions are tagged with distinct `core = N` indices
+//       per the KTDP ODS `#ktdp.spyre_memory_space<LX, core = N>` form
+//       (KernelTileIR/src/Dialects/KTDP/KTDPOps.td:68-104).  In real hardware
+//       each compute core has its own private LX SRAM, so A_LX0's and
+//       A_LX1's byte-address spaces are independent and both bases could
+//       naturally be 0 (a common layout in real kernels).
+// NOTE: Simulator caveat — ktir-cpu does not yet honor the `core = N`
+//       index: every `<LX, core = *>` memref resolves to the currently
+//       executing core's single scratchpad.  This test is marked xfail
+//       until per-core LX routing is implemented.  Once it lands, all
+//       three partition bases can collapse to 0.
 
 // A is a 192x64 logical tensor partitioned across three memory spaces:
 //   A_HBM  = rows   0..95,  stored on HBM,  row-major    (96x64)
@@ -19,7 +30,7 @@
 #var_space_order = affine_map<(d0, d1) -> (d0, d1)>
 
 module {
-  func.func @distributed_view_copy() {
+  func.func @distributed_view_copy() attributes { grid = [2, 1, 1] } {
 
         %c0 = arith.constant 0 : index
 
@@ -51,12 +62,12 @@ module {
         // Note: column-major layout expressed via strides [1, 64]
         %A_LX0_view = ktdp.construct_memory_view %A_LX0_addr, sizes: [32, 64], strides: [1, 64] {
             coordinate_set = #A_LX0_coord_set,
-            memory_space = #ktdp.spyre_memory_space<LX>
+            memory_space = #ktdp.spyre_memory_space<LX, core = 0>
         } : memref<32x64xf16>
 
         %A_LX1_view = ktdp.construct_memory_view %A_LX1_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #A_LX1_coord_set,
-            memory_space = #ktdp.spyre_memory_space<LX>
+            memory_space = #ktdp.spyre_memory_space<LX, core = 1>
         } : memref<64x64xf16>
 
         // (1) Compose the three partition views into a single logical distributed view of shape 192x64

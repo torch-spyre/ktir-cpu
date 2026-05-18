@@ -47,4 +47,5 @@ python_files = ["test_*.py"]
 python_functions = ["test_*"]
 markers = [
     "spec_gap: RFC conformance gap — feature not yet implemented in the interpreter",
+    "regex_only: test validates regex-parser-specific behaviour; skipped under the MLIR frontend adapter",
 ]

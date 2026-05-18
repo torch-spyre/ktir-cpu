@@ -177,7 +177,7 @@ module {
         regions=[],
     )
     with pytest.raises(ValueError, match="totally.unknown_op"):
-        interp._execute_operation(unknown_op, core, interp.ring_network)
+        interp._execute_operation(unknown_op, core)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ module {
             result_type=None,
             regions=[],
         )
-        interp._execute_operation(op, core, interp.ring_network)
+        interp._execute_operation(op, core)
 
     assert core.get_value("%x") == 10
     assert core.get_value("%y") == 20
@@ -256,4 +256,4 @@ module {
             regions=[],
         )
         with pytest.raises(TypeError):
-            interp._execute_operation(op, core, interp.ring_network)
+            interp._execute_operation(op, core)

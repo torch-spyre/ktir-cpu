@@ -18,9 +18,12 @@ Grid and core execution management for KTIR CPU backend.
 Simulates multi-core grid execution with per-core execution contexts.
 """
 
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Any
 from .ir_types import Tile
 from .memory import LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
+
+if TYPE_CHECKING:
+    from .ops.comm_ops import RingBackend
 
 
 class CoreContext:
@@ -69,14 +72,36 @@ class CoreContext:
         # Re-bind %m_acc = %m_new in parent scope, re-track LX.
     """
 
-    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator):
+    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator, ring_backend: Optional["RingBackend"] = None):
         self.core_id = core_id
         self.grid_pos = grid_pos  # (x, y, z) position in grid
-        self.lx = lx  # Core-local LX scratchpad
-        self.hbm = hbm  # Shared HBM
+        self.lx = lx              # Core-local LX scratchpad
+        self.hbm = hbm            # Shared HBM
+        # Backend for remote LX access.  None is allowed for tests that
+        # construct CoreContext directly and never access a remote core's LX.
+        # get_lx() raises explicitly if a remote core is requested without a backend.
+        self.ring_backend = ring_backend
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
+
+    def get_lx(self, core_id: Optional[int] = None) -> LXScratchpad:
+        """Return the LXScratchpad for *core_id*.
+
+        When *core_id* is None or equals this core's own id, returns the
+        local scratchpad directly.  For a remote core, delegates to
+        ring_backend.get_lx() — raises if no backend is configured
+        (single-core mode).
+        """
+        if core_id is None or core_id == self.core_id:
+            return self.lx
+        if self.ring_backend is None:
+            raise RuntimeError(
+                f"CoreContext(core_id={self.core_id}) has no ring_backend — "
+                f"cannot access remote LX for core {core_id}. "
+                f"Pass ring_backend when constructing CoreContext for multi-core execution."
+            )
+        return self.ring_backend.get_lx(core_id)
 
     def get_grid_id(self, dim: int) -> int:
         """Get grid ID for dimension.
@@ -215,17 +240,18 @@ class GridExecutor:
     Handles sequential simulation of cores with communication support.
     """
 
-    def __init__(self, grid_shape: Tuple[int, int, int], memory: SpyreMemoryHierarchy):
+    def __init__(self, grid_shape: Tuple[int, int, int], memory: SpyreMemoryHierarchy, ring_backend: Optional["RingBackend"] = None):
         self.grid_shape = grid_shape
         self.memory = memory
         self.num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
 
-        # Create core contexts
+        # Create core contexts — ring_backend is injected so each core can
+        # access remote LX scratchpads via context.get_lx(core_id).
         self.cores = []
         for core_id in range(self.num_cores):
             grid_pos = self._linear_to_grid(core_id)
             lx = memory.get_lx(core_id)
-            self.cores.append(CoreContext(core_id, grid_pos, lx, memory.hbm))
+            self.cores.append(CoreContext(core_id, grid_pos, lx, memory.hbm, ring_backend))
 
     def _linear_to_grid(self, core_id: int) -> Tuple[int, int, int]:
         """Convert linear core ID to (x, y, z) grid position.
@@ -296,14 +322,18 @@ class GridExecutor:
 
         return core_ids
 
-    def execute_with_communication(self, execute_fn, ring_network, max_rounds=10, *args, **kwargs):
+    def execute_with_communication(self, execute_fn, max_rounds=10, *args, **kwargs):
         """Execute function on all cores with communication support.
 
-        Uses multi-pass execution to handle inter-core communication.
+        Uses single-pass execution under DirectLXBackend (no ring messages
+        actually flow).  When RingTransferBackend lands, this method will
+        need access to the ring backend (via ExecutionEnv or a direct
+        parameter) to drive message delivery between rounds — calling
+        ring_backend.deliver_all() and checking for pending messages
+        before deciding whether to continue or raise on non-convergence.
 
         Args:
-            execute_fn: Function to execute
-            ring_network: RingNetwork instance for communication
+            execute_fn: Function(core: CoreContext) to execute per core
             max_rounds: Maximum communication rounds
             *args, **kwargs: Additional arguments
 
@@ -311,21 +341,8 @@ class GridExecutor:
             List of results from each core
         """
         for round_num in range(max_rounds):
-            # Execute all cores
             results = []
             for core in self.cores:
-                result = execute_fn(core, ring_network, *args, **kwargs)
+                result = execute_fn(core, *args, **kwargs)
                 results.append(result)
-
-            # Deliver messages
-            ring_network.deliver_all()
-
-            # Check if communication is done
-            if not ring_network.has_pending_messages():
-                return results
-
-        # Communication didn't converge
-        raise RuntimeError(
-            f"Communication didn't converge after {max_rounds} rounds. "
-            f"Still have {ring_network.pending_message_count()} pending messages."
-        )
+            return results

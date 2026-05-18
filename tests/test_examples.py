@@ -191,6 +191,34 @@ class TestVectorAddExecution(InterpreterTestMixin):
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
 
+class TestVectorAddDynamicExecution(InterpreterTestMixin):
+    """End-to-end execution of vector_add_dynamic_ktir.mlir.
+
+    Verifies that a symbolic coordinate set (memref<?xf32>) correctly masks
+    out-of-range elements through ktdp.load / ktdp.store for varying n_elements.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel_dynamic"))
+    def test_vector_add_dynamic(self, path, func_name, entry):
+        interp = self._make_interp()
+        interp.load(path)
+
+        x_ptr, y_ptr, output_ptr, n_elements = interp.arg_names(func_name)
+        n = entry["execute_kwargs"]["n_elements"]
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal(n).astype(np.float32)
+        y = rng.standard_normal(n).astype(np.float32)
+        output = np.zeros(n, dtype=np.float32)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x, y_ptr: y, output_ptr: output,
+            n_elements: np.int32(n),
+        })
+
+        result = outputs[output_ptr]
+        np.testing.assert_allclose(result, x + y, rtol=1e-5, atol=1e-5)
+
+
 class TestSoftmaxExecution(InterpreterTestMixin):
     """End-to-end execution of softmax MLIR."""
 

@@ -19,41 +19,58 @@ Tile view construction, sub-tile access, and HBM/LX load/store
 primitives used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
-from ..affine import AffineMap
+from ..affine import AffineMap, AffineSet, BoxSet
 from ..dialects.ktdp_helpers import eval_subscript_expr
-from ..dtypes import bytes_per_elem as _bytes_per_elem
-from ..ir_types import MemRef, Tile, TileRef
+from ..dtypes import bytes_per_elem as _bytes_per_elem, to_np_dtype as _to_np_dtype
+from ..ir_types import (
+    CoordinateSet, DistributedMemRef, DistributedTileRef, MemRef, Tile, TileRef,
+)
 from ..grid import CoreContext
 from ..memory import HBMSimulator
 
 
 class _MemAccessor:
-    """Resolves a (context, memref, byte_addr) triple into simulator read/write calls.
+    """Resolves a (context, memory_space, byte_addr) triple into simulator
+    read/write calls.
 
     This is the single place in the codebase that manages the intra-stick byte
-    offset abstraction: HBMSimulator requires a (stick, intra_byte) address pair
-    while LXScratchpad uses a plain byte address.  ``MemRef.split_addr`` produces
-    the pair; this class captures it and forwards any extra address kwargs to the
-    underlying simulator so callers never handle them directly.
+    offset abstraction: HBMSimulator requires a (stick, intra_byte) address
+    pair while LXScratchpad uses a plain byte address.  The accessor consumes
+    only ``memory_space`` (for simulator dispatch) and an absolute
+    ``byte_addr``; the byte_addr must live in physical memory matching the
+    given memory_space.  Callers do not need to manufacture a MemRef.
 
-    ``stick_bytes`` is exposed for callers that need to count distinct HBM sticks
-    touched by an access (latency accounting); it is None for LX.
+    ``stick_bytes`` is exposed for callers that need to count distinct HBM
+    sticks touched by an access (latency accounting); it is None for LX.
 
-    To extend to a new memory space, add a branch in ``__init__`` that populates
-    ``_args`` and ``_kwargs`` appropriately — ``read`` and ``write`` require no
-    changes.
+    To extend to a new memory space, add a branch in ``__init__`` that
+    populates ``_args`` and ``_kwargs`` appropriately — ``read`` and ``write``
+    require no changes.
     """
 
-    def __init__(self, context: CoreContext, memref: MemRef, byte_addr: int):
-        _main, _intra = memref.split_addr(byte_addr)
-        self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES if memref.memory_space == "HBM" else None
-        self._sim = context.hbm if memref.memory_space == "HBM" else context.lx
-        self._args = (_main,)
-        self._kwargs = {}
-        if memref.memory_space == "HBM":
-            self._kwargs["intra_byte"] = _intra
+    def __init__(
+        self,
+        context: CoreContext,
+        memory_space: str,
+        byte_addr: int,
+        lx_core_id: Optional[int] = None,
+    ):
+        if memory_space == "HBM":
+            self.stick_bytes: Optional[int] = HBMSimulator.STICK_BYTES
+            self._sim = context.hbm
+            stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
+            self._args = (stick,)
+            self._kwargs = {"intra_byte": intra}
+        else:
+            self.stick_bytes = None
+            # Per-core routing: when lx_core_id is None or matches the
+            # executing core, context.lx is used directly; otherwise we
+            # route to a remote LX scratchpad via the ring backend.
+            self._sim = context.get_lx(lx_core_id)
+            self._args = (byte_addr,)
+            self._kwargs = {}
 
     def read(self, n: int, dtype: str) -> np.ndarray:
         return self._sim.read(*self._args, n, dtype, **self._kwargs)
@@ -73,22 +90,14 @@ class MemoryOps:
         memory_space: str,
         dtype: str = "f16",
         coordinate_set: Optional[str] = None,
+        lx_core_id: Optional[int] = None,
     ) -> MemRef:
         """Create a hardware-aware memory view (MemRef).
 
         Builds a MemRef describing a contiguous region in HBM or LX.
-
-        Args:
-            context: Core execution context
-            ptr: Base pointer (stick index for HBM, byte address for LX)
-            shape: Tile shape
-            strides: Memory strides (element counts)
-            memory_space: "HBM" or "LX"
-            dtype: Data type
-            coordinate_set: Verbatim affine_set string, no evaluation
-
-        Returns:
-            MemRef describing the memory layout
+        ``lx_core_id``, when set, identifies which core's LX scratchpad
+        the data lives in (parsed from #ktdp.spyre_memory_space<LX, core=N>);
+        load/store use it to route via context.get_lx().
         """
         return MemRef(
             base_ptr=ptr,
@@ -97,6 +106,7 @@ class MemoryOps:
             memory_space=memory_space,
             dtype=dtype,
             coordinate_set=coordinate_set,
+            lx_core_id=lx_core_id,
         )
 
     @staticmethod
@@ -244,7 +254,7 @@ class MemoryOps:
         Returns:
             Tile value (tensor) loaded into LX
         """
-        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
+        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
         stick_bytes = mgr.stick_bytes
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
@@ -294,6 +304,12 @@ class MemoryOps:
         to those local coordinates via a read-modify-write on the allocation.
         When *coords* is None, stores the full tile (contiguous or strided).
 
+        Source data layout: ``tile.data`` is read in C-order via
+        ``numpy.ndarray.flatten()``, which always returns a contiguous copy.
+        Non-contiguous source arrays are handled internally — callers do not
+        need to pre-``ascontiguousarray`` the tile. When *coords* is supplied,
+        ``coords[i]`` receives the i-th element of ``tile.data`` in C-order.
+
         A single ``mem.read`` + ``mem.write`` covers the entire footprint;
         no per-element dict scans occur.
 
@@ -303,7 +319,7 @@ class MemoryOps:
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
         """
-        mgr = _MemAccessor(context, tile_ref.memref, tile_ref.base_ptr)
+        mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
@@ -330,36 +346,397 @@ class MemoryOps:
         Enumerates the variable space, resolves each coordinate tuple
         (direct dims use the variable value, indirect dims look up the
         index in an index memref), then delegates to :meth:`load`.
+
+        Raises NotImplementedError if ``variables_space_order`` is non-identity.
         """
         vss = iat.variables_space_set
         vso = iat.variables_space_order
 
-        # Enumerate all points in the variable space
-        points = vss.enumerate(iat.shape)
-        if vso is not None:
-            points = [vso.eval(pt) for pt in points]
+        if vso is not None and not vso.is_identity():
+            raise NotImplementedError(
+                "indirect_load: output tile permutation via non-identity "
+                "variables_space_order is not yet implemented"
+            )
 
-        # For each point, resolve the actual coordinates in the parent memref
+        # Pre-compile per-dim resolvers so branch dispatch and constant lookups
+        # happen once instead of per enumerated point.
+        resolvers = []
+        for sub in iat.dim_subscripts:
+            kind = sub["kind"]
+            if kind == "direct":
+                resolvers.append(("direct", sub["var_index"]))
+            elif kind == "direct_expr":
+                resolvers.append(("direct_expr", sub["subscript"]))
+            elif kind == "indirect":
+                idx_view = iat.index_views[sub["index_view_idx"]]
+                bpe = _bytes_per_elem(idx_view.dtype)
+                resolvers.append(("indirect", sub["idx_exprs"], idx_view, bpe))
+            else:
+                raise ValueError(f"Unknown indirect subscript kind: {kind}")
+
+        points = vss.enumerate(iat.shape)
+
         coords = []
         for pt in points:
             coord = []
-            for sub in iat.dim_subscripts:
-                if sub["kind"] == "indirect":
-                    # Look up the index from the index memref
-                    idx_view = iat.index_views[sub["index_view_idx"]]
-                    # Compute address into the index tensor
-                    idx_coords = tuple(
-                        eval_subscript_expr(e, pt) for e in sub["idx_exprs"]
-                    )
+            for res in resolvers:
+                tag = res[0]
+                if tag == "direct":
+                    coord.append(pt[res[1]])
+                elif tag == "direct_expr":
+                    coord.append(eval_subscript_expr(res[1], pt))
+                else:  # indirect
+                    _, idx_exprs, idx_view, bpe = res
+                    idx_coords = tuple(eval_subscript_expr(e, pt) for e in idx_exprs)
                     offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
-                    addr = idx_view.byte_address + offset * _bytes_per_elem(idx_view.dtype)
-                    raw = _MemAccessor(context, idx_view, addr).read(1, idx_view.dtype)
-                    coord.append(int(raw[0]))
-                elif sub["kind"] == "direct":
-                    coord.append(pt[sub["var_index"]])
-                elif sub["kind"] == "direct_expr":
-                    coord.append(eval_subscript_expr(sub["subscript"], pt))
+                    addr = idx_view.byte_address + offset * bpe
+                    raw_idx = int(_MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)[0])
+                    # NumPy fancy-index reads silently wrap negative
+                    # indices; reject them here. Use raise so the check
+                    # survives python -O.
+                    if raw_idx < 0:
+                        raise IndexError(
+                            f"indirect index {raw_idx} from {idx_view} is negative"
+                        )
+                    coord.append(raw_idx)
             coords.append(tuple(coord))
 
         out_shape = result_shape if result_shape is not None else iat.shape
         return MemoryOps.load(context, iat.parent_ref.to_tile_ref(), coords=coords, result_shape=out_shape)
+
+    # ------------------------------------------------------------------
+    # Distributed memory views (RFC 0682 §3.3)
+    #
+    # Naming used throughout:
+    #   x   = global_base = base_map.eval(indices) — global origin of
+    #         the access tile
+    #   A   = access_tile_set, in local coords 0..access_shape-1; None
+    #         means the full box [0, access_shape)
+    #   x+A = global footprint of the access tile
+    #   B_i = partition i's coordinate_set, in global coords
+    #   C_i = (x + A) ∩ B_i — global coords covered by both the access
+    #         tile and partition i; per-survivor coordinate_set
+    #   p_i = min(B_i) — partition i's origin in global coords
+    #
+    # distributed_load consumes C_i and p_i directly:
+    #   load coords (partition-local) = C_i - p_i
+    #   output coords (access-local)  = C_i - x
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def distributed_tile_access(
+        dist_ref: DistributedMemRef,
+        access_shape: Tuple[int, ...],
+        base_map: AffineMap,
+        indices: List[int],
+        access_tile_set: Optional[Union[BoxSet, AffineSet]] = None,
+    ) -> DistributedTileRef:
+        """Resolve partition routing once, return a DistributedTileRef.
+
+        Fast path (BoxSet): when both ``B_i`` and the access set ``A``
+        (or the implicit full-box A) are :class:`BoxSet`, compute
+        ``C_i = B_i ∩ (x + A)`` in O(ndim) via ``translate`` +
+        ``intersect`` and store ``C_i`` as a ``BoxSet``.  Skip empty
+        intersections.
+
+        Slow path (AffineSet on either side): enumerate B_i over the
+        global shape, filter by membership in ``x + A``, store C_i as
+        a ``List[Tuple[int, ...]]``.
+
+        Each survivor inherits ``memref = P_i``, ``base_ptr =
+        P_i.byte_address``, and ``strides = P_i.strides``.  Load/store
+        translate per-coord via ``C_i - p_i``.
+
+        ``p_i = min(B_i)`` (per-axis) is the partition's origin in
+        global coords.  This is correct because per-axis ``strides`` on
+        ``MemRef`` can only describe a strided rectangle, so any
+        non-rectangular ``B_i`` is stored BB-padded inside the
+        partition's ``shape`` (see ``MemRef.coordinate_set``).
+        """
+        global_base = tuple(base_map.eval(indices))
+        x = global_base
+        ndim = len(dist_ref.shape)
+
+        # Pre-compute (x + A) as a BoxSet when possible.  None ⇒ A is
+        # the implicit full box [0, access_shape).
+        xA_box: Optional[BoxSet] = None
+        if access_tile_set is None:
+            xA_box = BoxSet(
+                lo=tuple(x),
+                hi=tuple(x[d] + access_shape[d] for d in range(ndim)),
+            )
+        elif isinstance(access_tile_set, BoxSet):
+            xA_box = access_tile_set.translate(x)
+
+        def _in_xA(p: Tuple[int, ...]) -> bool:
+            """Slow-path membership test: point ∈ x + A."""
+            if access_tile_set is None:
+                return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
+            return access_tile_set.contains(tuple(p[d] - x[d] for d in range(ndim)))
+
+        survivors: List[TileRef] = []
+        for part in dist_ref.partitions:
+            B_i = part.coordinate_set
+            if isinstance(B_i, BoxSet) and xA_box is not None:
+                # Fast path: O(ndim) intersect
+                C_i = B_i.intersect(xA_box)
+                if C_i.is_empty():
+                    continue
+                p_i = B_i.lower_bounds()
+                coordinate_set_out: CoordinateSet = C_i
+            else:
+                # Slow path: brute-force enumerate + filter
+                B_i_pts = B_i.enumerate(dist_ref.shape)
+                if not B_i_pts:
+                    continue
+                p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
+                C_i_pts = [pt for pt in B_i_pts if _in_xA(pt)]
+                if not C_i_pts:
+                    continue
+                coordinate_set_out = C_i_pts
+
+            survivors.append(TileRef(
+                base_ptr=part.byte_address,
+                shape=part.shape,
+                strides=list(part.strides),
+                memref=part,
+                dtype=part.dtype,
+                coordinate_set=coordinate_set_out,
+                partition_origin=p_i,
+            ))
+
+        if not survivors:
+            raise ValueError(
+                f"distributed_tile_access: no partition covers access region "
+                f"global_base={global_base} shape={access_shape}"
+            )
+        return DistributedTileRef(
+            partitions=survivors,
+            shape=dist_ref.shape,
+            dtype=dist_ref.dtype,
+            global_base=global_base,
+        )
+
+    @staticmethod
+    def _subtile_ref(survivor: TileRef, box: BoxSet) -> TileRef:
+        """Build a TileRef covering exactly *box* (in global coords) within *survivor*.
+
+        Inherits the survivor's strides verbatim; only ``shape`` shrinks
+        to the box extent and ``base_ptr`` shifts to the box's local
+        origin (``box.lo - p_i``, in element units, scaled by bpe).  The
+        resulting sub-TileRef plugs into :meth:`load` / :meth:`store`,
+        whose strided iteration lands each element at the byte offset
+        the parent layout dictates — row-major and column-packed
+        partitions both work uniformly without caller-side transposes.
+        """
+        ndim = len(survivor.shape)
+        p_i = survivor.partition_origin or (0,) * ndim
+        local_lo = tuple(box.lo[d] - p_i[d] for d in range(ndim))
+        sub_shape = tuple(box.hi[d] - box.lo[d] for d in range(ndim))
+        bpe = _bytes_per_elem(survivor.dtype)
+        byte_offset = sum(local_lo[d] * survivor.strides[d] for d in range(ndim)) * bpe
+        return TileRef(
+            base_ptr=survivor.base_ptr + byte_offset,
+            shape=sub_shape,
+            strides=list(survivor.strides),
+            memref=survivor.memref,
+            dtype=survivor.dtype,
+        )
+
+    @staticmethod
+    def distributed_load(
+        context: CoreContext,
+        dist_tile_ref: DistributedTileRef,
+        result_shape: Optional[Tuple[int, ...]] = None,
+    ) -> Tile:
+        """Gather elements across surviving partitions into a single LX-resident Tile.
+
+        Fast path (BoxSet C_i): build a sub-TileRef of the partition
+        covering exactly C_i, delegate the read to :meth:`load`, and
+        slot the returned tile into a rectangular slice of the output
+        buffer.  One NumPy slice assignment per partition.
+
+        Slow path (List[Tuple] C_i): per-coord scatter — translate C_i
+        to partition-local coords, issue one batched read, write each
+        element into the access-local position of the output buffer.
+        """
+        x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
+        ndim = len(dist_tile_ref.shape)
+        out_shape = (
+            tuple(result_shape) if result_shape is not None else tuple(dist_tile_ref.shape)
+        )
+        out = np.zeros(out_shape, dtype=_to_np_dtype(dist_tile_ref.dtype))
+
+        total_unique_sticks = 0
+        for survivor in dist_tile_ref.partitions:
+            cs = survivor.coordinate_set
+            if isinstance(cs, BoxSet):
+                # Fast path: rectangular sub-tile.
+                sub = MemoryOps._subtile_ref(survivor, cs)
+                tile = MemoryOps.load(context, sub)
+                # access-local rectangle = C_i - x
+                slc = tuple(
+                    slice(cs.lo[d] - x[d], cs.hi[d] - x[d]) for d in range(ndim)
+                )
+                out[slc] = tile.data
+                if tile.unique_sticks is not None:
+                    total_unique_sticks += tile.unique_sticks
+                continue
+
+            # Slow path: List[Tuple[int, ...]] enumeration.
+            C_i = cs or []
+            p_i = survivor.partition_origin or (0,) * ndim
+            local_coords = [
+                tuple(c[d] - p_i[d] for d in range(ndim)) for c in C_i
+            ]
+            access_coords = [
+                tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
+            ]
+            mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr, survivor.memref.lx_core_id)
+            offsets, unique_sticks = MemoryOps._flat_memory_offsets(
+                survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
+                local_coords, stick_bytes=mgr.stick_bytes,
+            )
+            span = max(offsets) + 1 if offsets else 1
+            flat = mgr.read(span, survivor.dtype)
+            for ac, off in zip(access_coords, offsets):
+                out[ac] = flat[off]
+            if unique_sticks is not None:
+                total_unique_sticks += unique_sticks
+
+        MemoryOps._write_to_lx(context, out)
+        return Tile(
+            out,
+            dist_tile_ref.dtype,
+            out_shape,
+            total_unique_sticks if total_unique_sticks else None,
+        )
+
+    @staticmethod
+    def distributed_store(
+        context: CoreContext,
+        tile: Tile,
+        dist_tile_ref: DistributedTileRef,
+    ) -> None:
+        """Scatter a tile to surviving partitions, symmetric to :meth:`distributed_load`.
+
+        Fast path (BoxSet C_i): slice the source tile rectangularly at
+        ``C_i - x``, wrap in a Tile, write through a sub-TileRef built
+        on C_i.  np.ascontiguousarray covers the case where the slice
+        is a non-contiguous view.
+
+        Slow path (List[Tuple] C_i): per-coord gather/write via one
+        read-modify-write.
+        """
+        x = dist_tile_ref.global_base or (0,) * len(dist_tile_ref.shape)
+        ndim = len(dist_tile_ref.shape)
+
+        for survivor in dist_tile_ref.partitions:
+            cs = survivor.coordinate_set
+            if isinstance(cs, BoxSet):
+                sub = MemoryOps._subtile_ref(survivor, cs)
+                slc = tuple(
+                    slice(cs.lo[d] - x[d], cs.hi[d] - x[d]) for d in range(ndim)
+                )
+                src = np.ascontiguousarray(tile.data[slc])
+                sub_tile = Tile(src, survivor.dtype, src.shape)
+                MemoryOps.store(context, sub_tile, sub)
+                continue
+
+            C_i = cs or []
+            p_i = survivor.partition_origin or (0,) * ndim
+            local_coords = [
+                tuple(c[d] - p_i[d] for d in range(ndim)) for c in C_i
+            ]
+            access_coords = [
+                tuple(c[d] - x[d] for d in range(ndim)) for c in C_i
+            ]
+            mgr = _MemAccessor(context, survivor.memref.memory_space, survivor.base_ptr, survivor.memref.lx_core_id)
+            offsets, _ = MemoryOps._flat_memory_offsets(
+                survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
+                local_coords,
+            )
+            span = max(offsets) + 1 if offsets else 1
+            flat = mgr.read(span, survivor.dtype)
+            for ac, off in zip(access_coords, offsets):
+                flat[off] = tile.data[ac]
+            mgr.write(flat)
+
+    @staticmethod
+    def indirect_store(
+        context: CoreContext,
+        tile: Tile,
+        iat: "IndirectAccessTile",
+    ) -> None:
+        """Store data using an indirect access tile (scatter pattern).
+
+        Mirror of :meth:`indirect_load`. Enumerates the variable space,
+        resolves each coordinate tuple (direct dims use the variable value,
+        indirect dims look up the index in an index memref), then delegates
+        to :meth:`store`.
+
+        Coordinate collisions (multiple source elements mapping to the same
+        destination coordinate) are *implementation-defined*; the current
+        behavior is last-writer-wins via NumPy fancy-index assignment.
+        """
+        # MLIR type system should already enforce shape match; raise here so a
+        # mismatch surfaces clearly instead of as an opaque NumPy shape error.
+        if tuple(tile.shape) != tuple(iat.shape):
+            raise ValueError(
+                f"indirect_store: source tile shape {tuple(tile.shape)} does not "
+                f"match IAT shape {tuple(iat.shape)}"
+            )
+
+        vss = iat.variables_space_set
+        vso = iat.variables_space_order
+
+        if vso is not None and not vso.is_identity():
+            raise NotImplementedError(
+                "indirect_store: output tile permutation via non-identity "
+                "variables_space_order is not yet implemented"
+            )
+
+        # Pre-compile per-dim resolvers (loop-invariant hoisting): branch
+        # dispatch and constant lookups happen once, not per enumerated point.
+        resolvers = []
+        for sub in iat.dim_subscripts:
+            kind = sub["kind"]
+            if kind == "direct":
+                resolvers.append(("direct", sub["var_index"]))
+            elif kind == "direct_expr":
+                resolvers.append(("direct_expr", sub["subscript"]))
+            elif kind == "indirect":
+                idx_view = iat.index_views[sub["index_view_idx"]]
+                bpe = _bytes_per_elem(idx_view.dtype)
+                resolvers.append(("indirect", sub["idx_exprs"], idx_view, bpe))
+            else:
+                raise ValueError(f"Unknown indirect subscript kind: {kind}")
+
+        points = vss.enumerate(iat.shape)
+
+        coords = []
+        for pt in points:
+            coord = []
+            for res in resolvers:
+                tag = res[0]
+                if tag == "direct":
+                    coord.append(pt[res[1]])
+                elif tag == "direct_expr":
+                    coord.append(eval_subscript_expr(res[1], pt))
+                else:  # indirect
+                    _, idx_exprs, idx_view, bpe = res
+                    idx_coords = tuple(eval_subscript_expr(e, pt) for e in idx_exprs)
+                    offset = sum(c * s for c, s in zip(idx_coords, idx_view.strides))
+                    addr = idx_view.byte_address + offset * bpe
+                    raw_idx = int(_MemAccessor(context, idx_view.memory_space, addr, idx_view.lx_core_id).read(1, idx_view.dtype)[0])
+                    # NumPy fancy-index assignment silently wraps negative
+                    # indices; reject them here. Use raise so the check
+                    # survives python -O.
+                    if raw_idx < 0:
+                        raise IndexError(
+                            f"indirect index {raw_idx} from {idx_view} is negative"
+                        )
+                    coord.append(raw_idx)
+            coords.append(tuple(coord))
+
+        MemoryOps.store(context, tile, iat.parent_ref.to_tile_ref(), coords=coords)

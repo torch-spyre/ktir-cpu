@@ -23,6 +23,83 @@ from typing import Dict, List, Tuple, Callable, Optional
 import numpy as np
 from ..ir_types import Tile
 from ..grid import CoreContext
+from ..memory import LXScratchpad, SpyreMemoryHierarchy
+
+
+class RingBackend:
+    """Abstract backend for inter-core LX access and ring communication.
+
+    The backend is the single seam between memory operations that need
+    remote LX data and the communication model used to obtain it.
+
+    Two implementations are planned:
+
+    DirectLXBackend (this file, first pass):
+        Returns the target scratchpad directly from SpyreMemoryHierarchy.
+        No ring messages, no latency modelling.  Valid when LX partitions
+        are pre-seeded by the host before kernel execution (e.g. the RFC
+        distributed-view-copy test).
+
+    RingTransferBackend (future):
+        When a core requests remote LX data, it issues a send on
+        RingNetwork and suspends execution at that point (coroutine model).
+        The scheduler resumes the core once the sender has delivered the
+        message.  This models actual ring hop cost and enables correct
+        cyclic communication.
+    """
+
+    def get_lx(self, core_id: int) -> LXScratchpad:
+        """Return the LXScratchpad for *core_id*."""
+        raise NotImplementedError
+
+    def send(self, src_core: int, dst_core: int, tile: Tile) -> None:
+        """Send *tile* from *src_core* to *dst_core* via the ring."""
+        raise NotImplementedError
+
+    def recv(self, src_core: int, dst_core: int) -> Optional[Tile]:
+        """Receive a tile sent from *src_core* to *dst_core*."""
+        raise NotImplementedError
+
+
+class DirectLXBackend(RingBackend):
+    """First-pass backend: direct scratchpad access, no ring modelling.
+
+    get_lx(N) returns memory.lx_scratchpads[N] directly — valid for the
+    distributed-view use case where LX partitions are pre-seeded by the
+    host and no cross-core data movement occurs at runtime.
+
+    send/recv delegate to the provided RingNetwork so that ktdp.transfer
+    and ktdp.reduce continue to work as before.
+    """
+
+    def __init__(self, memory: SpyreMemoryHierarchy, ring: Optional["RingNetwork"] = None):
+        self._memory = memory
+        self._ring = ring
+
+    def get_lx(self, core_id: int) -> LXScratchpad:
+        """Return the LXScratchpad for *core_id* via direct lookup."""
+        num = self._memory.num_cores
+        if core_id < 0 or core_id >= num:
+            raise ValueError(
+                f"get_lx: core_id={core_id} is out of range [0, {num}) for this grid"
+            )
+        return self._memory.get_lx(core_id)
+
+    def send(self, src_core: int, dst_core: int, tile: Tile) -> None:
+        if self._ring is None:
+            raise NotImplementedError(
+                "DirectLXBackend was constructed without a RingNetwork — "
+                "ktdp.transfer/reduce require one"
+            )
+        self._ring.send(src_core, dst_core, tile)
+
+    def recv(self, src_core: int, dst_core: int) -> Optional[Tile]:
+        if self._ring is None:
+            raise NotImplementedError(
+                "DirectLXBackend was constructed without a RingNetwork — "
+                "ktdp.transfer/reduce require one"
+            )
+        return self._ring.recv_from(src_core, dst_core)
 
 
 class RingNetwork:
@@ -102,18 +179,11 @@ class CommOps:
         context: CoreContext,
         tile: Tile,
         dst_cores: List[int],
-        ring: RingNetwork
+        ring_backend: RingBackend,
     ):
-        """Transfer a tile to destination cores via the ring network.
-
-        Args:
-            context: Core execution context
-            tile: Tile to transfer
-            dst_cores: List of destination core IDs
-            ring: Ring network
-        """
+        """Transfer a tile to destination cores via the ring backend."""
         for dst_core in dst_cores:
-            ring.send(context.core_id, dst_core, tile)
+            ring_backend.send(context.core_id, dst_core, tile)
 
     @staticmethod
     def reduce(
@@ -121,7 +191,7 @@ class CommOps:
         tile: Tile,
         core_group: List[int],
         reduce_fn: Callable[[Tile, Tile], Tile],
-        ring: RingNetwork
+        ring_backend: RingBackend,
     ) -> Tuple[Tile, bool]:
         """Reduce a tile across a core group using the ring network.
 
@@ -160,14 +230,14 @@ class CommOps:
             # Send to next core in ring
             next_idx = (my_idx + 1) % n_cores
             next_core = core_group[next_idx]
-            ring.send(context.core_id, next_core, result)
+            ring_backend.send(context.core_id, next_core, result)
 
             # Receive from previous core in ring
             prev_idx = (my_idx - 1) % n_cores
             prev_core = core_group[prev_idx]
 
             # In sequential simulation, message is immediately available
-            received = ring.recv_from(prev_core, context.core_id)
+            received = ring_backend.recv(prev_core, context.core_id)
 
             # Apply reduction
             if received is not None:
