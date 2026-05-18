@@ -22,7 +22,7 @@ from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
 from ..parser_ast import parse_affine_map
-from ..parser_utils import parse_attr_list
+from ..parser_utils import find_ssa_names, parse_attr_list
 from .registry import register, register_parser
 
 
@@ -338,9 +338,9 @@ def parse_linalg_fill(op_text, parse_ctx):
 
     operands = []
     if ins_match:
-        operands.extend(re.findall(r'%\w+', ins_match.group(1)))
+        operands.extend(find_ssa_names(ins_match.group(1)))
     if outs_match:
-        operands.extend(re.findall(r'%\w+', outs_match.group(1)))
+        operands.extend(find_ssa_names(outs_match.group(1)))
 
     return Operation(
         result=result_name,
@@ -397,12 +397,12 @@ def parse_linalg_generic(op_text, parse_ctx):
     ins_operands = []
     ins_match = re.search(r'\bins\s*\(([^)]+)\)', op_text)
     if ins_match:
-        ins_operands = re.findall(r'%\w+', ins_match.group(1).split(':')[0])
+        ins_operands = find_ssa_names(ins_match.group(1).split(':')[0])
 
     outs_operands = []
     outs_match = re.search(r'\bouts\s*\(([^)]+)\)', op_text)
     if outs_match:
-        outs_operands = re.findall(r'%\w+', outs_match.group(1).split(':')[0])
+        outs_operands = find_ssa_names(outs_match.group(1).split(':')[0])
 
     return Operation(
         result=result_name,
@@ -434,7 +434,7 @@ def parse_linalg_yield(op_text, parse_ctx):
     m = re.match(r'linalg\.yield\s+(.*)', op_text)
     if not m:
         return None
-    operands = re.findall(r'%\w+', m.group(1).split(':')[0])
+    operands = find_ssa_names(m.group(1).split(':')[0])
     return Operation(
         result=None,
         op_type="linalg.yield",
@@ -458,9 +458,9 @@ def parse_linalg_broadcast(op_text, parse_ctx):
 
     operands = []
     if ins_match:
-        operands.extend(re.findall(r'%\w+', ins_match.group(1)))
+        operands.extend(find_ssa_names(ins_match.group(1)))
     if outs_match:
-        operands.extend(re.findall(r'%\w+', outs_match.group(1)))
+        operands.extend(find_ssa_names(outs_match.group(1)))
 
     dims = []
     dims_match = re.search(r'dimensions\s*=\s*\[([^\]]*)\]', op_text)

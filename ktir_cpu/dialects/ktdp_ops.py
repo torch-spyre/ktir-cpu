@@ -22,7 +22,7 @@ from ..latency import LatencyCategory as LC
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
-from ..parser_utils import _extract_bracket_content, parse_attr_block, split_top_level
+from ..parser_utils import _extract_bracket_content, find_ssa_names, parse_attr_block, parse_multi_result_lhs, split_top_level
 from .registry import ParseContext, register, register_parser
 
 
@@ -125,24 +125,6 @@ def ktdp__store(op, context, env):
 # Comma form keeps result names verbatim ("%x", "%y").
 # Bundled form synthesizes "%g#0", "%g#1" so downstream operand lookup
 # finds distinct keys.
-_GET_COMPUTE_TILE_ID_RE = re.compile(
-    r"""
-    ^\s*
-    (?:
-        (?P<comma> %\w+ (?: \s*,\s* %\w+ )* )                # %x  or  %x, %y, ...
-      |
-        (?P<base>  %\w+ ) : (?P<result_count> [1-9]\d* )     # %g:N  (N >= 1)
-    )
-    \s*=\s*
-    ktdp\.get_compute_tile_id
-    \s*:\s*
-    (?P<types> [^{(]* )                                      # trailing type list
-    \s*$
-    """,
-    re.VERBOSE,
-)
-
-
 def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
     return Operation(
         result=result,
@@ -155,45 +137,20 @@ def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
 
 @register_parser("ktdp.get_compute_tile_id")
 def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
-    match = _GET_COMPUTE_TILE_ID_RE.match(op_text)
-    if not match:
-        return None
-
-    # Trailing ": index, index, ..." must agree with the result
-    # name count. A mismatch is malformed will fail at parse time rather than
-    # silently store the wrong number of names.
-    type_count = sum(1 for t in match["types"].split(",") if t.strip())
-
-    if match["comma"] is not None:
-        names = [r.strip() for r in match["comma"].split(",")]
-        if len(names) != type_count:
-            raise ValueError(
-                f"ktdp.get_compute_tile_id: {len(names)} result name(s) but "
-                f"{type_count} result type(s) in: {op_text!r}"
-            )
-        result = names[0] if len(names) == 1 else names
-        return _make_compute_tile_id_op(result)
-
-    # Bundled form — synthesize the use-site reference names.
-    declared_result_count = int(match["result_count"])
-    if declared_result_count != type_count:
-        raise ValueError(
-            f"ktdp.get_compute_tile_id: bundled form declares "
-            f"{declared_result_count} result(s) but {type_count} result type(s) "
-            f"in: {op_text!r}"
-        )
-    base = match["base"]
-    # Honor the codebase-wide invariant: single result ⇔ bare string,
-    # multi-result ⇔ list[≥2]. The "%base#0" suffix is preserved so that
-    # downstream operands written as "%base#0" still resolve via env lookup.
-    # The MLIR-frontend backend collapses bundled N=1 to a single SSA value
-    # at parse time; emitting a string here keeps both backends consistent
-    # and avoids a list[1] shape that no other producer/consumer expects.
-    if declared_result_count == 1:
-        return _make_compute_tile_id_op(f"{base}#0")
-    return _make_compute_tile_id_op(
-        [f"{base}#{i}" for i in range(declared_result_count)]
+    m = re.match(
+        r"^(.*?)\s*=\s*ktdp\.get_compute_tile_id\s*:\s*([^{(]*)\s*$", op_text
     )
+    if not m:
+        return None
+    names = parse_multi_result_lhs(m.group(1))
+    type_count = sum(1 for t in m.group(2).split(",") if t.strip())
+    if len(names) != type_count:
+        raise ValueError(
+            f"ktdp.get_compute_tile_id: {len(names)} result name(s) but "
+            f"{type_count} result type(s) in: {op_text!r}"
+        )
+    result = names[0] if len(names) == 1 else names
+    return _make_compute_tile_id_op(result)
 
 
 @register_parser("ktdp.construct_memory_view")
@@ -294,7 +251,7 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
     result_name = result_match.group(1)
 
     after_eq = op_text[op_text.index('=') + 1:]
-    operands = re.findall(r'%\w+', after_eq)
+    operands = find_ssa_names(after_eq)
 
     tile_match = re.search(r'!ktdp\.access_tile<([^>]+)>', op_text)
     if not tile_match:

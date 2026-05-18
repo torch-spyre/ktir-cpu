@@ -22,6 +22,34 @@ either side without creating a circular import.
 import re
 from typing import Any, Dict, List, Optional
 
+_SSA_RE = re.compile(r'%\w+(?:#\d+)?')
+
+
+def find_ssa_names(text: str) -> list[str]:
+    """Find all SSA value references in *text*, including multi-result ``%base#N`` forms."""
+    return _SSA_RE.findall(text)
+
+
+def parse_multi_result_lhs(lhs_text: str) -> list[str]:
+    """Parse the LHS of a multi-result MLIR assignment.
+
+    Accepts:
+      bundled form  ``"%g:2"``    -> ``["%g#0", "%g#1"]``
+      comma form    ``"%x, %y"``  -> ``["%x", "%y"]``
+      single        ``"%x"``      -> ``["%x"]``
+
+    Raises ``ValueError`` on malformed input.
+    """
+    m = re.fullmatch(r'(%\w+):([1-9]\d*)', lhs_text.strip())
+    if m:
+        base, n = m.group(1), int(m.group(2))
+        return [f"{base}#{i}" for i in range(n)]
+    parts = [p.strip() for p in lhs_text.split(",")]
+    if all(re.fullmatch(r'%\w+', p) for p in parts):
+        return parts
+    raise ValueError(f"cannot parse multi-result LHS: {lhs_text!r}")
+
+
 def parse_tensor_type(type_str: str) -> Optional[Dict]:
     """Parse a tensor type string, returning shape and dtype if it matches.
 
