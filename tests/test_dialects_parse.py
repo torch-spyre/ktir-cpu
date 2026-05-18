@@ -534,20 +534,24 @@ class TestKtdpParsers(ParseTestMixin):
         assert isinstance(op.result, list)
         assert len(op.result) == 2
 
-    def test_get_compute_tile_id_bundled(self):
+    @pytest.mark.parametrize("n", [2, 3])
+    def test_get_compute_tile_id_bundled(self, n):
         # One base name with a ":N" suffix declaring N results. The parser
         # must canonicalize this into N distinct SSA result names — backends
         # disagree on the exact spelling (regex preserves "%pid#0/#1";
         # MLIR-frontend rewrites to canonical "%N"), so we only assert
         # structural shape: N entries, each a non-empty "%..." SSA name.
-        op = self._parse("%pid:2 = ktdp.get_compute_tile_id : index, index")
+        # Parametrized over N to cover both the minimum multi-result case
+        # (N=2) and N>2, since the bundled grammar admits any [1-9]\d*.
+        types = ", ".join(["index"] * n)
+        op = self._parse(f"%pid:{n} = ktdp.get_compute_tile_id : {types}")
         self.assert_op_type(op, "ktdp.get_compute_tile_id")
         assert isinstance(op.result, list)
-        assert len(op.result) == 2
+        assert len(op.result) == n
         assert all(isinstance(r, str) and r.startswith("%") and len(r) > 1
                    for r in op.result)
         # The N names must be distinct.
-        assert len(set(op.result)) == 2
+        assert len(set(op.result)) == n
 
     def test_get_compute_tile_id_bundled_single_result(self):
         # N=1 is the lower endpoint of the bundled grammar — the regex
@@ -562,30 +566,33 @@ class TestKtdpParsers(ParseTestMixin):
         assert op.result.startswith("%")
         assert len(op.result) > 1
 
-    def test_get_compute_tile_id_bundled_three_results(self):
-        # Bundled form works for N > 2, not just N == 2.
-        op = self._parse(
-            "%g:3 = ktdp.get_compute_tile_id : index, index, index"
-        )
-        assert isinstance(op.result, list)
-        assert len(op.result) == 3
-        assert all(isinstance(r, str) and r.startswith("%") and len(r) > 1
-                   for r in op.result)
-        assert len(set(op.result)) == 3
+    # Both surface forms (bundled "%pid:2" and comma "%x, %y") flow
+    # through the shared parse_multi_result_lhs helper and raise the same
+    # regex-parser diagnostic. The MLIR frontend (used by future
+    # BindingsParseTestMixin subclasses) raises a different but equally
+    # specific diagnostic. Match each backend's full phrasing rather than
+    # a tiny substring — short patterns like "result type" can match
+    # unrelated future error messages and silently let regressions slip
+    # through.
+    _COUNT_MISMATCH_MSG = (
+        # Regex parser:
+        # "ktdp.get_compute_tile_id: N result name(s) but M result
+        #  type(s) in: ..."
+        r"\d+ result name\(s\) but \d+ result type\(s\)"
+        r"|"
+        # MLIR frontend:
+        # "operation defines N results but was provided M to bind"
+        r"operation defines \d+ results but was provided \d+ to bind"
+    )
 
     def test_get_compute_tile_id_bundled_count_mismatch_rejected(self):
-        # Regex parser raises ValueError("result type ..."); MLIR frontend
-        # raises MLIRError("operation defines N results but was provided M
-        # to bind"). Both pinpoint the same defect (result-count mismatch),
-        # so accept either by widening to Exception and matching either
-        # message.
-        with pytest.raises(Exception, match="result type|results but was provided"):
+        # Bundled form "%pid:2 = ... : index" — 2 results declared, 1 type.
+        with pytest.raises(Exception, match=self._COUNT_MISMATCH_MSG):
             self._parse("%pid:2 = ktdp.get_compute_tile_id : index")
 
     def test_get_compute_tile_id_comma_count_mismatch_rejected(self):
-        # Two names, one type — must fail at parse. Same dual-backend
-        # message handling as above.
-        with pytest.raises(Exception, match="result type|results but was provided"):
+        # Comma form "%x, %y = ... : index" — 2 names, 1 type.
+        with pytest.raises(Exception, match=self._COUNT_MISMATCH_MSG):
             self._parse("%x, %y = ktdp.get_compute_tile_id : index")
 
     def test_bundled_result_referenced_via_hash_index(self):
