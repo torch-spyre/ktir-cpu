@@ -467,6 +467,14 @@ class GridExecutor:
         None, the transfer function raises if invoked — fine for
         single-core or all-local executions.
         """
+        if not operations:
+            return [None] * self.num_cores
+        if not callable(execute_op):
+            raise ValueError(
+                f"execute_op must be callable, got {type(execute_op)!r}"
+            )
+        if input_ptrs is None:
+            input_ptrs = {}
         messages: Dict[Tuple[int, int], deque] = {}
         stacks: Dict[int, "CoreExecutionStack"] = {}
         waiting: Dict[int, int] = {}   # core_id -> src_core it is waiting on
@@ -486,7 +494,11 @@ class GridExecutor:
 
         def _advance(core_id: int, send_val: Any = None) -> None:
             stack = stacks[core_id]
-            result = stack.resume(send_val)
+            try:
+                result = stack.resume(send_val)
+            except Exception as e:
+                e.add_note(f"  [core {core_id}]")
+                raise
             if stack.is_blocked():
                 waiting[core_id] = stack.waiting_on
             else:
