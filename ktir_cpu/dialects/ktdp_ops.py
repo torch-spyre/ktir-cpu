@@ -209,7 +209,13 @@ def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
     if not m:
         return None
     names = parse_multi_result_lhs(m.group(1))
-    type_count = sum(1 for t in m.group(2).split(",") if t.strip())
+    types_text = m.group(2).strip()
+    if not types_text:
+        raise ValueError("no result types specified")
+    type_list = [t.strip() for t in types_text.split(",")]
+    if any(not t for t in type_list):
+        raise ValueError(f"empty type in list: {types_text!r}")
+    type_count = len(type_list)
     if len(names) != type_count:
         raise ValueError(
             f"ktdp.get_compute_tile_id: {len(names)} result name(s) but "
