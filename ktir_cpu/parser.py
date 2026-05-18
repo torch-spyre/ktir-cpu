@@ -603,8 +603,6 @@ class KTIRParser(KTIRParserBase):
         # attribute blocks.
         cleaned = re.sub(r'\{[^}]*\}', '', text)
 
-        # "%name#N" is MLIR's multi-result of N ops defined as 
-        # "%base:N = ..." — keep the "#N" attached so results are distinct keys.
         operands = find_ssa_names(cleaned)
 
         # Remove result name if present
