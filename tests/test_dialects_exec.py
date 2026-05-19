@@ -64,7 +64,7 @@ def _make_env(grid_shape=(1, 1, 1)):
             result = op(context)
         return result
 
-    return ExecutionEnv(grid_executor=grid, ring_backend=None, execute_region=execute_region)
+    return ExecutionEnv(grid_executor=grid, execute_region=execute_region)
 
 
 def _call(op_type, context, env, **op_kwargs):
