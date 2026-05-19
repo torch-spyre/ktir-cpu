@@ -90,15 +90,27 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
     """
     interp = KTIRInterpreter()
     interp.load(path)
+    # Build a name→value map of every arith.constant in the function so we can
+    # look up addresses by their SSA name (e.g. %Idx_start_address) instead of
+    # hardcoding the literal integers.  If the .mlir changes the address values,
+    # the test automatically picks them up.
+    func = interp.module.get_function(func_name)
+    addrs = {
+        op.result.lstrip("%"): op.attributes["value"]
+        for op in func.operations
+        if op.op_type == "arith.constant" and op.result
+    }
     _orig = interp._prepare_execution
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        # Idx tensor at 20000000: shape 4x32 i32, all zeros → every page ID = 0
-        hbm.write(20000000, np.zeros(4 * 32, dtype=np.int32))
-        # X tensor at 30000000: seed page 0 only (65536 f16 elements)
-        # All accesses land on page 0 because Idx is all zeros.
-        hbm.write(30000000, np.zeros(65536, dtype=np.float16))
+        # Idx tensor (Nb × Ntkv/Ptkv i32): all zeros so every indirect page ID resolves to 0.
+        idx_n_elements = addrs["Nb"] * (addrs["Ntkv"] // addrs["Ptkv"])
+        hbm.write(addrs["Idx_start_address"], np.zeros(idx_n_elements, dtype=np.int32))
+        # X tensor: only page 0 needs data (one page = Nhkv * Ptkv * Ndkv f16 elements).
+        # Because Idx is all zeros every gather access lands on page 0.
+        x_page_n_elements = addrs["Nhkv"] * addrs["Ptkv"] * addrs["Ndkv"]
+        hbm.write(addrs["X_start_address"], np.zeros(x_page_n_elements, dtype=np.float16))
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
