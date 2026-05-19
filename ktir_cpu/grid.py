@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Set
 from .ir_types import Tile
 from .memory import LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
 
+if TYPE_CHECKING:
+    from .ops.comm_ops import TransferBackend
+
 
 @dataclass(frozen=True)
 class RecvRequest:
@@ -34,10 +37,6 @@ class RecvRequest:
     then resumes the generator via ``gen.send(tile)``.
     """
     src: int  # core ID to receive from
-
-if TYPE_CHECKING:
-    from .ops.comm_ops import RingBackend
-
 
 class CoreContext:
     """Execution context for a single core.
@@ -85,39 +84,63 @@ class CoreContext:
         # Re-bind %m_acc = %m_new in parent scope, re-track LX.
     """
 
-    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator, ring_backend: Optional["RingBackend"] = None):
+    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator):
         self.core_id = core_id
         self.grid_pos = grid_pos  # (x, y, z) position in grid
         self.lx = lx              # Core-local LX scratchpad
         self.hbm = hbm            # Shared HBM
-        # Backend for remote LX access.  None is allowed for tests that
-        # construct CoreContext directly and never access a remote core's LX.
-        # get_lx() raises explicitly if a remote core is requested without a backend.
-        self.ring_backend = ring_backend
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
-        # Set by the scheduler before running a generator — routes send_to()
-        # calls to the scheduler's message queue.
+        # Scheduler-managed cross-core access — both functions are set by
+        # GridExecutor.execute_with_communication via attach_scheduler() and
+        # cleared via detach_scheduler() at the end of the run.
+        # NOTE: these private fields back the public send_to() and get_lx()
+        # methods. The naming keeps "ring_*" out of the type — see
+        # docs/cross_core_scheduling.md for the planned rename of the
+        # ring_backend → transfer_backend nomenclature site by site.
         self._send_fn: Optional[Callable[[int, "Tile"], None]] = None
+        self._transfer_fn: Optional[Callable[[int], LXScratchpad]] = None
+
+    def attach_scheduler(
+        self,
+        send_fn: Callable[[int, "Tile"], None],
+        transfer_fn: Callable[[int], LXScratchpad],
+    ) -> None:
+        """Wire scheduler-managed cross-core access for the duration of a run.
+
+        Called by ``GridExecutor.execute_with_communication`` before
+        stepping this core's generator. ``send_fn`` enqueues a tile into
+        the scheduler's message queue; ``transfer_fn(src_core)`` returns
+        the LXScratchpad for a remote core (only invoked for genuinely
+        remote cores — local fast path stays in ``get_lx``).
+
+        The binding is valid until ``detach_scheduler`` is called.
+        """
+        self._send_fn = send_fn
+        self._transfer_fn = transfer_fn
+
+    def detach_scheduler(self) -> None:
+        """Clear the scheduler bindings installed by :meth:`attach_scheduler`."""
+        self._send_fn = None
+        self._transfer_fn = None
 
     def get_lx(self, core_id: Optional[int] = None) -> LXScratchpad:
         """Return the LXScratchpad for *core_id*.
 
         When *core_id* is None or equals this core's own id, returns the
-        local scratchpad directly.  For a remote core, delegates to
-        ring_backend.get_lx() — raises if no backend is configured
-        (single-core mode).
+        local scratchpad directly.  For a remote core, delegates to the
+        attached transfer function — raises if no scheduler is attached.
         """
         if core_id is None or core_id == self.core_id:
             return self.lx
-        if self.ring_backend is None:
+        if self._transfer_fn is None:
             raise RuntimeError(
-                f"CoreContext(core_id={self.core_id}) has no ring_backend — "
-                f"cannot access remote LX for core {core_id}. "
-                f"Pass ring_backend when constructing CoreContext for multi-core execution."
+                f"CoreContext(core_id={self.core_id}).get_lx requested remote "
+                f"core {core_id} but no scheduler is attached. "
+                f"GridExecutor.execute_with_communication must run first."
             )
-        return self.ring_backend.get_lx(core_id)
+        return self._transfer_fn(core_id)
 
     def get_grid_id(self, dim: int) -> int:
         """Get grid ID for dimension.
@@ -184,14 +207,15 @@ class CoreContext:
     def send_to(self, dst_core: int, tile: "Tile") -> None:
         """Enqueue *tile* for delivery to *dst_core*.
 
-        Wired by the scheduler before stepping this core's generator.
-        Raises if called outside a scheduler-managed execution (e.g. in
-        single-core tests that never set _send_fn).
+        Wired by the scheduler via :meth:`attach_scheduler` before
+        stepping this core's generator. Raises if called outside a
+        scheduler-managed execution (e.g. single-core tests that never
+        attach).
         """
         if self._send_fn is None:
             raise RuntimeError(
                 f"CoreContext(core_id={self.core_id}).send_to called without "
-                "a scheduler — construct via GridExecutor._run_scheduler"
+                f"a scheduler — GridExecutor.execute_with_communication must run first."
             )
         self._send_fn(dst_core, tile)
 
@@ -337,18 +361,20 @@ class GridExecutor:
     Handles sequential simulation of cores with communication support.
     """
 
-    def __init__(self, grid_shape: Tuple[int, int, int], memory: SpyreMemoryHierarchy, ring_backend: Optional["RingBackend"] = None):
+    def __init__(self, grid_shape: Tuple[int, int, int], memory: SpyreMemoryHierarchy):
         self.grid_shape = grid_shape
         self.memory = memory
         self.num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
 
-        # Create core contexts — ring_backend is injected so each core can
-        # access remote LX scratchpads via context.get_lx(core_id).
+        # CoreContexts hold per-core local state. The transfer backend
+        # used to satisfy remote ``get_lx`` is supplied at execution
+        # time via ``execute_with_communication`` and bound onto each
+        # core through ``attach_scheduler``.
         self.cores = []
         for core_id in range(self.num_cores):
             grid_pos = self._linear_to_grid(core_id)
             lx = memory.get_lx(core_id)
-            self.cores.append(CoreContext(core_id, grid_pos, lx, memory.hbm, ring_backend))
+            self.cores.append(CoreContext(core_id, grid_pos, lx, memory.hbm))
 
     def _linear_to_grid(self, core_id: int) -> Tuple[int, int, int]:
         """Convert linear core ID to (x, y, z) grid position.
@@ -424,6 +450,7 @@ class GridExecutor:
         operations: List["Operation"],
         input_ptrs: Dict[str, Any],
         execute_op: Callable[["Operation", "CoreContext"], Any],
+        transfer_backend: Optional["TransferBackend"] = None,
     ) -> List[Any]:
         """Drive all cores to completion via the generator scheduler.
 
@@ -432,7 +459,22 @@ class GridExecutor:
         blocking recv).  The scheduler parks that core, delivers the
         message when it arrives, and resumes.  Unresolvable waits raise
         ``RuntimeError('Deadlock detected: ...')``.
+
+        Before stepping any core, attaches per-core scheduler state via
+        ``CoreContext.attach_scheduler``: a send function (queues onto
+        the scheduler's message buffer) and a transfer function
+        (resolves remote ``ctx.get_lx``). When *transfer_backend* is
+        None, the transfer function raises if invoked — fine for
+        single-core or all-local executions.
         """
+        if not operations:
+            return [None] * self.num_cores
+        if not callable(execute_op):
+            raise ValueError(
+                f"execute_op must be callable, got {type(execute_op)!r}"
+            )
+        if input_ptrs is None:
+            input_ptrs = {}
         messages: Dict[Tuple[int, int], deque] = {}
         stacks: Dict[int, "CoreExecutionStack"] = {}
         waiting: Dict[int, int] = {}   # core_id -> src_core it is waiting on
@@ -452,7 +494,11 @@ class GridExecutor:
 
         def _advance(core_id: int, send_val: Any = None) -> None:
             stack = stacks[core_id]
-            result = stack.resume(send_val)
+            try:
+                result = stack.resume(send_val)
+            except Exception as e:
+                e.add_note(f"  [core {core_id}]")
+                raise
             if stack.is_blocked():
                 waiting[core_id] = stack.waiting_on
             else:
@@ -471,7 +517,18 @@ class GridExecutor:
             return True
 
         for core in self.cores:
-            core._send_fn = lambda dst, tile, _src=core.core_id: _enqueue(_src, dst, tile)
+            send_fn = (lambda dst, tile, _src=core.core_id:
+                       _enqueue(_src, dst, tile))
+            if transfer_backend is not None:
+                transfer_fn = (lambda src, _ctx=core, _bk=transfer_backend:
+                               _bk.run(_ctx, src))
+            else:
+                def transfer_fn(src):  # noqa: E306 — explicit error message
+                    raise RuntimeError(
+                        "transfer_fn invoked but no transfer_backend was "
+                        "passed to execute_with_communication."
+                    )
+            core.attach_scheduler(send_fn=send_fn, transfer_fn=transfer_fn)
             stacks[core.core_id] = CoreExecutionStack(core, operations, input_ptrs, execute_op)
             _advance(core.core_id)
 

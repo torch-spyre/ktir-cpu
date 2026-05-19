@@ -124,10 +124,15 @@ from typing import Any, Callable, Dict, List, Tuple
 import numpy as np
 import pytest
 
-from ktir_cpu.grid import GridExecutor
+from ktir_cpu.grid import GridExecutor, RecvRequest
 from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.memory import SpyreMemoryHierarchy
-from ktir_cpu.ops.comm_ops import CommOps
+from ktir_cpu.ops.comm_ops import (
+    CommOps,
+    RingReduceBackend,
+    get_reduce_backend,
+    register_reduce_backend,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -177,16 +182,18 @@ def _sum_tiles(a: Tile, b: Tile) -> Tile:
 # ``_STUB_HANDLERS``. No registry, no fixture patching.
 # ---------------------------------------------------------------------------
 
+@register_reduce_backend("test.reduce", RingReduceBackend)
 def _h_reduce(op: Operation, ctx) -> Any:
-    """test.reduce — wraps CommOps.reduce (ring reduction, per-core view).
+    """test.reduce — wraps CommOps.reduce with the registered backend.
 
-    Returns the generator produced by ``CommOps.reduce``. The scheduler
-    drives ``N-1`` ``RecvRequest`` yields per core; the final accumulator
-    is bound to ``op.result``.
+    Returns the generator produced by ``RingReduceBackend.run`` (via
+    ``CommOps.reduce``). The scheduler drives ``N-1`` ``RecvRequest``
+    yields per core; the final accumulator is bound to ``op.result``.
     """
     tile = ctx.get_value(op.operands[0])
     group = op.attributes["group"]
-    return CommOps.reduce(ctx, tile, group, _sum_tiles)
+    backend_cls = get_reduce_backend(op.op_type)
+    return CommOps.reduce(ctx, tile, group, backend_cls(_sum_tiles))
 
 
 _STUB_HANDLERS: Dict[str, Callable[[Operation, Any], Any]] = {
@@ -426,3 +433,92 @@ SPEC_RING_REDUCE_4X4X1_COLS = {
 def test_ring_reduce(spec, execute_fn):
     """Ring reduction across one or more disjoint groups."""
     run_spec(spec, execute_fn)
+
+
+# ---------------------------------------------------------------------------
+# Deadlock detection
+# ---------------------------------------------------------------------------
+# These tests exist as both a check on the scheduler's deadlock detector
+# *and* a demonstration that the framework cannot deadlock under normal
+# usage — to get here we have to monkey-patch ``RingReduceBackend.run``
+# with deliberately broken protocol.
+#
+# Three failure modes are covered; each is a class of bug a backend
+# implementer might introduce, and each must be caught by the scheduler:
+#
+#   - mutual_recv  : recv-only, no sends                 (flat deadlock)
+#   - wrong_dest   : send to wrong destination           (miscoordinated channels)
+#   - extra_recv   : N recvs after N-1 sends (off-by-one) (deadlock after partial
+#                                                          progress)
+#
+# All three exercise the same end-to-end harness (run_spec on the
+# 4-core spec) so any change to the harness propagates to the
+# deadlock cases automatically.
+# ---------------------------------------------------------------------------
+
+def _broken_recv_only(self, ctx, tile, group):
+    """Recv from the previous neighbor, never send. Every participating
+    core blocks on round 1 → flat mutual-recv deadlock.
+    """
+    if ctx.core_id not in group:
+        return tile
+    n = len(group)
+    my_idx = group.index(ctx.core_id)
+    prev = group[(my_idx - 1) % n]
+    yield RecvRequest(src=prev)
+    return tile
+
+
+def _broken_wrong_dest(self, ctx, tile, group):
+    """Send to (idx+2) % n while recv-ing from (idx-1) % n. Every core's
+    send lands in a queue no one reads from; every core's recv waits
+    on a queue no one writes to. Deadlock at round 1.
+    """
+    if ctx.core_id not in group:
+        return tile
+    n = len(group)
+    my_idx = group.index(ctx.core_id)
+    wrong_dst = group[(my_idx + 2) % n]
+    prev = group[(my_idx - 1) % n]
+    ctx.send_to(wrong_dst, tile)
+    yield RecvRequest(src=prev)
+    return tile
+
+
+def _broken_extra_recv(self, ctx, tile, group):
+    """Run N-1 ring rounds correctly, then dangle one extra recv. The
+    final recv has no matching send → deadlock after the algorithm
+    has otherwise made progress.
+    """
+    if ctx.core_id not in group:
+        return tile
+    n = len(group)
+    my_idx = group.index(ctx.core_id)
+    next_core = group[(my_idx + 1) % n]
+    prev_core = group[(my_idx - 1) % n]
+    result = tile.copy()
+    to_forward = tile.copy()
+    for _ in range(n - 1):
+        ctx.send_to(next_core, to_forward)
+        received = yield RecvRequest(src=prev_core)
+        result = self.reduce_fn(result, received)
+        to_forward = received
+    # Dangling recv — no one sent for this round.
+    yield RecvRequest(src=prev_core)
+    return result
+
+
+@pytest.mark.parametrize(
+    "broken_run",
+    [
+        pytest.param(_broken_recv_only,  id="mutual_recv"),
+        pytest.param(_broken_wrong_dest, id="wrong_dest"),
+        pytest.param(_broken_extra_recv, id="extra_recv"),
+    ],
+)
+def test_scheduler_detects_deadlock(broken_run, execute_fn, monkeypatch):
+    """Scheduler raises RuntimeError('Deadlock detected: ...') when a
+    backend breaks the send/recv protocol."""
+    monkeypatch.setattr(RingReduceBackend, "run", broken_run)
+    with pytest.raises(RuntimeError, match="Deadlock detected"):
+        run_spec(SPEC_RING_REDUCE_4X1X1, execute_fn)
