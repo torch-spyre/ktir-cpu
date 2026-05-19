@@ -521,4 +521,4 @@ def test_scheduler_detects_deadlock(broken_run, execute_fn, monkeypatch):
     backend breaks the send/recv protocol."""
     monkeypatch.setattr(RingReduceBackend, "run", broken_run)
     with pytest.raises(RuntimeError, match="Deadlock detected"):
-        run_spec(SPEC_RING_REDUCE_4_CORES, execute_fn)
+        run_spec(SPEC_RING_REDUCE_4X1X1, execute_fn)
