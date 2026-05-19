@@ -18,7 +18,7 @@ from .grid_ops import GridOps
 from .memory_ops import MemoryOps
 from .arith_ops import ArithOps
 from .math_ops import MathOps
-from .comm_ops import CommOps, RingNetwork
+from .comm_ops import CommOps
 from .control_ops import ControlOps
 
 __all__ = [
@@ -27,6 +27,5 @@ __all__ = [
     "ArithOps",
     "MathOps",
     "CommOps",
-    "RingNetwork",
     "ControlOps",
 ]
