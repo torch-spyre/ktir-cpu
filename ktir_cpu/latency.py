@@ -32,6 +32,7 @@ import numpy as np
 from .ir_types import AccessTile, IndirectAccessTile, MemRef, Tile, TileRef
 from .dtypes import bytes_per_elem
 from .memory import HBMSimulator
+from .ops.memory_ops import _idx_unique_sticks_no_reads
 
 
 from .dialects.registry import get_latency_category
@@ -298,11 +299,27 @@ class LatencyTracker:
                 total += result.unique_sticks * HBMSimulator.STICK_BYTES
             else:
                 total += result.data.nbytes
+            if result.index_unique_sticks is not None:
+                total += result.index_unique_sticks * HBMSimulator.STICK_BYTES
         for v in operands:
             if isinstance(v, IndirectAccessTile):
-                for iv in v.index_views:
-                    if iv.memory_space == "HBM":
-                        total += int(np.prod(iv.shape)) * bytes_per_elem(iv.dtype)
+                # Load case (result is a Tile): idx sticks already charged
+                # via result.index_unique_sticks above. The IAT-load
+                # contract requires the handler to set the field to an
+                # integer (0 for an all-LX IAT, positive for HBM); a
+                # surviving None means the handler skipped
+                # ``_resolve_idx_reads``, which would silently undercount.
+                if isinstance(result, Tile):
+                    if result.index_unique_sticks is None:
+                        raise RuntimeError(
+                            "IAT operand with Tile result must populate "
+                            "index_unique_sticks; got None. This indicates "
+                            "the op handler skipped _resolve_idx_reads."
+                        )
+                    continue
+                # Store case: no result Tile carries the count, so
+                # recompute from the IAT. Always int (0 for all-LX).
+                total += _idx_unique_sticks_no_reads(v) * HBMSimulator.STICK_BYTES
             elif isinstance(v, Tile):
                 if result is not None:
                     raise ValueError(
