@@ -55,6 +55,100 @@ class TestAffineMapObject:
             m.n_dims = 99  # type: ignore[misc]
 
 
+class TestAffineMapIsPermutation:
+    """is_permutation() detects coordinate-permutation affine maps.
+
+    Used as a precondition guard for ops whose semantics require sorting
+    enumerated points by the map's image (e.g. ``variables_space_order``
+    on indirect access tiles).  Non-permutation maps would produce
+    duplicate sort keys with undefined relative output positions.
+    """
+
+    def test_1d_identity(self):
+        """1-D edge: ``(d0) -> (d0)`` is the trivial permutation."""
+        m = parse_affine_map("affine_map<(d0) -> (d0)>")
+        assert m.is_permutation()
+
+    def test_identity(self):
+        m = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
+        assert m.is_permutation()
+
+    def test_2d_swap(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d1, d0)>")
+        assert m.is_permutation()
+
+    def test_3d_cycle(self):
+        m = parse_affine_map("affine_map<(d0, d1, d2) -> (d2, d0, d1)>")
+        assert m.is_permutation()
+
+    def test_shear_rejected(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0 + d1, d1)>")
+        assert not m.is_permutation()
+
+    def test_many_to_one_rejected(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0, d0)>")
+        assert not m.is_permutation()
+
+    def test_non_square_rejected(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0)>")
+        assert not m.is_permutation()
+
+    def test_linear_combination_rejected(self):
+        """Regression: probe-based ``sorted(eval(probe)) == probe`` accepts
+        ``(d0+d1-2, d0+d1-1)`` because probe ``[1,2]`` happens to give
+        ``(1,2)``.  Structural check rejects it: neither output is a
+        single dim variable.  pt=(3,1) → (2,3), confirming non-permutation
+        behaviour at runtime.
+        """
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0 + d1 - 2, d0 + d1 - 1)>")
+        assert not m.is_permutation()
+        assert m.eval([3, 1]) == (2, 3)  # would shift the box if accepted
+
+    def test_constant_offset_rejected(self):
+        """``(d1-1, d0+1)`` shifts both coordinates; not a coordinate
+        permutation.  Probe ``[1,2]`` evaluates to ``(1,2)`` and would slip
+        past a probe-based check.
+        """
+        m = parse_affine_map("affine_map<(d0, d1) -> (d1 - 1, d0 + 1)>")
+        assert not m.is_permutation()
+
+    def test_trivial_wrappers_accepted(self):
+        """Permutations expressed with redundant ``+0`` / ``1*`` wrappers
+        still accepted — the structural check flattens to linear form
+        before inspecting coefficients.
+        """
+        m = parse_affine_map("affine_map<(d0, d1) -> (1 * d1 + 0, d0)>")
+        assert m.is_permutation()
+
+
+class TestAffineMapIsIdentity:
+    """is_identity() detects the strict coordinate-identity map.
+
+    Regression for a probe-based check that accepts linear combinations
+    whose evaluation on ``[1, 2, ..., n]`` happens to coincide with the
+    probe (e.g. ``(d1-1, d0+1)`` on probe ``[1,2]`` returns ``(1,2)``).
+    The structural check requires each output ``i`` to be exactly
+    ``d_i``.
+    """
+
+    def test_identity_accepted(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+        assert m.is_identity()
+
+    def test_swap_rejected(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d1, d0)>")
+        assert not m.is_identity()
+
+    def test_constant_offset_rejected(self):
+        m = parse_affine_map("affine_map<(d0, d1) -> (d1 - 1, d0 + 1)>")
+        assert not m.is_identity()
+
+    def test_trivial_wrappers_accepted(self):
+        """``d0 + 0`` and ``1 * d0`` flatten to ``d0`` and remain identity."""
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0 + 0, 1 * d1)>")
+        assert m.is_identity()
+
+
 class TestAffineSetObject:
     """AffineSet behaviour on sets that are *not* lowerable to BoxSet."""
 

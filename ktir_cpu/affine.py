@@ -98,7 +98,7 @@ class AffineMap:
         return eval_affine_map(self, dims)
 
     def is_identity(self) -> bool:
-        """Return True if this map is the identity: output == input for all inputs.
+        """Return True if this map is the identity: output[i] == d_i for every i.
 
         Used at parse time to detect trivial coordinate-order maps.  When
         ``access_tile_order`` is an identity map it has no effect on which
@@ -106,16 +106,51 @@ class AffineMap:
         ``coordinate_order`` to ``None``.  This allows load/store to skip
         the per-coord ``cso.eval()`` calls and, combined with a full
         ``coordinate_set``, enables the contiguous fast path entirely.
+
+        Implemented structurally: each output expression must flatten to
+        ``1 * d_i + 0`` with output position ``i`` matching the dim index.
+        A probe-based ``eval(probe) == probe`` check would accept maps
+        like ``(d0, d1) -> (d1 - 1, d0 + 1)`` (probe ``[1,2]`` → ``(1,2)``),
+        which are not identity.
         """
-        # Quick structural check: same number of inputs and outputs, and each
-        # output expression is just the corresponding input dimension variable.
         if len(self.exprs) != self.n_dims:
             return False
-        # Verify by evaluation: identity map satisfies eval(dims) == dims for
-        # a non-trivial probe vector.  Using [1, 2, ..., n_dims] avoids false
-        # positives from constant-zero expressions.
-        probe = list(range(1, self.n_dims + 1))
-        return list(self.eval(probe)) == probe
+        for i, expr in enumerate(self.exprs):
+            idx = _expr_as_single_dim(expr, self.n_dims)
+            if idx != i:
+                return False
+        return True
+
+    def is_permutation(self) -> bool:
+        """Return True if this map permutes its input dimensions.
+
+        A permutation map is square (output count equals input count) and
+        each output expression is exactly one dim variable, with every dim
+        index appearing exactly once.  Accepts coordinate permutations
+        like ``(d0, d1, d2) -> (d2, d0, d1)``; rejects shears, scalings,
+        constant offsets, and many-to-one collapses.
+
+        Used by ops whose semantics require iteration over the input space
+        in a permuted order (e.g. ``variables_space_order`` on indirect
+        access tiles): the implementation sorts enumerated points by the
+        map's image, which is well-defined only when the image is a
+        permutation of the original points.
+
+        Implemented structurally on the parsed AST.  A probe-based
+        ``sorted(eval(probe)) == probe`` check would accept linear
+        combinations such as ``(d0, d1) -> (d0 + d1 - 2, d0 + d1 - 1)``
+        (probe ``[1,2]`` → ``(1,2)``), which are not coordinate
+        permutations.
+        """
+        if len(self.exprs) != self.n_dims:
+            return False
+        seen = set()
+        for expr in self.exprs:
+            idx = _expr_as_single_dim(expr, self.n_dims)
+            if idx is None or idx in seen:
+                return False
+            seen.add(idx)
+        return True
 
 
 @dataclass(frozen=True)
@@ -323,6 +358,29 @@ class BoxSet:
         if any(v is None for v in los) or any(v is None for v in his):
             return None
         return cls(lo=tuple(los), hi=tuple(his))  # type: ignore[arg-type]
+
+
+def _expr_as_single_dim(node: "_Node", n_dims: int) -> Optional[int]:
+    """Return ``i`` if *node* is structurally equivalent to ``1 * d_i + 0``.
+
+    Returns ``None`` for any expression that flattens to a linear form
+    with a non-zero constant, a non-unit coefficient, or coefficients on
+    more than one dim variable.  Used by :meth:`AffineMap.is_identity`
+    and :meth:`AffineMap.is_permutation` for structural checks that
+    cannot be fooled by linear combinations whose evaluation on a
+    specific probe happens to coincide with the probe (e.g.
+    ``d0 + d1 - 2`` evaluates to ``1`` on probe ``[1, 2]``).
+    """
+    lin = _constraint_to_linear(node, n_dims)
+    if lin is None:
+        return None
+    coeffs, const = lin
+    if const != 0:
+        return None
+    nz = [i for i, k in enumerate(coeffs) if k != 0]
+    if len(nz) != 1 or coeffs[nz[0]] != 1:
+        return None
+    return nz[0]
 
 
 def _constraint_to_linear(node: "_Node", n_dims: int) -> Optional[Tuple[List[int], int]]:

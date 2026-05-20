@@ -472,3 +472,383 @@ def test_negative_indirect_index_raises(mlir, func_name):
 
     with pytest.raises(IndexError, match="is negative"):
         interp.execute_function(func_name)
+
+
+# ---------------------------------------------------------------------------
+# Non-identity variables_space_order
+# ---------------------------------------------------------------------------
+# RFC 0682 §473: vso defines lexicographic traversal order over the variable
+# space (rightmost output = innermost iteration).  These fixtures exercise the
+# non-identity branch by templating the vso affine_map into a 4x4 IAT shell.
+
+def _gather_vso_mlir_4x4(vso_str: str, func_name: str) -> str:
+    """4x4 indirect gather fixture parameterised on variables_space_order."""
+    return f"""
+#coord_set_4x4   = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>
+#var_space_order = affine_map<{vso_str}>
+#cso_identity    = affine_map<(d0, d1) -> (d0, d1)>
+
+module {{
+  func.func @{func_name}() attributes {{grid = [1, 1]}} {{
+    %X_addr    = arith.constant 0 : index
+    %IDX1_addr = arith.constant 1 : index
+    %IDX2_addr = arith.constant 2 : index
+    %Y_addr    = arith.constant 3 : index
+
+    %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xf16>
+
+    %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xi32>
+
+    %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xi32>
+
+    %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xf16>
+
+    %X_access_tile = ktdp.construct_indirect_access_tile
+        intermediate_variables(%m, %k)
+        %X[ind(%IDX1[%m, %k]), ind(%IDX2[%m, %k])] {{
+            variables_space_set = #coord_set_4x4,
+            variables_space_order = #var_space_order
+        }} : memref<4x4xf16>, memref<4x4xi32>, memref<4x4xi32> -> !ktdp.access_tile<4x4xindex>
+
+    %c0 = arith.constant 0 : index
+    %Y_access_tile = ktdp.construct_access_tile %Y_view[%c0, %c0] {{
+        access_tile_set   = #coord_set_4x4,
+        access_tile_order = #cso_identity
+    }} : memref<4x4xf16> -> !ktdp.access_tile<4x4xindex>
+
+    %X_data_tile = ktdp.load %X_access_tile : !ktdp.access_tile<4x4xindex> -> tensor<4x4xf16>
+    ktdp.store %X_data_tile, %Y_access_tile : tensor<4x4xf16>, !ktdp.access_tile<4x4xindex>
+
+    return
+  }}
+}}
+"""
+
+
+def _scatter_vso_mlir_4x4(vso_str: str, func_name: str) -> str:
+    """4x4 indirect scatter fixture parameterised on variables_space_order."""
+    return f"""
+#coord_set_4x4   = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>
+#var_space_order = affine_map<{vso_str}>
+#cso_identity    = affine_map<(d0, d1) -> (d0, d1)>
+
+module {{
+  func.func @{func_name}() attributes {{grid = [1, 1]}} {{
+    %X_addr    = arith.constant 0 : index
+    %IDX1_addr = arith.constant 1 : index
+    %IDX2_addr = arith.constant 2 : index
+    %Y_addr    = arith.constant 3 : index
+
+    %X_view = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xf16>
+
+    %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xi32>
+
+    %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xi32>
+
+    %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [4, 4], strides: [4, 1] {{
+        coordinate_set = #coord_set_4x4,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    }} : memref<4x4xf16>
+
+    %c0 = arith.constant 0 : index
+    %X_access_tile = ktdp.construct_access_tile %X_view[%c0, %c0] {{
+        access_tile_set   = #coord_set_4x4,
+        access_tile_order = #cso_identity
+    }} : memref<4x4xf16> -> !ktdp.access_tile<4x4xindex>
+
+    %Y_access_tile = ktdp.construct_indirect_access_tile
+        intermediate_variables(%m, %k)
+        %Y_view[ind(%IDX1[%m, %k]), ind(%IDX2[%m, %k])] {{
+            variables_space_set = #coord_set_4x4,
+            variables_space_order = #var_space_order
+        }} : memref<4x4xf16>, memref<4x4xi32>, memref<4x4xi32> -> !ktdp.access_tile<4x4xindex>
+
+    %X_data_tile = ktdp.load %X_access_tile : !ktdp.access_tile<4x4xindex> -> tensor<4x4xf16>
+    ktdp.store %X_data_tile, %Y_access_tile : tensor<4x4xf16>, !ktdp.access_tile<4x4xindex>
+
+    return
+  }}
+}}
+"""
+
+
+def _seed_swap_4x4(interp):
+    """X = 0..15 row-major; IDX1[m,k]=m; IDX2[m,k]=k; Y zeroed."""
+    _orig = interp._prepare_execution
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        hbm.write(0, np.arange(16, dtype=np.float16))                       # X[m,k] = m*4+k
+        hbm.write(1, np.repeat(np.arange(4, dtype=np.int32), 4))            # IDX1[m,k] = m
+        hbm.write(2, np.tile(np.arange(4, dtype=np.int32), 4))              # IDX2[m,k] = k
+        hbm.write(3, np.zeros(16, dtype=np.float16))                        # Y zeroed
+    interp._prepare_execution = _prepare_and_seed
+
+
+@pytest.mark.parametrize(
+    "mlir_factory,func_name",
+    [
+        (_gather_vso_mlir_4x4,  "gather_swap_vso"),
+        (_scatter_vso_mlir_4x4, "scatter_swap_vso"),
+    ],
+    ids=["indirect_load_4x4_swap", "indirect_store_4x4_swap"],
+)
+def test_swap_vso(mlir_factory, func_name):
+    """A swap vso (d0,d1)->(d1,d0) reorders iteration to (d1,d0); with
+    identity-coord IDX (IDX1[m,k]=m, IDX2[m,k]=k) the result Y equals X
+    transposed.
+
+    The same expected Y holds for both load (gather X via IAT then store
+    direct) and store (load X direct then scatter via IAT) — vso is applied
+    on the IAT side in both directions.
+
+    Subscript resolution must use the variable-space point (not vso(pt)):
+    IDX values are sensitive to which point is passed in, so a wrong
+    implementation that fed vso(pt) to the subscripts would produce X
+    itself rather than X^T at non-symmetric positions.
+    """
+    mlir = mlir_factory("(d0, d1) -> (d1, d0)", func_name)
+    interp = KTIRInterpreter()
+    interp.load(mlir)
+    _seed_swap_4x4(interp)
+    interp.execute_function(func_name)
+
+    y_data = interp.memory.hbm.read(3, 16, "f16").reshape(4, 4)
+    # Y[r, c] = X[c, r] = c*4 + r
+    expected = np.array(
+        [[c * 4 + r for c in range(4)] for r in range(4)],
+        dtype=np.float16,
+    )
+    np.testing.assert_array_equal(y_data, expected)
+
+
+# 3-D 2x2x2 fixture for the canonical 3-cycle vso example (RFC 0682 §473
+# worked through in issue #58 discussion).  The 3-cycle is non-involution,
+# so this case distinguishes the sort-then-gather implementation from any
+# apply-then-load alternative that happens to coincide on involutions.
+_SMALL_3D_INDIRECT_GATHER_3CYCLE_MLIR = """
+#coord_set_2x2x2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 1 >= 0)>
+#vso_3cycle      = affine_map<(d0, d1, d2) -> (d2, d0, d1)>
+#cso_identity_3d = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+
+module {
+  func.func @small_3d_indirect_gather_3cycle() attributes {grid = [1, 1]} {
+    %X_addr   = arith.constant 0 : index
+    %IDX_addr = arith.constant 1 : index
+    %Y_addr   = arith.constant 2 : index
+
+    %X = ktdp.construct_memory_view %X_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
+        coordinate_set = #coord_set_2x2x2,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x2x2xf16>
+
+    %IDX = ktdp.construct_memory_view %IDX_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
+        coordinate_set = #coord_set_2x2x2,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x2x2xi32>
+
+    %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
+        coordinate_set = #coord_set_2x2x2,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x2x2xf16>
+
+    %X_access_tile = ktdp.construct_indirect_access_tile
+        intermediate_variables(%m, %k, %l)
+        %X[ind(%IDX[%m, %k, %l]), (%k), (%l)] {
+            variables_space_set = #coord_set_2x2x2,
+            variables_space_order = #vso_3cycle
+        } : memref<2x2x2xf16>, memref<2x2x2xi32> -> !ktdp.access_tile<2x2x2xindex>
+
+    %c0 = arith.constant 0 : index
+    %Y_access_tile = ktdp.construct_access_tile %Y_view[%c0, %c0, %c0] {
+        access_tile_set   = #coord_set_2x2x2,
+        access_tile_order = #cso_identity_3d
+    } : memref<2x2x2xf16> -> !ktdp.access_tile<2x2x2xindex>
+
+    %X_data_tile = ktdp.load %X_access_tile : !ktdp.access_tile<2x2x2xindex> -> tensor<2x2x2xf16>
+    ktdp.store %X_data_tile, %Y_access_tile : tensor<2x2x2xf16>, !ktdp.access_tile<2x2x2xindex>
+
+    return
+  }
+}
+"""
+
+
+def test_indirect_load_with_3cycle_vso():
+    """3-D non-involution vso (d0,d1,d2)->(d2,d0,d1) — the canonical
+    worked example from RFC 0682 §473 / issue #58.
+
+    Setup: X[m,k,l] = m*4+k*2+l (values 0..7), IDX[m,k,l] = m, dims 1+2 are
+    direct (k, l) — so the gather coordinate is just (m, k, l) and each
+    point reads X[pt].
+
+    Sort key under the 3-cycle is (l, m, k); enumerated points sorted by
+    this key visit (in lex sort-key order):
+        (0,0,0)→X=0, (0,1,0)→X=2, (1,0,0)→X=4, (1,1,0)→X=6,
+        (0,0,1)→X=1, (0,1,1)→X=3, (1,0,1)→X=5, (1,1,1)→X=7
+    Reshaped to (2,2,2) row-major:
+        [[[0, 2], [4, 6]],
+         [[1, 3], [5, 7]]]
+
+    A non-3-cycle implementation (e.g. apply-then-load) would land at a
+    different layout for this input — distinguishing this from the
+    involution case caught by test_swap_vso.
+    """
+    interp = KTIRInterpreter()
+    interp.load(_SMALL_3D_INDIRECT_GATHER_3CYCLE_MLIR)
+    _orig = interp._prepare_execution
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        hbm.write(0, np.arange(8, dtype=np.float16))                        # X
+        hbm.write(1, np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32))    # IDX[m,k,l]=m
+        hbm.write(2, np.zeros(8, dtype=np.float16))                         # Y zeroed
+    interp._prepare_execution = _prepare_and_seed
+
+    interp.execute_function("small_3d_indirect_gather_3cycle")
+
+    y_data = interp.memory.hbm.read(2, 8, "f16").reshape(2, 2, 2)
+    expected = np.array(
+        [[[0, 2], [4, 6]],
+         [[1, 3], [5, 7]]],
+        dtype=np.float16,
+    )
+    np.testing.assert_array_equal(y_data, expected)
+
+
+_SMALL_3D_INDIRECT_SCATTER_3CYCLE_MLIR = """
+#coord_set_2x2x2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 1 >= 0, d2 >= 0, -d2 + 1 >= 0)>
+#vso_3cycle      = affine_map<(d0, d1, d2) -> (d2, d0, d1)>
+#cso_identity_3d = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+
+module {
+  func.func @small_3d_indirect_scatter_3cycle() attributes {grid = [1, 1]} {
+    %X_addr   = arith.constant 0 : index
+    %IDX_addr = arith.constant 1 : index
+    %Y_addr   = arith.constant 2 : index
+
+    %X_view = ktdp.construct_memory_view %X_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
+        coordinate_set = #coord_set_2x2x2,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x2x2xf16>
+
+    %IDX = ktdp.construct_memory_view %IDX_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
+        coordinate_set = #coord_set_2x2x2,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x2x2xi32>
+
+    %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
+        coordinate_set = #coord_set_2x2x2,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x2x2xf16>
+
+    %c0 = arith.constant 0 : index
+    %X_access_tile = ktdp.construct_access_tile %X_view[%c0, %c0, %c0] {
+        access_tile_set   = #coord_set_2x2x2,
+        access_tile_order = #cso_identity_3d
+    } : memref<2x2x2xf16> -> !ktdp.access_tile<2x2x2xindex>
+
+    %Y_access_tile = ktdp.construct_indirect_access_tile
+        intermediate_variables(%m, %k, %l)
+        %Y_view[ind(%IDX[%m, %k, %l]), (%k), (%l)] {
+            variables_space_set = #coord_set_2x2x2,
+            variables_space_order = #vso_3cycle
+        } : memref<2x2x2xf16>, memref<2x2x2xi32> -> !ktdp.access_tile<2x2x2xindex>
+
+    %X_data_tile = ktdp.load %X_access_tile : !ktdp.access_tile<2x2x2xindex> -> tensor<2x2x2xf16>
+    ktdp.store %X_data_tile, %Y_access_tile : tensor<2x2x2xf16>, !ktdp.access_tile<2x2x2xindex>
+
+    return
+  }
+}
+"""
+
+
+def test_indirect_store_with_3cycle_vso():
+    """Mirror of :func:`test_indirect_load_with_3cycle_vso` on the store
+    side.  Read X identity-direct, scatter through Y with vso=3-cycle.
+
+    Sort key under the 3-cycle is (l, m, k); enumerated points sort to:
+        [(0,0,0), (0,1,0), (1,0,0), (1,1,0),
+         (0,0,1), (0,1,1), (1,0,1), (1,1,1)]
+    With IDX[m,k,l]=m the resolved write coord equals the variable-space
+    point itself, so ``Y[sorted_pts[i]] = X.flatten()[i]``.
+
+    Crucial vs the involution case in :func:`test_swap_vso`: a 3-cycle is
+    non-self-inverse, so any implementation that writes ``Y[vso(pt)]``
+    instead of using vso only as an iteration sort key would land at a
+    different layout — distinguishing the spec'd sort-then-scatter
+    semantics from any apply-then-store alternative.
+    """
+    interp = KTIRInterpreter()
+    interp.load(_SMALL_3D_INDIRECT_SCATTER_3CYCLE_MLIR)
+    _orig = interp._prepare_execution
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        hbm.write(0, np.arange(8, dtype=np.float16))                        # X[m,k,l]
+        hbm.write(1, np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int32))    # IDX[m,k,l]=m
+        hbm.write(2, np.zeros(8, dtype=np.float16))                         # Y zeroed
+    interp._prepare_execution = _prepare_and_seed
+
+    interp.execute_function("small_3d_indirect_scatter_3cycle")
+
+    y_data = interp.memory.hbm.read(2, 8, "f16").reshape(2, 2, 2)
+    expected = np.array(
+        [[[0, 4], [1, 5]],
+         [[2, 6], [3, 7]]],
+        dtype=np.float16,
+    )
+    np.testing.assert_array_equal(y_data, expected)
+
+
+@pytest.mark.parametrize(
+    "mlir_factory,func_name",
+    [
+        (_gather_vso_mlir_4x4,  "gather_bad_vso"),
+        (_scatter_vso_mlir_4x4, "scatter_bad_vso"),
+    ],
+    ids=["indirect_load_non_perm", "indirect_store_non_perm"],
+)
+def test_non_permutation_vso_raises(mlir_factory, func_name):
+    """A non-permutation vso (here (d0,d1)->(d0,d0), which collapses two
+    inputs to the same output) must be rejected at op-execution time, not
+    silently ordered.  Stable sort on duplicate keys would cluster
+    same-key points together — that is well-defined Python but produces
+    semantically meaningless output for the spec."""
+    mlir = mlir_factory("(d0, d1) -> (d0, d0)", func_name)
+    interp = KTIRInterpreter()
+    interp.load(mlir)
+    _orig = interp._prepare_execution
+    def _prepare(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        hbm.write(0, np.zeros(16, dtype=np.float16))    # X
+        hbm.write(1, np.zeros(16, dtype=np.int32))      # IDX1
+        hbm.write(2, np.zeros(16, dtype=np.int32))      # IDX2
+        hbm.write(3, np.zeros(16, dtype=np.float16))    # Y
+    interp._prepare_execution = _prepare
+
+    with pytest.raises(ValueError, match="must permute its input dimensions"):
+        interp.execute_function(func_name)
