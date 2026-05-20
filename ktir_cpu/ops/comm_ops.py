@@ -20,7 +20,7 @@ dialect handlers in ``ktir_cpu.dialects``.
 """
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Generator, List, Type
+from typing import Callable, Dict, Generator, List, Type, Union
 from ..ir_types import Tile
 from ..grid import CoreContext, RecvRequest
 from ..memory import LXScratchpad, SpyreMemoryHierarchy
@@ -103,7 +103,7 @@ class ReduceBackend(ABC):
         context: CoreContext,
         tile: Tile,
         core_group: List[int],
-    ) -> Generator[RecvRequest, Tile, Tile]:
+    ) -> Union[Tile, Generator[RecvRequest, Tile, Tile]]:
         ...
 
 
