@@ -27,7 +27,7 @@ from .ir_types import Operation, IRModule, Tile
 from .parser import KTIRParser, KTIRParserBase
 from .memory import SpyreMemoryHierarchy
 from .grid import GridExecutor, CoreContext
-from .ops.comm_ops import DirectLXBackend, RingBackend, RingNetwork
+from .ops.comm_ops import DirectLXBackend, RingBackend
 from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
@@ -65,7 +65,6 @@ class KTIRInterpreter:
         self.module: Optional[IRModule] = None
         self.memory: Optional[SpyreMemoryHierarchy] = None
         self.grid_executor: Optional[GridExecutor] = None
-        self.ring_network: Optional[RingNetwork] = None
         self.ring_backend: Optional[RingBackend] = None
         self._env: Optional[ExecutionEnv] = None
         self._parser: Optional[KTIRParserBase] = parser
@@ -100,7 +99,6 @@ class KTIRInterpreter:
         # distributed memory views. Cross-core comm goes through the
         # scheduler protocol (CoreContext.send_to + RecvRequest), not
         # through a backend. See docs/cross_core_scheduling.md.
-        self.ring_network = RingNetwork(num_cores)
         self.ring_backend = DirectLXBackend(self.memory)
         self.grid_executor = GridExecutor(grid_shape, self.memory, ring_backend=self.ring_backend)
         self._env = ExecutionEnv(

@@ -19,62 +19,37 @@ Inter-core tile transfer and ring-based reduction primitives used by
 dialect handlers in ``ktir_cpu.dialects``.
 """
 
-from typing import Dict, Generator, List, Tuple, Callable, Optional
-import numpy as np
+from typing import Callable, Generator, List
 from ..ir_types import Tile
 from ..grid import CoreContext, RecvRequest
 from ..memory import LXScratchpad, SpyreMemoryHierarchy
 
 
 class RingBackend:
-    """Abstract backend for inter-core LX access and ring communication.
+    """Abstract backend for remote LX scratchpad access.
 
-    The backend is the single seam between memory operations that need
-    remote LX data and the communication model used to obtain it.
-
-    Two implementations are planned:
-
-    DirectLXBackend (this file, first pass):
-        Returns the target scratchpad directly from SpyreMemoryHierarchy.
-        No ring messages, no latency modelling.  Valid when LX partitions
-        are pre-seeded by the host before kernel execution (e.g. the RFC
-        distributed-view-copy test).
-
-    RingTransferBackend (future):
-        When a core requests remote LX data, it issues a send on
-        RingNetwork and suspends execution at that point (coroutine model).
-        The scheduler resumes the core once the sender has delivered the
-        message.  This models actual ring hop cost and enables correct
-        cyclic communication.
+    The single seam between memory ops that need a remote core's LX
+    data and the model used to obtain it. Cross-core comm is *not* on
+    this path — it goes through the scheduler protocol
+    (``CoreContext.send_to`` + ``RecvRequest``); see
+    ``docs/cross_core_scheduling.md``.
     """
 
     def get_lx(self, core_id: int) -> LXScratchpad:
         """Return the LXScratchpad for *core_id*."""
         raise NotImplementedError
 
-    def send(self, src_core: int, dst_core: int, tile: Tile) -> None:
-        """Send *tile* from *src_core* to *dst_core* via the ring."""
-        raise NotImplementedError
-
-    def recv(self, src_core: int, dst_core: int) -> Optional[Tile]:
-        """Receive a tile sent from *src_core* to *dst_core*."""
-        raise NotImplementedError
-
 
 class DirectLXBackend(RingBackend):
-    """First-pass backend: direct scratchpad access, no ring modelling.
+    """Direct scratchpad access — no ring messages, no latency model.
 
-    get_lx(N) returns memory.lx_scratchpads[N] directly — valid for the
+    Returns ``memory.lx_scratchpads[N]`` by index. Valid for the
     distributed-view use case where LX partitions are pre-seeded by the
     host and no cross-core data movement occurs at runtime.
-
-    send/recv delegate to the provided RingNetwork so that ktdp.transfer
-    and ktdp.reduce continue to work as before.
     """
 
-    def __init__(self, memory: SpyreMemoryHierarchy, ring: Optional["RingNetwork"] = None):
+    def __init__(self, memory: SpyreMemoryHierarchy):
         self._memory = memory
-        self._ring = ring
 
     def get_lx(self, core_id: int) -> LXScratchpad:
         """Return the LXScratchpad for *core_id* via direct lookup."""
@@ -84,91 +59,6 @@ class DirectLXBackend(RingBackend):
                 f"get_lx: core_id={core_id} is out of range [0, {num}) for this grid"
             )
         return self._memory.get_lx(core_id)
-
-    def send(self, src_core: int, dst_core: int, tile: Tile) -> None:
-        if self._ring is None:
-            raise NotImplementedError(
-                "DirectLXBackend was constructed without a RingNetwork — "
-                "ktdp.transfer/reduce require one"
-            )
-        self._ring.send(src_core, dst_core, tile)
-
-    def recv(self, src_core: int, dst_core: int) -> Optional[Tile]:
-        if self._ring is None:
-            raise NotImplementedError(
-                "DirectLXBackend was constructed without a RingNetwork — "
-                "ktdp.transfer/reduce require one"
-            )
-        return self._ring.recv_from(src_core, dst_core)
-
-
-class RingNetwork:
-    """Simulates inter-core ring network topology.
-
-    Spyre's 32 cores are connected via two rings:
-    - One clockwise ring (4 TB/s)
-    - One anti-clockwise ring (4 TB/s)
-
-    Both rings connect all 32 cores. We simulate a single logical ring
-    since directionality doesn't affect correctness in CPU simulation.
-    """
-
-    def __init__(self, num_cores: int):
-        self.num_cores = num_cores
-        self.message_buffers: Dict[Tuple[int, int], List[Tile]] = {}  # (src, dst) -> [tiles]
-        self.pending_messages = []
-
-    def send(self, src_core: int, dst_core: int, tile: Tile):
-        """Send tile from source core to destination core.
-
-        Messages are buffered until deliver_all() is called.
-
-        Args:
-            src_core: Source core ID
-            dst_core: Destination core ID
-            tile: Tile to send
-        """
-        key = (src_core, dst_core)
-        if key not in self.message_buffers:
-            self.message_buffers[key] = []
-        self.message_buffers[key].append(tile.copy())
-        self.pending_messages.append(key)
-
-    def recv_from(self, src_core: int, dst_core: int) -> Optional[Tile]:
-        """Receive tile from specific source.
-
-        Args:
-            src_core: Source core ID
-            dst_core: Destination core ID (receiver)
-
-        Returns:
-            Tile if available, None otherwise
-        """
-        key = (src_core, dst_core)
-        if key in self.message_buffers and self.message_buffers[key]:
-            return self.message_buffers[key].pop(0)
-        return None
-
-    def deliver_all(self):
-        """Deliver all pending messages.
-
-        In sequential simulation, this is a no-op since messages
-        are immediately available after send().
-        """
-        self.pending_messages.clear()
-
-    def has_pending_messages(self) -> bool:
-        """Check if there are pending messages."""
-        return any(len(msgs) > 0 for msgs in self.message_buffers.values())
-
-    def pending_message_count(self) -> int:
-        """Count pending messages."""
-        return sum(len(msgs) for msgs in self.message_buffers.values())
-
-    def clear(self):
-        """Clear all messages."""
-        self.message_buffers.clear()
-        self.pending_messages.clear()
 
 
 class CommOps:
