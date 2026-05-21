@@ -164,15 +164,20 @@ def ktdp__load(op, context, env):
 
 @register("ktdp.store", latency_category=LC.MEMORY)
 def ktdp__store(op, context, env):
+    """Stores have no IR result, but the handler returns the HBM
+    ``unique_sticks`` (``int``, ``0`` for LX) from ``MemoryOps.store`` /
+    ``indirect_store`` / ``distributed_store`` as a latency sideband.
+    :meth:`LatencyTracker._data_size` reads it via ``isinstance(result,
+    int)`` and charges HBM traffic at stick granularity, matching the
+    load-side carrier on ``Tile.unique_sticks``.
+    """
     value = context.get_value(op.operands[0])
     assert isinstance(value, Tile), f"ktdp.store expects a Tile, got {type(value)}"
     access_tile = context.get_value(op.operands[1])
     if isinstance(access_tile, IndirectAccessTile):
-        MemoryOps.indirect_store(context, value, access_tile)
-        return None
+        return MemoryOps.indirect_store(context, value, access_tile)
     if isinstance(access_tile.parent_ref, DistributedTileRef):
-        MemoryOps.distributed_store(context, value, access_tile.parent_ref)
-        return None
+        return MemoryOps.distributed_store(context, value, access_tile.parent_ref)
     tile_ref = access_tile.parent_ref
     css = access_tile.coordinate_set
     cso = access_tile.coordinate_order
@@ -180,10 +185,8 @@ def ktdp__store(op, context, env):
         coords = css.enumerate(access_tile.shape)
         if cso is not None:
             coords = [cso.eval(pt) for pt in coords]
-        MemoryOps.store(context, value, tile_ref, coords=coords)
-    else:
-        MemoryOps.store(context, value, tile_ref)
-    return None
+        return MemoryOps.store(context, value, tile_ref, coords=coords)
+    return MemoryOps.store(context, value, tile_ref)
 
 
 # ---------------------------------------------------------------------------

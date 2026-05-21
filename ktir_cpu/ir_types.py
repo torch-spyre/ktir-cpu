@@ -242,6 +242,11 @@ class Tile:
     # tile.  Set by ``MemoryOps.load`` for all access patterns.  None only
     # for tiles produced by compute ops (not loaded from memory).
     unique_sticks: Optional[int] = None
+    # Number of distinct HBM sticks touched by index-tensor reads during
+    # an indirect load/store.  Tracked separately from ``unique_sticks``
+    # so that ``coalescing_efficiency`` retains its data-layout meaning.
+    # None for direct loads (no index tensors) and compute-produced tiles.
+    index_unique_sticks: Optional[int] = None
 
     def copy(self) -> 'Tile':
         """Create a deep copy of this tile.
@@ -252,7 +257,10 @@ class Tile:
         target device's base_ptr — currently we propagate the source
         value since the memory layout is abstracted away from Tile.
         """
-        return Tile(self.data.copy(), self.dtype, self.shape, self.unique_sticks)
+        return Tile(
+            self.data.copy(), self.dtype, self.shape,
+            self.unique_sticks, self.index_unique_sticks,
+        )
 
     def size_bytes(self) -> int:
         """Return size in bytes."""

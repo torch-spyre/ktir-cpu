@@ -286,30 +286,64 @@ class LatencyTracker:
     def _data_size(result: Any, operands: List[Any]) -> int:
         """Estimate bytes transferred by a memory operation.
 
-        Counts result bytes (loads), operand Tile bytes (stores), and
-        index tensor bytes (indirect access loads and scatter stores).
-
         HBM traffic is always charged at stick granularity:
         ``unique_sticks * HBMSimulator.STICK_BYTES``.
+
+        Two carriers convey ``unique_sticks`` from the op handler:
+
+        * **Loads** stamp ``unique_sticks`` (data) and
+          ``index_unique_sticks`` (idx, when an IAT is involved) on the
+          result :class:`Tile`. ``_data_size`` reads them off the result.
+        * **Stores** have no result Tile — the dialect handler instead
+          returns the int from ``MemoryOps.store`` /
+          ``indirect_store`` / ``distributed_store`` as the op result.
+          ``_data_size`` consumes it via ``isinstance(result, int)``.
+          For an indirect store, the int already aggregates both the
+          parent destination's sticks and the idx-side sticks.
         """
+        # Store sideband: the handler propagated MemoryOps.{store,
+        # indirect_store, distributed_store}'s int return as op result.
+        if isinstance(result, int):
+            return result * HBMSimulator.STICK_BYTES
+
         total = 0
         if isinstance(result, Tile):
-            if result.unique_sticks is not None:
-                total += result.unique_sticks * HBMSimulator.STICK_BYTES
-            else:
-                total += result.data.nbytes
+            if result.unique_sticks is None:
+                raise RuntimeError(
+                    "Tile result on HBM path must populate unique_sticks; "
+                    "got None. Load handlers must set unique_sticks for "
+                    "stick-granular HBM accounting."
+                )
+            total += result.unique_sticks * HBMSimulator.STICK_BYTES
+            if result.index_unique_sticks is not None:
+                total += result.index_unique_sticks * HBMSimulator.STICK_BYTES
         for v in operands:
             if isinstance(v, IndirectAccessTile):
-                for iv in v.index_views:
-                    if iv.memory_space == "HBM":
-                        total += int(np.prod(iv.shape)) * bytes_per_elem(iv.dtype)
+                if not isinstance(result, Tile):
+                    raise RuntimeError(
+                        "IAT operand without Tile result and without int "
+                        f"sideband; got result={type(result).__name__}. "
+                        "Store handlers must return MemoryOps.indirect_store's "
+                        "int as the op result for stick-granular accounting."
+                    )
+                if result.index_unique_sticks is None:
+                    raise RuntimeError(
+                        "IAT operand with Tile result must populate "
+                        "index_unique_sticks; got None. This indicates "
+                        "the op handler skipped _resolve_idx_reads."
+                    )
+                continue
             elif isinstance(v, Tile):
                 if result is not None:
                     raise ValueError(
-                        f"_data_size: Tile in operands but result is also a Tile ({type(result)}); "
-                        "no ktdp op should produce both"
+                        f"_data_size: Tile in operands but result is also "
+                        f"{type(result).__name__}; no ktdp op should produce both"
                     )
-                total += v.data.nbytes
+                raise RuntimeError(
+                    "Tile operand with None result: store handler must "
+                    "propagate MemoryOps.store's int return as op result "
+                    "for stick-granular HBM accounting."
+                )
         return total
 
     @staticmethod
