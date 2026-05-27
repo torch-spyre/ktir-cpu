@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from .ir_types import Operation, IRFunction, IRModule
 from .dialects import dispatch_parser, make_parse_context, ParseContext
 from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
+from .parser_utils import find_ssa_names
 
 
 class KTIRParserBase(ABC):
@@ -194,11 +195,15 @@ class KTIRParser(KTIRParserBase):
         Returns:
             (x, y, z) grid dimensions
         """
-        # Pattern: grid = [X, Y, Z] or grid = [X, Y]
-        grid_match = re.search(r'grid\s*=\s*\[(\d+),\s*(\d+)(?:,\s*(\d+))?\]', func_header)
+        # Pattern: grid = [X] or grid = [X, Y] or grid = [X, Y, Z].
+        # Missing dims default to 1.
+        grid_match = re.search(
+            r'grid\s*=\s*\[(\d+)(?:,\s*(\d+))?(?:,\s*(\d+))?\]',
+            func_header,
+        )
         if grid_match:
             x = int(grid_match.group(1))
-            y = int(grid_match.group(2))
+            y = int(grid_match.group(2)) if grid_match.group(2) else 1
             z = int(grid_match.group(3)) if grid_match.group(3) else 1
             return (x, y, z)
         return (1, 1, 1)  # Default: single-core when no grid attribute is present
@@ -598,7 +603,7 @@ class KTIRParser(KTIRParserBase):
         # attribute blocks.
         cleaned = re.sub(r'\{[^}]*\}', '', text)
 
-        operands = re.findall(r'%\w+', cleaned)
+        operands = find_ssa_names(cleaned)
 
         # Remove result name if present
         if result:

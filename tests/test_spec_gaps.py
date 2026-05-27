@@ -90,15 +90,27 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
     """
     interp = KTIRInterpreter()
     interp.load(path)
+    # Build a name→value map of every arith.constant in the function so we can
+    # look up addresses by their SSA name (e.g. %Idx_start_address) instead of
+    # hardcoding the literal integers.  If the .mlir changes the address values,
+    # the test automatically picks them up.
+    func = interp.module.get_function(func_name)
+    addrs = {
+        op.result.lstrip("%"): op.attributes["value"]
+        for op in func.operations
+        if op.op_type == "arith.constant" and op.result
+    }
     _orig = interp._prepare_execution
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        # Idx tensor at 20000000: shape 4x32 i32, all zeros → every page ID = 0
-        hbm.write(20000000, np.zeros(4 * 32, dtype=np.int32))
-        # X tensor at 30000000: seed page 0 only (65536 f16 elements)
-        # All accesses land on page 0 because Idx is all zeros.
-        hbm.write(30000000, np.zeros(65536, dtype=np.float16))
+        # Idx tensor (Nb × Ntkv/Ptkv i32): all zeros so every indirect page ID resolves to 0.
+        idx_n_elements = addrs["Nb"] * (addrs["Ntkv"] // addrs["Ptkv"])
+        hbm.write(addrs["Idx_start_address"], np.zeros(idx_n_elements, dtype=np.int32))
+        # X tensor: only page 0 needs data (one page = Nhkv * Ptkv * Ndkv f16 elements).
+        # Because Idx is all zeros every gather access lands on page 0.
+        x_page_n_elements = addrs["Nhkv"] * addrs["Ptkv"] * addrs["Ndkv"]
+        hbm.write(addrs["X_start_address"], np.zeros(x_page_n_elements, dtype=np.float16))
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
@@ -108,20 +120,37 @@ def test_paged_tensor_indirect_access(path, func_name, entry):
 # (Phase 2: 4-D paged indirect access with linalg.generic complete)
 
 
-# ===========================================================================
-# ktdp.construct_distributed_memory_view
-# RFC §C.3: compose per-partition views (HBM + LX) into one logical view.
-# ===========================================================================
-
 @pytest.mark.spec_gap
-@pytest.mark.xfail(strict=True, reason="ktdp.construct_distributed_memory_view not implemented")
-@pytest.mark.parametrize("path,func_name,entry", get_test_params("distributed_view_copy"))
-def test_distributed_memory_view(path, func_name, entry):
-    """construct_distributed_memory_view is not yet supported."""
+@pytest.mark.xfail(strict=True, reason="ktdp.load of 4x8x2048x128 f16 tile (16 MB) exceeds 2 MB LX scratchpad")
+@pytest.mark.parametrize("path,func_name,entry", get_test_params("paged_tensor_write_1core"))
+def test_paged_tensor_indirect_scatter(path, func_name, entry):
+    """paged-tensor-write.mlir is the scatter dual of paged-tensor-copy.mlir.
+    Same production-sized tensors and the same single ktdp.load of the full
+    4x8x2048x128 source tile (16 MB) overflows the 2 MB LX scratchpad. Once
+    that capacity gap is addressed, the scatter path (MemoryOps.indirect_store)
+    will execute end-to-end on this fixture.
+    """
     interp = KTIRInterpreter()
     interp.load(path)
+    _orig = interp._prepare_execution
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        # X tensor at 10000000: contiguous source, 4*2048*8*128 = 8388608 f16 elements
+        # (16.78 MB, ends at 26777216). We don't expect the load to succeed (LX
+        # overflow), but back X with zeros so any pre-load read paths see valid memory.
+        hbm.write(10000000, np.zeros(4 * 2048 * 8 * 128, dtype=np.float16))
+        # Idx tensor at 30000000: shape 4x32 i32 (512 B), placed past the end of X
+        # to avoid byte overlap. All zeros → every page ID = 0.
+        hbm.write(30000000, np.zeros(4 * 32, dtype=np.int32))
+    interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
+
+# ===========================================================================
+# ktdp.construct_distributed_memory_view
+# Implemented; positive coverage moved to tests/test_distributed_view.py.
+# ===========================================================================
 
 # ===========================================================================
 # RFC-explicit non-ktdp ops

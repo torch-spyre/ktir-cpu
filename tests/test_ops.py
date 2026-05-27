@@ -16,7 +16,7 @@
 Tests for ktir_cpu/ops/ layer.
 
 Covers: ArithOps, MathOps, GridOps, ControlOps.
-comm_ops (RingNetwork.reduce) skipped — tied to the replay bug (see docs/gap_analysis.md section K).
+CommOps is exercised via the scheduler in tests/test_grid_scheduler.py.
 """
 
 import numpy as np
@@ -27,7 +27,6 @@ from ktir_cpu.ops.arith_ops import ArithOps
 from ktir_cpu.ops.math_ops import MathOps
 from ktir_cpu.ops.grid_ops import GridOps
 from ktir_cpu.ops.control_ops import ControlOps
-from ktir_cpu.ops.comm_ops import RingNetwork
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
 
@@ -387,21 +386,3 @@ class TestControlOps:
         ControlOps.while_op(ctx, "before", "after", executor)
         assert count[0] == 3
 
-# ---------------------------------------------------------------------------
-# RingNetwork
-# ---------------------------------------------------------------------------
-
-class TestRingNetwork:
-    def test_send_recv(self):
-        # message sent from core 0 to core 1 is received intact
-        ring = RingNetwork(num_cores=4)
-        tile = _tile([1, 2])
-        ring.send(src_core=0, dst_core=1, tile=tile)
-        received = ring.recv_from(src_core=0, dst_core=1)
-        assert received is not None
-        assert np.array_equal(received.data, tile.data)
-
-    def test_recv_empty(self):
-        # receiving from an empty channel returns None
-        ring = RingNetwork(num_cores=4)
-        assert ring.recv_from(src_core=0, dst_core=1) is None

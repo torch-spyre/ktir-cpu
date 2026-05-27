@@ -18,7 +18,8 @@ Main KTIR interpreter engine.
 Orchestrates parsing, execution, and validation of KTIR code.
 """
 
-from typing import Dict, Tuple, Optional, Any, List
+import inspect
+from typing import Dict, Generator, Tuple, Optional, Any, List
 import numpy as np
 import math
 
@@ -26,7 +27,7 @@ from .ir_types import Operation, IRModule, Tile
 from .parser import KTIRParser, KTIRParserBase
 from .memory import SpyreMemoryHierarchy
 from .grid import GridExecutor, CoreContext
-from .ops.comm_ops import RingNetwork
+from .ops.comm_ops import InstantTransferBackend, TransferBackend
 from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
@@ -64,7 +65,9 @@ class KTIRInterpreter:
         self.module: Optional[IRModule] = None
         self.memory: Optional[SpyreMemoryHierarchy] = None
         self.grid_executor: Optional[GridExecutor] = None
-        self.ring_network: Optional[RingNetwork] = None
+        # TODO: rename ring_backend → transfer_backend across the codebase.
+        # Keeping the old name for now; the type is TransferBackend.
+        self.ring_backend: Optional[TransferBackend] = None
         self._env: Optional[ExecutionEnv] = None
         self._parser: Optional[KTIRParserBase] = parser
         self._latency_tracker: Optional[LatencyTracker] = (
@@ -94,11 +97,17 @@ class KTIRInterpreter:
         """
         num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
         self.memory = SpyreMemoryHierarchy(num_cores)
+        # ring_backend (a TransferBackend) serves CoreContext.get_lx() —
+        # remote LX peeks for distributed memory views. Passed directly
+        # to GridExecutor.execute_with_communication; the scheduler
+        # curries it into a per-core transfer_fn via attach_scheduler.
+        # Cross-core comm goes through the scheduler protocol
+        # (CoreContext.send_to + RecvRequest), not through a backend.
+        # See docs/cross_core_scheduling.md.
+        self.ring_backend = InstantTransferBackend(self.memory)
         self.grid_executor = GridExecutor(grid_shape, self.memory)
-        self.ring_network = RingNetwork(num_cores)
         self._env = ExecutionEnv(
             grid_executor=self.grid_executor,
-            ring=self.ring_network,
             execute_region=self.execute_region,
         )
         if self._latency_tracker is not None:
@@ -143,49 +152,36 @@ class KTIRInterpreter:
         input_dtypes = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = self.memory.hbm.allocate(tensor.nbytes)
-                self.memory.hbm.write(ptr, tensor)
-                input_ptrs[arg_name] = ptr
+                stick = self.memory.hbm.allocate(tensor.nbytes)
+                self.memory.hbm.write(stick, tensor)
+                input_ptrs[arg_name] = stick
                 input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
             else:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
 
-        # Execute on all cores
-        def execute_on_core(core: CoreContext, ring: RingNetwork):
-            # Initialize context with function arguments
-            for arg_name, arg_val in input_ptrs.items():
-                core.set_value("%" + arg_name, arg_val)
-
-            # Execute function body
-            for op in func.operations:
-                self._execute_operation(op, core, ring)
-
-        # Execute with communication support
         self.grid_executor.execute_with_communication(
-            execute_on_core,
-            self.ring_network,
-            max_rounds=10
+            func.operations, input_ptrs, self._execute_op,
+            transfer_backend=self.ring_backend,
         )
 
         # Read output tensors from HBM
         outputs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                ptr = input_ptrs[arg_name]
+                stick = input_ptrs[arg_name]
                 n_elements = math.prod(tensor.shape)
-                output_data = self.memory.hbm.read(ptr, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
+                output_data = self.memory.hbm.read(stick, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
                 outputs[arg_name] = output_data
 
         return outputs
 
-    def _execute_operation(self, op: Operation, context: CoreContext, ring: RingNetwork) -> Any:
+    def _execute_op(self, op: Operation, context: CoreContext) -> Any:
         """Execute a single operation.
 
         Args:
             op: Operation to execute
             context: Core execution context
-            ring: Ring network
 
         Returns:
             Operation result
@@ -267,16 +263,12 @@ class KTIRInterpreter:
         return self._latency_tracker.report()
 
     def execute_region(self, context: CoreContext, operations: List[Operation]) -> Any:
-        """Execute a region (list of operations).
+        """Execute a nested region synchronously (scf.for body, scf.if branch, etc.).
 
-        Args:
-            context: Core execution context
-            operations: List of operations to execute
-
-        Returns:
-            Result from last operation
+        Comm ops cannot appear inside nested regions in the current spec, so
+        this stays sync — no generator machinery needed.
         """
         result = None
         for op in operations:
-            result = self._execute_operation(op, context, self.ring_network)
+            result = self._execute_op(op, context)
         return result

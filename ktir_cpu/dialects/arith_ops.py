@@ -14,31 +14,22 @@
 
 """Arith dialect handlers — arithmetic on scalars and tiles."""
 
+import operator
 import re
 
 import numpy as np
 
 from ..dtypes import to_np_dtype
+from ..parser_utils import find_ssa_names
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
-from ..ops.arith_ops import ArithOps, arith_cast
+from ..ops.arith_ops import ArithOps
+from ._helpers import _float_binop, _int_binop, _unary
 from .registry import register, register_parser
 
 
 def _bool_not(x):
     return ~x if isinstance(x, np.ndarray) else not x
-
-
-def _is_scalar(v):
-    """Return True if *v* is a scalar numeric value (not a Tile)."""
-    return isinstance(v, (int, float, np.integer, np.floating))
-
-
-def _scalar_binop(a, b, py_op):
-    """Perform *py_op* on two scalars, preserving np.float16 when possible."""
-    if isinstance(a, (np.float16, np.floating)) or isinstance(b, (np.float16, np.floating)):
-        return np.float16(py_op(float(a), float(b)))
-    return py_op(float(a), float(b))
 
 
 
@@ -48,201 +39,224 @@ def _scalar_binop(a, b, py_op):
 
 @register("arith.addf", latency_category=LC.COMPUTE_FLOAT)
 def arith__addf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    if _is_scalar(a) and _is_scalar(b):
-        return _scalar_binop(a, b, lambda x, y: x + y)
-    if _is_scalar(a) and isinstance(b, Tile):
-        return Tile(np.float16(a) + b.data, b.dtype, b.shape)
-    if isinstance(a, Tile) and _is_scalar(b):
-        return Tile(a.data + np.float16(b), a.dtype, a.shape)
-    return ArithOps.addf(a, b)
+    return _float_binop(op, context, operator.add)
 
 
 @register("arith.subf", latency_category=LC.COMPUTE_FLOAT)
 def arith__subf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    if _is_scalar(a) and _is_scalar(b):
-        return _scalar_binop(a, b, lambda x, y: x - y)
-    if isinstance(a, Tile) and isinstance(b, Tile):
-        return ArithOps.subf(a, b)
-    if isinstance(a, Tile):
-        return Tile(a.data - np.float16(b), a.dtype, a.shape)
-    return Tile(np.float16(a) - b.data, b.dtype, b.shape)
+    return _float_binop(op, context, operator.sub)
 
 
 @register("arith.mulf", latency_category=LC.COMPUTE_FLOAT)
 def arith__mulf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    if _is_scalar(a) and _is_scalar(b):
-        return _scalar_binop(a, b, lambda x, y: x * y)
-    if isinstance(a, Tile) and isinstance(b, Tile):
-        return ArithOps.mulf(a, b)
-    if isinstance(a, Tile):
-        return Tile(a.data * np.float16(b), a.dtype, a.shape)
-    return Tile(np.float16(a) * b.data, b.dtype, b.shape)
+    return _float_binop(op, context, operator.mul)
 
 
 @register("arith.divf", latency_category=LC.COMPUTE_FLOAT)
 def arith__divf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    if _is_scalar(a) and _is_scalar(b):
-        return _scalar_binop(a, b, lambda x, y: x / y)
-    if isinstance(a, Tile) and isinstance(b, Tile):
-        return ArithOps.divf(a, b)
-    if isinstance(a, Tile):
-        return Tile(a.data / np.float16(b), a.dtype, a.shape)
-    return Tile(np.float16(a) / b.data, b.dtype, b.shape)
+    return _float_binop(op, context, operator.truediv)
+
+
+@register("arith.remf", latency_category=LC.COMPUTE_FLOAT)
+def arith__remf(op, context, env):
+    return _float_binop(op, context, operator.mod)
 
 
 # ---------------------------------------------------------------------------
-# Integer ops
+# Float unary ops
 # ---------------------------------------------------------------------------
 
-@register("arith.addi", latency_category=LC.COMPUTE_INT)
-def arith__addi(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    if isinstance(val1, Tile) or isinstance(val2, Tile):
-        t1 = val1 if isinstance(val1, Tile) else Tile(np.full(val2.shape, val1, dtype=val2.data.dtype), val2.dtype, val2.shape)
-        t2 = val2 if isinstance(val2, Tile) else Tile(np.full(val1.shape, val2, dtype=val1.data.dtype), val1.dtype, val1.shape)
-        return Tile(t1.data + t2.data, t1.dtype, t1.shape)
-    return ArithOps.addi(val1, val2)
+@register("arith.negf", latency_category=LC.COMPUTE_FLOAT)
+def arith__negf(op, context, env):
+    return _unary(op, context, ArithOps.negf)
 
 
-@register("arith.subi", latency_category=LC.COMPUTE_INT)
-def arith__subi(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    return ArithOps.subi(val1, val2)
-
-
-@register("arith.muli", latency_category=LC.COMPUTE_INT)
-def arith__muli(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    if isinstance(val1, Tile) or isinstance(val2, Tile):
-        t1 = val1 if isinstance(val1, Tile) else Tile(np.full(val2.shape, val1, dtype=val2.data.dtype), val2.dtype, val2.shape)
-        t2 = val2 if isinstance(val2, Tile) else Tile(np.full(val1.shape, val2, dtype=val1.data.dtype), val1.dtype, val1.shape)
-        return Tile(t1.data * t2.data, t1.dtype, t1.shape)
-    return ArithOps.muli(val1, val2)
-
-
-@register("arith.divui", latency_category=LC.COMPUTE_INT)
-def arith__divui(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    return ArithOps.divui(val1, val2)
-
-
-@register("arith.remui", latency_category=LC.COMPUTE_INT)
-def arith__remui(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    return ArithOps.remui(val1, val2)
+@register("arith.absf", latency_category=LC.COMPUTE_FLOAT)
+def arith__absf(op, context, env):
+    return _unary(op, context, ArithOps.absf)
 
 
 # ---------------------------------------------------------------------------
-# Constants & casts
+# Float min/max
 # ---------------------------------------------------------------------------
-
-@register("arith.constant")
-def arith__constant(op, context, env):
-    value = op.attributes.get("value", 0)
-    if op.attributes.get("is_tensor"):
-        shape = op.attributes["shape"]
-        dtype_str = op.attributes.get("dtype", "f16")
-        np_dtype = to_np_dtype(dtype_str)
-        return Tile(np.full(shape, value, dtype=np_dtype), dtype_str, shape)
-    return value
-
 
 # TODO: consider deprecating arith.maxf / arith.minf aliases — these were
 # renamed to arith.maximumf / arith.minimumf in upstream MLIR.
 @register("arith.maxf", "arith.maximumf", latency_category=LC.COMPUTE_FLOAT)
 def arith__maxf(op, context, env):
-    tile1 = context.get_value(op.operands[0])
-    tile2 = context.get_value(op.operands[1])
-    return ArithOps.maxf(tile1, tile2)
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.maxf(a, b)
 
 
 @register("arith.maxnumf", latency_category=LC.COMPUTE_FLOAT)
 def arith__maxnumf(op, context, env):
-    tile1 = context.get_value(op.operands[0])
-    tile2 = context.get_value(op.operands[1])
-    return ArithOps.maxnumf(tile1, tile2)
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.maxnumf(a, b)
 
 
 @register("arith.minf", "arith.minimumf", latency_category=LC.COMPUTE_FLOAT)
 def arith__minf(op, context, env):
-    tile1 = context.get_value(op.operands[0])
-    tile2 = context.get_value(op.operands[1])
-    return ArithOps.minf(tile1, tile2)
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.minf(a, b)
 
 
 @register("arith.minnumf", latency_category=LC.COMPUTE_FLOAT)
 def arith__minnumf(op, context, env):
-    tile1 = context.get_value(op.operands[0])
-    tile2 = context.get_value(op.operands[1])
-    return ArithOps.minnumf(tile1, tile2)
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.minnumf(a, b)
 
 
-@register("arith.extf")
-def arith__extf(op, context, env):
-    return ArithOps.extf(context.get_value(op.operands[0]))
+# ---------------------------------------------------------------------------
+# Float comparison
+# ---------------------------------------------------------------------------
+
+@register("arith.cmpf", latency_category=LC.COMPUTE_FLOAT)
+def arith__cmpf(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    predicate = op.attributes.get("predicate", "oeq")
+    return ArithOps.cmpf(a, b, predicate)
 
 
-@register("arith.truncf")
-def arith__truncf(op, context, env):
-    return ArithOps.truncf(context.get_value(op.operands[0]))
+# ---------------------------------------------------------------------------
+# Integer binary ops
+# ---------------------------------------------------------------------------
+
+@register("arith.addi", latency_category=LC.COMPUTE_INT)
+def arith__addi(op, context, env):
+    return _int_binop(op, context, operator.add)
 
 
-@register("arith.bitcast")
-def arith__bitcast(op, context, env):
-    """Reinterpret bits between integer and float types of the same width."""
-    val = context.get_value(op.operands[0])
-    dst_type = op.attributes.get("dst_type", "f32")
-    if isinstance(val, Tile):
-        if dst_type == "f32":
-            return Tile(val.data.view(np.float32), "f32", val.shape)
-        if dst_type in ("i32", "si32"):
-            return Tile(val.data.view(np.int32), "i32", val.shape)
-        raise NotImplementedError(f"arith.bitcast: unsupported dst_type '{dst_type}' for Tile")
-    # Scalar path — convert via raw bytes to handle both signed and unsigned
-    # integer inputs (e.g. 0xFF800000 from regex as unsigned, -8388608 from
-    # MLIR frontend as signed — both represent the same bit pattern).
-    if dst_type == "f32":
-        return float(np.frombuffer(int(val).to_bytes(4, "little", signed=(val < 0)),
-                                   dtype=np.float32)[0])
-    if dst_type in ("i32", "si32"):
-        return int(np.frombuffer(np.float32(val).tobytes(), dtype=np.int32)[0])
-    raise NotImplementedError(f"arith.bitcast: unsupported dst_type '{dst_type}' for scalar")
+@register("arith.subi", latency_category=LC.COMPUTE_INT)
+def arith__subi(op, context, env):
+    return _int_binop(op, context, operator.sub)
 
 
-@register("arith.extsi")
-def arith__extsi(op, context, env):
-    """Sign-extend integer (e.g., i32 -> i64). In Python, ints have arbitrary precision."""
-    return int(context.get_value(op.operands[0]))
+@register("arith.muli", latency_category=LC.COMPUTE_INT)
+def arith__muli(op, context, env):
+    return _int_binop(op, context, operator.mul)
 
 
-@register("arith.index_cast")
-def arith__index_cast(op, context, env):
-    return arith_cast(
-        context.get_value(op.operands[0]), np.int32,
-        expect_floating=False, op_name="index_cast",
-    )
+@register("arith.divui", latency_category=LC.COMPUTE_INT)
+def arith__divui(op, context, env):
+    return _int_binop(op, context, operator.floordiv)
 
 
-@register("arith.sitofp")
-def arith__sitofp(op, context, env):
-    return arith_cast(
-        context.get_value(op.operands[0]), np.float16,
-        expect_floating=False, op_name="sitofp",
-    )
+def _truncdiv(a, b):
+    # MLIR divsi truncates toward zero; Python // floors toward -inf.
+    return np.trunc(a / b).astype(np.asarray(a).dtype)
 
+
+def _truncrem(a, b):
+    # MLIR remsi is remainder after truncating division: a - (a/b)*b.
+    return np.asarray(a) - _truncdiv(a, b) * np.asarray(b)
+
+
+@register("arith.divsi", latency_category=LC.COMPUTE_INT)
+def arith__divsi(op, context, env):
+    return _int_binop(op, context, _truncdiv)
+
+
+@register("arith.ceildivsi", latency_category=LC.COMPUTE_INT)
+def arith__ceildivsi(op, context, env):
+    val1 = context.get_value(op.operands[0])
+    val2 = context.get_value(op.operands[1])
+    return ArithOps.ceildivsi(val1, val2)
+
+
+@register("arith.floordivsi", latency_category=LC.COMPUTE_INT)
+def arith__floordivsi(op, context, env):
+    return _int_binop(op, context, operator.floordiv)
+
+
+@register("arith.remui", latency_category=LC.COMPUTE_INT)
+def arith__remui(op, context, env):
+    return _int_binop(op, context, operator.mod)
+
+
+@register("arith.remsi", latency_category=LC.COMPUTE_INT)
+def arith__remsi(op, context, env):
+    return _int_binop(op, context, _truncrem)
+
+
+@register("arith.minsi", latency_category=LC.COMPUTE_INT)
+def arith__minsi(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.minsi(a, b)
+
+
+@register("arith.maxsi", latency_category=LC.COMPUTE_INT)
+def arith__maxsi(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.maxsi(a, b)
+
+
+@register("arith.minui", latency_category=LC.COMPUTE_INT)
+def arith__minui(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.minui(a, b)
+
+
+@register("arith.maxui", latency_category=LC.COMPUTE_INT)
+def arith__maxui(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.maxui(a, b)
+
+
+@register("arith.ceildivui", latency_category=LC.COMPUTE_INT)
+def arith__ceildivui(op, context, env):
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return ArithOps.ceildivui(a, b)
+
+
+# ---------------------------------------------------------------------------
+# Integer bitwise ops
+# ---------------------------------------------------------------------------
+
+@register("arith.andi", latency_category=LC.COMPUTE_INT)
+def arith__andi(op, context, env):
+    return _int_binop(op, context, operator.and_)
+
+
+@register("arith.ori", latency_category=LC.COMPUTE_INT)
+def arith__ori(op, context, env):
+    return _int_binop(op, context, operator.or_)
+
+
+@register("arith.xori", latency_category=LC.COMPUTE_INT)
+def arith__xori(op, context, env):
+    return _int_binop(op, context, operator.xor)
+
+
+@register("arith.shli", latency_category=LC.COMPUTE_INT)
+def arith__shli(op, context, env):
+    return _int_binop(op, context, operator.lshift)
+
+
+@register("arith.shrsi", latency_category=LC.COMPUTE_INT)
+def arith__shrsi(op, context, env):
+    return _int_binop(op, context, operator.rshift)
+
+
+@register("arith.shrui", latency_category=LC.COMPUTE_INT)
+def arith__shrui(op, context, env):
+    val1 = context.get_value(op.operands[0])
+    val2 = context.get_value(op.operands[1])
+    return ArithOps.shrui(val1, val2)
+
+
+# ---------------------------------------------------------------------------
+# Integer comparison
+# ---------------------------------------------------------------------------
 
 @register("arith.cmpi", latency_category=LC.COMPUTE_FLOAT)
 def arith__cmpi(op, context, env):
@@ -305,6 +319,108 @@ def arith__cmpf(op, context, env):
     result = cmp_ops[predicate]()
     return Tile(result, "i1", result.shape) if is_tile else result
 
+
+# ---------------------------------------------------------------------------
+# Constants & casts
+# ---------------------------------------------------------------------------
+
+@register("arith.constant")
+def arith__constant(op, context, env):
+    value = op.attributes.get("value", 0)
+    if op.attributes.get("is_tensor"):
+        shape = op.attributes["shape"]
+        dtype_str = op.attributes.get("dtype", "f16")
+        np_dtype = to_np_dtype(dtype_str)
+        return Tile(np.full(shape, value, dtype=np_dtype), dtype_str, shape)
+    return value
+
+
+@register("arith.extf")
+def arith__extf(op, context, env):
+    return _unary(op, context, ArithOps.extf, np.float32)
+
+
+@register("arith.truncf")
+def arith__truncf(op, context, env):
+    return _unary(op, context, ArithOps.truncf)
+
+
+@register("arith.extsi")
+def arith__extsi(op, context, env):
+    return _unary(op, context, lambda t: Tile(t.data.astype(np.int64), "i64", t.shape), int)
+
+
+@register("arith.extui")
+def arith__extui(op, context, env):
+    return _unary(op, context, ArithOps.extui, int)
+
+
+@register("arith.trunci")
+def arith__trunci(op, context, env):
+    return _unary(op, context, ArithOps.trunci, int)
+
+
+@register("arith.sitofp")
+def arith__sitofp(op, context, env):
+    dtype = op.result_type or "f32"
+    return _unary(op, context, lambda v: ArithOps.sitofp(v, dtype))
+
+
+@register("arith.uitofp")
+def arith__uitofp(op, context, env):
+    return _unary(op, context, ArithOps.uitofp, float)
+
+
+@register("arith.fptosi")
+def arith__fptosi(op, context, env):
+    return _unary(op, context, ArithOps.fptosi, int)
+
+
+@register("arith.fptoui")
+def arith__fptoui(op, context, env):
+    return _unary(op, context, ArithOps.fptoui, int)
+
+
+@register("arith.index_cast")
+def arith__index_cast(op, context, env):
+    return int(context.get_value(op.operands[0]))
+
+
+@register("arith.index_castui")
+def arith__index_castui(op, context, env):
+    return int(context.get_value(op.operands[0]))
+
+
+@register("arith.convertf")
+def arith__convertf(op, context, env):
+    return _unary(op, context, ArithOps.convertf)
+
+
+@register("arith.bitcast")
+def arith__bitcast(op, context, env):
+    """Reinterpret bits between integer and float types of the same width."""
+    val = context.get_value(op.operands[0])
+    dst_type = op.attributes.get("dst_type", "f32")
+    if isinstance(val, Tile):
+        if dst_type == "f32":
+            return Tile(val.data.view(np.float32), "f32", val.shape)
+        if dst_type in ("i32", "si32"):
+            return Tile(val.data.view(np.int32), "i32", val.shape)
+        raise NotImplementedError(f"arith.bitcast: unsupported dst_type '{dst_type}' for Tile")
+    # Scalar path — convert via raw bytes to handle both signed and unsigned
+    # integer inputs (e.g. 0xFF800000 from regex as unsigned, -8388608 from
+    # MLIR frontend as signed — both represent the same bit pattern).
+    if dst_type == "f32":
+        return float(np.frombuffer(int(val).to_bytes(4, "little", signed=(val < 0)),
+                                   dtype=np.float32)[0])
+    if dst_type in ("i32", "si32"):
+        return int(np.frombuffer(np.float32(val).tobytes(), dtype=np.int32)[0])
+    raise NotImplementedError(f"arith.bitcast: unsupported dst_type '{dst_type}' for scalar")
+
+
+# ---------------------------------------------------------------------------
+# Select
+# ---------------------------------------------------------------------------
 
 @register("arith.select", latency_category=LC.COMPUTE_FLOAT)
 def arith__select(op, context, env):
@@ -448,7 +564,7 @@ def parse_arith_cmpi(op_text, parse_ctx):
         raise ValueError(f"arith.cmpi: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
 
-    operands = re.findall(r'%\w+', op_text)
+    operands = find_ssa_names(op_text)
     operands = [o for o in operands if o != result_name]
 
     result_type = "unknown"
@@ -474,15 +590,15 @@ def parse_arith_cmpf(op_text, parse_ctx):
     result_name = result_match.group(1)
 
     pred_match = re.search(
-        r'arith\.cmpf\s+(oeq|one|olt|ole|ogt|oge|ueq|une|ult|ule|ugt|uge|ord|uno)', op_text)
+        r'arith\.cmpf\s+(true|false|oeq|ogt|oge|olt|ole|one|ord|ueq|ugt|uge|ult|ule|une|uno)', op_text)
     if not pred_match:
         raise ValueError(f"arith.cmpf: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
 
-    operands = re.findall(r'%\w+', op_text)
+    operands = find_ssa_names(op_text)
     operands = [o for o in operands if o != result_name]
 
-    result_type = "unknown"
+    result_type = "i1"
     type_match = re.search(r':\s*(.+)$', op_text)
     if type_match:
         result_type = type_match.group(1).strip()
@@ -521,7 +637,6 @@ def parse_arith_sitofp(op_text, parse_ctx):
 
 @register_parser("arith.bitcast")
 def parse_arith_bitcast(op_text, parse_ctx):
-    # %result = arith.bitcast %src : src_type to dst_type
     result_match = re.match(r'(%\w+)\s*=\s*arith\.bitcast\s+(%\w+)', op_text)
     if not result_match:
         return None

@@ -22,6 +22,7 @@ import numpy as np
 from ..grid import CoreContext
 from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
+from ..parser_utils import find_ssa_names
 from .registry import register, register_parser
 
 
@@ -265,7 +266,7 @@ def parse_tensor_extract(op_text, parse_ctx):
     if bracket_match:
         bracket_content = bracket_match.group(1).strip()
         if bracket_content:
-            indices = re.findall(r'%\w+', bracket_content)
+            indices = find_ssa_names(bracket_content)
 
     return Operation(
         result=result_name,
@@ -334,7 +335,7 @@ def parse_tensor_yield(op_text, parse_ctx):
         rest = yield_match.group(1)
     # Operands are before the `:` type annotation
     operand_text = rest.split(':')[0] if ':' in rest else rest
-    operands = re.findall(r'%\w+', operand_text)
+    operands = find_ssa_names(operand_text)
     return Operation(
         result=None,
         op_type="tensor.yield",

@@ -18,9 +18,8 @@ import re
 
 from ..ir_types import Operation
 from ..latency import LatencyCategory as LC
-from ..ops.comm_ops import CommOps
-from ..ops.arith_ops import ArithOps
 from ..ops.control_ops import ControlOps
+from ..parser_utils import find_ssa_names
 from .registry import register, register_parser
 
 
@@ -81,21 +80,7 @@ def _return_alias(op, context, env):
     return func__return(op, context, env)
 
 
-# Communication operations (bundled here since they're few)
-@register("ktdp.transfer", latency_category=LC.COMM)
-def ktdp__transfer(op, context, env):
-    tile = context.get_value(op.operands[0])
-    dst_cores = context.get_value(op.operands[1])
-    CommOps.transfer(context, tile, dst_cores, env.ring)
-    return None
-
-
-@register("ktdp.reduce", latency_category=LC.COMM)
-def ktdp__reduce(op, context, env):
-    tile = context.get_value(op.operands[0])
-    core_group = context.get_value(op.operands[1])
-    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
-    return CommOps.reduce(context, tile, core_group, reduce_fn, env.ring)
+# ktdp.transfer / ktdp.reduce moved to ktdp_ops.py (alongside other ktdp.* ops).
 
 
 # ---------------------------------------------------------------------------
@@ -184,7 +169,7 @@ def parse_scf_yield(op_text, parse_ctx):
     if yield_match:
         rest = yield_match.group(1)
     operand_text = rest.split(':')[0] if ':' in rest else rest
-    operands = re.findall(r'%\w+', operand_text)
+    operands = find_ssa_names(operand_text)
     return Operation(
         result=None,
         op_type="scf.yield",

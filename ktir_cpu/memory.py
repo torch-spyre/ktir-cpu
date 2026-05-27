@@ -220,7 +220,7 @@ class HBMSimulator:
         self.next_ptr = 0x10000  # Start allocations at 64KB
 
     def allocate(self, size: int) -> int:
-        """Allocate memory and return pointer.
+        """Allocate memory and return stick address.
 
         Called by ``KTIRInterpreter.execute_function`` to place host input
         tensors in HBM before kernel execution (interpreter.py).
@@ -229,52 +229,49 @@ class HBMSimulator:
             size: Size in bytes
 
         Returns:
-            Pointer (memory address)
+            HBM stick address (byte address // STICK_BYTES)
         """
+        assert self.next_ptr % self.STICK_BYTES == 0, (
+            f"next_ptr 0x{self.next_ptr:x} is not stick-aligned "
+            f"(STICK_BYTES={self.STICK_BYTES})"
+        )
         ptr = self.next_ptr
         self.next_ptr += size
         # Align to stick boundary
         self.next_ptr = (self.next_ptr + self.STICK_BYTES - 1) & ~(self.STICK_BYTES - 1)
-        return ptr
+        return ptr // self.STICK_BYTES
 
-    def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
-        """Read *n_elements* elements starting at byte address *ptr*.
-
-        Returns a flat array of length *n_elements*.  Raises ValueError if
-        *ptr* is unmapped.
-
-        Callers:
-        - ``MemoryOps.load`` — reads tile data from HBM (memory_ops.py)
-        - ``KTIRInterpreter.execute_function`` — reads output tensors back
-          after execution (interpreter.py)
+    def read(self, stick: int, n_elements: int, dtype: str, *, intra_byte: int = 0) -> np.ndarray:
+        """Read *n_elements* elements from HBM.
 
         Args:
-            ptr: Memory address (byte offset)
-            n_elements: Number of elements to read
-            dtype: Data type
+            stick: HBM stick index (from \`\`allocate()\`\` or \`\`MemRef.split_addr\`\`).
+            n_elements: Number of elements to read.
+            dtype: Data type.
+            intra_byte: Byte offset within the stick (default 0).
 
         Returns:
-            Flat NumPy array of length n_elements
+            Flat NumPy array of length n_elements.
         """
+        assert 0 <= intra_byte < self.STICK_BYTES, (
+            f"intra_byte {intra_byte} out of range [0, {self.STICK_BYTES})"
+        )
         np_dtype = to_np_dtype(dtype)
-        return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
+        return _read_flat(self.memory, stick * self.STICK_BYTES + intra_byte,
+                          n_elements, np_dtype, bytes_per_elem(dtype))
 
-    def write(self, ptr: int, data: np.ndarray):
-        """Write *data* (flat ndarray) starting at byte address *ptr*.
-
-        Patches an existing allocation in-place when *ptr* falls within one.
-        Creates a new allocation at *ptr* if unmapped.
-
-        Callers:
-        - ``KTIRInterpreter.execute_function`` — places host input tensors
-          in HBM before kernel execution (interpreter.py)
-        - ``MemoryOps.store`` — writes tile data to HBM (memory_ops.py)
+    def write(self, stick: int, data: np.ndarray, *, intra_byte: int = 0):
+        """Write *data* (flat ndarray) to HBM.
 
         Args:
-            ptr: Memory address (byte offset)
-            data: Flat NumPy array to write
+            stick: HBM stick index (from \`\`allocate()\`\` or \`\`MemRef.split_addr\`\`).
+            data: Flat NumPy array to write.
+            intra_byte: Byte offset within the stick (default 0).
         """
-        _write_flat(self.memory, ptr, data)
+        assert 0 <= intra_byte < self.STICK_BYTES, (
+            f"intra_byte {intra_byte} out of range [0, {self.STICK_BYTES})"
+        )
+        _write_flat(self.memory, stick * self.STICK_BYTES + intra_byte, data)
 
     def read_element(self, addr: int, dtype: str = "f16"):
         """Read a single element by byte address.

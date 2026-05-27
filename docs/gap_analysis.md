@@ -11,8 +11,8 @@
 
 | # | Spec Operation | Status | Notes |
 |---|---------------|--------|-------|
-| 1 | `ktdp.construct_distributed_memory_view` | ❌ | No handler, no parser. Key primitive for composing multiple per-partition memory views into a single distributed logical view. Critical for modeling distributed scratchpads. |
-| 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. |
+| 1 | `ktdp.construct_distributed_memory_view` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; produces `DistributedMemRef` (composition of N per-partition `MemRef`s). Per-partition routing at access time via `MemoryOps.distributed_tile_access` → `DistributedTileRef`. Tests in `tests/test_distributed_view.py`. |
+| 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. Both `ktdp.load` (gather, via `MemoryOps.indirect_load`) and `ktdp.store` (scatter, via `MemoryOps.indirect_store`) accept `IndirectAccessTile` (#44 closed). |
 
 ## B. `ktdp` Types & Attributes
 
@@ -131,7 +131,6 @@ The spec explicitly mentions `memref.subview` for view-based transformations. **
 ### High Priority
 Blocks running spec-compliant KTIR programs:
 
-- **#1**: ❌ `construct_distributed_memory_view`
 - **#25**: ❌ `linalg.add` — used in the spec's primary example and won't execute
 - **#5**: 🟡 `coordinate_set` on memory views preserved but not enforced
 
@@ -173,8 +172,6 @@ Significant progress since the original writeup:
 
 Remaining notable gaps:
 
-- `ktdp.construct_distributed_memory_view` (#1) is still the largest missing
-  ktdp op; it blocks distributed scratchpad modeling.
 - `linalg.add` (#25) is still missing — the RFC's canonical matrix-add example
   cannot execute without it.
 - `coordinate_set` on memory views (#5) is preserved in the IR but not used
@@ -191,7 +188,7 @@ The initial phases of this roadmap are complete. The conformance target was esta
 Goal: cover the RFC-defined `ktdp` surface.
 
 - ✅ Implement `ktdp.construct_indirect_access_tile`.
-- ❌ Implement `ktdp.construct_distributed_memory_view`.
+- ✅ Implement `ktdp.construct_distributed_memory_view`.
 - Add validation rules for:
   matching dimensionalities,
   allowed direct versus indirect dimensions,
@@ -234,44 +231,25 @@ spec surface.
 
 ### K1. Multi-round communication re-execution
 
-**Status**: ❌ Not yet fixed. Does not affect current example kernels.
+**Status**: ✅ Fixed in PR-B (grid-network branch, issue #50).
 
-`execute_with_communication` in `grid.py` re-executes the entire function body
-on every core for each communication round. The latency tracker accumulates
-costs from every round, so kernels using `ktdp.transfer` or `ktdp.reduce`
-would have inflated latency — all operations (loads, compute, stores) counted
-N times instead of once, where N is the number of communication rounds.
+`execute_with_communication` now uses a generator-based cooperative scheduler.
+Each core runs as a Python generator via `CoreExecutionStack`; blocking `recv`
+operations suspend the generator (`yield RecvRequest(src)`) until the expected
+tile is delivered. No BSP replay — each core executes exactly once.
 
-Current example kernels (vector_add, softmax, layernorm, matmul) are all
-embarrassingly parallel — no comm ops — so `execute_with_communication`
-completes in 1 round and latency is counted exactly once.
-
-The multi-round replay exists because the simulator executes cores
-sequentially. When core 0 calls `ktdp.transfer` to send data to core 5,
-core 5 may have already executed in this round and missed the message.
-BSP-style replay re-runs all cores so core 5 picks up the message on the
-next round.
-
-**Proposed fix**: Replace the BSP replay loop with a single-pass execution
-model where each core executes at most once, scheduled in dependency order.
-Cores blocked on a `recv_from` are retried after other cores complete. Cyclic
-dependencies are detected and raised as errors.
+See `docs/cross_core_scheduling.md` for the full design.
 
 ### K2. Cyclic communication correctness
 
-**Status**: ❌ Functional correctness problem.
+**Status**: ✅ Fixed in PR-B (grid-network branch, issue #50).
 
-The BSP replay model breaks for bidirectional exchanges and `ktdp.reduce`
-(which does its own internal ring loop within a single call):
-
-- `CommOps.reduce` calls `ring.recv_from()` with `pop(0)`, consuming messages.
-  On the next round the consumed messages are gone, producing different
-  intermediate results.
-- `CommOps.transfer` calls `ring.send()` every round, so duplicate messages
-  accumulate in the buffer.
-- Neither `ring_network` nor `core.values` are reset between rounds.
-
-The single-pass execution fix in K1 would also resolve this.
+`CommOps.reduce` is now a generator that yields `RecvRequest` per ring round.
+The scheduler drives it to completion via `gen.send(tile)`, consuming each
+message exactly once in order. No duplicate sends, no message loss.
+Bidirectional exchanges (both cores send then recv) are handled correctly
+because `send_to` is fire-and-forget — the sender enqueues and continues
+without blocking, so symmetric patterns never deadlock.
 
 ### K3. Multi-cast load modeling
 
@@ -294,7 +272,7 @@ If we want the fastest path to meaningful conformance progress:
 1. ✅ Build the first-class access-tile IR and affine evaluator.
 2. ✅ Rework `ktdp.load` / `ktdp.store` around that representation.
 3. ✅ Add `construct_indirect_access_tile`.
-4. ❌ Add `construct_distributed_memory_view`.
+4. ✅ Add `construct_distributed_memory_view`.
 5. ❌ Add `linalg.add`, `tensor.extract_slice`, and `memref.subview`.
 6. ❌ Fill in the missing RFC-listed SCF ops.
 7. ❌ Expand broader Arith/Math/Linalg coverage as compiler demand appears.
@@ -305,6 +283,6 @@ A strong first milestone would be:
 
 - ✅ affine attributes are preserved and exercised in tests
 - ✅ `ktdp.load` / `ktdp.store` operate over real coordinate collections
-- 🟡 all RFC-defined `ktdp` ops parse and execute (`construct_distributed_memory_view` still missing)
+- ✅ all RFC-defined `ktdp` ops parse and execute
 - ❌ the RFC matrix-add example can run with only mechanical syntax adaptation
 - ❌ the repo has explicit tests for unsupported versus supported RFC surface

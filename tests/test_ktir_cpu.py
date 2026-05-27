@@ -26,7 +26,7 @@ from pathlib import Path
 
 from ktir_cpu.memory import HBMSimulator, LXScratchpad
 from ktir_cpu.grid import GridExecutor
-from ktir_cpu.ir_types import Tile, TileRef
+from ktir_cpu.ir_types import MemRef, Tile, TileRef
 from ktir_cpu.interpreter import _ktir_dtype
 
 
@@ -71,8 +71,8 @@ def test_hbm_read_subarray_partial_padding():
     hbm.write(ptr, data)
 
     # Read starting 2 elements in, requesting 4 elements (only 2 available)
-    offset_ptr = ptr + 2 * 2  # skip 2 f16 elements (2 bytes each)
-    result = hbm.read(offset_ptr, 4, "f16")
+    byte_offset = 2 * 2  # skip 2 f16 elements (2 bytes each)
+    result = hbm.read(ptr, 4, "f16", intra_byte=byte_offset)
     assert result.shape == (4,), f"Expected shape (4,), got {result.shape}"
     assert result[0] == np.float16(30), f"Expected 30, got {result[0]}"
     assert result[1] == np.float16(40), f"Expected 40, got {result[1]}"
@@ -271,63 +271,6 @@ def test_grid_boundary_max_position():
     assert grid._grid_to_linear(*core.grid_pos) == last_id
 
 
-def test_execute_with_communication_multi_round():
-    """execute_with_communication runs multiple rounds and converges once all messages are consumed.
-
-    NOTE: The BSP replay model in execute_with_communication has a known correctness problem
-    described in docs/gap_analysis.md section K1 ("Multi-round communication re-execution").
-    Re-execution inflates latency tracking and breaks cyclic communication patterns.
-    This test only exercises the simple forward-propagation case (core 0 → core 1) which
-    converges correctly; it does not imply cyclic or bidirectional communication works.
-    """
-    from ktir_cpu.memory import SpyreMemoryHierarchy
-    from ktir_cpu.ops.comm_ops import RingNetwork
-    from ktir_cpu.ir_types import Tile
-
-    memory = SpyreMemoryHierarchy(num_cores=2)
-    grid = GridExecutor(grid_shape=(2, 1, 1), memory=memory)
-    ring = RingNetwork(num_cores=2)
-
-    round_num = [0]
-    call_counts = [0]
-
-    def execute_fn(core, ring_net):
-        call_counts[0] += 1
-        # Round 0 (call 0 and 1): core 0 sends to core 1.
-        # Round 1 (call 2 and 3): core 1 consumes the message — no pending after this round.
-        if round_num[0] == 0 and core.core_id == 0:
-            tile = Tile(np.array([42.0], dtype=np.float16), "f16", (1,))
-            ring_net.send(src_core=0, dst_core=1, tile=tile)
-        elif round_num[0] == 1 and core.core_id == 1:
-            ring_net.recv_from(src_core=0, dst_core=1)
-        # Track which round we're in based on call count parity.
-        if call_counts[0] % 2 == 0:
-            round_num[0] += 1
-
-    grid.execute_with_communication(execute_fn, ring)
-    # Two rounds × two cores = 4 calls
-    assert call_counts[0] == 4
-
-
-def test_execute_with_communication_exceeds_max_rounds():
-    """execute_with_communication raises RuntimeError when messages never drain."""
-    from ktir_cpu.memory import SpyreMemoryHierarchy
-    from ktir_cpu.ops.comm_ops import RingNetwork
-    from ktir_cpu.ir_types import Tile
-
-    memory = SpyreMemoryHierarchy(num_cores=2)
-    grid = GridExecutor(grid_shape=(2, 1, 1), memory=memory)
-    ring = RingNetwork(num_cores=2)
-
-    def always_send(core, ring_net):
-        # Accumulate messages that are never consumed — network never drains.
-        tile = Tile(np.array([1.0], dtype=np.float16), "f16", (1,))
-        ring_net.send(src_core=core.core_id, dst_core=(core.core_id + 1) % 2, tile=tile)
-
-    with pytest.raises(RuntimeError, match="Communication didn't converge"):
-        grid.execute_with_communication(always_send, ring, max_rounds=2)
-
-
 def test_hbm_allocate_f32():
     """HBMSimulator.allocate followed by write/read round-trips f32 data."""
     hbm = HBMSimulator()
@@ -393,8 +336,8 @@ def test_tile_operations():
     assert tile1.data[0] == 1, "Copy should be independent"
     print("  ✓ Tile copy works")
 
-    # Test TileRef
-    ref = TileRef(
+    # Test MemRef
+    ref = MemRef(
         base_ptr=0x1000,
         shape=(4,),
         strides=[1],
@@ -402,8 +345,8 @@ def test_tile_operations():
         dtype="f16"
     )
 
-    assert ref.size_bytes() == 8, "TileRef size calculation wrong"
-    print("  ✓ TileRef works")
+    assert ref.size_bytes() == 8, "MemRef size calculation wrong"
+    print("  ✓ MemRef works")
 
 
 @pytest.mark.parametrize("dtype, shape, expected_bytes", [
@@ -413,8 +356,8 @@ def test_tile_operations():
     ("i64", (4,), 32),
 ])
 def test_tileref_size_bytes(dtype, shape, expected_bytes):
-    """TileRef.size_bytes: correct byte count for each supported dtype."""
-    ref = TileRef(base_ptr=0, shape=shape, strides=[1], memory_space="HBM", dtype=dtype)
+    """MemRef.size_bytes: correct byte count for each supported dtype."""
+    ref = MemRef(base_ptr=0, shape=shape, strides=[1], memory_space="HBM", dtype=dtype)
     assert ref.size_bytes() == expected_bytes
 
 

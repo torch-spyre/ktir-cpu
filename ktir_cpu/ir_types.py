@@ -15,9 +15,16 @@
 """
 Core IR data types.
 
-- Tile: Data value backed by a NumPy array (tensor in MLIR)
-- TileRef: Memory layout descriptor (memref in MLIR)
-- AccessTile: Coordinate access tile referencing a sub-region of a TileRef
+Types are ordered by the data-flow pipeline:
+
+- MemRef: Hardware-aware memory view (construct_memory_view result; stick-indexed for HBM)
+- DistributedMemRef: Distributed analogue of MemRef — list of per-partition MemRefs
+  (construct_distributed_memory_view result)
+- TileRef: Byte-addressed sub-tile view (construct_access_tile result; produced from MemRef)
+- DistributedTileRef: Distributed analogue of TileRef — list of per-partition TileRef
+  survivors after access-set intersection (distributed_tile_access result)
+- Tile: Data value backed by a NumPy array (load result; tensor in MLIR)
+- AccessTile / IndirectAccessTile: Coordinate descriptors for load/store
 - Operation: Single IR operation
 - IRFunction / IRModule: Top-level IR containers
 """
@@ -26,7 +33,199 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
-from .affine import AffineMap, AffineSet
+from .affine import AffineMap, AffineSet, BoxSet
+
+# Type alias for TileRef.coordinate_set: parsed affine sets lower to BoxSet
+# at parse time when axis-aligned; non-box sets stay as AffineSet; the
+# distributed slow path stores a pre-enumerated list of points; None means
+# the field hasn't been set (ordinary single-allocation TileRefs).
+CoordinateSet = Union[BoxSet, AffineSet, List[Tuple[int, ...]]]
+
+
+@dataclass
+class MemRef:
+    """Hardware-aware memory view (result of construct_memory_view).
+
+    Represents a logical view over allocated memory.  ``base_ptr`` is a
+    stick index for HBM or a byte address for LX.  Use ``byte_address``
+    to get the absolute byte position regardless of memory space.
+    """
+    base_ptr: int              # stick index (HBM) or byte address (LX)
+    shape: Tuple[int, ...]
+    strides: List[int]         # element counts
+    memory_space: str          # "HBM" or "LX"
+    dtype: str = "f16"
+    # ``coordinate_set`` is the set of global coords this MemRef owns.
+    # Per-axis ``strides`` only describes a strided rectangle, so a
+    # non-rectangular set is stored BB-padded inside ``shape`` (slots
+    # outside the set are unused but addressable).  Hence the partition
+    # origin in global coords is ``min(coordinate_set)`` (= BB lower
+    # corner) — relied on by ``distributed_tile_access`` for ``p_i``.
+    coordinate_set: Optional[AffineSet] = None
+    # Set when memory_space="LX" and a core index was specified via
+    # #ktdp.spyre_memory_space<LX, core = N>.  None means "the executing
+    # core's own LX scratchpad" (default routing).
+    lx_core_id: Optional[int] = None
+
+    def __post_init__(self):
+        valid = ("HBM", "LX")
+        if self.memory_space not in valid:
+            raise ValueError(
+                f"Invalid memory_space {self.memory_space!r}. Must be one of {valid}."
+            )
+        if self.lx_core_id is not None and self.memory_space != "LX":
+            raise ValueError(
+                f"lx_core_id may only be set when memory_space is 'LX', "
+                f"got memory_space={self.memory_space!r}"
+            )
+
+    @property
+    def byte_address(self) -> int:
+        """Absolute byte address of this memref's base in its memory space."""
+        if self.memory_space == "HBM":
+            from .memory import HBMSimulator
+            return self.base_ptr * HBMSimulator.STICK_BYTES
+        return self.base_ptr
+
+    def to_tile_ref(self) -> 'TileRef':
+        """Convert to a byte-addressed TileRef for load/store operations."""
+        return TileRef(
+            base_ptr=self.byte_address,
+            shape=self.shape,
+            strides=self.strides,
+            dtype=self.dtype,
+            memref=self,
+        )
+
+    def split_addr(self, byte_addr: int) -> Tuple[int, int]:
+        """Split a byte address into a (main, intra) pair for memory reads/writes.
+
+        The meaning of the pair depends on memory space:
+        - HBM: ``(stick_index, intra_byte_offset)``
+        - LX:  ``(byte_addr, 0)`` — LX is byte-addressed with no sub-unit concept.
+
+        New memory spaces add a branch here; callers are unchanged.
+        """
+        if self.memory_space == "HBM":
+            from .memory import HBMSimulator
+            return byte_addr // HBMSimulator.STICK_BYTES, byte_addr % HBMSimulator.STICK_BYTES
+        return byte_addr, 0
+
+    def size_bytes(self) -> int:
+        """Calculate size in bytes."""
+        from .dtypes import bytes_per_elem
+        return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
+
+
+@dataclass
+class DistributedMemRef:
+    """Distributed memory view: composition of N per-partition MemRefs.
+
+    Produced by ``ktdp.construct_distributed_memory_view``.  Each partition
+    is a plain :class:`MemRef` carrying its own ``coordinate_set`` (= B_i
+    in global coords), ``memory_space``, ``base_ptr``, and ``strides``;
+    this wrapper records the global logical shape and can dispatch a
+    global coordinate to the first partition whose set contains it.
+
+    The op does not allocate or move data — this is bookkeeping only.
+    Access-time partition resolution (intersect with the access tile and
+    return the survivors) is performed by
+    ``MemoryOps.distributed_tile_access`` and yields a
+    :class:`DistributedTileRef`.
+    """
+    partitions: List[MemRef]
+    shape: Tuple[int, ...]   # global logical shape (coordinate_sets use these coords)
+    dtype: str
+
+    def __post_init__(self):
+        if not self.partitions:
+            raise ValueError("DistributedMemRef requires at least one partition")
+        for i, p in enumerate(self.partitions):
+            if p.coordinate_set is None:
+                raise ValueError(
+                    f"DistributedMemRef partition {i} must have a coordinate_set"
+                )
+            if p.dtype != self.dtype:
+                raise ValueError(
+                    f"DistributedMemRef partition {i} dtype {p.dtype!r} "
+                    f"does not match view dtype {self.dtype!r}"
+                )
+
+    def find_partition(self, coord: Tuple[int, ...]) -> Tuple[int, MemRef]:
+        """Return ``(index, partition)`` whose coordinate_set contains *coord*.
+
+        Returns the first match; per RFC 0682 §3.3, overlapping coordinate
+        sets produce unspecified behavior, and "first match" is a legal
+        (and conveniently deterministic) resolution.
+        """
+        for i, p in enumerate(self.partitions):
+            if p.coordinate_set.contains(coord):
+                return i, p
+        raise IndexError(
+            f"No partition of DistributedMemRef contains global coord {coord}"
+        )
+
+
+@dataclass
+class TileRef:
+    """Byte-addressed tile view for load/store operations.
+
+    Produced by ``tile_access()`` from a parent MemRef.  ``base_ptr`` is
+    always an absolute byte address regardless of memory space.  Holds a
+    reference to the parent ``memref`` for memory-space-aware queries
+    (e.g. ``unique_sticks``).
+    """
+    base_ptr: int              # always byte address
+    shape: Tuple[int, ...]
+    strides: List[int]         # element counts
+    memref: 'MemRef'           # parent MemRef — always set; owns memory_space and hw address conversion
+    dtype: str = "f16"
+    # Per-survivor metadata set by distributed_tile_access (None on
+    # ordinary single-allocation TileRefs).  ``coordinate_set`` is one of:
+    #   - BoxSet: axis-aligned C_i, produced by the BoxSet fast path in
+    #     distributed_tile_access (B_i and A both BoxSet).  O(ndim) ops.
+    #   - List[Tuple[int,...]]: pre-enumerated C_i points from the slow
+    #     path (B_i or A is AffineSet — non-box).
+    coordinate_set: Optional[CoordinateSet] = None
+    partition_origin: Optional[Tuple[int, ...]] = None      # p_i = min(B_i) in global coords
+
+    def size_bytes(self) -> int:
+        """Calculate size in bytes."""
+        from .dtypes import bytes_per_elem
+        return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
+
+
+@dataclass
+class DistributedTileRef:
+    """Distributed analogue of TileRef: per-partition survivors of an access.
+
+    Produced by ``MemoryOps.distributed_tile_access``.  Each survivor is a
+    plain :class:`TileRef` whose ``memref`` points to the partition's
+    :class:`MemRef` (so memory-space dispatch and per-core LX routing
+    work without any DistributedMemRef-aware code at the load/store call
+    site).
+
+    The wrapper records the global logical shape (inherited from the
+    DistributedMemRef the access was issued against) and ``global_base``
+    — the origin of the access tile in global coords (= ``base_map.eval(indices)``).
+    distributed_load and distributed_store consume this object directly.
+    """
+    partitions: List['TileRef']
+    shape: Tuple[int, ...]                           # global logical shape
+    dtype: str
+    global_base: Optional[Tuple[int, ...]] = None    # x = base_map.eval(indices); set by
+                                                     # distributed_tile_access, None on
+                                                     # construct_distributed_memory_view
+
+    def __post_init__(self):
+        if not self.partitions:
+            raise ValueError("DistributedTileRef requires at least one partition")
+        for i, p in enumerate(self.partitions):
+            if p.dtype != self.dtype:
+                raise ValueError(
+                    f"DistributedTileRef partition {i} dtype {p.dtype!r} "
+                    f"does not match view dtype {self.dtype!r}"
+                )
 
 
 @dataclass
@@ -43,6 +242,11 @@ class Tile:
     # tile.  Set by ``MemoryOps.load`` for all access patterns.  None only
     # for tiles produced by compute ops (not loaded from memory).
     unique_sticks: Optional[int] = None
+    # Number of distinct HBM sticks touched by index-tensor reads during
+    # an indirect load/store.  Tracked separately from ``unique_sticks``
+    # so that ``coalescing_efficiency`` retains its data-layout meaning.
+    # None for direct loads (no index tensors) and compute-produced tiles.
+    index_unique_sticks: Optional[int] = None
 
     def copy(self) -> 'Tile':
         """Create a deep copy of this tile.
@@ -53,7 +257,10 @@ class Tile:
         target device's base_ptr — currently we propagate the source
         value since the memory layout is abstracted away from Tile.
         """
-        return Tile(self.data.copy(), self.dtype, self.shape, self.unique_sticks)
+        return Tile(
+            self.data.copy(), self.dtype, self.shape,
+            self.unique_sticks, self.index_unique_sticks,
+        )
 
     def size_bytes(self) -> int:
         """Return size in bytes."""
@@ -76,41 +283,19 @@ class Tile:
 
 
 @dataclass
-class TileRef:
-    """Memory layout descriptor (does NOT contain data).
-
-    Describes a contiguous region of memory with base pointer, shape,
-    strides, and dtype (corresponds to ``memref<...>`` in MLIR).
-    """
-    base_ptr: int
-    shape: Tuple[int, ...]
-    strides: List[int]
-    memory_space: str  # "HBM" or "LX"
-    dtype: str = "f16"
-    coordinate_set: Optional[AffineSet] = None  # parsed; None if omitted in MLIR
-
-    def __post_init__(self):
-        valid = ("HBM", "LX")
-        if self.memory_space not in valid:
-            raise ValueError(
-                f"Invalid memory_space {self.memory_space!r}. Must be one of {valid}."
-            )
-
-    def size_bytes(self) -> int:
-        """Calculate size in bytes."""
-        from .dtypes import bytes_per_elem
-        return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
-
-
-@dataclass
 class AccessTile:
-    """Coordinate access tile referencing a sub-region of a TileRef.
+    """Coordinate access tile referencing a sub-region of a MemRef.
 
     Holds the affine attributes that describe which coordinates of the
     parent memref to access.  Load and store operations use these to
     find the actual memory location.
+
+    ``parent_ref`` is a :class:`TileRef` for the single-allocation case
+    or a :class:`DistributedTileRef` when the access was constructed
+    against a distributed memory view (in which case partition routing
+    has already been resolved by ``MemoryOps.distributed_tile_access``).
     """
-    parent_ref: TileRef
+    parent_ref: Union[TileRef, 'DistributedTileRef']
     shape: Tuple[int, ...]
     base_map: AffineMap                                  # always present; synthesized as identity if absent in MLIR
     coordinate_set: Optional[AffineSet] = None     # parsed access_tile_set; None if omitted
@@ -125,10 +310,10 @@ class IndirectAccessTile:
     - Directly via an intermediate variable value, or
     - Indirectly via a lookup into an index memory view.
     """
-    parent_ref: TileRef                         # primary memory view (e.g. X)
+    parent_ref: MemRef                          # primary memory view (e.g. X)
     shape: Tuple[int, ...]                      # output access tile shape
     dim_subscripts: List[Dict[str, Any]]        # per-dim descriptor (kind, var_indices, etc.)
-    index_views: List[TileRef]                  # index memrefs for indirect dims
+    index_views: List[MemRef]                   # index memrefs for indirect dims (used for byte_address)
     variables_space_set: AffineSet              # domain of intermediate variables
     variables_space_order: Optional[AffineMap]  # iteration order; None = default
 

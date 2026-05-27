@@ -92,11 +92,15 @@ class TestTensorAdapt(MLIRFrontendParseTestMixin, _TestTensorParsers):
 class TestKtdpAdapt(MLIRFrontendParseTestMixin, _TestKtdpParsers):
     """Ktdp tests via MLIRFrontendParser."""
 
-
     # test_construct_access_tile: inherited
-
     # test_construct_access_tile_non_index_elem_type_rejected: inherited
     # test_construct_access_tile_malformed_type_rejected: inherited
+
+    # test_affine_set_with_symbolic_dim: inherited
+    # test_construct_memory_view_dynamic_memref_type: inherited
+    # test_construct_memory_view_ssa_size_as_operand: inherited
+
+    # test_construct_memory_view_multi_dim_mixed_static_dynamic: inherited
 
 
 # ---------------------------------------------------------------------------

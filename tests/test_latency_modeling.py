@@ -396,17 +396,17 @@ class TestModelingAssumptions:
         expected_compute = (tile / base_cfg.simd_elements_per_cycle)
         assert report.counters[0].compute_cycles == pytest.approx(expected_compute, rel=1e-6)
 
-        # memory_cycles: loads charged at stick granularity, stores at packed bytes.
-        # Per core: 2 loads + 1 store.  Each op handles `tile` f16 elements.
+        # memory_cycles: HBM is stick-addressed, so both loads and stores
+        # ceil to stick boundary. Per core: 2 loads + 1 store, each op
+        # handles `tile` f16 elements over a contiguous, stick-aligned
+        # tile (the kernel splits along the leading dim only).
         from ktir_cpu.memory import HBMSimulator
         STICK_BYTES = HBMSimulator.STICK_BYTES
         bpe = 2  # f16
         tile_bytes = tile * bpe
-        # Contiguous stick-aligned loads: ceil to stick boundary
-        load_sticks = (tile_bytes + STICK_BYTES - 1) // STICK_BYTES
-        load_bytes_per_op = load_sticks * STICK_BYTES
-        store_bytes_per_op = tile_bytes
-        mem_bytes_per_core = 2 * load_bytes_per_op + store_bytes_per_op
+        sticks_per_op = (tile_bytes + STICK_BYTES - 1) // STICK_BYTES
+        bytes_per_op = sticks_per_op * STICK_BYTES
+        mem_bytes_per_core = 3 * bytes_per_op
         expected_mem = mem_bytes_per_core / cfg.hbm_bytes_per_cycle_per_core
         assert report.counters[0].memory_cycles == pytest.approx(expected_mem, rel=1e-6)
 
@@ -546,16 +546,17 @@ class TestModelingAssumptions:
         expected_compute = (tile / cfg.simd_elements_per_cycle) * cfg.transcendental_penalty
         assert compute_vals[0] == pytest.approx(expected_compute, rel=1e-6)
 
-        # memory_cycles: loads at stick granularity, stores at packed bytes.
-        # Per core: 1 load + 1 store, each handling `tile` f16 elements.
+        # memory_cycles: HBM is stick-addressed — loads and stores both
+        # ceil to stick boundary. Per core: 1 load + 1 store, each
+        # handling `tile` f16 elements over a contiguous, stick-aligned
+        # tile.
         from ktir_cpu.memory import HBMSimulator
         STICK_BYTES = HBMSimulator.STICK_BYTES
         bpe = 2  # f16
         tile_bytes = tile * bpe
-        load_sticks = (tile_bytes + STICK_BYTES - 1) // STICK_BYTES
-        load_bytes = load_sticks * STICK_BYTES
-        store_bytes = tile_bytes
-        expected_memory = (load_bytes + store_bytes) / cfg.hbm_bytes_per_cycle_per_core
+        sticks_per_op = (tile_bytes + STICK_BYTES - 1) // STICK_BYTES
+        bytes_per_op = sticks_per_op * STICK_BYTES
+        expected_memory = (2 * bytes_per_op) / cfg.hbm_bytes_per_cycle_per_core
         assert memory_vals[0] == pytest.approx(expected_memory, rel=1e-6)
 
     # --- Test 4: tile size → memory cycles proportional ---

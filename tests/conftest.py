@@ -155,6 +155,15 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             },
         },
     ],
+    "add_kernel_dynamic": [
+        {
+            "path": "triton-ktir/vector_add_dynamic_ktir.mlir",
+            # n_elements drives the symbolic coordinate set bound to %n;
+            # must be <= 1024 (access tile set covers d0 in [0, 1023]).
+            # List of values: the test parametrizes over each.
+            "execute_kwargs": {"n_elements": [256, 512, 1024]},
+        },
+    ],
     "reduce_explicit_region": [
         {
             "path": "ktir/reduce_generic.mlir",
@@ -207,11 +216,28 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    "indirect_scatter": [
+        {
+            "path": "rfc/indirect-scatter.mlir",
+            # Scatter dual of indirect-access-copy: Y[IDX1[m,k], IDX2[m,k]] = X[m,k].
+            # Requires ktdp.store with IndirectAccessTile.
+            "execute_kwargs": {},
+        },
+    ],
     "paged_tensor_copy_1core": [
         {
             "path": "rfc/paged-tensor-copy.mlir",
             # RFC §C.5 Example 2: paged-attention 4-D indirect gather
             # Requires ktdp.construct_indirect_access_tile.
+            "execute_kwargs": {},
+        },
+    ],
+    "paged_tensor_write_1core": [
+        {
+            "path": "rfc/paged-tensor-write.mlir",
+            # Scatter dual of paged-tensor-copy:
+            # Y[Idx[b, tkv/Ptkv], h, tkv%Ptkv, dkv] = X[b, tkv, h, dkv].
+            # Same LX-overflow constraint as paged-tensor-copy.
             "execute_kwargs": {},
         },
     ],
@@ -231,6 +257,21 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    # ---------------------------------------------------------------------------
+    # Cross-core communication examples
+    # ---------------------------------------------------------------------------
+    "ring_reduce": [
+        {
+            "path": "ktir/ring_reduce.mlir",
+            # 4-core ring reduce: ktdp.reduce (reduce_to_core<0>, sum, grid_axis<0>)
+            # grid = [4, 1, 1] → 4 cores; n_cols = 128 (from construct_memory_view sizes)
+            # HBM layout: in_ptr=0 (4×128×2=1024 bytes), out_ptr=1024 (128×2=256 bytes)
+            # xfail: parser support for #ktdp.reduce_kind / reduce_mode / grid_axis
+            # attributes not yet upstream (torch-spyre/ktir-mlir-frontend#21).
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 1024},
+            "n_cols": 128,
+        },
+    ],
 }
 
 
@@ -248,6 +289,11 @@ def get_test_params(
     skipped unless a ``filter`` string explicitly selects them.  This prevents
     failure examples from appearing in normal parametrize lists while still
     allowing dedicated failure tests to select them by path substring.
+
+    If any value in ``execute_kwargs`` is a list, the entry is expanded into
+    one triple per list element, with the list replaced by the scalar value.
+    This lets conftest express multiple runtime values (e.g. varying
+    ``n_elements``) without requiring a separate parametrize in each test.
     """
     names = func_names or tuple(EXAMPLE_PARAMS.keys())
     result = []
@@ -258,11 +304,22 @@ def get_test_params(
             if filter is not None:
                 if filter not in rel_path and filter not in fn:
                     continue
-                # Filter explicitly matched — include even failure examples.
             elif is_failure:
-                # No filter: skip failure examples in normal parametrize lists.
                 continue
-            result.append((str(EXAMPLES_DIR / rel_path), fn, entry))
+            abs_path = str(EXAMPLES_DIR / rel_path)
+            # Expand any list-valued execute_kwargs into separate entries.
+            list_keys = [k for k, v in entry["execute_kwargs"].items() if isinstance(v, list)]
+            if not list_keys:
+                result.append((abs_path, fn, entry))
+                continue
+            # Only one list key supported per entry.
+            assert len(list_keys) == 1, (
+                f"At most one list-valued execute_kwarg per entry; got {list_keys}"
+            )
+            key = list_keys[0]
+            for val in entry["execute_kwargs"][key]:
+                expanded = {**entry, "execute_kwargs": {**entry["execute_kwargs"], key: val}}
+                result.append((abs_path, fn, expanded))
     return result
 
 
@@ -338,10 +395,11 @@ def _parse_mlir_meta(text: str, func_name: str) -> ExampleMeta:
 
         tokens = [t.strip() for t in sizes_str.split(",")]
         if any(not t.lstrip("-").isdigit() for t in tokens):
-            # SSA names in sizes: — fall back to the concrete memref<NxMxdtype>
+            # SSA names in sizes: — fall back to the concrete memref<NxMxdtype>.
+            # "?" dimensions (dynamic) are represented as None in the shape tuple.
             memref_parts = memref_str.split("x")
             dtype = memref_parts[-1]
-            shape = tuple(int(p) for p in memref_parts[:-1])
+            shape = tuple(None if p == "?" else int(p) for p in memref_parts[:-1])
         else:
             shape = tuple(int(t) for t in tokens)
             dtype = memref_str.rsplit("x", 1)[-1]

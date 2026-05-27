@@ -159,21 +159,35 @@ MLIRTypeAdapter.install(
     "linalg.matmul",
     "linalg.yield",
     "scf.yield",
-    "arith.addf", "arith.addi",
-    "arith.subf", "arith.subi",
-    "arith.mulf", "arith.muli",
-    "arith.divf", "arith.divsi", "arith.divui",
-    "arith.sitofp",
+    # float binary
+    "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf",
+    # float unary
+    "arith.negf", "arith.absf",
+    # float min/max
+    "arith.maxf", "arith.maximumf", "arith.maxnumf",
+    "arith.minf", "arith.minimumf", "arith.minnumf",
+    # integer binary
+    "arith.addi", "arith.subi", "arith.muli",
+    "arith.divsi", "arith.divui",
+    "arith.ceildivsi", "arith.floordivsi",
+    "arith.remsi", "arith.remui",
+    "arith.minsi", "arith.maxsi",
+    "arith.minui", "arith.maxui",
+    # integer bitwise
+    "arith.andi", "arith.ori", "arith.xori",
+    "arith.shli", "arith.shrsi", "arith.shrui",
+    # casts
+    "arith.sitofp", "arith.uitofp",
+    "arith.fptosi", "arith.fptoui",
+    "arith.extf", "arith.truncf",
+    "arith.extsi", "arith.extui", "arith.trunci",
     "arith.index_cast",
     "arith.maxnumf",
     "arith.maximumf",
     "arith.minimumf",
     "arith.minnumf",
     "tensor.yield",
-    "arith.extf",
-    "arith.truncf",
     "arith.bitcast",
-    "arith.fptosi",
     "arith.select",
     "math.exp",
     "math.sqrt",
@@ -482,6 +496,21 @@ def _adapt_linalg_generic(mlir_op, attributes, result_type, operands):
     # Block arguments are the bb0 names; stored in attributes for the executor fallback
     block = mlir_op.regions[0].blocks[0]
     attributes["bb0_names"] = [arg.get_name() for arg in block.arguments]
+
+
+@MLIRTypeAdapter.install("arith.cmpf")
+def _adapt_arith_cmpf(mlir_op, attributes, result_type, operands):
+    """Normalize MLIR float predicate encoding → string the executor expects."""
+    # MLIR CmpFPredicateAttr integer encoding (matches mlir::arith::CmpFPredicate)
+    _pred_map = {
+        0: "false", 1: "oeq", 2: "ogt", 3: "oge", 4: "olt", 5: "ole",
+        6: "one", 7: "ord", 8: "ueq", 9: "ugt", 10: "uge", 11: "ult",
+        12: "ule", 13: "une", 14: "uno", 15: "true",
+    }
+    pred_int = IntegerAttr(mlir_op.attributes["predicate"]).value
+    if pred_int not in _pred_map:
+        raise ValueError(f"arith.cmpf: unknown predicate integer {pred_int}")
+    attributes["predicate"] = _pred_map[pred_int]
 
 
 @MLIRTypeAdapter.install("arith.cmpi")
