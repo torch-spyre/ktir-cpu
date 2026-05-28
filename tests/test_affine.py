@@ -148,6 +148,17 @@ class TestAffineMapIsIdentity:
         m = parse_affine_map("affine_map<(d0, d1) -> (d0 + 0, 1 * d1)>")
         assert m.is_identity()
 
+    def test_identity_through_cancellation(self):
+        """Subtractive cancellation must collapse through flatten.
+
+        ``d0 + d1 - d1`` flattens to ``1 * d0 + 0`` and ``d1 + d0 - d0``
+        flattens to ``1 * d1 + 0``, so the map is identity.  Pins the
+        flatten-form contract: a future syntactic-only matcher would
+        reject these forms and silently regress the structural check.
+        """
+        m = parse_affine_map("affine_map<(d0, d1) -> (d0 + d1 - d1, d1 + d0 - d0)>")
+        assert m.is_identity()
+
 
 class TestAffineSetObject:
     """AffineSet behaviour on sets that are *not* lowerable to BoxSet."""

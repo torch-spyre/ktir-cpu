@@ -116,7 +116,7 @@ class AffineMap:
         if len(self.exprs) != self.n_dims:
             return False
         for i, expr in enumerate(self.exprs):
-            idx = _expr_as_single_dim(expr, self.n_dims)
+            idx = _match_pure_dim_ref(expr, self.n_dims)
             if idx != i:
                 return False
         return True
@@ -146,7 +146,7 @@ class AffineMap:
             return False
         seen = set()
         for expr in self.exprs:
-            idx = _expr_as_single_dim(expr, self.n_dims)
+            idx = _match_pure_dim_ref(expr, self.n_dims)
             if idx is None or idx in seen:
                 return False
             seen.add(idx)
@@ -360,16 +360,31 @@ class BoxSet:
         return cls(lo=tuple(los), hi=tuple(his))  # type: ignore[arg-type]
 
 
-def _expr_as_single_dim(node: "_Node", n_dims: int) -> Optional[int]:
-    """Return ``i`` if *node* is structurally equivalent to ``1 * d_i + 0``.
+def _match_pure_dim_ref(node: "_Node", n_dims: int) -> Optional[int]:
+    """Match *node* against ``1 * d_i + 0`` and return ``i``, else ``None``.
 
-    Returns ``None`` for any expression that flattens to a linear form
-    with a non-zero constant, a non-unit coefficient, or coefficients on
-    more than one dim variable.  Used by :meth:`AffineMap.is_identity`
-    and :meth:`AffineMap.is_permutation` for structural checks that
-    cannot be fooled by linear combinations whose evaluation on a
-    specific probe happens to coincide with the probe (e.g.
-    ``d0 + d1 - 2`` evaluates to ``1`` on probe ``[1, 2]``).
+    A "pure dim ref" is an expression that flattens (via
+    :func:`_constraint_to_linear`) to exactly one dim variable with unit
+    coefficient and zero constant.  Used by :meth:`AffineMap.is_identity`
+    and :meth:`AffineMap.is_permutation` for structural checks that cannot
+    be fooled by linear combinations whose evaluation on a specific probe
+    happens to coincide with the probe (e.g. ``d0 + d1 - 2`` evaluates to
+    ``1`` on probe ``[1, 2]``).
+
+    Because matching goes through ``_constraint_to_linear``,
+    algebraically-equivalent forms collapse to the same flattened
+    representation: ``d0 + 0`` and ``d0 + d1 - d1`` both flatten to
+    ``1 * d0 + 0`` and match identically to bare ``d0``.
+
+    Examples (n_dims=3)::
+
+        d0           -> 0
+        d2           -> 2
+        d1 + 0       -> 1     # zero constant ok
+        d0 + 1       -> None  # non-zero constant
+        2 * d0       -> None  # non-unit coefficient
+        d0 + d1      -> None  # more than one dim
+        -d0          -> None  # coefficient -1, not 1
     """
     lin = _constraint_to_linear(node, n_dims)
     if lin is None:
