@@ -677,6 +677,16 @@ class MemoryOps:
         ``MemRef`` can only describe a strided rectangle, so any
         non-rectangular ``B_i`` is stored BB-padded inside the
         partition's ``shape`` (see ``MemRef.coordinate_set``).
+
+        Contract on dynamic shapes: callers must supply concrete
+        coordinate sets — symbol resolution happens upstream at
+        ``construct_memory_view`` (per partition) and
+        ``construct_access_tile`` boundaries.  A symbolic ``BoxSet``
+        leaking through here will surface as ``IndexError`` from
+        ``eval_bound`` rather than a silently wrong answer.  Keeping
+        symbol handling out of this function makes the specialise
+        boundary single-layer and avoids dead-code on the integration
+        path.
         """
         global_base = tuple(base_map.eval(indices))
         x = global_base
@@ -697,20 +707,22 @@ class MemoryOps:
             """Slow-path membership test: point ∈ x + A."""
             if access_tile_set is None:
                 return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
-            return access_tile_set.contains(tuple(p[d] - x[d] for d in range(ndim)))
+            return access_tile_set.contains(
+                tuple(p[d] - x[d] for d in range(ndim))
+            )
 
         survivors: List[TileRef] = []
         for part in dist_ref.partitions:
             B_i = part.coordinate_set
             if isinstance(B_i, BoxSet) and xA_box is not None:
-                # Fast path: O(ndim) intersect
+                # Fast path: O(ndim) intersect on concrete bounds.
                 C_i = B_i.intersect(xA_box)
                 if C_i.is_empty():
                     continue
                 p_i = B_i.lower_bounds()
                 coordinate_set_out: CoordinateSet = C_i
             else:
-                # Slow path: brute-force enumerate + filter
+                # Slow path: brute-force enumerate + filter.
                 B_i_pts = B_i.enumerate(dist_ref.shape)
                 if not B_i_pts:
                     continue

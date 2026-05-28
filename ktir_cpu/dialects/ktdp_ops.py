@@ -17,6 +17,7 @@
 import re
 
 from .ktdp_helpers import parse_subscript_expr
+from ..affine import BoxSet
 from ..ir_types import (
     AccessTile,
     DistributedMemRef,
@@ -64,15 +65,35 @@ def ktdp__construct_memory_view(op, context, env):
         if attr not in op.attributes:
             raise ValueError(f"construct_memory_view: missing required attribute '{attr}'")
     # SSA size names are stored as strings by the parser; resolve them at runtime.
+    shape_attr = op.attributes["shape"]
     shape = tuple(
         context.get_value(s) if isinstance(s, str) else s
-        for s in op.attributes["shape"]
+        for s in shape_attr
     )
     # SSA stride names are stored as strings by the parser; resolve them at runtime.
     strides = [context.get_value(s) if isinstance(s, str) else s for s in op.attributes["strides"]]
     memory_space = op.attributes["memory_space"]
     dtype = op.attributes["dtype"]
     coordinate_set = op.attributes.get("coordinate_set")
+    # Eagerly resolve any symbolic bounds in the coordinate set, per the
+    # ODS contract on ``ktdp.construct_memory_view``: "When dimension
+    # sizes are symbolic, the symbols in the ``coordinate_set`` integer
+    # set are bound to variables in the ``sizes`` operand, from
+    # left-to-right in a one-to-one fashion."  Variables here means the
+    # SSA operands listed in ``sizes:`` (the dynamic dims), not the
+    # static-int entries — for ``memref<64x?xf16>`` the static leading
+    # ``64`` must not steal symbol index 0 from the dynamic tail dim.
+    # Pre-resolution, dynamic entries appear as SSA-name strings in
+    # ``shape_attr``; we filter on that to recover the dynamic operands
+    # in declaration order, then resolve each through ``context``.
+    # Substituting here keeps downstream consumers (find_partition /
+    # distributed_tile_access / load) on the concrete fast path — they
+    # never see a symbolic set.
+    if isinstance(coordinate_set, BoxSet) and not coordinate_set._all_concrete:
+        symbols = tuple(
+            context.get_value(s) for s in shape_attr if isinstance(s, str)
+        )
+        coordinate_set = coordinate_set.specialize(symbols)
     lx_core_id = op.attributes.get("lx_core_id") if memory_space == "LX" else None
     return MemoryOps.tile_view(context, ptr, shape, strides, memory_space, dtype, coordinate_set, lx_core_id)
 
@@ -116,10 +137,32 @@ def ktdp__construct_access_tile(op, context, env):
     # the old rectangular sum(idx * stride) shortcut.
     base_map = op.attributes["base_map"]
     coordinate_set = op.attributes.get("coordinate_set")
+    # Symbolic ``access_tile_set`` is not yet supported.  Per the ODS
+    # spec ("when symbols are present, the ``symbol_operands`` list
+    # provides SSA values that are bound to these symbols in
+    # left-to-right order"), the binding source is the op's
+    # ``$symbol_operands`` argument list — independent from
+    # ``$indices`` and from the access tile shape.  The ktir-cpu Python
+    # parser does not yet surface that operand list on the
+    # ``Operation`` object; wiring it through and threading the
+    # resolved symbols here is tracked as an issue-#51 follow-up
+    # (gap_analysis row 36b).  Fail fast at this boundary rather than
+    # leaking a symbolic set into ``distributed_tile_access`` where it
+    # would surface as an opaque ``IndexError`` from ``eval_bound``.
+    if isinstance(coordinate_set, BoxSet) and not coordinate_set._all_concrete:
+        raise NotImplementedError(
+            "construct_access_tile: symbolic access_tile_set is not yet "
+            "supported — the parser does not surface the op's "
+            "$symbol_operands operand list (per ODS) needed to resolve "
+            "the symbols.  Tracked as a follow-up to issue #51 "
+            "(gap_analysis row 36b)."
+        )
     if isinstance(parent_ref, DistributedMemRef):
-        # Distributed parent: resolve partition routing now and produce a
-        # DistributedTileRef carrying surviving partitions.  Load/store
-        # consume it directly.
+        # Distributed parent: resolve partition routing now.  Each
+        # partition's coordinate_set was already specialised at
+        # construct_memory_view time, and ``access_tile_set`` is concrete
+        # by current scope — so distributed_tile_access runs entirely on
+        # concrete bounds.
         dist_tile_ref = MemoryOps.distributed_tile_access(
             parent_ref, access_shape, base_map, indices, access_tile_set=coordinate_set
         )

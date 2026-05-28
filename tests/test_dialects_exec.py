@@ -1105,6 +1105,129 @@ class TestKtdp:
         assert result.base_ptr == ptr
         assert result.shape == (256,)
 
+    def test_construct_memory_view_specializes_symbolic_coord_set_leading_dyn(self):
+        """Symbolic coordinate_set with the dynamic dim in axis 0.
+
+        Goes through the dialect handler — verifies the eager
+        specialise step turns ``[0, s_0)`` into a concrete BoxSet
+        ``[0, n)`` using the resolved value of ``%n``.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        coord_set = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>"
+        )
+        assert isinstance(coord_set, BoxSet) and not coord_set._all_concrete
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(256 * 2)
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%n", 100)
+        result = _call(
+            "ktdp.construct_memory_view", ctx, _make_env(),
+            operands=["%ptr"],
+            attributes={
+                "shape": ("%n",),     # one dynamic dim → s_0 binds to it
+                "strides": [1],
+                "memory_space": "HBM", "dtype": "f16",
+                "coordinate_set": coord_set,
+            },
+        )
+        assert isinstance(result.coordinate_set, BoxSet)
+        assert result.coordinate_set._all_concrete
+        assert result.coordinate_set == BoxSet(lo=(0,), hi=(100,))
+
+    def test_construct_access_tile_rejects_symbolic_access_tile_set(self):
+        """Symbolic ``access_tile_set`` is rejected at the handler boundary.
+
+        Lock-down for the deferred follow-up (gap_analysis row 36b): the
+        ODS spec routes symbolic access tile sets through
+        ``$symbol_operands``, which the ktir-cpu Python parser does not
+        yet surface.  Until that wire-up lands, the handler must fail
+        fast at construction time rather than letting a symbolic set
+        drift into ``distributed_tile_access`` and surface as an opaque
+        ``IndexError`` from ``eval_bound`` in the partition-routing
+        loop.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_map, parse_affine_set
+
+        sym_set = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>"
+        )
+        assert isinstance(sym_set, BoxSet) and not sym_set._all_concrete
+
+        ctx = _make_ctx()
+        parent = MemRef(
+            base_ptr=0, shape=(64,), strides=[1],
+            memory_space="HBM", dtype="f16",
+        )
+        ctx.set_value("%view", parent)
+        ctx.set_value("%c0", 0)
+        with pytest.raises(NotImplementedError, match=r"symbolic access_tile_set"):
+            _call(
+                "ktdp.construct_access_tile", ctx, _make_env(),
+                operands=["%view", "%c0"],
+                attributes={
+                    "shape": (64,),
+                    "base_map": parse_affine_map("affine_map<(d0) -> (d0)>"),
+                    "coordinate_set": sym_set,
+                },
+            )
+
+    def test_construct_memory_view_specializes_symbolic_coord_set_trailing_dyn(self):
+        """Regression: silent miscompile when the dynamic dim is *not* axis 0.
+
+        ``memref<64x?xf16>`` has only one dynamic operand but it's at
+        axis 1.  Symbol ``s_0`` in the coordinate_set must bind to that
+        single dynamic operand (= the column count), NOT to ``shape[0]``
+        (= the static row count 64).  An earlier version specialised
+        with the full resolved ``shape`` tuple, which would silently
+        have bound ``s_0 = 64`` here and produced a column extent of 64
+        rather than the intended ``%n``.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        # Column extent ``[0, s_0)`` symbolic on axis 1; row extent
+        # ``[0, 64)`` static on axis 0.
+        coord_set = parse_affine_set(
+            "affine_set<(d0, d1)[s0] : ("
+            "d0 >= 0, -d0 + 63 >= 0, "
+            "d1 >= 0, -d1 + s0 - 1 >= 0)>"
+        )
+        assert isinstance(coord_set, BoxSet) and not coord_set._all_concrete
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(64 * 100 * 2)
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%n", 100)
+        result = _call(
+            "ktdp.construct_memory_view", ctx, _make_env(),
+            operands=["%ptr"],
+            attributes={
+                # axis 0 is static (64); axis 1 is dynamic (%n).  The
+                # only SSA-name entry is the axis-1 dynamic operand, so
+                # symbol s_0 must bind to %n=100 — not to shape[0]=64.
+                "shape": (64, "%n"),
+                "strides": [100, 1],
+                "memory_space": "HBM", "dtype": "f16",
+                "coordinate_set": coord_set,
+            },
+        )
+        assert isinstance(result.coordinate_set, BoxSet)
+        assert result.coordinate_set._all_concrete
+        # Correct binding: s_0 = 100 → column extent [0, 100).
+        # Buggy binding (specialise with full shape): s_0 = 64 → would
+        # give column extent [0, 64), which this assertion would catch.
+        assert result.coordinate_set == BoxSet(lo=(0, 0), hi=(64, 100))
+
     def test_load_store_roundtrip(self):
         # load reads data from HBM; store writes it back modified
         from ktir_cpu.ir_types import AccessTile, MemRef

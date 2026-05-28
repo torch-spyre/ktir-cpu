@@ -29,6 +29,11 @@ from ktir_cpu.parser_ast import (
     eval_affine_map,
     affine_set_contains,
     enumerate_affine_set,
+    eval_bound,
+    sym_add,
+    sym_neg,
+    sym_max,
+    sym_min,
 )
 
 
@@ -486,3 +491,54 @@ class TestAffineEdgeCases:
         assert m.n_dims == 0
         assert len(m.exprs) == 3
         assert eval_affine_map(m, []) == (1, 2, 3)
+
+
+# ===========================================================================
+# Symbolic bound helpers (Bound = int | _Node, used by symbolic BoxSet)
+# ===========================================================================
+
+class TestSymBoundHelpers:
+    """``sym_*`` constructors + ``eval_bound`` round-trip.
+
+    These helpers underpin :class:`BoxSet` symbolic bounds.  Tests focus on
+    the contract: (a) concrete operands fold to a plain ``int``, (b) the
+    advertised MVP simplifications fire, (c) AST nodes evaluate to what
+    plain Python arithmetic would give once symbols are bound.
+    """
+
+    def test_concrete_operands_fold_to_int(self):
+        assert sym_add(2, 3) == 5
+        assert sym_neg(5) == -5
+        assert sym_max(3, 7) == 7
+        assert sym_min(3, 7) == 3
+
+    def test_mvp_simplifications(self):
+        s0 = ("sym", 0)
+        # additive identity
+        assert sym_add(0, s0) is s0
+        assert sym_add(s0, 0) is s0
+        # double negation collapses
+        assert sym_neg(("neg", s0)) is s0
+        # max/min idempotent on same SymRef (compare-by-value)
+        assert sym_max(s0, ("sym", 0)) == s0
+        assert sym_min(s0, ("sym", 0)) == s0
+
+    def test_int_operand_wrapped_as_const_node(self):
+        # When one side is symbolic, the int side gets wrapped so the AST
+        # is well-formed for ``_eval_node``.
+        s0 = ("sym", 0)
+        assert sym_add(5, s0) == ("add", ("const", 5), s0)
+        assert sym_max(0, s0) == ("max", ("const", 0), s0)
+        assert sym_min(s0, 10) == ("min", s0, ("const", 10))
+
+    def test_eval_bound_round_trip(self):
+        # eval_bound on plain int short-circuits (no ``symbols`` needed).
+        assert eval_bound(7, ()) == 7
+        # AST nodes evaluate to the same value as plain Python on the
+        # resolved symbols.  Covers sym, add, max, min, neg in one walk.
+        s0, s1 = ("sym", 0), ("sym", 1)
+        assert eval_bound(sym_add(s0, 1), [128]) == 129
+        assert eval_bound(sym_neg(s0), [3]) == -3
+        for a, b in [(3, 7), (-2, 0), (10, 5)]:
+            assert eval_bound(sym_max(s0, s1), [a, b]) == max(a, b)
+            assert eval_bound(sym_min(s0, s1), [a, b]) == min(a, b)

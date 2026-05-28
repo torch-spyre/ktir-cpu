@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .affine import AffineMap, AffineSet, BoxSet
 
@@ -75,6 +75,12 @@ from .affine import AffineMap, AffineSet, BoxSet
 #   ("sub",   node, node)
 #   ("neg",   node)           — unary negation
 #   ("mul",   int,  node)     — constant-coefficient multiplication
+#   ("max",   node, node)     — pointwise maximum (constructed by sym_max,
+#                               not the surface parser; used to express
+#                               symbolic ``BoxSet.lo`` after intersect)
+#   ("min",   node, node)     — pointwise minimum (constructed by sym_min,
+#                               not the surface parser; used to express
+#                               symbolic ``BoxSet.hi`` after intersect)
 # ---------------------------------------------------------------------------
 
 _Node = tuple
@@ -443,6 +449,10 @@ def _eval_node(node: _Node, dims: List[int], syms: Optional[List[int]] = None) -
         return -_eval_node(node[1], dims, syms)
     if tag == "mul":
         return node[1] * _eval_node(node[2], dims, syms)
+    if tag == "max":
+        return max(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
+    if tag == "min":
+        return min(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
     raise ValueError(f"Unknown AST node tag: {tag!r}")  # pragma: no cover
 
 
@@ -494,6 +504,108 @@ def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...], symbols: Seque
         )
     ranges = [range(s) for s in shape]
     return [pt for pt in itertools.product(*ranges) if affine_set_contains(aset, pt, symbols)]
+
+
+# ---------------------------------------------------------------------------
+# Symbolic bound helpers
+#
+# A ``Bound`` is either a Python ``int`` (concrete leaf) or an AST node
+# tuple representing an expression over symbol variables only (no ``dim``
+# nodes — bounds in :class:`BoxSet` are pure expressions of ``symbols``).
+# Concrete ints stay unwrapped so structural fast paths can identify them
+# with ``isinstance(b, int)`` rather than walking the AST.
+#
+# ``sym_*`` constructors apply the minimum constant folding needed to keep
+# ``intersect`` / ``translate`` from accumulating trivially redundant AST
+# nodes per partition (concrete fold of two ints; idempotence on the same
+# ``("sym", k)`` reference; additive identity).  Deeper canonicalisation
+# (commutativity, nested absorption) is intentionally out of scope — it
+# would need a structural-equality engine and the realistic candidate
+# count per axis is ≤ 2, so deep nesting does not arise.
+# ---------------------------------------------------------------------------
+
+Bound = Union[int, tuple]
+
+
+def eval_bound(b, symbols: Sequence[int]) -> int:
+    """Evaluate a :data:`Bound` against concrete *symbols*.
+
+    Concrete ``int`` bounds short-circuit without touching the AST.
+    Symbolic bounds delegate to :func:`_eval_node` with an empty ``dims``
+    environment — :class:`BoxSet` bounds never reference dimension
+    variables by construction.
+    """
+    if isinstance(b, int):
+        return b
+    return _eval_node(b, dims=[], syms=list(symbols))
+
+
+def sym_add(a, b):
+    """Build ``a + b`` over :data:`Bound` operands with constant folding.
+
+    Folds when both operands are concrete; absorbs additive identity
+    (``a + 0 → a``).  Otherwise constructs an ``("add", ...)`` AST node.
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return a + b
+    if isinstance(a, int) and a == 0:
+        return b
+    if isinstance(b, int) and b == 0:
+        return a
+    a_node = ("const", a) if isinstance(a, int) else a
+    b_node = ("const", b) if isinstance(b, int) else b
+    return ("add", a_node, b_node)
+
+
+def sym_neg(a):
+    """Build ``-a`` over a :data:`Bound` operand with constant folding."""
+    if isinstance(a, int):
+        return -a
+    # Double-negation collapses: -(-x) → x.  Cheap and avoids gratuitous
+    # nesting from ``-k`` on already-negative symbolic constants.
+    if a[0] == "neg":
+        return a[1]
+    return ("neg", a)
+
+
+def sym_max(a, b):
+    """Build ``max(a, b)`` over :data:`Bound` operands with MVP folding.
+
+    Folds when both operands are concrete.  Recognises identical
+    ``("sym", k)`` references as idempotent (``max(s_k, s_k) → s_k``).
+    No commutativity / nested-absorption rewriting — those would require
+    structural equality with canonicalisation (out of scope; per-axis
+    candidate count is ≤ 2 so deep nesting does not arise in practice).
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return max(a, b)
+    if (
+        not isinstance(a, int)
+        and not isinstance(b, int)
+        and a[0] == "sym" and b[0] == "sym" and a[1] == b[1]
+    ):
+        return a
+    a_node = ("const", a) if isinstance(a, int) else a
+    b_node = ("const", b) if isinstance(b, int) else b
+    return ("max", a_node, b_node)
+
+
+def sym_min(a, b):
+    """Build ``min(a, b)`` over :data:`Bound` operands with MVP folding.
+
+    Mirror of :func:`sym_max`; see that function for the folding rules.
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return min(a, b)
+    if (
+        not isinstance(a, int)
+        and not isinstance(b, int)
+        and a[0] == "sym" and b[0] == "sym" and a[1] == b[1]
+    ):
+        return a
+    a_node = ("const", a) if isinstance(a, int) else a
+    b_node = ("const", b) if isinstance(b, int) else b
+    return ("min", a_node, b_node)
 
 
 # ---------------------------------------------------------------------------

@@ -46,13 +46,17 @@ axis-aligned, fully-pinned, unit-coefficient, non-symbolic sets to
 ``AffineSet``.  ``parse_affine_set_raw`` skips the lowering for tests
 that need to inspect the AST directly.
 
-TODO: BoxSet does not yet compose with AffineSet's ``n_syms`` /
-``symbols`` parameters (added in PR #42 for dynamic-shape symbolic
-bounds).  ``try_from_affine_set`` currently rejects symbolic sets
-(``n_syms > 0``) so they stay on the AffineSet branch.  When symbolic
-boxes are needed, ``BoxSet.lo``/``hi`` will need to accept symbolic
-expressions and ``contains``/``enumerate`` will need to take a
-``symbols`` argument.
+Symbolic bounds: ``BoxSet.lo`` / ``hi`` may carry an integer constant
+(concrete leaf, fast path) or an AST node (a :data:`Bound` over symbol
+variables).  Per-axis operations that depend on a concrete value
+(``contains``, ``is_empty``, ``is_full``, ``enumerate``) take a
+``symbols`` argument that resolves the symbolic bounds; pure-int boxes
+short-circuit on the ``_all_concrete`` flag and ignore ``symbols``.
+``try_from_affine_set`` lowers symbolic axis-aligned sets — see its
+docstring for the accepted constraint shape.  Geometric operations
+(``intersect``, ``translate``) use :func:`parser_ast.sym_max` /
+``sym_min`` / ``sym_add`` so concrete-on-concrete cases stay O(ndim)
+without constructing AST nodes.
 
 TODO: ``parse_affine_set_raw`` (in ``parser_ast.py``) exists only because
 ``parse_affine_set`` now lowers axis-aligned inputs to ``BoxSet`` by
@@ -68,12 +72,18 @@ until after C4 to keep this commit faithful to backup.
 from __future__ import annotations
 
 import itertools
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
 
 if TYPE_CHECKING:
     # Avoid circular import at runtime; parser_ast imports nothing from here.
     from .parser_ast import _Node
+
+
+# A bound on a single axis of :class:`BoxSet`.  ``int`` is the concrete leaf
+# (fast path); a tuple is an AST node over symbol variables, evaluated by
+# :func:`parser_ast.eval_bound`.
+Bound = Union[int, tuple]
 
 
 @dataclass(frozen=True)
@@ -226,27 +236,60 @@ class BoxSet:
     visible at each call site via ``isinstance`` dispatch, not hidden
     behind polymorphism.  Mixed-type operations — e.g.
     ``BoxSet.intersect(aset: AffineSet)`` — raise ``TypeError``.
+
+    Symbolic bounds: ``lo[d]`` / ``hi[d]`` may be an ``int`` (concrete)
+    or an AST node tuple over symbol variables (see :data:`Bound` and
+    :func:`parser_ast.eval_bound`).  Whether the box is fully concrete
+    is cached in :attr:`_all_concrete` at construction so the hot path
+    (per-axis ``contains`` / ``is_empty``) skips ``isinstance`` checks
+    on every element.
     """
-    lo: Tuple[int, ...]   # inclusive
-    hi: Tuple[int, ...]   # exclusive
+    lo: Tuple["Bound", ...]   # inclusive
+    hi: Tuple["Bound", ...]   # exclusive
+    # Cached at __post_init__: True iff every entry in lo/hi is a plain int.
+    # ``compare=False`` keeps equality / hashing keyed off the bounds alone
+    # (the flag is a derived property).  ``init=False`` so callers don't pass it.
+    _all_concrete: bool = field(default=False, init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if len(self.lo) != len(self.hi):
             raise ValueError(
                 f"BoxSet: lo/hi length mismatch: lo={self.lo} hi={self.hi}"
             )
+        all_concrete = all(isinstance(b, int) for b in self.lo) and all(
+            isinstance(b, int) for b in self.hi
+        )
+        # Frozen dataclass: bypass the descriptor to set the cached flag once.
+        object.__setattr__(self, "_all_concrete", all_concrete)
 
     @property
     def n_dims(self) -> int:
         return len(self.lo)
 
-    def contains(self, point: Sequence[int]) -> bool:
-        """True iff ``lo[d] <= point[d] < hi[d]`` for every dim."""
+    def contains(self, point: Sequence[int], symbols: Sequence[int] = ()) -> bool:
+        """True iff ``lo[d] <= point[d] < hi[d]`` for every dim.
+
+        ``symbols`` is required to resolve symbolic bounds; concrete
+        boxes ignore it (the ``_all_concrete`` flag short-circuits the
+        AST walk).  Passing too few symbols on a symbolic box raises
+        ``IndexError`` (from :func:`parser_ast.eval_bound`) — the
+        contract matches :meth:`AffineSet.contains`.
+        """
         if len(point) != self.n_dims:
             return False
-        return all(self.lo[d] <= point[d] < self.hi[d] for d in range(self.n_dims))
+        if self._all_concrete:
+            return all(self.lo[d] <= point[d] < self.hi[d] for d in range(self.n_dims))
+        from .parser_ast import eval_bound
+        return all(
+            eval_bound(self.lo[d], symbols) <= point[d] < eval_bound(self.hi[d], symbols)
+            for d in range(self.n_dims)
+        )
 
-    def enumerate(self, shape: Optional[Tuple[int, ...]] = None) -> List[Tuple[int, ...]]:
+    def enumerate(
+        self,
+        shape: Optional[Tuple[int, ...]] = None,
+        symbols: Sequence[int] = (),
+    ) -> List[Tuple[int, ...]]:
         """Return all integer points in the box in row-major order.
 
         ``shape`` is accepted for signature parity with
@@ -254,50 +297,113 @@ class BoxSet:
         for its brute-force iteration).  A ``BoxSet`` is self-bounded,
         so ``shape`` only serves as a sanity check: passed values must
         upper-bound ``hi`` componentwise.
+
+        Symbolic boxes are resolved against ``symbols`` by specialising
+        once before enumerating; concrete boxes skip that step.
         """
+        box = self if self._all_concrete else self.specialize(symbols)
         if shape is not None:
-            if len(shape) != self.n_dims:
+            if len(shape) != box.n_dims:
                 raise ValueError(
                     f"BoxSet.enumerate: shape ndim {len(shape)} does not "
-                    f"match box ndim {self.n_dims}"
+                    f"match box ndim {box.n_dims}"
                 )
-            for d in range(self.n_dims):
-                if self.hi[d] > shape[d]:
+            for d in range(box.n_dims):
+                if box.hi[d] > shape[d]:
                     raise ValueError(
-                        f"BoxSet.enumerate: hi[{d}]={self.hi[d]} exceeds "
+                        f"BoxSet.enumerate: hi[{d}]={box.hi[d]} exceeds "
                         f"shape[{d}]={shape[d]} — box is not contained in "
                         f"the nominal bounding box."
                     )
-        return list(itertools.product(*(range(self.lo[d], self.hi[d]) for d in range(self.n_dims))))
+        return list(itertools.product(*(range(box.lo[d], box.hi[d]) for d in range(box.n_dims))))
 
-    def is_empty(self) -> bool:
-        """True iff any axis has ``hi[d] <= lo[d]`` (i.e. empty extent)."""
-        return any(self.hi[d] <= self.lo[d] for d in range(self.n_dims))
+    def is_empty(self, symbols: Sequence[int] = ()) -> bool:
+        """True iff any axis has ``hi[d] <= lo[d]`` (i.e. empty extent).
 
-    def is_full(self, shape: Tuple[int, ...]) -> bool:
-        """True iff this box equals ``[0, shape)``."""
+        On symbolic boxes the per-axis comparison is done after resolving
+        the bounds against ``symbols``.
+        """
+        if self._all_concrete:
+            return any(self.hi[d] <= self.lo[d] for d in range(self.n_dims))
+        from .parser_ast import eval_bound
+        return any(
+            eval_bound(self.hi[d], symbols) <= eval_bound(self.lo[d], symbols)
+            for d in range(self.n_dims)
+        )
+
+    def is_full(
+        self, shape: Tuple[int, ...], symbols: Sequence[int] = ()
+    ) -> bool:
+        """True iff this box equals ``[0, shape)``.
+
+        On symbolic boxes the comparison can only be answered for
+        concrete shapes after resolving against ``symbols`` (a tuple
+        equality on AST nodes would always fail structurally even when
+        the runtime extent matches).
+        """
         if len(shape) != self.n_dims:
             return False
-        return self.lo == (0,) * self.n_dims and tuple(self.hi) == tuple(shape)
+        if self._all_concrete:
+            return self.lo == (0,) * self.n_dims and tuple(self.hi) == tuple(shape)
+        return self.specialize(symbols).is_full(shape)
 
-    def lower_bounds(self) -> Tuple[int, ...]:
-        """Return ``lo`` — the per-axis minimum coordinate, O(1)."""
-        return self.lo
+    def lower_bounds(self, symbols: Sequence[int] = ()) -> Tuple[int, ...]:
+        """Return ``lo`` — the per-axis minimum coordinate, O(1) when concrete.
 
-    def translate(self, offset: Sequence[int]) -> "BoxSet":
-        """Return a new box shifted by *offset* along each axis."""
+        ``symbols`` is accepted for signature parity with :meth:`contains`
+        / :meth:`is_empty` / :meth:`enumerate` so call sites can thread a
+        single ``symbols`` tuple uniformly through the API.  On a concrete
+        box the cached ``_all_concrete`` flag short-circuits and returns
+        ``self.lo`` directly; on a symbolic box each entry is resolved
+        against ``symbols`` so the return type is always a tuple of
+        ``int``.
+        """
+        if self._all_concrete:
+            return self.lo  # type: ignore[return-value]
+        from .parser_ast import eval_bound
+        return tuple(eval_bound(b, symbols) for b in self.lo)
+
+    def specialize(self, symbols: Sequence[int]) -> "BoxSet":
+        """Return a concrete ``BoxSet`` with all symbolic bounds resolved.
+
+        Concrete boxes return ``self`` unchanged (cached flag check, no
+        copy).  Used at the boundary between symbolic-IR-time and
+        runtime-resolved values — see ``MemoryOps.distributed_tile_access``.
+        """
+        if self._all_concrete:
+            return self
+        from .parser_ast import eval_bound
+        return BoxSet(
+            lo=tuple(eval_bound(b, symbols) for b in self.lo),
+            hi=tuple(eval_bound(b, symbols) for b in self.hi),
+        )
+
+    def translate(self, offset: Sequence["Bound"]) -> "BoxSet":
+        """Return a new box shifted by *offset* along each axis.
+
+        ``offset`` may carry symbolic entries; ``sym_add`` folds the
+        concrete-on-concrete case so a static box translated by a static
+        offset stays fully concrete.
+        """
         if len(offset) != self.n_dims:
             raise ValueError(
                 f"BoxSet.translate: offset dim mismatch: "
                 f"offset={tuple(offset)} n_dims={self.n_dims}"
             )
+        from .parser_ast import sym_add
         return BoxSet(
-            lo=tuple(self.lo[d] + offset[d] for d in range(self.n_dims)),
-            hi=tuple(self.hi[d] + offset[d] for d in range(self.n_dims)),
+            lo=tuple(sym_add(self.lo[d], offset[d]) for d in range(self.n_dims)),
+            hi=tuple(sym_add(self.hi[d], offset[d]) for d in range(self.n_dims)),
         )
 
     def intersect(self, other: "BoxSet") -> "BoxSet":
-        """Axis-wise intersection; result may be empty (``is_empty()``)."""
+        """Axis-wise intersection; result may be empty (``is_empty()``).
+
+        Uses ``sym_max`` / ``sym_min`` so concrete-on-concrete intersects
+        fold to ints (no AST allocation), while symbolic operands keep
+        their symbols in the result for evaluation against ``symbols``
+        later.
+        """
         if not isinstance(other, BoxSet):
             raise TypeError(
                 f"BoxSet.intersect: mixed-type intersection not supported "
@@ -308,9 +414,10 @@ class BoxSet:
             raise ValueError(
                 f"BoxSet.intersect: n_dims mismatch {self.n_dims} vs {other.n_dims}"
             )
+        from .parser_ast import sym_max, sym_min
         return BoxSet(
-            lo=tuple(max(self.lo[d], other.lo[d]) for d in range(self.n_dims)),
-            hi=tuple(min(self.hi[d], other.hi[d]) for d in range(self.n_dims)),
+            lo=tuple(sym_max(self.lo[d], other.lo[d]) for d in range(self.n_dims)),
+            hi=tuple(sym_min(self.hi[d], other.hi[d]) for d in range(self.n_dims)),
         )
 
     @classmethod
@@ -319,40 +426,49 @@ class BoxSet:
 
         Returns ``None`` when the set is not representable as an integer
         box.  Lowering succeeds iff every constraint has the form
-        ``c * d_i + k >= 0`` with ``c ∈ {+1, -1}`` (single dim, unit coeff)
-        and every axis is pinned on **both** sides (at least one ``+d_i``
-        and one ``-d_i`` constraint).
+        ``c * d_i + k(syms) >= 0`` with ``c ∈ {+1, -1}`` (single dim,
+        unit coeff) and every axis is pinned on **both** sides (at least
+        one ``+d_i`` and one ``-d_i`` constraint).  ``k(syms)`` may be
+        an integer constant or a linear combination of symbol variables
+        and integers — in the symbolic case the resulting ``lo`` / ``hi``
+        carry an AST node (see :data:`Bound`) instead of a plain ``int``.
 
-        TODO: symbolic sets (``aset.n_syms > 0``, added by PR #42 for
-        dynamic shapes) are rejected here — they stay on the AffineSet
-        branch.  Lifting this would require BoxSet to carry symbolic
-        bounds and a ``symbols`` argument on contains/enumerate to
-        compose with AffineSet's signature.  ``getattr`` keeps this
-        correct on older AffineSet objects without ``n_syms``.
+        Bounds on the same axis that come from multiple constraints are
+        combined with ``max`` (lo) / ``min`` (hi) — see
+        :func:`sym_max` / :func:`sym_min` for the MVP folding.
+
+        Assumes all symbols ``s_i >= 0`` (matches dim-size semantics).
+        Constraints with non-``±1`` dim coefficients, dim coefficients
+        that themselves carry a symbol, or non-linear symbol products
+        cause this function to return ``None`` so the set stays on the
+        AffineSet slow path.
         """
-        if getattr(aset, "n_syms", 0) != 0:
-            return None
+        from .parser_ast import sym_add, sym_max, sym_min, sym_neg
+
         n = aset.n_dims
-        los: List[Optional[int]] = [None] * n
-        his: List[Optional[int]] = [None] * n
+        n_syms = aset.n_syms
+        los: List[Optional["Bound"]] = [None] * n
+        his: List[Optional["Bound"]] = [None] * n
         for c in aset.constraints:
-            lin = _constraint_to_linear(c, n)
+            lin = _constraint_to_linear_syms(c, n, n_syms)
             if lin is None:
                 return None
-            coeffs, const = lin
-            nz = [i for i, k in enumerate(coeffs) if k != 0]
+            dim_coeffs, sym_coeffs, const = lin
+            nz = [i for i, k in enumerate(dim_coeffs) if k != 0]
             if len(nz) != 1:
                 return None
             i = nz[0]
-            k = coeffs[i]
+            k = dim_coeffs[i]
+            # Build k(syms) as a Bound: int constant + sum(sym_coeffs[j] * s_j).
+            sym_term = _build_sym_term(sym_coeffs, const)
             if k == 1:
-                # d_i + const >= 0  →  d_i >= -const
-                candidate = -const
-                los[i] = candidate if los[i] is None else max(los[i], candidate)
+                # d_i + k(syms) >= 0  →  d_i >= -k(syms)
+                candidate = sym_neg(sym_term)
+                los[i] = candidate if los[i] is None else sym_max(los[i], candidate)
             elif k == -1:
-                # -d_i + const >= 0  →  d_i <= const  →  hi = const + 1
-                candidate = const + 1
-                his[i] = candidate if his[i] is None else min(his[i], candidate)
+                # -d_i + k(syms) >= 0  →  d_i <= k(syms)  →  hi = k(syms) + 1
+                candidate = sym_add(sym_term, 1)
+                his[i] = candidate if his[i] is None else sym_min(his[i], candidate)
             else:
                 return None
         if any(v is None for v in los) or any(v is None for v in his):
@@ -405,6 +521,19 @@ def _constraint_to_linear(node: "_Node", n_dims: int) -> Optional[Tuple[List[int
     dimension variables and integer constants (e.g. contains ``sym`` or
     ``ref`` atoms).  The constraint represents
     ``sum(coeffs[i] * d_i) + const >= 0``.
+
+    Symbolic constraints (``sym`` atoms) take the AffineSet branch — see
+    :func:`_constraint_to_linear_syms` for the variant that accepts them.
+
+    .. warning::
+        The walk in this function is intentionally near-duplicated by
+        :func:`_constraint_to_linear_syms` so that this dim-only flattener
+        — exercised on a hot path by :func:`_match_pure_dim_ref` — stays
+        unchanged in shape and call signature.  When extending the AST
+        with new node types (e.g. ``floordiv``), update **both** walkers
+        in lockstep; the dim-only one will silently miscompile new shapes
+        otherwise.  Consolidating the two via a thin wrapper is tracked
+        as a follow-up.
     """
     coeffs = [0] * n_dims
     const_box = [0]
@@ -439,3 +568,94 @@ def _constraint_to_linear(node: "_Node", n_dims: int) -> Optional[Tuple[List[int
     if not walk(node, 1):
         return None
     return coeffs, const_box[0]
+
+
+def _build_sym_term(sym_coeffs: List[int], const: int) -> "Bound":
+    """Reassemble a ``Bound`` from ``sum(sym_coeffs[j] * s_j) + const``.
+
+    Returns a plain ``int`` when no symbol contributes (every coefficient
+    is zero) — the structural fast path on concrete bounds depends on
+    that.  Otherwise returns an AST node tuple suitable for evaluation
+    by :func:`parser_ast.eval_bound`.
+    """
+    from .parser_ast import sym_add, sym_neg
+
+    expr: "Bound" = const
+    for j, c in enumerate(sym_coeffs):
+        if c == 0:
+            continue
+        term: "Bound" = ("sym", j)
+        if c == -1:
+            term = sym_neg(term)
+        elif c != 1:
+            term = ("mul", c, ("sym", j))
+        expr = sym_add(expr, term)
+    return expr
+
+
+def _constraint_to_linear_syms(
+    node: "_Node", n_dims: int, n_syms: int
+) -> Optional[Tuple[List[int], List[int], int]]:
+    """Flatten a parsed constraint AST into ``(dim_coeffs, sym_coeffs, const)``.
+
+    Symbol-aware variant of :func:`_constraint_to_linear`.  The constraint
+    represents
+    ``sum(dim_coeffs[i] * d_i) + sum(sym_coeffs[j] * s_j) + const >= 0``.
+
+    Returns ``None`` if the expression isn't separable into that form
+    — e.g. a ``ref`` atom appears, or a sym × dim product is constructed
+    at the AST layer (the surface parser cannot produce
+    ``("mul", sym, dim)`` since the first ``mul`` operand must be an
+    int literal, but the walker still rejects defensively).  Used by
+    :meth:`BoxSet.try_from_affine_set` to lower symbolic axis-aligned
+    sets — kept as a sibling of :func:`_constraint_to_linear` rather
+    than replacing it so the dim-only flattener used on a hot path by
+    :func:`_match_pure_dim_ref` is byte-identical to its pre-issue-#51
+    shape.  See that function's warning for the AST-extension contract.
+    """
+    dim_coeffs = [0] * n_dims
+    sym_coeffs = [0] * n_syms
+    const_box = [0]
+
+    def walk(n: "_Node", sign: int) -> bool:
+        tag = n[0]
+        if tag == "const":
+            const_box[0] += sign * n[1]
+            return True
+        if tag == "dim":
+            dim_coeffs[n[1]] += sign
+            return True
+        if tag == "sym":
+            j = n[1]
+            if j >= n_syms:
+                return False
+            sym_coeffs[j] += sign
+            return True
+        if tag == "add":
+            return walk(n[1], sign) and walk(n[2], sign)
+        if tag == "sub":
+            return walk(n[1], sign) and walk(n[2], -sign)
+        if tag == "neg":
+            return walk(n[1], -sign)
+        if tag == "mul":
+            coef = n[1]
+            inner = n[2]
+            if inner[0] == "dim":
+                dim_coeffs[inner[1]] += sign * coef
+                return True
+            if inner[0] == "sym":
+                j = inner[1]
+                if j >= n_syms:
+                    return False
+                sym_coeffs[j] += sign * coef
+                return True
+            if inner[0] == "const":
+                const_box[0] += sign * coef * inner[1]
+                return True
+            return False
+        # 'ref' or anything else — not a separable linear combination.
+        return False
+
+    if not walk(node, 1):
+        return None
+    return dim_coeffs, sym_coeffs, const_box[0]

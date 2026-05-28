@@ -607,6 +607,104 @@ def test_distributed_tile_access_fast_path_emits_box_set():
 
 
 # ---------------------------------------------------------------------------
+# Symbolic-shape variant of the structural fast-path assertion (issue #51)
+#
+# Pure ops-layer test: each partition's row extent is given symbolically
+# (``[0, s_0)`` and ``[s_0, 2*s_0)``); the test specialises both manually
+# before handing the partitions to ``distributed_tile_access``.  This
+# verifies the GEOMETRY ``distributed_tile_access`` produces on already-
+# concrete symbolic-derived partitions plus the
+# ``survivor.coordinate_set is BoxSet`` regression guard the issue test
+# plan asks for.
+#
+# It does NOT exercise the dialect handler's symbol-binding step — the
+# ``specialize(P0_shape)`` call here passes the full per-partition shape
+# tuple, which only happens to coincide with the right symbol values
+# because the symbolic dim is leading (``s_0`` == ``shape[0]``).  The
+# binding-source verification (and a regression for the trailing-``?``
+# case where ``shape[0]`` is the wrong source) lives in
+# ``test_dialects_exec.py::TestKtdp``.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("partition_rows", [2, 4, 8])
+def test_distributed_tile_access_dynamic_shape_emits_box_set(partition_rows):
+    """Geometry + ``is BoxSet`` survivor check on symbolic-derived partitions.
+
+    Parametrised over partition row counts to exercise the lowering and
+    intersect on a few concrete values.  Pure ops-layer — see the module
+    comment for why the binding source isn't verified here.
+    """
+    from ktir_cpu.affine import AffineMap, BoxSet
+    from ktir_cpu.ir_types import DistributedMemRef, MemRef
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map, parse_affine_set
+
+    # Symbolic partition extents:
+    #   B0 = rows [0, s0), cols [0, 3]
+    #   B1 = rows [s0, 2*s0), cols [0, 3]
+    B0_sym = parse_affine_set(
+        "affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0, d1 >= 0, -d1 + 3 >= 0)>"
+    )
+    B1_sym = parse_affine_set(
+        "affine_set<(d0, d1)[s0] : (d0 - s0 >= 0, -d0 + 2*s0 - 1 >= 0, d1 >= 0, -d1 + 3 >= 0)>"
+    )
+    assert isinstance(B0_sym, BoxSet) and not B0_sym._all_concrete
+    assert isinstance(B1_sym, BoxSet) and not B1_sym._all_concrete
+
+    # Specialise manually before constructing the DistributedMemRef.  This
+    # leans on the per-partition row count being the leading dim so a
+    # plain ``shape`` tuple happens to be the right symbols tuple — see
+    # module comment for the caveat.
+    P0_shape = (partition_rows, 4)
+    P1_shape = (partition_rows, 4)
+    B0 = B0_sym.specialize(P0_shape)
+    B1 = B1_sym.specialize(P1_shape)
+    assert B0._all_concrete and B1._all_concrete
+
+    P0 = MemRef(
+        base_ptr=0, shape=P0_shape, strides=[4, 1],
+        memory_space="HBM", coordinate_set=B0,
+    )
+    P1 = MemRef(
+        base_ptr=P0_shape[0] * 4 * 2, shape=P1_shape, strides=[4, 1],
+        memory_space="HBM", coordinate_set=B1,
+    )
+    total_rows = 2 * partition_rows
+    dist = DistributedMemRef(
+        partitions=[P0, P1], shape=(total_rows, 4), dtype="f16",
+    )
+
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    assert isinstance(base_map, AffineMap)
+    out = MemoryOps.distributed_tile_access(
+        dist_ref=dist,
+        access_shape=(total_rows, 4),
+        base_map=base_map,
+        indices=[0, 0],
+        access_tile_set=None,
+    )
+
+    # Both partitions survive a full-tile access; each survivor's
+    # coordinate_set must be BoxSet — the regression guard the issue
+    # test plan asks for.
+    assert len(out.partitions) == 2
+    for part in out.partitions:
+        assert isinstance(part.coordinate_set, BoxSet), (
+            f"dynamic-shape fast path must store BoxSet in coordinate_set, "
+            f"got {type(part.coordinate_set).__name__}"
+        )
+    # Geometry derived from the resolved sizes — no hand-coded constants.
+    assert out.partitions[0].coordinate_set == BoxSet(
+        lo=(0, 0), hi=(partition_rows, 4)
+    )
+    assert out.partitions[1].coordinate_set == BoxSet(
+        lo=(partition_rows, 0), hi=(2 * partition_rows, 4)
+    )
+    assert out.partitions[0].partition_origin == (0, 0)
+    assert out.partitions[1].partition_origin == (partition_rows, 0)
+
+
+# ---------------------------------------------------------------------------
 # distributed_tile_access fast/slow path: verified against a static fixture
 #
 # Scenario (shared by both tests below):
