@@ -46,11 +46,12 @@ CoordinateSet = Union[BoxSet, AffineSet, List[Tuple[int, ...]]]
 class MemRef:
     """Hardware-aware memory view (result of construct_memory_view).
 
-    Represents a logical view over allocated memory.  ``base_ptr`` is a
-    stick index for HBM or a byte address for LX.  Use ``byte_address``
-    to get the absolute byte position regardless of memory space.
+    Represents a logical view over allocated memory.  ``base_ptr`` is an
+    element index — the number of elements from the start of the address
+    space, matching what MLIR pointer operands carry.  Use ``byte_address``
+    to get the absolute byte position for load/store.
     """
-    base_ptr: int              # stick index (HBM) or byte address (LX)
+    base_ptr: int              # element index (both HBM and LX)
     shape: Tuple[int, ...]
     strides: List[int]         # element counts
     memory_space: str          # "HBM" or "LX"
@@ -82,10 +83,8 @@ class MemRef:
     @property
     def byte_address(self) -> int:
         """Absolute byte address of this memref's base in its memory space."""
-        if self.memory_space == "HBM":
-            from .memory import HBMSimulator
-            return self.base_ptr * HBMSimulator.STICK_BYTES
-        return self.base_ptr
+        from .dtypes import bytes_per_elem
+        return self.base_ptr * bytes_per_elem(self.dtype)
 
     def to_tile_ref(self) -> 'TileRef':
         """Convert to a byte-addressed TileRef for load/store operations."""

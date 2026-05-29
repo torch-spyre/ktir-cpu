@@ -73,9 +73,9 @@ SMALL_INDIRECT_MLIR = """
 module {
   func.func @small_indirect_gather() attributes {grid = [1, 1]} {
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 1 : index
-    %IDX2_addr = arith.constant 2 : index
-    %Y_addr    = arith.constant 3 : index
+    %IDX1_addr = arith.constant 32 : index
+    %IDX2_addr = arith.constant 64 : index
+    %Y_addr    = arith.constant 192 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
@@ -168,7 +168,7 @@ _SSA_NONZERO_RANGE_MLIR = """
 module {
   func.func @bad_indirect() attributes {grid = [1, 1]} {
     %X_addr   = arith.constant 0   : index
-    %IDX_addr = arith.constant 64  : index
+    %IDX_addr = arith.constant 2048 : index
     %c2       = arith.constant 2   : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
@@ -200,7 +200,7 @@ _SSA_ZERO_RANGE_MLIR = """
 module {
   func.func @ok_indirect() attributes {grid = [1, 1]} {
     %X_addr   = arith.constant 0   : index
-    %IDX_addr = arith.constant 64  : index
+    %IDX_addr = arith.constant 2048 : index
     %c2       = arith.constant 2   : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
@@ -322,9 +322,9 @@ SMALL_INDIRECT_SCATTER_MLIR = """
 module {
   func.func @small_indirect_scatter() attributes {grid = [1, 1]} {
     %X_addr    = arith.constant 0 : index
-    %IDX1_addr = arith.constant 1 : index
-    %IDX2_addr = arith.constant 2 : index
-    %Y_addr    = arith.constant 3 : index
+    %IDX1_addr = arith.constant 32 : index
+    %IDX2_addr = arith.constant 64 : index
+    %Y_addr    = arith.constant 192 : index
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,

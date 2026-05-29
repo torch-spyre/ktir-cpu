@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 
 from ktir_cpu import KTIRInterpreter
+from ktir_cpu.dtypes import stick_to_elem_idx
 from conftest import get_test_params
 
 
@@ -41,11 +42,14 @@ from conftest import get_test_params
 # ---------------------------------------------------------------------------
 
 def _write_strided(mem, base_ptr: int, block: np.ndarray, strides: List[int]):
-    """Write *block* (f16) into *mem* at *base_ptr* using *strides* (element units).
+    """Write *block* (f16) into *mem* at *base_ptr* (element index) using *strides* (element units).
 
     Element (i, j) lands at byte offset ``(base_ptr + (i*strides[0] + j*strides[1])) * 2``.
     Holes from non-contiguous layouts are left as zero.
+    For HBM, *base_ptr* is converted to a stick index before writing.
+    For LX, *base_ptr* is converted to a byte address before writing.
     """
+    from ktir_cpu.memory import HBMSimulator
     assert block.dtype == np.float16
     ndim = block.ndim
     assert len(strides) == ndim
@@ -55,7 +59,12 @@ def _write_strided(mem, base_ptr: int, block: np.ndarray, strides: List[int]):
     span = int(offsets.max()) + 1 if offsets.size else 1
     buf = np.zeros(span, dtype=np.float16)
     buf[offsets] = block.flatten()
-    mem.write(base_ptr, buf)
+    if isinstance(mem, HBMSimulator):
+        byte_addr = base_ptr * 2  # f16
+        stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
+        mem.write(stick, buf, intra_byte=intra)
+    else:
+        mem.write(base_ptr * 2, buf)
 
 
 def _get_mem(interp, space: str):
@@ -482,7 +491,8 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
         p1_mem = _get_mem(interp, p1.memory_space)
         _write_strided(p0_mem, p0.base_ptr, p0_block.copy(), p0.strides)
         _write_strided(p1_mem, p1.base_ptr, p1_block.copy(), p1.strides)
-        interp.memory.hbm.write(spec.out_ptr, np.zeros(ac[0] * ac[1], dtype=np.float16))
+        out_stick = (spec.out_ptr * 2) // interp.memory.hbm.STICK_BYTES
+        interp.memory.hbm.write(out_stick, np.zeros(ac[0] * ac[1], dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function("dist_copy")
@@ -490,7 +500,8 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
     r0, c0 = idx[0], idx[1]
     expected = full[r0:r0 + ac[0], c0:c0 + ac[1]]
     n_out = ac[0] * ac[1]
-    actual = interp.memory.hbm.read(spec.out_ptr, n_out, "f16").reshape(ac)
+    out_stick = (spec.out_ptr * 2) // interp.memory.hbm.STICK_BYTES
+    actual = interp.memory.hbm.read(out_stick, n_out, "f16").reshape(ac)
     return expected, actual
 
 
@@ -518,22 +529,26 @@ def test_distributed_view_copy_rfc(path, func_name, entry):
         lx0 = interp.memory.get_lx(0)
         lx1 = interp.memory.get_lx(1)
         full = np.arange(192 * 64, dtype=np.float16).reshape(192, 64)
+        # MLIR constants are element indices (f16, 2 bytes/elem).
+        # A_HBM_addr=0  → byte 0   → stick 0
+        # A_LX0_addr=12288 → byte 24576 (via _write_strided element-index path)
+        # A_LX1_addr=16384 → byte 32768
+        # B_addr=24576 → byte 49152 → stick 384
         hbm.write(0, full[0:96, :].flatten())
         _write_strided(lx0, 12288, full[96:128, :].copy(), strides=[1, 64])
-        lx1.write(16384, full[128:192, :].flatten())
-        hbm.write(24576, np.zeros(192 * 64, dtype=np.float16))
-        # Advance each LX next_ptr past its seeded region so that _write_to_lx
-        # staging (which bumps from next_ptr upward) does not overwrite source data.
-        # lx0 seeded at 12288, col-packed span = 31 + 63*64 + 1 = 4064 elems = 8128 bytes
-        # lx1 seeded at 16384, row-major span = 64*64 = 4096 elems = 8192 bytes
-        lx0.next_ptr = 12288 + 8128
-        lx1.next_ptr = 16384 + 8192
+        lx1.write(16384 * 2, full[128:192, :].flatten())
+        hbm.write(24576 * 2 // hbm.STICK_BYTES, np.zeros(192 * 64, dtype=np.float16))
+        # Advance each LX next_ptr past its seeded region.
+        # lx0 seeded at byte 24576, col-packed span = 31 + 63*64 + 1 = 4064 elems = 8128 bytes
+        # lx1 seeded at byte 32768, row-major span = 64*64 = 4096 elems = 8192 bytes
+        lx0.next_ptr = 16384 * 2 + 8128
+        lx1.next_ptr = 16384 * 2 + 8192
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
     expected = np.arange(192 * 64, dtype=np.float16).reshape(192, 64)
-    b = interp.memory.hbm.read(24576, 192 * 64, "f16").reshape(192, 64)
+    b = interp.memory.hbm.read(24576 * 2 // interp.memory.hbm.STICK_BYTES, 192 * 64, "f16").reshape(192, 64)
     np.testing.assert_array_equal(b, expected)
 
 
@@ -796,9 +811,9 @@ def test_distributed_store_does_not_trample_outside_C_i():
     B1 = parse_affine_set("affine_set<(d0, d1) : (d0 - 8 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
     assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
 
-    P0 = MemRef(base_ptr=P0_STICK, shape=PART_SHAPE, strides=[NCOLS, 1],
+    P0 = MemRef(base_ptr=stick_to_elem_idx(P0_STICK, DTYPE), shape=PART_SHAPE, strides=[NCOLS, 1],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
-    P1 = MemRef(base_ptr=P1_STICK, shape=PART_SHAPE, strides=[NCOLS, 1],
+    P1 = MemRef(base_ptr=stick_to_elem_idx(P1_STICK, DTYPE), shape=PART_SHAPE, strides=[NCOLS, 1],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
     dist = DistributedMemRef(partitions=[P0, P1], shape=(16, 16), dtype=DTYPE)
 
@@ -878,9 +893,9 @@ def test_distributed_store_col_packed_does_not_trample_outside_C_i():
     assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
 
     # strides=[1, NROWS] → column-packed: element (r, c) at offset r + c*NROWS.
-    P0 = MemRef(base_ptr=P0_STICK, shape=PART_SHAPE, strides=[1, NROWS],
+    P0 = MemRef(base_ptr=stick_to_elem_idx(P0_STICK, DTYPE), shape=PART_SHAPE, strides=[1, NROWS],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
-    P1 = MemRef(base_ptr=P1_STICK, shape=PART_SHAPE, strides=[1, NROWS],
+    P1 = MemRef(base_ptr=stick_to_elem_idx(P1_STICK, DTYPE), shape=PART_SHAPE, strides=[1, NROWS],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
     dist = DistributedMemRef(partitions=[P0, P1], shape=(16, 16), dtype=DTYPE)
 

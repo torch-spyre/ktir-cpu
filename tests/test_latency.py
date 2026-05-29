@@ -22,6 +22,7 @@ import pytest
 from pathlib import Path
 
 from ktir_cpu import KTIRInterpreter, HardwareConfig, LatencyReport
+from ktir_cpu.dtypes import stick_to_elem_idx
 
 from conftest import EXAMPLES_DIR, get_test_params, parse_example
 
@@ -1391,10 +1392,10 @@ class TestIndirectAccessLatency:
         lx = LXScratchpad(core_id=0)
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=HBMSimulator())
 
-        parent_ptr = 0
-        idx_ptr = 64  # past parent's 8 f16 = 16 bytes; safe non-overlap
-        lx.write(parent_ptr, np.zeros(8, dtype=np.float16))  # seed for read-modify-write
-        lx.write(idx_ptr, np.arange(4, dtype=np.int32))
+        parent_ptr = 0   # element index 0 → byte 0 (f16)
+        idx_ptr = 16     # element index 16 → byte 64 (i32, 4 bytes); past parent's 8 f16 = 16 bytes
+        lx.write(parent_ptr * 2, np.zeros(8, dtype=np.float16))   # seed at byte 0
+        lx.write(idx_ptr * 4, np.arange(4, dtype=np.int32))       # seed at byte 64
 
         parent_ref = MemRef(
             base_ptr=parent_ptr, shape=(8,), strides=[1],
@@ -1493,11 +1494,11 @@ class TestIndirectAccessLatency:
         hbm.write(idx1_stick, np.zeros(64, dtype=np.int32))
         hbm.write(idx2_stick, np.zeros(64, dtype=np.int32))
 
-        parent = MemRef(base_ptr=x_stick, shape=(8, 8), strides=[8, 1],
+        parent = MemRef(base_ptr=stick_to_elem_idx(x_stick, "f16"), shape=(8, 8), strides=[8, 1],
                         memory_space="HBM", dtype="f16")
-        idx1 = MemRef(base_ptr=idx1_stick, shape=(8, 8), strides=[8, 1],
+        idx1 = MemRef(base_ptr=stick_to_elem_idx(idx1_stick, "i32"), shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
-        idx2 = MemRef(base_ptr=idx2_stick, shape=(8, 8), strides=[8, 1],
+        idx2 = MemRef(base_ptr=stick_to_elem_idx(idx2_stick, "i32"), shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
 
         iat = IndirectAccessTile(

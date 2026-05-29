@@ -32,7 +32,7 @@ from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
 
-from .dtypes import to_ktir_dtype as _ktir_dtype
+from .dtypes import to_ktir_dtype as _ktir_dtype, stick_to_elem_idx as _stick_to_elem_idx
 
 
 class KTIRInterpreter:
@@ -150,12 +150,16 @@ class KTIRInterpreter:
         # Allocate input tensors in HBM
         input_ptrs = {}
         input_dtypes = {}
+        input_sticks = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
+                dtype = _ktir_dtype(tensor.dtype)
                 stick = self.memory.hbm.allocate(tensor.nbytes)
                 self.memory.hbm.write(stick, tensor)
-                input_ptrs[arg_name] = stick
-                input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
+                input_sticks[arg_name] = stick
+                # MLIR pointer operands are element indices.
+                input_ptrs[arg_name] = _stick_to_elem_idx(stick, dtype)
+                input_dtypes[arg_name] = dtype
             else:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
@@ -169,7 +173,7 @@ class KTIRInterpreter:
         outputs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                stick = input_ptrs[arg_name]
+                stick = input_sticks[arg_name]
                 n_elements = math.prod(tensor.shape)
                 output_data = self.memory.hbm.read(stick, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
                 outputs[arg_name] = output_data

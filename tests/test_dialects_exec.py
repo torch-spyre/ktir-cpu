@@ -28,6 +28,7 @@ import pytest
 from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
+from ktir_cpu.dtypes import stick_to_elem_idx
 from ktir_cpu.dialects.registry import dispatch, ExecutionEnv
 
 # ---------------------------------------------------------------------------
@@ -1118,7 +1119,7 @@ class TestKtdp:
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
         identity_map = parse_affine_map("affine_map<(d0) -> (d0)>")
-        memref = MemRef(base_ptr=ptr, shape=(8,), strides=[1],
+        memref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(8,), strides=[1],
                         memory_space="HBM", dtype="f16")
         tile_ref = memref.to_tile_ref()
         access_tile = AccessTile(parent_ref=tile_ref, shape=(8,),
