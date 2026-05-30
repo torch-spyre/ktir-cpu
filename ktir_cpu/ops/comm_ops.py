@@ -95,7 +95,30 @@ class ReduceBackend(ABC):
     Returns the reduced tile for *this* core. Cores not in
     ``core_group`` should return *tile* unchanged without
     communicating.
+
+    Bandwidth accounting — the ``comm_bytes`` contract
+    ----------------------------------------------------
+    Subclasses MUST populate ``self.bytes_moved`` during ``run`` with
+    the total bytes this core sent over the transport.  The dialect
+    handler reads it once ``run`` completes and stamps the value onto
+    ``Tile.comm_bytes`` on the result; the latency tracker reads
+    ``comm_bytes`` from the result in ``_comm_size`` to charge ring
+    bandwidth.  End-to-end:
+
+        backend.run            : self.bytes_moved += tile.size_bytes()
+        dialect handler        : final.comm_bytes = backend.bytes_moved
+        latency._comm_size     : return result.comm_bytes
+
+    The value is meaningful only after ``run`` returns; reading it
+    before is undefined.  Backend instances are constructed fresh per
+    op (one per core per produce op via ``TileFuture``), so the
+    counter starts at 0 and accumulates across the rounds of a single
+    ``run``.
     """
+
+    # Default bandwidth counter — subclasses overwrite during ``run``.
+    # Declared at class level so the contract is visible on the base.
+    bytes_moved: int = 0
 
     @abstractmethod
     def run(
@@ -103,6 +126,7 @@ class ReduceBackend(ABC):
         context: CoreContext,
         tile: Tile,
         core_group: List[int],
+        reduce_fn: Callable[[Tile, Tile], Tile],
     ) -> Union[Tile, Generator[RecvRequest, Tile, Tile]]:
         ...
 
@@ -162,10 +186,15 @@ class RingReduceBackend(ReduceBackend):
     communicating.
     """
 
-    def __init__(self, reduce_fn: Callable[[Tile, Tile], Tile]):
-        self.reduce_fn = reduce_fn
+    def __init__(self):
+        # Per-instance bandwidth counter.  The base class declares
+        # ``bytes_moved: int = 0`` at class level, but we re-init on
+        # the instance to avoid the class-level slot being shared
+        # across instances if a subclass ever mutates without
+        # re-assigning to self.
+        self.bytes_moved = 0
 
-    def run(self, context, tile, core_group):
+    def run(self, context, tile, core_group, reduce_fn):
         if context.core_id not in core_group:
             return tile
 
@@ -178,9 +207,10 @@ class RingReduceBackend(ReduceBackend):
         to_forward = tile.copy()   # tile to send next round (round 1: local)
 
         for _ in range(n_cores - 1):
+            self.bytes_moved += to_forward.size_bytes()
             context.send_to(next_core, to_forward)
             received = yield RecvRequest(src=prev_core)
-            result = self.reduce_fn(result, received)
+            result = reduce_fn(result, received)
             to_forward = received  # pass received tile onward unchanged
 
         return result

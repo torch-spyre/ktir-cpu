@@ -30,10 +30,15 @@ Types are ordered by the data-flow pipeline:
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from .affine import AffineMap, AffineSet, BoxSet
+
+if TYPE_CHECKING:
+    # comm_ops imports Tile from this module; use a TYPE_CHECKING ref to
+    # avoid the cycle while still giving mypy/IDEs the precise type.
+    from .ops.comm_ops import ReduceBackend
 
 # Type alias for TileRef.coordinate_set: parsed affine sets lower to BoxSet
 # at parse time when axis-aligned; non-box sets stay as AffineSet; the
@@ -247,6 +252,15 @@ class Tile:
     # so that ``coalescing_efficiency`` retains its data-layout meaning.
     # None for direct loads (no index tensors) and compute-produced tiles.
     index_unique_sticks: Optional[int] = None
+    # Total bytes moved across cores by the comm op that produced this
+    # tile.  Set by ``ktdp.inter_tile_reduce`` (and future delivery ops)
+    # from the transport backend's accumulated send total.  None for any
+    # tile not produced by a comm op.  The latency tracker reads this
+    # off the result for stick-granular comm bandwidth accounting,
+    # mirroring how ``unique_sticks`` carries memory provenance.  Not
+    # propagated by ``copy()`` — the bytes belong to the production
+    # event, not to copies of the data.
+    comm_bytes: Optional[int] = None
 
     def copy(self) -> 'Tile':
         """Create a deep copy of this tile.
@@ -316,6 +330,40 @@ class IndirectAccessTile:
     index_views: List[MemRef]                   # index memrefs for indirect dims (used for byte_address)
     variables_space_set: AffineSet              # domain of intermediate variables
     variables_space_order: Optional[AffineMap]  # iteration order; None = default
+
+
+@dataclass
+class TileFuture:
+    """Per-core handle produced by ``ktdp.inter_tile_produce``.
+
+    Holds *this* core's contribution and the not-yet-running transport
+    backend that the matching delivery op will trigger. SPMD: each core
+    has its own ``TileFuture`` instance bound to its local ``%fut``
+    SSA value; cross-core data movement happens via the scheduler's
+    mailbox once ``backend.run`` starts, not by reading other cores'
+    futures.
+
+    Fields:
+      ``partial_tensor_types``: declared T_p_1, ..., T_p_N (verbatim).
+      ``local_partial``: this core's yielded tile(s) — the seed for the
+          transport. ``None`` when the core is in ``groups_set`` but
+          outside ``producer_set`` (would-be identity contribution; v1
+          rejects this case downstream).
+      ``backend``: a ``ReduceBackend`` instance with no ``reduce_fn``
+          bound yet. The delivery op constructs the fold from its own
+          combiner region and passes it to ``backend.run``.
+      ``producer_set`` / ``groups_set``: parsed IR sets, kept on the
+          future so the consumer handler can compute its core_group
+          without re-parsing.
+      ``group_idx``: the group this core belongs to, computed once at
+          produce time.
+    """
+    partial_tensor_types: Tuple[str, ...]
+    local_partial: Optional[Tuple['Tile', ...]]
+    backend: "ReduceBackend"
+    producer_set: AffineSet
+    groups_set: AffineSet
+    group_idx: int
 
 
 @dataclass

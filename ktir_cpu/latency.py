@@ -26,7 +26,6 @@ Kernel latency = max across all cores (critical path).
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Dict, List, Optional, Tuple
-import math
 import numpy as np
 
 from .ir_types import AccessTile, IndirectAccessTile, MemRef, Tile, TileRef
@@ -244,15 +243,15 @@ class LatencyTracker:
             return ("compute", cycles, float(n_elems), 0)
 
         if category == LC.COMM:
-            # Ring communication (allgather, reduce, …): bytes over
-            # ring bandwidth.  No FLOPs — pure data movement.
-            # Reduce requires log2(num_cores) rounds.
-            nbytes = self._comm_size(operands)
+            # Ring/transport bytes for this core's contribution to the
+            # comm op.  When the dialect handler stamps ``comm_bytes`` on
+            # the result Tile (as ``ktdp.inter_tile_reduce`` does), use
+            # that exact per-core total — it reflects what the transport
+            # actually moved, including any per-tile sync subset.  The
+            # operand-based fallback is for legacy/test paths only.
+            nbytes = self._comm_size(result)
             bw = self.config.ring_bytes_per_cycle
             cycles = nbytes / bw if bw > 0 else 0.0
-            if op_type == "ktdp.reduce":
-                rounds = max(1, math.ceil(math.log2(self.config.num_cores)))
-                cycles *= rounds
             return ("comm", cycles, 0.0, nbytes)
 
         # Unknown category
@@ -371,12 +370,32 @@ class LatencyTracker:
         return (1, 1, 1)
 
     @staticmethod
-    def _comm_size(operands: List[Any]) -> int:
-        """Estimate bytes transferred by a communication operation."""
-        for v in operands:
-            if isinstance(v, Tile):
-                return v.data.nbytes
-        return 0
+    def _comm_size(result: Any) -> int:
+        """Bytes transferred by a communication operation.
+
+        Comm ops must stamp the per-core wire total onto the result
+        ``Tile.comm_bytes`` from inside the handler.
+        ``ktdp.inter_tile_reduce`` does this by reading
+        ``RingReduceBackend.bytes_moved`` after ``yield from`` returns
+        and assigning to ``final.comm_bytes``.  Future delivery ops
+        (``inter_tile_consume``, ``inter_tile_reduce_scatter``) follow
+        the same pattern.
+
+        Raises if the carrier is missing — it's a contract violation,
+        not a fallback case.
+        """
+        if not isinstance(result, Tile):
+            raise RuntimeError(
+                f"_comm_size: comm op result must be a Tile, got "
+                f"{type(result).__name__}"
+            )
+        if result.comm_bytes is None:
+            raise RuntimeError(
+                "_comm_size: Tile result on comm path must populate "
+                "comm_bytes; got None.  Comm-op handlers must stamp "
+                "comm_bytes from the transport backend's send total."
+            )
+        return result.comm_bytes
 
 
 # ---------------------------------------------------------------------------

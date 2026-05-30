@@ -184,16 +184,16 @@ def _sum_tiles(a: Tile, b: Tile) -> Tile:
 
 @register_reduce_backend("test.reduce", RingReduceBackend)
 def _h_reduce(op: Operation, ctx) -> Any:
-    """test.reduce — wraps CommOps.reduce with the registered backend.
+    """test.reduce — wraps RingReduceBackend.run with the registered backend.
 
-    Returns the generator produced by ``RingReduceBackend.run`` (via
-    ``CommOps.reduce``). The scheduler drives ``N-1`` ``RecvRequest``
-    yields per core; the final accumulator is bound to ``op.result``.
+    Returns the generator produced by ``RingReduceBackend.run``. The
+    scheduler drives ``N-1`` ``RecvRequest`` yields per core; the final
+    accumulator is bound to ``op.result``.
     """
     tile = ctx.get_value(op.operands[0])
     group = op.attributes["group"]
     backend_cls = get_reduce_backend(op.op_type)
-    return CommOps.reduce(ctx, tile, group, backend_cls(_sum_tiles))
+    return backend_cls().run(ctx, tile, group, _sum_tiles)
 
 
 _STUB_HANDLERS: Dict[str, Callable[[Operation, Any], Any]] = {
@@ -456,7 +456,7 @@ def test_ring_reduce(spec, execute_fn):
 # deadlock cases automatically.
 # ---------------------------------------------------------------------------
 
-def _broken_recv_only(self, ctx, tile, group):
+def _broken_recv_only(self, ctx, tile, group, reduce_fn):
     """Recv from the previous neighbor, never send. Every participating
     core blocks on round 1 → flat mutual-recv deadlock.
     """
@@ -469,7 +469,7 @@ def _broken_recv_only(self, ctx, tile, group):
     return tile
 
 
-def _broken_wrong_dest(self, ctx, tile, group):
+def _broken_wrong_dest(self, ctx, tile, group, reduce_fn):
     """Send to (idx+2) % n while recv-ing from (idx-1) % n. Every core's
     send lands in a queue no one reads from; every core's recv waits
     on a queue no one writes to. Deadlock at round 1.
@@ -485,7 +485,7 @@ def _broken_wrong_dest(self, ctx, tile, group):
     return tile
 
 
-def _broken_extra_recv(self, ctx, tile, group):
+def _broken_extra_recv(self, ctx, tile, group, reduce_fn):
     """Run N-1 ring rounds correctly, then dangle one extra recv. The
     final recv has no matching send → deadlock after the algorithm
     has otherwise made progress.
@@ -501,7 +501,7 @@ def _broken_extra_recv(self, ctx, tile, group):
     for _ in range(n - 1):
         ctx.send_to(next_core, to_forward)
         received = yield RecvRequest(src=prev_core)
-        result = self.reduce_fn(result, received)
+        result = reduce_fn(result, received)
         to_forward = received
     # Dangling recv — no one sent for this round.
     yield RecvRequest(src=prev_core)
