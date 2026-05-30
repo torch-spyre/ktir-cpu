@@ -824,12 +824,30 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
 # ---------------------------------------------------------------------------
 # Inter-tile communication — `ktdp.inter_tile_produce` / `inter_tile_reduce`
 # ---------------------------------------------------------------------------
-# Spec: docs/inter-tile-communication.md (in ktir-mlir-frontend).
+# 🧪 EXPERIMENTAL — TRACKS UNMERGED UPSTREAM SPEC PR
 #
-# Production op returns a !ktdp.tile_future<T_p>; the delivery op consumes it.
-# v1 supports a single partial role (N=1) and the full-barrier sync model
-# (no producer_dependency_per_consumer execution semantics — parsed but not
-# honoured at runtime).
+# The four-op inter-tile design (produce + consume / reduce / reduce_scatter)
+# lives in ktir-mlir-frontend PR #23:
+#   https://github.com/torch-spyre/ktir-mlir-frontend/pull/23
+#
+# The spec PR is not yet merged.  Op names, attribute keys (e.g.
+# ``producer_tiles_per_group``, ``consumer_tiles_per_group``,
+# ``producer_dependency_per_consumer``), and the ``!ktdp.tile_future<...>``
+# type may shift to track the upstream PR before it lands on main.  Avoid
+# baking these names into stable APIs until the spec is final.
+#
+# Implemented here: the reduce path only — `ktdp.inter_tile_produce` +
+# `ktdp.inter_tile_reduce`, with `yield_partial` / `yield_reduced` region
+# terminators.  Production returns a `!ktdp.tile_future<T_p>`; the delivery
+# op consumes it.  v1 supports a single partial role (N=1) and the
+# full-barrier sync model (no `producer_dependency_per_consumer` execution
+# semantics — parsed but not honoured at runtime).
+#
+# Not implemented: `inter_tile_consume` (broadcast),
+# `inter_tile_reduce_scatter`, per-tile sync runtime.
+#
+# See `docs/cross_core_scheduling.md` for the simulator design and
+# `docs/gap_analysis.md` rows 2a–2d for status.
 # ---------------------------------------------------------------------------
 
 

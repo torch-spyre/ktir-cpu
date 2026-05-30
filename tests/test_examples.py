@@ -566,6 +566,9 @@ class TestRingReduceExecution:
     (``ktdp.inter_tile_produce`` + ``ktdp.inter_tile_reduce``) — every
     core ends up holding the all-reduced sum, but only core 0 writes it
     back to HBM (gated by ``scf.if %is_writer``).
+
+    The latency-tracker breakdown for the same kernel lives in
+    ``tests/test_latency.py::TestRingReduceLatency``.
     """
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce"))

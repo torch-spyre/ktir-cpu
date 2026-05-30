@@ -96,15 +96,11 @@ def _run_vector_reduce(path, func_name, entry, cfg, trace=False):
     """Run a vector reduce (per-core tile) and return report."""
     interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
     interp.load(path)
-    # Build tensor args using the interpreter's declared arg names so we
-    # match the parser's normalization (arg0, arg1, ...).
     arg_names = interp.arg_names(func_name)
     sizes = interp.tensor_input_output_sizes(func_name)
 
-    # Use the first argument as the input tensor for the reduce example.
     arg0 = arg_names[0]
     shape = sizes[arg0]["shape"]
-    # shape may be a tuple like (1, 4)
     rng = np.random.default_rng(42)
     inp = rng.standard_normal(tuple(shape)).astype(np.float16)
 
@@ -115,6 +111,41 @@ def _run_vector_reduce(path, func_name, entry, cfg, trace=False):
     kwargs = {**scalars, **{arg0: inp}}
     interp.execute_function(func_name, **kwargs)
     return interp.get_latency_report()
+
+
+def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
+    """Run ring_reduce on its 4-core grid and return ``(report, rows, n_cols)``.
+
+    Differs from the other ``_run_*`` helpers because ``ring_reduce.mlir``
+    takes raw stick-index pointers (``in_ptr`` / ``out_ptr``) rather than
+    ndarray kwargs.  We patch ``_prepare_execution`` to seed the input
+    rows after HBM allocation; this mirrors
+    ``test_examples.py::TestRingReduceExecution::test_ring_reduce_sum``.
+    Returning ``rows`` and ``n_cols`` lets callers compute the expected
+    ring-traffic byte count without re-deriving it.
+    """
+    meta = parse_example(path, func_name)
+    num_cores = math.prod(meta.grid)
+    n_cols = entry["n_cols"]
+    in_ptr = entry["execute_kwargs"]["in_ptr"]
+    out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+    rng = np.random.default_rng(42)
+    rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
+
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    _orig = interp._prepare_execution
+
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        interp.memory.hbm.write(in_ptr,  rows.flatten())
+        interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+
+    interp._prepare_execution = _prepare_and_seed
+    interp.execute_function(func_name, **entry["execute_kwargs"])
+    return interp.get_latency_report(), rows, n_cols
 
 
 # ---------------------------------------------------------------------------
@@ -1726,3 +1757,223 @@ class TestIndirectAccessLatency:
             f"load idx sticks={load_idx_sticks}, "
             f"store idx sticks={store_idx_sticks}, expected both to be 4"
         )
+
+
+# ---------------------------------------------------------------------------
+# Ring reduce latency — comm-dominated path
+# ---------------------------------------------------------------------------
+# 🧪 Experimental — tracks ktir-mlir-frontend#23.  Validates the
+# inter-tile + scheduler + latency pipeline: ring bytes accumulated by
+# RingReduceBackend land on Tile.comm_bytes and flow into the per-core
+# LatencyReport.  Correctness counterpart:
+# tests/test_examples.py::TestRingReduceExecution.
+
+class TestRingReduceLatency:
+    """Per-core latency report from the 4-core ring reduce in
+    ``examples/ktir/ring_reduce.mlir``.
+
+    Scope of validity
+    -----------------
+    This test pins ``comm_cycles = ring_bytes / ring_bytes_per_cycle``
+    for the kernel as written.  That formula is exact **only** under two
+    conditions, both of which hold here:
+
+    1. **Single group, contiguous cores.**  The kernel uses
+       ``producer_tiles_per_group = (i)[g] : (i - 4*g >= 0,
+       -i + 4*g + 3 >= 0)`` with ``groups = (g) : (g == 0)``, so the
+       producer set for the single group is ``{0, 1, 2, 3}`` — exactly
+       the four physical cores in core-id order.  ``RingReduceBackend``
+       lays the ring out in that order, so ``send_to(next_core, ...)``
+       is always a 1-hop transfer to the *immediate* neighbor:
+       0 → 1 → 2 → 3 → 0.
+
+    2. **No per-hop overhead in the latency model today.**  ``LC.COMM``
+       in ``latency.py`` charges ``bytes / ring_bytes_per_cycle`` and
+       nothing else.  No constant per-hop latency, no multi-hop scaling.
+
+    For any pattern where the producer set's logical order does **not**
+    match physical wire order — e.g. multi-group with strided membership
+    like ``{g, g+8, g+16, g+24}``, butterfly mirror, or one-to-many
+    broadcast — the model would underestimate and this test's cycle
+    assertion would no longer reflect the real cost.  The structural
+    assertions (per-core counts, category buckets, store-only-on-core-0)
+    remain valid regardless.  A multi-group latency test will need to
+    pin per-hop costs once that part of the model is added.
+
+    Ring layout — 4 cores, 3 rounds
+    -------------------------------
+    Each arrow ``→`` is one ``send_to`` of one ``1x128 f16`` payload
+    (256 bytes) to the *immediate* core-id neighbor.  The wire wraps
+    3 → 0.  Each core does ``N - 1 = 3`` rounds.  After round 3 every
+    core's accumulator has folded in every starting tile exactly once,
+    so all four cores hold ``t0 + t1 + t2 + t3``.
+
+    Each cell shows ``acc | fwd``: the accumulator value on that core
+    *after* the round's reduce, and the tile that core will *forward*
+    in the next round (= the tile it just received this round).
+    ``send`` annotations on the arrows show the round-1 payloads.
+
+                        round 1               round 2          round 3
+
+      core 0  start:t0  ┌── send t0 ─→┐    ┌── send t3 ─→┐    ┌── send t2 ─→┐
+                        │ recv t3      │    │ recv t2      │    │ recv t1      │
+                        │ acc=t0+t3    │    │ acc=t0+t3+t2 │    │ acc=Σt       │
+                        │ fwd=t3       │    │ fwd=t2       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+      core 1  start:t1  ┌── send t1 ─→┐    ┌── send t0 ─→┐    ┌── send t3 ─→┐
+                        │ recv t0      │    │ recv t3      │    │ recv t2      │
+                        │ acc=t1+t0    │    │ acc=t1+t0+t3 │    │ acc=Σt       │
+                        │ fwd=t0       │    │ fwd=t3       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+      core 2  start:t2  ┌── send t2 ─→┐    ┌── send t1 ─→┐    ┌── send t0 ─→┐
+                        │ recv t1      │    │ recv t0      │    │ recv t3      │
+                        │ acc=t2+t1    │    │ acc=t2+t1+t0 │    │ acc=Σt       │
+                        │ fwd=t1       │    │ fwd=t0       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+      core 3  start:t3  ┌── send t3 ─→┐    ┌── send t2 ─→┐    ┌── send t1 ─→┐
+                        │ recv t2      │    │ recv t1      │    │ recv t0      │
+                        │ acc=t3+t2    │    │ acc=t3+t2+t1 │    │ acc=Σt       │
+                        │ fwd=t2       │    │ fwd=t1       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+    Wire usage per core: 3 sends × 256 bytes = 768 bytes/core, all over
+    1-hop neighbor edges.  That's the byte total ``RingReduceBackend``
+    accumulates into ``self.bytes_moved`` and the consume handler stamps
+    onto ``Tile.comm_bytes``.
+
+    Per-core trace (each core, in order)
+    ------------------------------------
+    With ``HardwareConfig()`` defaults — ``simd_elements_per_cycle = 64``,
+    ``hbm_bandwidth_tb_s = 1.0``, ``ring_bandwidth_tb_s = 4.0``,
+    ``num_cores = 32`` — and a ``1 x 128 f16`` partial (256 bytes,
+    occupying 2 HBM sticks)::
+
+      arith.constant                  zero    cycles=0.0
+      arith.constant                  zero    cycles=0.0
+      ktdp.get_compute_tile_id        zero    cycles=0.0
+      arith.muli                      compute cycles=0.0   (scalar index)
+      arith.addi                      compute cycles=0.0   (scalar index)
+      ktdp.construct_memory_view      zero    cycles=0.0
+      ktdp.construct_access_tile      zero    cycles=0.0
+      ktdp.load                       memory  cycles=8.192 (256 bytes / 31.25 B/cyc)
+      ktdp.yield_partial              zero    cycles=0.0
+      ktdp.inter_tile_produce         zero    cycles=0.0   (no LC.COMM)
+      arith.constant                  zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.fill                     zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.add                      compute cycles=2.0   (128 elems / 64 simd)
+      ktdp.yield_reduced              zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.add                      compute cycles=2.0   <- combiner round 2
+      ktdp.yield_reduced              zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.add                      compute cycles=2.0   <- combiner round 3
+      ktdp.yield_reduced              zero    cycles=0.0
+      ktdp.inter_tile_reduce          comm    cycles=0.192 (768 bytes / 4000 B/cyc)
+      arith.cmpi                      compute cycles=0.015625 (1 elem / 64 simd)
+      [core 0 only:  tensor.expand_shape  zero    cycles=0.0]
+      [core 0 only:  ktdp.construct_memory_view  zero    cycles=0.0]
+      [core 0 only:  ktdp.construct_access_tile  zero    cycles=0.0]
+      [core 0 only:  ktdp.store              memory  cycles=8.192 (256 bytes)]
+      scf.if                          zero    cycles=0.0
+      return                          zero    cycles=0.0
+
+    The ring reduce contributes ``(N_ring - 1) * partial_bytes = 3 * 256
+    = 768`` bytes per core.  The combiner region (``linalg.add``) runs
+    ``N_ring - 1 = 3`` times on each core, once per ring round (the
+    backend's ``reduce_fn`` invocation; see
+    ``RingReduceBackend.run`` in ``ktir_cpu/ops/comm_ops.py``).
+
+    Per-core totals
+    ---------------
+    - All cores: ``compute = 2.0 * 3 + 0.015625 = 6.015625`` cycles,
+      ``comm = 0.192`` cycles.
+    - Cores 1, 2, 3: ``memory = 8.192`` cycles (one ``ktdp.load``).
+    - Core 0:       ``memory = 16.384`` cycles (``ktdp.load`` +
+      ``ktdp.store``).
+    - ``rep.kernel_cycles = max(total_cycles)`` is on core 0, since it
+      carries the extra HBM store.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce"))
+    def test_ring_reduce_per_core_breakdown(self, path, func_name, entry):
+        cfg = HardwareConfig()
+        rep, rows, n_cols = _run_ring_reduce(
+            path, func_name, entry, cfg, trace=True
+        )
+
+        assert rep is not None, (
+            "latency report should be present when latency_config is set"
+        )
+
+        N_ring = rows.shape[0]                  # 4 producers per group
+        partial_bytes = n_cols * 2              # 1 x 128 f16 = 256 bytes
+        per_core_ring_bytes = (N_ring - 1) * partial_bytes
+        expected_comm_cycles = per_core_ring_bytes / cfg.ring_bytes_per_cycle
+
+        # Every core should have a counters record.
+        assert set(rep.counters.keys()) == set(range(N_ring))
+
+        # ---- Per-core invariants ----
+        for core_id, cc in rep.counters.items():
+            ops = [t.op_type for t in cc.trace]
+
+            # Each core runs the produce + reduce pair exactly once.
+            assert ops.count("ktdp.inter_tile_produce") == 1
+            assert ops.count("ktdp.inter_tile_reduce") == 1
+
+            # Produce is a metadata-only op now (no LC.COMM): cycles=0.
+            produce_entry = next(
+                t for t in cc.trace if t.op_type == "ktdp.inter_tile_produce"
+            )
+            assert produce_entry.cycles == 0
+            assert produce_entry.category == "zero"
+
+            # Reduce is the comm-charged op.  Bytes stamped onto
+            # Tile.comm_bytes by RingReduceBackend flow into the
+            # tracker via _comm_size; cycles = bytes /
+            # ring_bytes_per_cycle, with no log2(num_cores) multiplier
+            # (dropped in the per-message accounting redesign).
+            reduce_entry = next(
+                t for t in cc.trace if t.op_type == "ktdp.inter_tile_reduce"
+            )
+            assert reduce_entry.category == "comm"
+            assert reduce_entry.cycles == pytest.approx(expected_comm_cycles)
+
+            # Total per-core comm equals exactly the reduce charge —
+            # no other op in the trace contributes to the comm bucket.
+            assert cc.comm_cycles == pytest.approx(expected_comm_cycles)
+
+            # Cumulative comm bytes for this core (the only comm op is
+            # the reduce, so total_bytes - HBM-side load/store bytes
+            # equals the ring's per-core wire load).  We pin the comm
+            # bytes via the cycle assertion above; this asserts the
+            # aggregate counter agrees: ring bytes contribute exactly
+            # ``per_core_ring_bytes`` to ``total_bytes``.
+            # Note ``total_bytes`` also includes HBM bytes from
+            # ``ktdp.load`` / ``ktdp.store``, so we can't pin it on its
+            # own — we just assert it's at least the ring bytes.
+            assert cc.total_bytes >= per_core_ring_bytes
+
+            # Each core loads its own row from HBM exactly once.
+            assert ops.count("ktdp.load") == 1
+
+        # ---- Cross-core invariants ----
+        # Only core 0 writes back (gated by ``scf.if %is_writer``).
+        store_cores = [
+            cid for cid, cc in rep.counters.items()
+            if any(t.op_type == "ktdp.store" for t in cc.trace)
+        ]
+        assert store_cores == [0], (
+            f"expected only core 0 to ktdp.store, got {store_cores}"
+        )
+
+        # Kernel wall-clock = max of per-core total cycles.  Core 0
+        # carries the extra HBM store, so it must be the heaviest.
+        per_core_total = {cid: cc.total_cycles for cid, cc in rep.counters.items()}
+        assert rep.kernel_cycles == max(per_core_total.values())
+        assert per_core_total[0] >= max(per_core_total[c] for c in (1, 2, 3))
