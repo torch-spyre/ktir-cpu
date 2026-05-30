@@ -440,6 +440,7 @@ class BoxSet:
     def try_from_affine_set(cls, aset: "AffineSet") -> Optional["BoxSet"]:
         """Lower an axis-aligned :class:`AffineSet` to a ``BoxSet``.
 
+<<<<<<< HEAD
         Returns ``None`` when the set is not representable as an integer
         box.  Lowering succeeds iff every constraint has the form
         ``c * d_i + k(syms) >= 0`` with ``c ∈ {+1, -1}`` (single dim,
@@ -458,6 +459,27 @@ class BoxSet:
         that themselves carry a symbol, or non-linear symbol products
         cause this function to return ``None`` so the set stays on the
         AffineSet slow path.
+=======
+        Returns ``None`` when the set cannot be represented as an integer box.
+
+        Each constraint must be a single-dim, unit-coefficient expression:
+
+          Inequality  ``±d_i + const >= 0``:
+            +d_i  →  d_i >= -const          →  tightens lo[i]
+            -d_i  →  d_i <=  const          →  tightens hi[i] (exclusive: const+1)
+
+          Equality  ``±d_i + const == 0``:
+            +d_i  →  d_i == -const          →  pins both lo[i] = -const, hi[i] = -const+1
+            -d_i  →  d_i ==  const          →  pins both lo[i] =  const, hi[i] =  const+1
+
+        Multiple constraints on the same axis intersect: lo takes the max,
+        hi takes the min.  Lowering fails if any axis ends up with no lo or
+        no hi bound.
+
+        TODO: symbolic sets (n_syms > 0) are rejected — BoxSet carries only
+        integer bounds.  getattr keeps this correct on older AffineSet objects
+        without n_syms.
+>>>>>>> f0cfdbf ([Feature] affine eq node: first-class == constraint in affine sets)
         """
         from .parser_ast import sym_add, sym_max, sym_min, sym_neg
 
@@ -466,7 +488,9 @@ class BoxSet:
         los: List[Optional["Bound"]] = [None] * n
         his: List[Optional["Bound"]] = [None] * n
         for c in aset.constraints:
-            lin = _constraint_to_linear_syms(c, n, n_syms)
+            is_eq = (c[0] == "eq")
+            expr = c[1] if is_eq else c
+            lin = _constraint_to_linear_syms(expr, n, n_syms)
             if lin is None:
                 return None
             dim_coeffs, sym_coeffs, const = lin
@@ -475,18 +499,24 @@ class BoxSet:
                 return None
             i = nz[0]
             k = dim_coeffs[i]
-            # Build k(syms) as a Bound: int constant + sum(sym_coeffs[j] * s_j).
+            if abs(k) != 1:
+                return None
+            # Build k(syms): int constant + sum(sym_coeffs[j] * s_j).
             sym_term = _build_sym_term(sym_coeffs, const)
-            if k == 1:
+            if is_eq:
+                # k*d_i + k(syms) == 0  →  d_i == pin
+                pin = sym_neg(sym_term) if k == 1 else sym_term
+                los[i] = pin             if los[i] is None else sym_max(los[i], pin)
+                his[i] = sym_add(pin, 1) if his[i] is None else sym_min(his[i], sym_add(pin, 1))
+            elif k == 1:
                 # d_i + k(syms) >= 0  →  d_i >= -k(syms)
                 candidate = sym_neg(sym_term)
                 los[i] = candidate if los[i] is None else sym_max(los[i], candidate)
-            elif k == -1:
-                # -d_i + k(syms) >= 0  →  d_i <= k(syms)  →  hi = k(syms) + 1
+            else:
+                # -d_i + k(syms) >= 0  →  d_i <= k(syms)  →  hi exclusive = k(syms) + 1
                 candidate = sym_add(sym_term, 1)
                 his[i] = candidate if his[i] is None else sym_min(his[i], candidate)
-            else:
-                return None
+
         if any(v is None for v in los) or any(v is None for v in his):
             return None
         return cls(lo=tuple(los), hi=tuple(his))  # type: ignore[arg-type]
