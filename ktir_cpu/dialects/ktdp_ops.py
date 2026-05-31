@@ -34,7 +34,7 @@ from ..ops.comm_ops import RingReduceBackend
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
-from ..parser_utils import _extract_bracket_content, find_ssa_names, parse_attr_block, parse_multi_result_lhs, parse_tensor_type, split_top_level
+from ..parser_utils import _extract_bracket_content, extract_named_attr, find_ssa_names, parse_attr_block, parse_multi_result_lhs, parse_tensor_type, split_top_level
 from .registry import ParseContext, register, register_parser
 
 
@@ -881,52 +881,6 @@ def _find_tile_group(tile_id, producer_set, groups_set):
     return matches[0]
 
 
-def _extract_named_attr(op_text: str, key: str, aliases: dict | None = None):
-    """Extract a single bare ``key = value`` attribute from ``op_text``.
-
-    The four inter-tile ops carry their attributes bare (no enclosing
-    ``{ ... }`` block) — e.g.
-    ``producer_tiles_per_group = #all_tiles, groups = #one_group``.
-    Returns the resolved value string (alias-resolved when applicable),
-    or ``None`` if not found.
-    """
-    # Match `key =` then capture either an `#alias`, a `keyword<...>`
-    # value, or a bare token up to the next comma / colon / arrow / brace.
-    m = re.search(rf'\b{re.escape(key)}\s*=\s*', op_text)
-    if not m:
-        return None
-    rest = op_text[m.end():].lstrip()
-
-    if rest.startswith('#'):
-        end = re.search(r'[,\n}]|\s+:|\s*->', rest)
-        raw = rest[:end.start()].strip() if end else rest.strip()
-        return aliases.get(raw, raw) if aliases else raw
-
-    kw_m = re.match(r'[\w.]+<', rest)
-    if kw_m:
-        i = kw_m.end() - 1
-        depth = 0
-        while i < len(rest):
-            ch = rest[i]
-            if ch == '>' and i + 1 < len(rest) and rest[i + 1] == '=':
-                i += 2
-                continue
-            if ch == '-' and i + 1 < len(rest) and rest[i + 1] == '>':
-                i += 2
-                continue
-            if ch == '<':
-                depth += 1
-            elif ch == '>':
-                depth -= 1
-                if depth == 0:
-                    return rest[:i + 1]
-            i += 1
-        return rest
-
-    end = re.search(r'[,\n}]|\s+:|\s*->', rest)
-    return rest[:end.start()].strip() if end else rest.strip()
-
-
 def _producer_core_group(producer_set, group_idx, num_cores):
     """Return the list of tile ids in ``producer_tiles_per_group(group_idx)``,
     ascending. Used as the ``core_group`` argument to ``RingReduceBackend.run``.
@@ -999,12 +953,12 @@ def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
         return None
     result_name = m.group(1)
 
-    producer_set_str = _extract_named_attr(
+    producer_set_str = extract_named_attr(
         op_text, "producer_tiles_per_group", parse_ctx.aliases
     )
     if producer_set_str is None:
         raise ValueError("ktdp.inter_tile_produce: missing producer_tiles_per_group")
-    groups_str = _extract_named_attr(op_text, "groups", parse_ctx.aliases)
+    groups_str = extract_named_attr(op_text, "groups", parse_ctx.aliases)
     if groups_str is None:
         raise ValueError("ktdp.inter_tile_produce: missing groups")
 
@@ -1193,19 +1147,19 @@ def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext):
     result_name = m.group(1)
     fut_operand = m.group(2)
 
-    consumer_set_str = _extract_named_attr(
+    consumer_set_str = extract_named_attr(
         op_text, "consumer_tiles_per_group", parse_ctx.aliases
     )
     if consumer_set_str is None:
         raise ValueError("ktdp.inter_tile_reduce: missing consumer_tiles_per_group")
     consumer_set = parse_affine_set(consumer_set_str)
 
-    groups_str = _extract_named_attr(op_text, "groups", parse_ctx.aliases)
+    groups_str = extract_named_attr(op_text, "groups", parse_ctx.aliases)
     if groups_str is None:
         raise ValueError("ktdp.inter_tile_reduce: missing groups")
     groups_set = parse_affine_set(groups_str)
 
-    pdpc_str = _extract_named_attr(
+    pdpc_str = extract_named_attr(
         op_text, "producer_dependency_per_consumer", parse_ctx.aliases
     )
     pdpc = parse_affine_set(pdpc_str) if pdpc_str is not None else None
