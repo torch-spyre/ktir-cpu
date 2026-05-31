@@ -443,6 +443,35 @@ The def-use edge `%fut → consume(%fut)` is a *per-core* edge that
 serialises produce-then-consume on each individual core. Cross-core
 ordering is provided by the transport.
 
+### Def-use is simulated by `TileFuture`, not walked
+
+The spec uses the SSA def-use edge for two roles: (1) pin produce
+before consume in execution order, and (2) identify *which* produce
+a delivery op is paired with (the spec's "single-use" invariant).
+This simulator does not walk the IR's def-use graph for either
+role.  Both are absorbed by the per-core `TileFuture` object:
+
+- **Ordering.**  Each core executes its IR top-down; the consume
+  handler reads `%fut` via `ctx.get_value`, which only succeeds if
+  the produce op already bound it.  Standard SSA scoping is the
+  ordering check.
+- **Pairing.**  The `TileFuture` instance returned by produce *is*
+  the edge.  When the consume handler picks up `%fut`, it gets
+  exactly the future the matching produce built — there's no
+  IR-level "trace from this consume back to its produce" step
+  because the producer-side data already lives on the future the
+  consumer holds.
+
+Spec invariants that *do* require checking the producer-side
+attributes against the consumer-side attributes — `groups` match,
+`producer_dependency_per_consumer ⊆ producer_tiles_per_group`,
+coverage of producers by consumers' deps — are not enforced today.
+They are deferred until the upstream spec finalises (see
+`ktir_cpu/dialects/ktdp_ops.py` "Verification — deferred"); when
+they land they'll fit in `CommPlan.for_reduce` (subset / coverage)
+and a small consume-handler-entry check (`groups` match via
+bounded enumeration over `ctx.num_cores`).
+
 ## RingReduceBackend — what the generator does
 
 Per-core (one generator instance per core, all running the same code):
