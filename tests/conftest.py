@@ -296,6 +296,23 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "n_cols": 128,
         },
     ],
+    "ring_reduce_multi_group": [
+        {
+            "path": "latency/ring_reduce_multi_group.mlir",
+            # 16-core workgroup partitioned into 4 groups of 4; each
+            # group does an in-group all-reduce; the first core of
+            # each group (pid % 4 == 0) writes back to a per-group
+            # output row.
+            # grid = [16, 1, 1] → 16 cores; n_cols = 128.
+            # HBM stick layout:
+            #   sticks [0..31]  → 16 input rows × 2 sticks each (4096 bytes)
+            #   sticks [32..39] → 4 output rows × 2 sticks each (1024 bytes)
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 32},
+            "n_cols": 128,
+            "n_groups": 4,
+            "group_size": 4,
+        },
+    ],
 }
 
 

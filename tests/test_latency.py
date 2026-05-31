@@ -148,6 +148,48 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     return interp.get_latency_report(), rows, n_cols
 
 
+def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
+    """Run the multi-group ring_reduce on its 16-core grid and return
+    ``(report, rows, n_cols, n_groups, group_size)``.
+
+    Mirrors ``_run_ring_reduce`` but for the 16-core, 4-group kernel
+    in ``examples/latency/ring_reduce_multi_group.mlir``.  Every core
+    holds its own 1×128 partial; the kernel runs four concurrent
+    in-group all-reduces and writes one output row per group.
+    """
+    meta = parse_example(path, func_name)
+    num_cores = math.prod(meta.grid)
+    n_cols = entry["n_cols"]
+    n_groups = entry["n_groups"]
+    group_size = entry["group_size"]
+    in_ptr = entry["execute_kwargs"]["in_ptr"]
+    out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+    rng = np.random.default_rng(42)
+    rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
+
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    _orig = interp._prepare_execution
+
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        interp.memory.hbm.write(in_ptr,  rows.flatten())
+        interp.memory.hbm.write(out_ptr, np.zeros(n_groups * n_cols, dtype=np.float16))
+
+    interp._prepare_execution = _prepare_and_seed
+    interp.execute_function(func_name, **entry["execute_kwargs"])
+    return (
+        interp.get_latency_report(),
+        rows,
+        n_cols,
+        n_groups,
+        group_size,
+        interp.memory.hbm.read(out_ptr, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vector add latency — memory-dominated
 # ---------------------------------------------------------------------------
@@ -1977,3 +2019,94 @@ class TestRingReduceLatency:
         per_core_total = {cid: cc.total_cycles for cid, cc in rep.counters.items()}
         assert rep.kernel_cycles == max(per_core_total.values())
         assert per_core_total[0] >= max(per_core_total[c] for c in (1, 2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Multi-group ring reduce — comm-dominated, 4 groups of 4 on a 16-core grid
+# ---------------------------------------------------------------------------
+# 🧪 Experimental — tracks ktir-mlir-frontend#23.  Validates two
+# things the single-group test cannot:
+#   1. Correctness of the plan-aware fold in ``RingReduceBackend.run``
+#      — every group's accumulator must contain only its own four
+#      tiles, even though the ring spans the whole 16-core
+#      workgroup.  Out-of-plan tiles flow through but are discarded
+#      at fold time; misbehaviour here would smear values across
+#      groups.
+#   2. Per-core ring bytes scale with ``ctx.num_cores``, not group
+#      size — the ring is over the whole workgroup, so a 16-core
+#      workgroup with 4 groups of 4 sends ``num_cores - 1 = 15``
+#      messages per core, not ``group_size - 1 = 3``.
+
+class TestRingReduceMultiGroupLatency:
+    """4 concurrent groups of 4 cores on a 16-core workgroup.
+
+    Hardware-config defaults: ``ring_bandwidth_tb_s = 4.0``,
+    ``ring_bytes_per_cycle = 4000``.  Workgroup geometry:
+
+    - 16 cores, 4 groups of 4: group ``g`` is ``{4g, 4g+1, 4g+2, 4g+3}``.
+    - Each core holds a ``tensor<1x128xf16>`` partial (256 bytes).
+    - Per-core ring traffic = ``(num_cores - 1) * partial_bytes`` =
+      ``15 * 256 = 3840`` bytes.
+    - Per-core comm cycles = ``3840 / 4000 = 0.96``.
+
+    Note the difference from the single-group test: the ring's size
+    is ``num_cores - 1``, *not* ``group_size - 1``.  Multi-group does
+    not shrink the per-op ring; it just narrows the fold via the
+    plan.
+    """
+
+    @pytest.mark.parametrize(
+        "path,func_name,entry",
+        get_test_params("ring_reduce_multi_group"),
+    )
+    def test_multi_group_correctness_and_bytes(self, path, func_name, entry):
+        cfg = HardwareConfig()
+        rep, rows, n_cols, n_groups, group_size, output = (
+            _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=True)
+        )
+
+        num_cores = n_groups * group_size
+        partial_bytes = n_cols * 2          # 1 x 128 f16 = 256 bytes
+        per_core_ring_bytes = (num_cores - 1) * partial_bytes
+        expected_comm_cycles = per_core_ring_bytes / cfg.ring_bytes_per_cycle
+
+        # ---- Correctness: each group's writer holds the in-group sum ----
+        # ``output[g]`` was written by core ``4*g``; expected value is
+        # the sum of rows[4g..4g+3].  If the plan-aware fold slipped
+        # and folded out-of-group tiles, this assertion would catch it.
+        for g in range(n_groups):
+            expected = rows[g * group_size:(g + 1) * group_size].sum(axis=0)
+            np.testing.assert_allclose(
+                output[g], expected, rtol=1e-2,
+                err_msg=f"group {g}: output does not match in-group sum",
+            )
+
+        # ---- Latency: every core's comm bucket = (num_cores-1) * partial_bytes ----
+        # Includes non-writer cores (most of the 16) — they all run the
+        # ring; only the comm bucket varies, not store traffic.
+        assert set(rep.counters.keys()) == set(range(num_cores))
+        for core_id, cc in rep.counters.items():
+            assert cc.comm_cycles == pytest.approx(expected_comm_cycles), (
+                f"core {core_id}: comm_cycles {cc.comm_cycles} "
+                f"!= expected {expected_comm_cycles}"
+            )
+
+            ops = [t.op_type for t in cc.trace]
+            assert ops.count("ktdp.inter_tile_produce") == 1
+            assert ops.count("ktdp.inter_tile_reduce") == 1
+
+            reduce_entry = next(
+                t for t in cc.trace if t.op_type == "ktdp.inter_tile_reduce"
+            )
+            assert reduce_entry.category == "comm"
+            assert reduce_entry.cycles == pytest.approx(expected_comm_cycles)
+
+        # ---- Cross-core invariants: only group writers store ----
+        store_cores = sorted(
+            cid for cid, cc in rep.counters.items()
+            if any(t.op_type == "ktdp.store" for t in cc.trace)
+        )
+        expected_writers = [g * group_size for g in range(n_groups)]
+        assert store_cores == expected_writers, (
+            f"expected writers {expected_writers}, got {store_cores}"
+        )
