@@ -33,7 +33,7 @@ from ..ops.arith_ops import ArithOps
 from ..ops.comm_ops import CommPlan, RingReduceBackend
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
-from ..parser_ast import parse_affine_map, parse_affine_set
+from ..parser_ast import enumerate_membership_keys, parse_affine_map, parse_affine_set
 from ..parser_utils import _extract_bracket_content, extract_named_attr, find_ssa_names, parse_attr_block, parse_multi_result_lhs, parse_tensor_type, split_top_level
 from .registry import ParseContext, register, register_parser
 
@@ -846,28 +846,61 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
 # Not implemented: `inter_tile_consume` (broadcast),
 # `inter_tile_reduce_scatter`, per-tile sync runtime.
 #
+# Def-use edge — how it's simulated.  The spec uses the SSA def-use
+# edge ``%fut → consume(%fut)`` to pin produce-then-consume ordering
+# and identify which produce a delivery op is paired with.  In this
+# simulator we don't walk the def-use graph: each core's
+# ``inter_tile_produce`` returns a per-core ``TileFuture`` instance
+# bound to that core's local ``%fut``; the consume handler reads
+# ``%fut`` via ``ctx.get_value`` and dispatches.  The TileFuture
+# *is* the def-use edge for our purposes — its identity per core
+# substitutes for tracing the IR-level chain.
+#
+# Verification — deferred until the upstream spec is final.  Once
+# ktir-mlir-frontend#23 lands, add:
+#
+#   A2. ``groups`` match between produce and consume.
+#       Bounded-enumeration equality over ``ctx.num_cores`` —
+#       compare ``{g : groups_a.contains([g])}`` and
+#       ``{g : groups_b.contains([g])}`` once at consume-handler
+#       entry.  No polyhedral set difference needed.
+#
+#   B1. Subset.  ``producer_dependency_per_consumer ⊆
+#       producer_tiles_per_group`` for every (p, c) the deps name.
+#       Trivial post-check on ``CommPlan.for_reduce`` — every
+#       producer-id mentioned in ``deps`` must be in ``producers``.
+#
+#   B2. Coverage.  Every producer in ``producer_tiles_per_group(g)``
+#       must be the dependency of at least one consumer in
+#       ``consumer_tiles_per_group(g)``.  Same place as B1, post
+#       ``CommPlan.for_reduce``.
+#
+# These are spec invariants the runtime currently trusts.  They
+# should be enforced when the upstream surface stabilises so we
+# don't lock in error messages keyed on names that may yet change.
+#
 # See `docs/cross_core_scheduling.md` for the simulator design and
 # `docs/gap_analysis.md` rows 2a–2d for status.
 # ---------------------------------------------------------------------------
 
 
-def _find_tile_group(tile_id, producer_set, groups_set):
-    """Return the unique group index ``g`` whose membership set contains
-    ``tile_id``.
+def _find_tile_group(tile_id, producer_set, groups_set, num_cores):
+    """Return the unique group index ``g`` whose membership set
+    contains ``tile_id``.
 
-    ``producer_set`` is a 1-D parameterized affine set ``(i)[g] : ...``;
-    ``groups_set`` is an unparameterized 1-D affine set over the group
-    index.  Iterates ``g`` over a generous shape (the per-group max is
-    bounded by the workgroup size) and picks the unique containing
-    group.
+    Thin wrapper over :func:`enumerate_membership_keys`: ``producer_set``
+    is the family ``(i)[g]``, ``groups_set`` is the key domain, and
+    we want the keys ``g`` for which ``tile_id`` is in the family.
+    Group count is upper-bounded by ``num_cores`` (every group must
+    contain at least one core).  Raises if zero or more than one
+    match — the spec's disjointness invariant says exactly one.
     """
-    # Enumerate possible g values from the groups set.  We don't know the
-    # max group count a priori; use a sentinel upper bound large enough
-    # for any real workgroup.  This is a v1 heuristic — a follow-up could
-    # propagate workgroup size through the IR.
-    GROUP_BOUND = 1024
-    candidates = groups_set.enumerate((GROUP_BOUND,))
-    matches = [g[0] for g in candidates if producer_set.contains([tile_id], [g[0]])]
+    matches = enumerate_membership_keys(
+        family=producer_set,
+        domain=groups_set,
+        point=(tile_id,),
+        bound=num_cores,
+    )
     if not matches:
         raise RuntimeError(
             f"tile {tile_id} is not contained in any producer group "
@@ -913,7 +946,7 @@ def ktdp__inter_tile_produce(op, context, env):
     partial_types = op.attributes["partial_tensor_types"]
 
     tile_id = context.core_id
-    gid = _find_tile_group(tile_id, producer_set, groups_set)
+    gid = _find_tile_group(tile_id, producer_set, groups_set, context.num_cores)
 
     region = op.regions[0] if op.regions else []
     bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
