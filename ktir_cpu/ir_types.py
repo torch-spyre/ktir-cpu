@@ -30,15 +30,10 @@ Types are ordered by the data-flow pipeline:
 """
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 
 from .affine import AffineMap, AffineSet, BoxSet
-
-if TYPE_CHECKING:
-    # comm_ops imports Tile from this module; use a TYPE_CHECKING ref to
-    # avoid the cycle while still giving mypy/IDEs the precise type.
-    from .ops.comm_ops import ReduceBackend
 
 # Type alias for TileRef.coordinate_set: parsed affine sets lower to BoxSet
 # at parse time when axis-aligned; non-box sets stay as AffineSet; the
@@ -347,20 +342,17 @@ class TileFuture:
       ``partial_tensor_types``: declared T_p_1, ..., T_p_N (verbatim).
       ``local_partial``: this core's yielded tile(s) — the seed for the
           transport. ``None`` when the core is in ``groups_set`` but
-          outside ``producer_set`` (would-be identity contribution; v1
-          rejects this case downstream).
-      ``backend``: a ``ReduceBackend`` instance with no ``reduce_fn``
-          bound yet. The delivery op constructs the fold from its own
-          combiner region and passes it to ``backend.run``.
+          outside ``producer_set`` (non-producer cores still run the
+          delivery op so they participate in the workgroup-wide
+          protocol; the backend substitutes ``identity`` for them).
       ``producer_set`` / ``groups_set``: parsed IR sets, kept on the
-          future so the consumer handler can compute its core_group
+          future so the consumer handler can build a ``CommPlan``
           without re-parsing.
       ``group_idx``: the group this core belongs to, computed once at
           produce time.
     """
     partial_tensor_types: Tuple[str, ...]
     local_partial: Optional[Tuple['Tile', ...]]
-    backend: "ReduceBackend"
     producer_set: AffineSet
     groups_set: AffineSet
     group_idx: int

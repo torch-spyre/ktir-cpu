@@ -20,7 +20,9 @@ dialect handlers in ``ktir_cpu.dialects``.
 """
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Generator, List, Type, Union
+from dataclasses import dataclass
+from typing import Callable, Dict, FrozenSet, Generator, List, Optional, Tuple, Type, Union
+from ..affine import AffineSet
 from ..ir_types import Tile
 from ..grid import CoreContext, RecvRequest
 from ..memory import LXScratchpad, SpyreMemoryHierarchy
@@ -69,6 +71,96 @@ class InstantTransferBackend(TransferBackend):
 
 
 # ---------------------------------------------------------------------------
+# CommPlan — logical input to a ReduceBackend
+# ---------------------------------------------------------------------------
+# The dialect handler builds a CommPlan from the IR's affine sets at
+# consume-op entry; the backend reads it to know who participates and
+# (when set) which producers each consumer depends on.  Pure logical:
+# no ring order, no neighbour relation, no schedule, no topology —
+# those are the backend's concern.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CommPlan:
+    """Logical structure of one inter-tile op: who produces, who
+    consumes, who depends on whom.
+
+    Built fresh by the consume handler at op entry from the future's
+    parsed sets and the consume op's own attributes; passed to
+    ``ReduceBackend.run``; discarded when ``run`` returns.
+
+    Fields:
+      ``producers``: tile ids producing partials in this group.
+      ``consumers``: tile ids that should hold the result.
+      ``deps``: optional ``producer_dependency_per_consumer`` resolved
+          to ``{consumer_id: frozenset[producer_id]}``.  ``None`` =
+          full-barrier mode (every consumer depends on every producer).
+    """
+    producers: Tuple[int, ...]
+    consumers: Tuple[int, ...]
+    deps: Optional[Dict[int, FrozenSet[int]]] = None
+
+    def is_producer(self, core_id: int) -> bool:
+        return core_id in self.producers
+
+    def is_consumer(self, core_id: int) -> bool:
+        return core_id in self.consumers
+
+    def producers_for(self, consumer_id: int) -> FrozenSet[int]:
+        """Producers this consumer depends on.
+
+        Full-barrier (``deps`` is ``None``) → every producer.
+        Per-tile sync (``deps`` set) → the declared subset for this
+        consumer; raises ``KeyError`` if the consumer is missing
+        from the deps map (caller bug — every consumer must appear).
+        """
+        if self.deps is None:
+            return frozenset(self.producers)
+        return self.deps[consumer_id]
+
+    @classmethod
+    def for_reduce(
+        cls,
+        *,
+        producer_set: AffineSet,
+        consumer_set: AffineSet,
+        group_idx: int,
+        num_cores: int,
+        dep_set: Optional[AffineSet] = None,
+    ) -> "CommPlan":
+        """Build a CommPlan for an ``inter_tile_reduce`` op.
+
+        Enumerates ``producer_set`` and ``consumer_set`` over the
+        ``num_cores`` workgroup at the bound ``group_idx``.  When
+        ``dep_set`` is given, evaluates it as ``(p)[c, g]`` (or
+        ``(p)[c]`` when group-independent) for each consumer to
+        populate ``deps``.
+        """
+        producers = tuple(
+            i for i in range(num_cores)
+            if producer_set.contains([i], [group_idx])
+        )
+        consumers = tuple(
+            i for i in range(num_cores)
+            if consumer_set.contains([i], [group_idx])
+        )
+        deps: Optional[Dict[int, FrozenSet[int]]] = None
+        if dep_set is not None:
+            # producer_dependency_per_consumer is parameterised either
+            # ``(p)[c]`` (group-independent: one symbol) or ``(p)[c, g]``
+            # (group-aware: two symbols).  Both shapes pass through
+            # ``contains`` cleanly with the right symbol vector.
+            deps = {}
+            for c in consumers:
+                syms = [c, group_idx] if dep_set.n_syms >= 2 else [c]
+                deps[c] = frozenset(
+                    p for p in producers if dep_set.contains([p], syms)
+                )
+        return cls(producers=producers, consumers=consumers, deps=deps)
+
+
+# ---------------------------------------------------------------------------
 # Reduce backends
 # ---------------------------------------------------------------------------
 # A ReduceBackend owns the full reduce protocol — messaging, compute,
@@ -86,23 +178,24 @@ class InstantTransferBackend(TransferBackend):
 class ReduceBackend(ABC):
     """Abstract reduce algorithm — owns messaging, compute, completion.
 
-    ``run`` is called once per participating core. It may be a
+    ``run`` is called once per core in the workgroup.  It may be a
     generator (yields ``RecvRequest`` at each blocking point) or a
     plain function (synchronous algorithms, e.g. LX-scratchpad
     reduce). The scheduler treats both shapes uniformly via
     ``inspect.isgenerator``.
 
-    Returns the reduced tile for *this* core. Cores not in
-    ``core_group`` should return *tile* unchanged without
-    communicating.
+    Returns the reduced tile for *this* core if it is a consumer;
+    ``None`` otherwise.  ``CommPlan`` is a *mask*: non-producers
+    contribute ``identity`` so the fold stays well-defined;
+    non-consumers run the protocol but discard the result.
 
     Bandwidth accounting — the ``comm_bytes`` contract
     ----------------------------------------------------
     Subclasses MUST populate ``self.bytes_moved`` during ``run`` with
     the total bytes this core sent over the transport, then stamp it
-    onto ``result.comm_bytes`` before returning.  The latency tracker
-    reads ``comm_bytes`` from the result in ``_comm_size`` to charge
-    ring bandwidth.  End-to-end:
+    onto ``result.comm_bytes`` before returning (when returning a
+    Tile).  The latency tracker reads ``comm_bytes`` from the result
+    in ``_comm_size`` to charge ring bandwidth.  End-to-end:
 
         backend.run            : self.bytes_moved += tile.size_bytes()
                                  ...
@@ -111,10 +204,10 @@ class ReduceBackend(ABC):
         latency._comm_size     : return result.comm_bytes
 
     The dialect handler does not touch ``bytes_moved`` or
-    ``comm_bytes`` — the field is published by the backend that filled
-    it.  Backend instances are constructed fresh per op (one per core
-    per produce op via ``TileFuture``), so the counter starts at 0
-    and accumulates across the rounds of a single ``run``.
+    ``comm_bytes`` — the field is published by the backend that
+    filled it.  Backend instances are constructed fresh per call
+    (one per core per consume op), so the counter starts at 0 and
+    accumulates across the rounds of a single ``run``.
     """
 
     # Default bandwidth counter — subclasses overwrite during ``run``.
@@ -126,43 +219,50 @@ class ReduceBackend(ABC):
         self,
         context: CoreContext,
         tile: Tile,
-        core_group: List[int],
+        plan: "CommPlan",
         reduce_fn: Callable[[Tile, Tile], Tile],
-    ) -> Union[Tile, Generator[RecvRequest, Tile, Tile]]:
+        identity: Tile,
+    ) -> Union[Tile, None, Generator[RecvRequest, Tile, Union[Tile, None]]]:
         ...
 
 
 class RingReduceBackend(ReduceBackend):
-    """Ring reduction across *core_group* — one core's view.
+    """Ring reduction over the whole workgroup — one core's view.
 
-    Generator. Yields ``RecvRequest`` exactly ``len(core_group) - 1``
-    times. After all rounds every participating core holds the full
-    reduction (sum, max, …) of every starting tile in the group.
+    Generator. Every core in the workgroup runs the protocol; the
+    ring spans all ``ctx.num_cores`` cores in id order.  Yields
+    ``RecvRequest`` exactly ``num_cores - 1`` times.
 
-    Algorithm
-    ---------
-    Cores in *core_group* are arranged into a logical ring in list
-    order: each core sends to ``(my_idx + 1) % N`` and receives from
-    ``(my_idx - 1) % N``. The local core runs ``N-1`` rounds and
-    maintains two values:
+    ``CommPlan`` masks contributions and outputs:
 
-    - ``result``     — the accumulator, folded in via ``reduce_fn``.
+    - **Non-producers** inject ``identity`` so the fold remains
+      well-defined.  They still execute the protocol — they have to,
+      because they're on the wire — but their seed is the identity
+      tensor instead of a real partial.
+    - **Non-consumers** run the protocol but ``return None``; the
+      interpreter's SSA-bind logic skips storing ``None`` results,
+      matching the spec's "results are undefined for non-participants"
+      rule.
+
+    Layout: naive ``range(n)`` ring in core-id order.  Each core's
+    neighbour is ``(my_idx ± 1) % n``.  A different layout
+    (e.g. coordinated with sibling groups, or a snake through a 2-D
+    mesh) would be a different ``ReduceBackend`` subclass.
+
+    Algorithm — reduce-then-forward
+    -------------------------------
+    Each core maintains two values:
+
+    - ``result``     — the accumulator, folded via ``reduce_fn``.
     - ``to_forward`` — the tile to send next round.
 
-    In round 1, ``to_forward`` is the local starting tile. In every
-    subsequent round, ``to_forward`` is the tile we received the
-    previous round — we pass it onward unchanged. Each starting
-    tile thus travels exactly ``N-1`` hops around the ring, visiting
-    every other core once, and is folded into each visited core's
-    accumulator. After ``N-1`` rounds, every core's accumulator has
-    seen all ``N`` starting tiles, so every core holds the full
-    reduction.
-
-    This is the standard reduce-then-forward ring algorithm — not a
-    scan, and not all-to-all. Sending the *received* tile (rather
-    than the accumulator) is what keeps each value visiting every
-    core exactly once; sending the accumulator instead causes
-    double-counting.
+    Round 1's ``to_forward`` is the local seed (real partial for
+    producers, ``identity`` for non-producers).  Every subsequent
+    round forwards the tile *received* the previous round, unchanged.
+    Each starting tile thus travels exactly ``N - 1`` hops, visiting
+    every other core once, folded into each visited core's
+    accumulator.  Sending the accumulator instead would
+    double-count.
 
     Example: 4 cores, sum, starting values [1, 2, 3, 4]::
 
@@ -172,8 +272,7 @@ class RingReduceBackend(ReduceBackend):
           core 2:  recv 2 (from 1); send 3 to 3; acc = 3+2 = 5
           core 3:  recv 3 (from 2); send 4 to 0; acc = 4+3 = 7
         round 2:
-          core 0:  recv 3 (the tile that was at 3 last round);
-                   forward 4 to 1; acc = 5+3 = 8
+          core 0:  recv 3; forward 4 to 1; acc = 5+3 = 8
           core 1:  recv 4; forward 1 to 2; acc = 3+4 = 7
           core 2:  recv 1; forward 2 to 3; acc = 5+1 = 6
           core 3:  recv 2; forward 3 to 0; acc = 7+2 = 9
@@ -182,9 +281,6 @@ class RingReduceBackend(ReduceBackend):
           core 1:  recv 3; acc = 7+3 = 10
           core 2:  recv 4; acc = 6+4 = 10
           core 3:  recv 1; acc = 9+1 = 10
-
-    Cores not in *core_group* return *tile* unchanged without
-    communicating.
     """
 
     def __init__(self):
@@ -195,30 +291,56 @@ class RingReduceBackend(ReduceBackend):
         # re-assigning to self.
         self.bytes_moved = 0
 
-    def run(self, context, tile, core_group, reduce_fn):
-        if context.core_id not in core_group:
-            return tile
+    def run(self, context, tile, plan, reduce_fn, identity):
+        n = context.num_cores
+        next_core = (context.core_id + 1) % n
+        prev_core = (context.core_id - 1) % n
 
-        n_cores = len(core_group)
-        my_idx = core_group.index(context.core_id)
-        next_core = core_group[(my_idx + 1) % n_cores]
-        prev_core = core_group[(my_idx - 1) % n_cores]
+        # Seed.
+        # Producers start with their partial; non-producer consumers
+        # start with identity so the first fold gives the right
+        # answer.  ``to_forward`` is what this core injects onto the
+        # wire — its content matters only when the *receiving* core
+        # treats this core as an in-plan producer; otherwise the
+        # receiver discards it.  We default to ``tile`` for
+        # producers and ``identity`` for non-producers; the latter is
+        # arbitrary (any tile of the right shape works) but keeps the
+        # wire payload predictable.
+        is_prod = plan.is_producer(context.core_id)
+        seed = tile if is_prod else identity
+        result = seed.copy()       # accumulator
+        to_forward = seed.copy()   # tile to send next round (round 1: local)
 
-        result = tile.copy()       # accumulator
-        to_forward = tile.copy()   # tile to send next round (round 1: local)
-
-        for _ in range(n_cores - 1):
+        # Ring runs over the whole workgroup in lock-step: every core
+        # sends and receives every round, regardless of whether it's
+        # in ``plan.producers``.  The fold is plan-aware — only tiles
+        # originating from in-plan producers are folded into the
+        # accumulator.  Out-of-plan tiles still flow through
+        # (preserving lock-step) but are discarded at fold time.
+        #
+        # Origin tracking: the tile this core receives in round k from
+        # ``prev_core`` was originally produced by core
+        # ``(my_id - k) mod n`` in the ring's id-order layout.  Each
+        # subsequent round, the same tile is forwarded one hop further,
+        # so we just step the origin index.
+        my_id = context.core_id
+        for k in range(1, n):
+            origin = (my_id - k) % n
             self.bytes_moved += to_forward.size_bytes()
             context.send_to(next_core, to_forward)
             received = yield RecvRequest(src=prev_core)
-            result = reduce_fn(result, received)
+            if plan.is_producer(origin):
+                result = reduce_fn(result, received)
             to_forward = received  # pass received tile onward unchanged
 
+        # Mask: non-consumers run the ring but discard the result.
+        # The interpreter's SSA-bind ``if result is not None`` guard
+        # then skips storing anything for this core.
+        if not plan.is_consumer(context.core_id):
+            return None
+
         # Stamp the per-core wire total onto the result Tile so the
-        # latency tracker can read it via ``Tile.comm_bytes``.  Owning
-        # the field-set here (rather than the dialect handler) keeps
-        # the contract local: the backend that *fills* ``bytes_moved``
-        # is the one that *publishes* it.
+        # latency tracker can read it via ``Tile.comm_bytes``.
         result.comm_bytes = self.bytes_moved
         return result
 

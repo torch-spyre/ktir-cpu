@@ -30,7 +30,7 @@ from ..ir_types import (
 )
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
-from ..ops.comm_ops import RingReduceBackend
+from ..ops.comm_ops import CommPlan, RingReduceBackend
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import parse_affine_map, parse_affine_set
@@ -881,40 +881,32 @@ def _find_tile_group(tile_id, producer_set, groups_set):
     return matches[0]
 
 
-def _producer_core_group(producer_set, group_idx, num_cores):
-    """Return the list of tile ids in ``producer_tiles_per_group(group_idx)``,
-    ascending. Used as the ``core_group`` argument to ``RingReduceBackend.run``.
-    """
-    return [
-        i for i in range(num_cores)
-        if producer_set.contains([i], [group_idx])
-    ]
-
-
 # ---------------------------------------------------------------------------
 # ktdp.inter_tile_produce
 # ---------------------------------------------------------------------------
 
 @register("ktdp.inter_tile_produce")
 def ktdp__inter_tile_produce(op, context, env):
-    """Materialise this core's partial and bind it into a per-core
-    TileFuture together with a not-yet-running transport backend.
+    """Materialise this core's partial and stash it on a per-core
+    TileFuture.
 
     Every core in the workgroup runs this handler once with its own
     ``CoreContext``; each call returns a separate ``TileFuture``
     bound to that core's local ``%fut`` SSA value.  No cross-core
     shared state — partials reach consumers via the scheduler's
-    mailbox once the matching delivery op triggers
-    ``fut.backend.run``.  See ``docs/cross_core_scheduling.md``,
-    "Inter-tile communication: produce + reduce, end to end".
+    mailbox once the matching delivery op runs.  See
+    ``docs/cross_core_scheduling.md``, "Inter-tile communication:
+    produce + reduce, end to end".
+
+    Backend selection happens at consume time, not here — the future
+    just carries the producer/groups affine sets and the bound
+    group index alongside the local partial.
 
     Steps:
       1. Resolve this core's group index ``gid`` from the IR sets.
-      2. Execute the producer region with ``%gid`` bound; capture the
-         ``yield_partial`` value(s) as the local partial.
-      3. Construct a fresh ``RingReduceBackend()`` (no ``reduce_fn``
-         yet — the consumer attaches it at ``run`` time).
-      4. Wrap everything in a ``TileFuture`` and return.
+      2. Execute the producer region with ``%gid`` bound; capture
+         the ``yield_partial`` value(s) as the local partial.
+      3. Wrap everything in a ``TileFuture`` and return.
     """
     producer_set = op.attributes["producer_tiles_per_group"]
     groups_set = op.attributes["groups"]
@@ -939,7 +931,6 @@ def ktdp__inter_tile_produce(op, context, env):
     return TileFuture(
         partial_tensor_types=partial_types,
         local_partial=local_partial,
-        backend=RingReduceBackend(),
         producer_set=producer_set,
         groups_set=groups_set,
         group_idx=gid,
@@ -1036,23 +1027,35 @@ def parse_yield_reduced(op_text, parse_ctx: ParseContext):
 # ktdp.inter_tile_reduce
 # ---------------------------------------------------------------------------
 
+def _select_reduce_backend(plan: CommPlan, op_attrs):
+    """Pick a ``ReduceBackend`` for an ``inter_tile_reduce`` op.
+
+    Today: a single fixed strategy (``RingReduceBackend``).  When
+    other strategies (tree, point-to-point for sparse deps, …) land,
+    this dispatcher pattern-matches on ``plan`` shape and selects.
+    """
+    return RingReduceBackend()
+
+
 @register("ktdp.inter_tile_reduce", latency_category=LC.COMM)
 def ktdp__inter_tile_reduce(op, context, env):
-    """Trigger the future's backend with this op's combiner region.
+    """Build a ``CommPlan``, pick a backend, run it.
 
-    The future already carries this core's local partial and a
-    not-yet-running ``RingReduceBackend`` instance (constructed at
-    ``inter_tile_produce`` time).  This handler:
+    Every core in the workgroup runs this handler, even cores not in
+    ``consumer_tiles_per_group`` — the backend's ring spans the whole
+    workgroup; ``CommPlan`` masks contributions and outputs.  See
+    ``docs/cross_core_scheduling.md`` §"Inter-tile communication".
 
-      1. Builds a ``reduce_fn`` from the combiner region (``^bb0(%lhs,
-         %rhs) -> yield_reduced``).
-      2. Computes ``core_group`` from the producer set in the future +
-         the consumer set on this op.
-      3. Calls ``fut.backend.run(...)`` — that generator is where the
-         scheduler-visible blocking begins.
-      4. Reshapes the reduced tile into the declared ``T_r``.
-
-    See ``docs/cross_core_scheduling.md`` for the design.
+    Steps:
+      1. Validate the ``%fut`` operand and resolve the ``identity``
+         operand to a Tile.
+      2. Build a ``CommPlan`` from the future's producer set (plus
+         this op's consumer set + optional dep set) at
+         ``ctx.num_cores``.
+      3. Build a ``reduce_fn`` from the combiner region
+         (``^bb0(%lhs, %rhs) → yield_reduced``).
+      4. Pick a backend and run it; ``attach_reshape`` collapses
+         ``T_p → T_r`` on the result tile.
     """
     fut = context.get_value(op.operands[0])
     if not isinstance(fut, TileFuture):
@@ -1060,15 +1063,20 @@ def ktdp__inter_tile_reduce(op, context, env):
             f"ktdp.inter_tile_reduce: operand 0 must be a TileFuture, got {type(fut)}"
         )
 
-    if fut.local_partial is None:
-        raise RuntimeError(
-            f"ktdp.inter_tile_reduce on core {context.core_id}: future has no "
-            f"local_partial — this core was not in producer_tiles_per_group"
-        )
-    local_tile = fut.local_partial[0]   # v1 N=1 role
+    # Producers see local_partial; non-producers seed the ring with
+    # the identity tensor instead.  ``RingReduceBackend.run`` does the
+    # mask check via ``plan.is_producer``.
+    local_tile = fut.local_partial[0] if fut.local_partial else None
+    identity = context.get_value(op.operands[1])
 
-    num_cores = env.grid_executor.num_cores
-    core_group = _producer_core_group(fut.producer_set, fut.group_idx, num_cores)
+    # Build the logical plan.
+    plan = CommPlan.for_reduce(
+        producer_set=fut.producer_set,
+        consumer_set=op.attributes["consumer_tiles_per_group"],
+        group_idx=fut.group_idx,
+        num_cores=context.num_cores,
+        dep_set=op.attributes.get("producer_dependency_per_consumer"),
+    )
 
     # Build reduce_fn from the combiner region.
     region = op.regions[0] if op.regions else []
@@ -1096,14 +1104,9 @@ def ktdp__inter_tile_reduce(op, context, env):
             )
         return result
 
-    # Trigger the future's backend.  RingReduceBackend.run takes
-    # reduce_fn at run() time so the same backend instance can back
-    # any delivery op (reduce / reduce_scatter / consume).  The
-    # backend is a generator (yields RecvRequest) and stamps its own
-    # ``comm_bytes`` on the result; ``attach_reshape`` drives it and
-    # collapses the within-group tile axis to give T_r.
+    backend = _select_reduce_backend(plan, op.attributes)
     target_shape = op.attributes.get("_result_shape")
-    raw = fut.backend.run(context, local_tile, core_group, reduce_fn)
+    raw = backend.run(context, local_tile, plan, reduce_fn, identity)
     return attach_reshape(raw, target_shape)
 
 
