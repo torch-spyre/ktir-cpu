@@ -238,6 +238,57 @@ def parse_attr_list(op_text: str, aliases: Optional[Dict] = None,
     return result
 
 
+def extract_named_attr(op_text: str, key: str,
+                       aliases: Optional[Dict] = None) -> Optional[str]:
+    """Extract a single bare ``key = value`` attribute from ``op_text``.
+
+    Sibling to :func:`parse_attr_block` for ops that carry attributes
+    *outside* a ``{ ... }`` block — e.g. ops whose attribute list lives
+    on the op header itself rather than wrapped in braces:
+    ``producer_tiles_per_group = #all_tiles, groups = #one_group``.
+
+    Returns the resolved value string (alias-resolved when applicable),
+    or ``None`` if not found.  Caller-driven: caller names the key it
+    expects.
+    """
+    m = re.search(rf'\b{re.escape(key)}\s*=\s*', op_text)
+    if not m:
+        return None
+    rest = op_text[m.end():].lstrip()
+
+    # #alias reference
+    if rest.startswith('#'):
+        end = re.search(r'[,\n}]|\s+:|\s*->', rest)
+        raw = rest[:end.start()].strip() if end else rest.strip()
+        return aliases.get(raw, raw) if aliases else raw
+
+    # keyword<...> values — count <> depth, skip >= and ->
+    kw_m = re.match(r'[\w.]+<', rest)
+    if kw_m:
+        i = kw_m.end() - 1
+        depth = 0
+        while i < len(rest):
+            ch = rest[i]
+            if ch == '>' and i + 1 < len(rest) and rest[i + 1] == '=':
+                i += 2
+                continue
+            if ch == '-' and i + 1 < len(rest) and rest[i + 1] == '>':
+                i += 2
+                continue
+            if ch == '<':
+                depth += 1
+            elif ch == '>':
+                depth -= 1
+                if depth == 0:
+                    return rest[:i + 1]
+            i += 1
+        return rest
+
+    # Plain token up to next comma / newline / brace / colon / arrow.
+    end = re.search(r'[,\n}]|\s+:|\s*->', rest)
+    return rest[:end.start()].strip() if end else rest.strip()
+
+
 def _extract_attr_value(text: str, aliases: Optional[Dict]) -> tuple:
     """Extract one attribute value from the start of *text*.
 
