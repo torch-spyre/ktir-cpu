@@ -16,7 +16,7 @@
 
 import re
 
-from .ktdp_helpers import parse_subscript_expr
+from .ktdp_helpers import attach_reshape, parse_subscript_expr
 from ..affine import BoxSet
 from ..ir_types import (
     AccessTile,
@@ -1096,44 +1096,15 @@ def ktdp__inter_tile_reduce(op, context, env):
             )
         return result
 
-    target_shape = op.attributes.get("_result_shape")
-
-    def _reshape(reduced) -> Tile:
-        if not isinstance(reduced, Tile):
-            raise TypeError(
-                f"ktdp.inter_tile_reduce: expected Tile from backend, "
-                f"got {type(reduced).__name__}"
-            )
-        if target_shape is None or reduced.shape == tuple(target_shape):
-            return reduced
-        from numpy import prod
-        if int(prod(reduced.shape)) != int(prod(target_shape)):
-            raise ValueError(
-                f"ktdp.inter_tile_reduce: result shape {reduced.shape} "
-                f"and declared T_r {target_shape} have different element counts"
-            )
-        return Tile(
-            reduced.data.reshape(target_shape),
-            reduced.dtype,
-            tuple(target_shape),
-            unique_sticks=reduced.unique_sticks,
-            index_unique_sticks=reduced.index_unique_sticks,
-        )
-
     # Trigger the future's backend.  RingReduceBackend.run takes
     # reduce_fn at run() time so the same backend instance can back
-    # any delivery op (reduce / reduce_scatter / consume).  The backend
-    # is a generator (yields RecvRequest); the wrapper drives it,
-    # reshapes T_p -> T_r, and stamps comm_bytes onto the result for the
-    # latency tracker.
+    # any delivery op (reduce / reduce_scatter / consume).  The
+    # backend is a generator (yields RecvRequest) and stamps its own
+    # ``comm_bytes`` on the result; ``attach_reshape`` drives it and
+    # collapses the within-group tile axis to give T_r.
+    target_shape = op.attributes.get("_result_shape")
     raw = fut.backend.run(context, local_tile, core_group, reduce_fn)
-
-    def _gen():
-        reduced = yield from raw
-        final = _reshape(reduced)
-        final.comm_bytes = fut.backend.bytes_moved
-        return final
-    return _gen()
+    return attach_reshape(raw, target_shape)
 
 
 @register_parser("ktdp.inter_tile_reduce")

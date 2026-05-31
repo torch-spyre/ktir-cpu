@@ -99,21 +99,22 @@ class ReduceBackend(ABC):
     Bandwidth accounting — the ``comm_bytes`` contract
     ----------------------------------------------------
     Subclasses MUST populate ``self.bytes_moved`` during ``run`` with
-    the total bytes this core sent over the transport.  The dialect
-    handler reads it once ``run`` completes and stamps the value onto
-    ``Tile.comm_bytes`` on the result; the latency tracker reads
-    ``comm_bytes`` from the result in ``_comm_size`` to charge ring
-    bandwidth.  End-to-end:
+    the total bytes this core sent over the transport, then stamp it
+    onto ``result.comm_bytes`` before returning.  The latency tracker
+    reads ``comm_bytes`` from the result in ``_comm_size`` to charge
+    ring bandwidth.  End-to-end:
 
         backend.run            : self.bytes_moved += tile.size_bytes()
-        dialect handler        : final.comm_bytes = backend.bytes_moved
+                                 ...
+                                 result.comm_bytes = self.bytes_moved
+                                 return result
         latency._comm_size     : return result.comm_bytes
 
-    The value is meaningful only after ``run`` returns; reading it
-    before is undefined.  Backend instances are constructed fresh per
-    op (one per core per produce op via ``TileFuture``), so the
-    counter starts at 0 and accumulates across the rounds of a single
-    ``run``.
+    The dialect handler does not touch ``bytes_moved`` or
+    ``comm_bytes`` — the field is published by the backend that filled
+    it.  Backend instances are constructed fresh per op (one per core
+    per produce op via ``TileFuture``), so the counter starts at 0
+    and accumulates across the rounds of a single ``run``.
     """
 
     # Default bandwidth counter — subclasses overwrite during ``run``.
@@ -213,6 +214,12 @@ class RingReduceBackend(ReduceBackend):
             result = reduce_fn(result, received)
             to_forward = received  # pass received tile onward unchanged
 
+        # Stamp the per-core wire total onto the result Tile so the
+        # latency tracker can read it via ``Tile.comm_bytes``.  Owning
+        # the field-set here (rather than the dialect handler) keeps
+        # the contract local: the backend that *fills* ``bytes_moved``
+        # is the one that *publishes* it.
+        result.comm_bytes = self.bytes_moved
         return result
 
 
