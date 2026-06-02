@@ -607,7 +607,7 @@ def test_distributed_tile_access_fast_path_emits_box_set():
 
 
 # ---------------------------------------------------------------------------
-# Symbolic-shape variant of the structural fast-path assertion (issue #51)
+# Symbolic-shape variant of the structural fast-path assertion
 #
 # Pure ops-layer test: each partition's row extent is given symbolically
 # (``[0, s_0)`` and ``[s_0, 2*s_0)``); the test specialises both manually

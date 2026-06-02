@@ -145,7 +145,7 @@ def ktdp__construct_access_tile(op, context, env):
     # ``$indices`` and from the access tile shape.  The ktir-cpu Python
     # parser does not yet surface that operand list on the
     # ``Operation`` object; wiring it through and threading the
-    # resolved symbols here is tracked as an issue-#51 follow-up.
+    # resolved symbols here is tracked as a follow-up.
     # Fail fast at this boundary rather than leaking a symbolic set
     # into ``distributed_tile_access`` where it would surface as an
     # opaque ``IndexError`` from ``eval_bound``.
@@ -154,7 +154,7 @@ def ktdp__construct_access_tile(op, context, env):
             "construct_access_tile: symbolic access_tile_set is not yet "
             "supported — the parser does not surface the op's "
             "$symbol_operands operand list (per ODS) needed to resolve "
-            "the symbols.  Tracked as a follow-up to issue #51."
+            "the symbols.  Tracked as a follow-up."
         )
     if isinstance(parent_ref, DistributedMemRef):
         # Distributed parent: resolve partition routing now.  Each

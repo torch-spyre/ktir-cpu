@@ -402,7 +402,7 @@ class TestParseAffineSetLowering:
 
 
 # ===========================================================================
-# Symbolic BoxSet — lowering, ops, and specialize round-trip (issue #51)
+# Symbolic BoxSet — lowering, ops, and specialize round-trip
 # ===========================================================================
 
 class TestSymbolicBoxSet:
