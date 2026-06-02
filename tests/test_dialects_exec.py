@@ -1143,14 +1143,13 @@ class TestKtdp:
     def test_construct_access_tile_rejects_symbolic_access_tile_set(self):
         """Symbolic ``access_tile_set`` is rejected at the handler boundary.
 
-        Lock-down for the deferred follow-up (gap_analysis row 36b): the
-        ODS spec routes symbolic access tile sets through
-        ``$symbol_operands``, which the ktir-cpu Python parser does not
-        yet surface.  Until that wire-up lands, the handler must fail
-        fast at construction time rather than letting a symbolic set
-        drift into ``distributed_tile_access`` and surface as an opaque
-        ``IndexError`` from ``eval_bound`` in the partition-routing
-        loop.
+        Defensive fail-fast for a case that does not arise in real IR.
+        In practice ``access_tile_set`` is always concrete: dynamic
+        symbols on memory views are bound and eliminated at
+        ``construct_memory_view`` via the ``sizes:`` operands, and
+        ``!ktdp.access_tile<NxMxindex>`` carries no symbols at the type
+        level.  This guard preserves a clear error if a future lowering
+        pass ever regresses that invariant.
         """
         from ktir_cpu.affine import BoxSet
         from ktir_cpu.ir_types import MemRef
