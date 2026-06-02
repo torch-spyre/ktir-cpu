@@ -73,17 +73,13 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, cast
 
 if TYPE_CHECKING:
-    # Avoid circular import at runtime; parser_ast imports nothing from here.
-    from .parser_ast import _Node
-
-
-# A bound on a single axis of :class:`BoxSet`.  ``int`` is the concrete leaf
-# (fast path); a tuple is an AST node over symbol variables, evaluated by
-# :func:`parser_ast.eval_bound`.
-Bound = Union[int, tuple]
+    # Avoid circular import at runtime; parser_ast imports affine types.
+    # ``Bound`` (axis bound type for :class:`BoxSet`) lives in parser_ast
+    # next to the AST helpers (``eval_bound``, ``sym_add``, ``sym_max``).
+    from .parser_ast import _Node, Bound  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -266,6 +262,16 @@ class BoxSet:
     def n_dims(self) -> int:
         return len(self.lo)
 
+    @property
+    def is_concrete(self) -> bool:
+        """True iff every ``lo`` / ``hi`` entry is a Python ``int``.
+
+        Public read accessor for the cached structural fast-path flag.
+        Use this from outside the class instead of touching
+        ``_all_concrete`` directly.
+        """
+        return self._all_concrete
+
     def contains(self, point: Sequence[int], symbols: Sequence[int] = ()) -> bool:
         """True iff ``lo[d] <= point[d] < hi[d]`` for every dim.
 
@@ -336,30 +342,40 @@ class BoxSet:
     ) -> bool:
         """True iff this box equals ``[0, shape)``.
 
-        On symbolic boxes the comparison can only be answered for
-        concrete shapes after resolving against ``symbols`` (a tuple
-        equality on AST nodes would always fail structurally even when
-        the runtime extent matches).
+        Matches :meth:`AffineSet.is_full` semantics: a translated box
+        ``[x, x + shape)`` returns ``False`` even when its per-axis
+        extent matches.  The asymmetry is intentional — callers
+        (e.g. ``ktdp.load`` / ``ktdp.store`` normalisation in
+        ``ktdp_ops.parse_construct_access_tile``) use a ``True`` here
+        as licence to drop ``coordinate_set`` to ``None`` and take the
+        contiguous fast path that assumes a zero origin; reporting full
+        on a translated box would silently miscompile.
+        Symbolic boxes are resolved against ``symbols`` first, since
+        AST nodes cannot be compared structurally for runtime equality.
         """
         if len(shape) != self.n_dims:
             return False
-        if self._all_concrete:
-            return self.lo == (0,) * self.n_dims and tuple(self.hi) == tuple(shape)
-        return self.specialize(symbols).is_full(shape)
+        spec = self if self._all_concrete else self.specialize(symbols)
+        return all(
+            spec.lo[d] == 0 and spec.hi[d] == shape[d]
+            for d in range(self.n_dims)
+        )
 
     def lower_bounds(self, symbols: Sequence[int] = ()) -> Tuple[int, ...]:
-        """Return ``lo`` — the per-axis minimum coordinate, O(1) when concrete.
+        """Return ``lo`` — the per-axis minimum coordinate, resolved to ``int``.
 
         ``symbols`` is accepted for signature parity with :meth:`contains`
         / :meth:`is_empty` / :meth:`enumerate` so call sites can thread a
         single ``symbols`` tuple uniformly through the API.  On a concrete
         box the cached ``_all_concrete`` flag short-circuits and returns
-        ``self.lo`` directly; on a symbolic box each entry is resolved
-        against ``symbols`` so the return type is always a tuple of
-        ``int``.
+        ``self.lo`` directly (``cast`` narrows the static
+        ``Tuple[Bound, ...]`` field type to the dynamic guarantee that
+        every entry is ``int``).  On a symbolic box each entry is
+        resolved against ``symbols`` so the return type is always a
+        tuple of ``int``.
         """
         if self._all_concrete:
-            return self.lo  # type: ignore[return-value]
+            return cast(Tuple[int, ...], self.lo)
         from .parser_ast import eval_bound
         return tuple(eval_bound(b, symbols) for b in self.lo)
 
@@ -515,59 +531,18 @@ def _match_pure_dim_ref(node: "_Node", n_dims: int) -> Optional[int]:
 
 
 def _constraint_to_linear(node: "_Node", n_dims: int) -> Optional[Tuple[List[int], int]]:
-    """Flatten a parsed constraint AST into ``(coeffs, const)``.
+    """Flatten a dim-only constraint AST into ``(coeffs, const)``.
 
-    Returns ``None`` if the expression isn't a pure linear combination of
-    dimension variables and integer constants (e.g. contains ``sym`` or
-    ``ref`` atoms).  The constraint represents
-    ``sum(coeffs[i] * d_i) + const >= 0``.
-
-    Symbolic constraints (``sym`` atoms) take the AffineSet branch — see
-    :func:`_constraint_to_linear_syms` for the variant that accepts them.
-
-    .. warning::
-        The walk in this function is intentionally near-duplicated by
-        :func:`_constraint_to_linear_syms` so that this dim-only flattener
-        — exercised on a hot path by :func:`_match_pure_dim_ref` — stays
-        unchanged in shape and call signature.  When extending the AST
-        with new node types (e.g. ``floordiv``), update **both** walkers
-        in lockstep; the dim-only one will silently miscompile new shapes
-        otherwise.  Consolidating the two via a thin wrapper is tracked
-        as a follow-up.
+    Wrapper over :func:`_constraint_to_linear_syms` with ``n_syms=0`` —
+    any ``sym`` atom in the AST trips the ``j >= n_syms`` guard and
+    returns ``None``, preserving the original "reject symbols" contract.
+    The constraint represents ``sum(coeffs[i] * d_i) + const >= 0``.
     """
-    coeffs = [0] * n_dims
-    const_box = [0]
-
-    def walk(n: "_Node", sign: int) -> bool:
-        tag = n[0]
-        if tag == "const":
-            const_box[0] += sign * n[1]
-            return True
-        if tag == "dim":
-            coeffs[n[1]] += sign
-            return True
-        if tag == "add":
-            return walk(n[1], sign) and walk(n[2], sign)
-        if tag == "sub":
-            return walk(n[1], sign) and walk(n[2], -sign)
-        if tag == "neg":
-            return walk(n[1], -sign)
-        if tag == "mul":
-            coef = n[1]
-            inner = n[2]
-            if inner[0] == "dim":
-                coeffs[inner[1]] += sign * coef
-                return True
-            if inner[0] == "const":
-                const_box[0] += sign * coef * inner[1]
-                return True
-            return False
-        # 'sym', 'ref', or anything else — not a linear combination of dims.
-        return False
-
-    if not walk(node, 1):
+    result = _constraint_to_linear_syms(node, n_dims, n_syms=0)
+    if result is None:
         return None
-    return coeffs, const_box[0]
+    dim_coeffs, _sym_coeffs, const = result
+    return dim_coeffs, const
 
 
 def _build_sym_term(sym_coeffs: List[int], const: int) -> "Bound":
@@ -598,20 +573,16 @@ def _constraint_to_linear_syms(
 ) -> Optional[Tuple[List[int], List[int], int]]:
     """Flatten a parsed constraint AST into ``(dim_coeffs, sym_coeffs, const)``.
 
-    Symbol-aware variant of :func:`_constraint_to_linear`.  The constraint
-    represents
+    Canonical flattener used by :meth:`BoxSet.try_from_affine_set`; the
+    dim-only :func:`_constraint_to_linear` is a thin wrapper over this
+    function.  The constraint represents
     ``sum(dim_coeffs[i] * d_i) + sum(sym_coeffs[j] * s_j) + const >= 0``.
 
     Returns ``None`` if the expression isn't separable into that form
     — e.g. a ``ref`` atom appears, or a sym × dim product is constructed
     at the AST layer (the surface parser cannot produce
     ``("mul", sym, dim)`` since the first ``mul`` operand must be an
-    int literal, but the walker still rejects defensively).  Used by
-    :meth:`BoxSet.try_from_affine_set` to lower symbolic axis-aligned
-    sets — kept as a sibling of :func:`_constraint_to_linear` rather
-    than replacing it so the dim-only flattener used on a hot path by
-    :func:`_match_pure_dim_ref` is byte-identical to its pre-issue-#51
-    shape.  See that function's warning for the AST-extension contract.
+    int literal, but the walker still rejects defensively).
     """
     dim_coeffs = [0] * n_dims
     sym_coeffs = [0] * n_syms

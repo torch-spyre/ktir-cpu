@@ -89,7 +89,7 @@ def ktdp__construct_memory_view(op, context, env):
     # Substituting here keeps downstream consumers (find_partition /
     # distributed_tile_access / load) on the concrete fast path — they
     # never see a symbolic set.
-    if isinstance(coordinate_set, BoxSet) and not coordinate_set._all_concrete:
+    if isinstance(coordinate_set, BoxSet) and not coordinate_set.is_concrete:
         symbols = tuple(
             context.get_value(s) for s in shape_attr if isinstance(s, str)
         )
@@ -145,17 +145,16 @@ def ktdp__construct_access_tile(op, context, env):
     # ``$indices`` and from the access tile shape.  The ktir-cpu Python
     # parser does not yet surface that operand list on the
     # ``Operation`` object; wiring it through and threading the
-    # resolved symbols here is tracked as an issue-#51 follow-up
-    # (gap_analysis row 36b).  Fail fast at this boundary rather than
-    # leaking a symbolic set into ``distributed_tile_access`` where it
-    # would surface as an opaque ``IndexError`` from ``eval_bound``.
-    if isinstance(coordinate_set, BoxSet) and not coordinate_set._all_concrete:
+    # resolved symbols here is tracked as an issue-#51 follow-up.
+    # Fail fast at this boundary rather than leaking a symbolic set
+    # into ``distributed_tile_access`` where it would surface as an
+    # opaque ``IndexError`` from ``eval_bound``.
+    if isinstance(coordinate_set, BoxSet) and not coordinate_set.is_concrete:
         raise NotImplementedError(
             "construct_access_tile: symbolic access_tile_set is not yet "
             "supported — the parser does not surface the op's "
             "$symbol_operands operand list (per ODS) needed to resolve "
-            "the symbols.  Tracked as a follow-up to issue #51 "
-            "(gap_analysis row 36b)."
+            "the symbols.  Tracked as a follow-up to issue #51."
         )
     if isinstance(parent_ref, DistributedMemRef):
         # Distributed parent: resolve partition routing now.  Each

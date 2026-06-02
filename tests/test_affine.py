@@ -464,10 +464,17 @@ class TestSymbolicBoxSet:
         # AST shape on the symbolic side; concrete sides fold.
         s = parse_affine_set("affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>")
         shifted = s.translate([5])
-        # Concrete value flows through; symbolic value still resolves
-        # against ``symbols`` after translation.
+        # Concrete side folds to a plain int; symbolic side stays as an
+        # AST tuple (not ``int``) and still resolves against ``symbols``
+        # after translation.
         assert eval_bound_eq(shifted.lo[0], (), 5)
+        assert isinstance(shifted.hi[0], tuple), (
+            f"hi[0] should remain an AST tuple after translate, "
+            f"got {type(shifted.hi[0]).__name__}: {shifted.hi[0]!r}"
+        )
         for n in (8, 64):
+            # Per-symbol resolution: hi specialises to 5 + n.
+            assert eval_bound_eq(shifted.hi[0], (n,), 5 + n)
             assert shifted.specialize([n]) == BoxSet(lo=(5,), hi=(5 + n,))
 
     def test_reject_multi_dim_with_symbol(self):
@@ -487,6 +494,29 @@ class TestSymbolicBoxSet:
             "affine_set<(d0)[s0] : (2 * d0 + s0 >= 0, -d0 + 3 >= 0)>"
         )
         assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_negative_symbol_coefficient_in_bound(self):
+        # ``d0 - s0 >= 0``  →  d0 >= s0  →  lo[0] depends on +s0; the
+        # symmetric upper-bound case ``-d0 + s0 - 1 >= 0`` already
+        # exercises the +s0 path.  This case forces ``_build_sym_term``
+        # to emit a negated symbol term in lo[0] (`("neg", ("sym", 0))`
+        # via ``sym_neg``) instead of a bare ``("sym", 0)`` reference.
+        s = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>"
+        )
+        assert isinstance(s, BoxSet)
+        assert s.hi == (1024,)                     # concrete fold
+        assert isinstance(s.lo[0], tuple)          # symbolic AST retained
+        # Cross-check against the AffineSet slow path on equivalent input.
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw(
+            "affine_set<(d0)[s0] : (d0 - s0 >= 0, -d0 + 1023 >= 0)>"
+        )
+        for n in (0, 3, 1023):
+            spec = s.specialize([n])
+            assert spec == BoxSet(lo=(n,), hi=(1024,))
+            for pt in [(n - 1,), (n,), (n + 1,), (1022,), (1023,)]:
+                assert s.contains(pt, symbols=[n]) == aset.contains(pt, symbols=[n])
 
 
 def eval_bound_eq(b, symbols, expected):

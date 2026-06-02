@@ -117,8 +117,6 @@ The spec explicitly mentions `memref.subview` for view-based transformations. **
 | 34 | `ktdp.load` only implements rectangular slice semantics | ✅ | Now enumerates coordinates from `access_tile_set` and applies `access_tile_order`; supports general polyhedral regions. |
 | 35 | `ktdp.store` only implements rectangular slice semantics | ✅ | Same coordinate-set enumeration as load. |
 | 36 | `module { }` is tolerated, but module-level structure is not modeled | 🟡 | The parser can find `func.func` inside a `module { ... }` wrapper, but it does not model module-level attributes, declarations, or non-function top-level constructs. |
-| 36a | `coordinate_set` with symbolic dimensions on `construct_memory_view` | ✅ | Issue #51. `BoxSet` carries `Bound = int \| AST` per axis; `try_from_affine_set` lowers `n_syms > 0` axis-aligned sets; the handler resolves symbols positionally against the dynamic `sizes:` operands per ODS contract (`KtdpOps.td:137-139`), so downstream consumers see only concrete sets. |
-| 36b | `access_tile_set` with symbolic dimensions on `construct_access_tile` | ❌ | The ODS spec already defines a `Variadic<Index>:$symbol_operands` argument list; the ktir-cpu Python parser does not yet surface it. Symbolic `access_tile_set` therefore stays unresolved in the handler. Tracked as a follow-up to issue #51. |
 
 ## G. Parser Limitations
 
