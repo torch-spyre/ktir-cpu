@@ -429,8 +429,8 @@ class TestEqualityConstraints:
         assert len(s.constraints) == 1
         c = s.constraints[0]
         assert c[0] == "eq"
-        # Normalised to ("eq", ("sub", lhs, rhs)) — lhs - rhs == 0
-        assert c[1] == ("sub", ("dim", 0), ("const", 0))
+        assert c[1] == ("dim", 0)
+        assert c[2] == ("const", 0)
 
     def test_parse_eq_one_node_not_two(self):
         """A single == must produce one constraint node, not two sub nodes."""

@@ -621,3 +621,18 @@ class TestEqualityBoxSetLowering:
         assert box is not None
         assert not box.is_concrete
         assert box.specialize([5]) == BoxSet(lo=(3,), hi=(4,))
+
+    def test_reject_conflicting_eq_constraints(self):
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw("affine_set<(d0) : (d0 == 2, d0 == 3)>")
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_eq_ineq_conflict(self):
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw("affine_set<(d0) : (d0 == 2, d0 >= 5)>")
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_conflicting_inequalities(self):
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw("affine_set<(d0) : (d0 >= 5, -d0 + 3 >= 0)>")
+        assert BoxSet.try_from_affine_set(aset) is None

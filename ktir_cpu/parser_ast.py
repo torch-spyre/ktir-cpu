@@ -290,7 +290,7 @@ class _Parser:
           - ``lhs >= rhs``  → stored as ``("sub", lhs, rhs)``
           - ``lhs <= rhs``  → stored as ``("sub", rhs, lhs)``
 
-        Equality constraints are stored as a first-class node:
+        Equality constraints are stored as a first-class 3-tuple:
           - ``lhs == rhs``  → stored as ``("eq", lhs, rhs)``
         """
         self.consume("(")
@@ -304,7 +304,7 @@ class _Parser:
             elif op == "<=":
                 node = ("sub", rhs, lhs)
             elif op == "==":
-                node = ("eq", ("sub", lhs, rhs))
+                node = ("eq", lhs, rhs)
             else:
                 raise ValueError(f"Unsupported constraint operator: {op!r}")
             constraints.append(node)
@@ -453,8 +453,6 @@ def _eval_node(node: _Node, dims: List[int], syms: Optional[List[int]] = None) -
         return max(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
     if tag == "min":
         return min(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
-    if tag == "eq":
-        return _eval_node(node[1], dims, syms)
     raise ValueError(f"Unknown AST node tag: {tag!r}")  # pragma: no cover
 
 
@@ -484,7 +482,8 @@ def affine_set_contains(aset: AffineSet, point: Sequence[int], symbols: Sequence
     env = list(point)
     syms = list(symbols)
     return all(
-        _eval_node(c, env, syms) == 0 if c[0] == "eq" else _eval_node(c, env, syms) >= 0
+        _eval_node(c[1], env, syms) == _eval_node(c[2], env, syms) if c[0] == "eq"
+        else _eval_node(c, env, syms) >= 0
         for c in aset.constraints
     )
 

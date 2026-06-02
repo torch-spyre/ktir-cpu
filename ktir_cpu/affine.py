@@ -440,46 +440,25 @@ class BoxSet:
     def try_from_affine_set(cls, aset: "AffineSet") -> Optional["BoxSet"]:
         """Lower an axis-aligned :class:`AffineSet` to a ``BoxSet``.
 
-<<<<<<< HEAD
         Returns ``None`` when the set is not representable as an integer
         box.  Lowering succeeds iff every constraint has the form
-        ``c * d_i + k(syms) >= 0`` with ``c ∈ {+1, -1}`` (single dim,
-        unit coeff) and every axis is pinned on **both** sides (at least
-        one ``+d_i`` and one ``-d_i`` constraint).  ``k(syms)`` may be
-        an integer constant or a linear combination of symbol variables
-        and integers — in the symbolic case the resulting ``lo`` / ``hi``
-        carry an AST node (see :data:`Bound`) instead of a plain ``int``.
+        ``c * d_i + k(syms) >= 0`` or ``c * d_i + k(syms) == 0`` with
+        ``c ∈ {+1, -1}`` (single dim, unit coeff) and every axis is
+        pinned on **both** sides.  ``k(syms)`` may be an integer constant
+        or a linear combination of symbol variables — in the symbolic case
+        the resulting ``lo`` / ``hi`` carry an AST node (see :data:`Bound`)
+        instead of a plain ``int``.
 
-        Bounds on the same axis that come from multiple constraints are
-        combined with ``max`` (lo) / ``min`` (hi) — see
-        :func:`sym_max` / :func:`sym_min` for the MVP folding.
+        Equality constraints pin both ``lo[i]`` and ``hi[i]`` to the
+        solved value (``hi`` is exclusive, so ``hi = pin + 1``).
+        Inequality / equality bounds on the same axis are combined with
+        ``sym_max`` (lo) / ``sym_min`` (hi).
 
         Assumes all symbols ``s_i >= 0`` (matches dim-size semantics).
         Constraints with non-``±1`` dim coefficients, dim coefficients
         that themselves carry a symbol, or non-linear symbol products
         cause this function to return ``None`` so the set stays on the
         AffineSet slow path.
-=======
-        Returns ``None`` when the set cannot be represented as an integer box.
-
-        Each constraint must be a single-dim, unit-coefficient expression:
-
-          Inequality  ``±d_i + const >= 0``:
-            +d_i  →  d_i >= -const          →  tightens lo[i]
-            -d_i  →  d_i <=  const          →  tightens hi[i] (exclusive: const+1)
-
-          Equality  ``±d_i + const == 0``:
-            +d_i  →  d_i == -const          →  pins both lo[i] = -const, hi[i] = -const+1
-            -d_i  →  d_i ==  const          →  pins both lo[i] =  const, hi[i] =  const+1
-
-        Multiple constraints on the same axis intersect: lo takes the max,
-        hi takes the min.  Lowering fails if any axis ends up with no lo or
-        no hi bound.
-
-        TODO: symbolic sets (n_syms > 0) are rejected — BoxSet carries only
-        integer bounds.  getattr keeps this correct on older AffineSet objects
-        without n_syms.
->>>>>>> f0cfdbf ([Feature] affine eq node: first-class == constraint in affine sets)
         """
         from .parser_ast import sym_add, sym_max, sym_min, sym_neg
 
@@ -489,7 +468,7 @@ class BoxSet:
         his: List[Optional["Bound"]] = [None] * n
         for c in aset.constraints:
             is_eq = (c[0] == "eq")
-            expr = c[1] if is_eq else c
+            expr = ("sub", c[1], c[2]) if is_eq else c
             lin = _constraint_to_linear_syms(expr, n, n_syms)
             if lin is None:
                 return None
@@ -519,6 +498,12 @@ class BoxSet:
 
         if any(v is None for v in los) or any(v is None for v in his):
             return None
+        # For concrete boxes, detect contradictions early (e.g. d0 >= 5, d0 <= 3).
+        # Symbolic boxes may resolve to contradictions at specialize time; callers
+        # can detect that via is_empty(symbols=...) after specialising.
+        if all(isinstance(lo, int) and isinstance(hi, int) for lo, hi in zip(los, his)):
+            if any(los[i] >= his[i] for i in range(n)):  # type: ignore[operator]
+                return None
         return cls(lo=tuple(los), hi=tuple(his))  # type: ignore[arg-type]
 
 
