@@ -60,14 +60,18 @@ def parse_tensor_type(type_str: str) -> Optional[Dict]:
         {"shape": tuple, "dtype": str} if tensor type, else None
     """
     tensor_match = re.match(r'tensor<([^>]+)>', type_str)
-    if tensor_match:
-        inner = tensor_match.group(1)
-        parts = inner.split('x')
-        if len(parts) >= 2:
-            shape = tuple(int(p) for p in parts[:-1] if p.isdigit())
-            dtype = parts[-1]
-            return {"shape": shape, "dtype": dtype}
-    return None
+    if not tensor_match:
+        return None
+    inner = tensor_match.group(1)
+    shape: list = []
+    pos = 0
+    while (m := re.match(r'(\d+)x', inner[pos:])):
+        shape.append(int(m.group(1)))
+        pos += m.end()
+    dtype = inner[pos:]
+    if not shape or not dtype:
+        return None
+    return {"shape": tuple(shape), "dtype": dtype}
 
 def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to a Python int or float.
