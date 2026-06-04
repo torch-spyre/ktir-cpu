@@ -152,6 +152,27 @@ def linalg__matmul(op, context, env):
     return result
 
 
+@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL)
+def linalg__batch_matmul(op, context, env):
+    """Execute linalg.batch_matmul: result = outs + ins[0] @ ins[1] (batched).
+
+    MLIR linalg.batch_matmul syntax:
+        %result = linalg.batch_matmul
+                    ins(%A, %B : tensor<BxMxKxf32>, tensor<BxKxNxf32>)
+                    outs(%C    : tensor<BxMxNxf32>) -> tensor<BxMxNxf32>
+
+    Operands = [%A, %B, %C] (fallback parser order).
+    """
+    tile_a = context.get_value(op.operands[0])  # ins[0] = A  (B×M×K)
+    tile_b = context.get_value(op.operands[1])  # ins[1] = B  (B×K×N)
+    result = Tile(tile_a.data @ tile_b.data, tile_a.dtype, (tile_a.data @ tile_b.data).shape)
+    if len(op.operands) > 2:
+        acc = context.get_value(op.operands[2])
+        if isinstance(acc, Tile):
+            result = Tile(acc.data + result.data, acc.dtype, acc.shape)
+    return result
+
+
 @register("linalg.generic", latency_category=LC.COMPUTE_FLOAT)
 def linalg__generic(op, context, env):
     """Vectorised linalg.generic executor.
