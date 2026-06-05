@@ -884,6 +884,40 @@ class TestLinalg:
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(float(data.max()), abs=1e-2)
 
+    @pytest.mark.xfail(reason="multi-axis reduce not supported: parser keeps only "
+                              "dims[0] and the tree fold indexes a single axis. "
+                              "Tracked in issue #85.",
+                       strict=True)
+    def test_reduce_multi_axis(self):
+        # dimensions = [0, 1] should reduce BOTH axes (2x3 -> scalar 15).
+        data = np.arange(6, dtype=np.float16).reshape(2, 3)  # sum = 15
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dim": [0, 1],
+                                   "outs_var": "%init"})
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(15.0, abs=1e-2)
+
+    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
+                              "the tree fold seeds from the input only. Harmless "
+                              "while the frontend inits outs to the identity. "
+                              "Tracked in issue #85.",
+                       strict=True)
+    def test_reduce_folds_outs_init(self):
+        # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
+        # outs init = 100 should be 110, not 10.
+        data = np.array([[1, 2, 3, 4]], dtype=np.float16)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.array([100.0], dtype=np.float16), "f16", (1,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dim": 1,
+                                   "outs_var": "%init"})
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(110.0, abs=1e-1)
+
     def test_fill(self):
         # fill a tile with a scalar value
         out = Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))
