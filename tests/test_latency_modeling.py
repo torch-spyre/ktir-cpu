@@ -291,6 +291,60 @@ class TestHardwareConfig:
 
 
 # ---------------------------------------------------------------------------
+# TestHardwarePresets
+# ---------------------------------------------------------------------------
+
+class TestHardwarePresets:
+    """Validate AIU generation-specific hardware presets."""
+
+    def test_aiu_1p0_field_values(self):
+        cfg = HardwareConfig.aiu_1p0()
+        assert cfg.num_cores == 32
+        assert cfg.clock_ghz == 1.2
+        assert cfg.hbm_bandwidth_tb_s == 0.2048
+        assert cfg.ring_bandwidth_tb_s == 0.154
+        assert cfg.simd_elements_per_cycle == 64
+        assert cfg.systolic_flops_per_cycle == 2048
+        assert cfg.transcendental_penalty == 4
+
+    def test_aiu_1p5_field_values(self):
+        cfg = HardwareConfig.aiu_1p5()
+        assert cfg.num_cores == 32
+        assert cfg.clock_ghz == 1.5
+        assert cfg.hbm_bandwidth_tb_s == 1.0
+        assert cfg.ring_bandwidth_tb_s == 0.192
+        assert cfg.simd_elements_per_cycle == 64
+        assert cfg.systolic_flops_per_cycle == 16384
+        assert cfg.transcendental_penalty == 4
+
+    def test_aiu_1p0_derived_properties(self):
+        cfg = HardwareConfig.aiu_1p0()
+        # 204.8 GB/s at 1.2 GHz = 0.2048e12 / 1.2e9 / 32 ≈ 5.33 B/cy/core
+        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(5.333, rel=1e-2)
+        # Ring: 0.154e12 / 1.2e9 ≈ 128.3 B/cy
+        assert cfg.ring_bytes_per_cycle == pytest.approx(128.3, rel=1e-2)
+
+    def test_aiu_1p5_derived_properties(self):
+        cfg = HardwareConfig.aiu_1p5()
+        # 1 TB/s at 1.5 GHz = 1e12 / 1.5e9 / 32 ≈ 20.83 B/cy/core
+        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(20.83, rel=1e-2)
+        # Ring: 0.192e12 / 1.5e9 = 128.0 B/cy
+        assert cfg.ring_bytes_per_cycle == pytest.approx(128.0, rel=1e-2)
+
+    def test_presets_are_hardware_config_instances(self):
+        assert isinstance(HardwareConfig.aiu_1p0(), HardwareConfig)
+        assert isinstance(HardwareConfig.aiu_1p5(), HardwareConfig)
+
+    def test_defaults_unchanged(self):
+        """Presets must not alter the generic HardwareConfig() defaults."""
+        cfg = HardwareConfig()
+        assert cfg.num_cores == 32
+        assert cfg.clock_ghz == 1.0
+        assert cfg.hbm_bandwidth_tb_s == 1.0
+        assert cfg.systolic_flops_per_cycle == 2 * 64 * 64 * 64
+
+
+# ---------------------------------------------------------------------------
 # TestModelingAssumptions
 # ---------------------------------------------------------------------------
 

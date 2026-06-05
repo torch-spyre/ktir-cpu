@@ -99,6 +99,46 @@ class HardwareConfig:
         """Ring network bytes per cycle (one direction)."""
         return self.ring_bandwidth_tb_s * 1e12 / (self.clock_ghz * 1e9)
 
+    @classmethod
+    def aiu_1p0(cls) -> "HardwareConfig":
+        """AIU 1.0 (RCUDD1A) production hardware.
+
+        Sources: MICRO 2026 paper, deeptools sysdef.cpp.
+        - 32 cores @ 1.2 GHz, 204.8 GB/s LPDDR5
+        - PE array: 2 corelets × 8 PT rows × 8 cols × 8 SIMD × 2 FMA
+          = 2048 FLOPs/cy/core
+        - Ring: 128 B/cy per link per direction
+        """
+        return cls(
+            num_cores=32,
+            clock_ghz=1.2,
+            hbm_bandwidth_tb_s=0.2048,
+            ring_bandwidth_tb_s=0.154,
+            simd_elements_per_cycle=64,
+            systolic_flops_per_cycle=2048,
+            transcendental_penalty=4,
+        )
+
+    @classmethod
+    def aiu_1p5(cls) -> "HardwareConfig":
+        """AIU 1.5 (SEN1P5) next-generation hardware (single-chip 120W).
+
+        Sources: hardware-generations.md, deeptools sysdef.cpp.
+        - 32 cores @ 1.5 GHz, 1 TB/s HBM 3e
+        - PE array: 2 corelets × 4 PT rows × 8 cols × 8 SIMD × 8 subSIMD
+          × 2 FMA = 16384 FLOPs/cy/core
+        - Ring: 128 B/cy per link per direction
+        """
+        return cls(
+            num_cores=32,
+            clock_ghz=1.5,
+            hbm_bandwidth_tb_s=1.0,
+            ring_bandwidth_tb_s=0.192,
+            simd_elements_per_cycle=64,
+            systolic_flops_per_cycle=16384,
+            transcendental_penalty=4,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Per-core latency counters

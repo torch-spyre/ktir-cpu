@@ -139,6 +139,26 @@ cfg = HardwareConfig(hbm_bandwidth_tb_s=2.0, num_cores=8)
 interp = KTIRInterpreter(latency_config=cfg)
 ```
 
+## Hardware presets
+
+Named factory methods return configs matching real AIU generations:
+
+```python
+cfg = HardwareConfig.aiu_1p0()   # AIU 1.0 (RCUDD1A) production
+cfg = HardwareConfig.aiu_1p5()   # AIU 1.5 (SEN1P5) next-gen, single-chip 120W
+```
+
+| Parameter | `HardwareConfig()` | `.aiu_1p0()` | `.aiu_1p5()` |
+|-----------|-------------------|--------------|--------------|
+| `clock_ghz` | 1.0 | 1.2 | 1.5 |
+| `hbm_bandwidth_tb_s` | 1.0 | 0.2048 | 1.0 |
+| `ring_bandwidth_tb_s` | 4.0 | 0.154 | 0.192 |
+| `systolic_flops_per_cycle` | 524,288 | 2,048 | 16,384 |
+| **bw per core** | 31.25 B/cy | 5.33 B/cy | 20.83 B/cy |
+| **ring B/cy** | 4,000 | 128.3 | 128.0 |
+
+The generic `HardwareConfig()` defaults remain unchanged for backward compatibility. Sources: MICRO 2026 paper, `deeptools/dsc/sysdef.cpp`, spyre-knowledgebase.
+
 ## Systolic array model
 
 The `systolic_flops_per_cycle` parameter models the throughput of a [systolic array](https://en.wikipedia.org/wiki/Systolic_array) — a grid of processing elements (PEs) that perform matrix multiply in lock-step. Data flows through the array rhythmically: one matrix streams left-to-right, the other top-to-bottom, so each PE reuses data from its neighbors without going back to memory.
