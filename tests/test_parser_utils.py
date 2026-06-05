@@ -90,6 +90,7 @@ def test_parse_tensor_type_index_dtype(type_str, expected_shape):
         "",                     # Empty
         "tensor<>",             # Malformed: empty body
         "tensor<f32>",          # Rank-0 tensor — unsupported by the regex parser
+        "tensor<?xf16>",        # All-dynamic dims — no static dims to return
     ],
 )
 def test_parse_tensor_type_rejects_non_tensor(type_str):
@@ -105,10 +106,9 @@ def test_parse_tensor_type_rejects_non_tensor(type_str):
 @pytest.mark.parametrize(
     "type_str, expected_shape, expected_dtype",
     [
-        # Dynamic dim: '?' becomes -1 (NumPy-style sentinel).
-        ("tensor<?x4xf32>", (-1, 4), "f32"),
-        ("tensor<?xf16>", (-1,), "f16"),
-        ("tensor<2x?x4xindex>", (2, -1, 4), "index"),
+        # Dynamic dims ('?') are silently dropped; only static dims are kept.
+        ("tensor<?x4xf32>", (4,), "f32"),
+        ("tensor<2x?x4xindex>", (2, 4), "index"),
         # Encoding attribute (RFC-allowed second positional).
         ("tensor<4x4xf32, #my_enc>", (4, 4), "f32"),
         ("tensor<8xf16, dense<0> : tensor<8xi1>>", (8,), "f16"),

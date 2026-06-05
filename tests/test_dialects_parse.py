@@ -1087,6 +1087,15 @@ class TestParseTensorType:
         assert parse_tensor_type("memref<10xf32>") is None
         assert parse_tensor_type("f32") is None
 
+    @pytest.mark.xfail(strict=True, reason="nested '<>' in dtype unsupported; regex stops at first '>'")
+    @pytest.mark.parametrize("type_str,expected", [
+        ("tensor<4xcomplex<f32>>", {"shape": (4,), "dtype": "complex<f32>"}),
+        ("tensor<4x!tt.ptr<f32>>", {"shape": (4,), "dtype": "!tt.ptr<f32>"}),
+        ("tensor<4xvector<4xf32>>", {"shape": (4,), "dtype": "vector<4xf32>"}),
+    ])
+    def test_nested_bracket_dtype_unsupported(self, type_str, expected):
+        assert parse_tensor_type(type_str) == expected
+
 
 # ---------------------------------------------------------------------------
 # registry: variadic register()
