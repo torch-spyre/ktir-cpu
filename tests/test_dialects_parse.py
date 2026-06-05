@@ -313,6 +313,22 @@ class TestArithParsers(ParseTestMixin):
         self.assert_op_type(op, "arith.index_cast")
         self.assert_num_operands(op, 1)
 
+    def test_index_castui(self):
+        op = self._parse(
+            "%r = arith.index_castui %a : i32 to index",
+            args={"%a": "i32"},
+        )
+        self.assert_op_type(op, "arith.index_castui")
+        self.assert_num_operands(op, 1)
+
+    def test_ceildivui(self):
+        op = self._parse(
+            "%r = arith.ceildivui %a, %b : i32",
+            args={"%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, "arith.ceildivui")
+        self.assert_num_operands(op, 2)
+
     def test_select(self):
         op = self._parse(
             "%r = arith.select %cond, %a, %b : i32",
@@ -440,6 +456,31 @@ class TestLinalgParsers(ParseTestMixin):
         self.assert_attribute(op, "dimensions", [1])
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%buf")
+
+    def test_matmul(self):
+        # matmul carries no attributes; operands are [A, B, C] (ins then outs)
+        op = self._parse(
+            "%r = linalg.matmul ins(%a, %b : tensor<4x8xf16>, tensor<8x16xf16>)"
+            " outs(%c : tensor<4x16xf16>) -> tensor<4x16xf16>",
+            args={"%a": "tensor<4x8xf16>", "%b": "tensor<8x16xf16>", "%c": "tensor<4x16xf16>"},
+        )
+        self.assert_op_type(op, "linalg.matmul")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
+    def test_batch_matmul(self):
+        # batch_matmul has the same operand structure as matmul: [A, B, C].
+        # Added in #81 on the executor side; this verifies both parser
+        # backends handle it (the MLIR frontend needs an installed handler).
+        op = self._parse(
+            "%r = linalg.batch_matmul"
+            " ins(%a, %b : tensor<2x4x8xf16>, tensor<2x8x16xf16>)"
+            " outs(%c : tensor<2x4x16xf16>) -> tensor<2x4x16xf16>",
+            args={"%a": "tensor<2x4x8xf16>", "%b": "tensor<2x8x16xf16>", "%c": "tensor<2x4x16xf16>"},
+        )
+        self.assert_op_type(op, "linalg.batch_matmul")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
 
 
 # ---------------------------------------------------------------------------
