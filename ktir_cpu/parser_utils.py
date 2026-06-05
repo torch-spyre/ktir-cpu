@@ -50,59 +50,38 @@ def parse_multi_result_lhs(lhs_text: str) -> list[str]:
     raise ValueError(f"cannot parse multi-result LHS: {lhs_text!r}")
 
 
-# Tensor type: ``tensor<<dim>x<dim>x...x<dtype>[, <encoding>]>``.
-#
-#   group 1 — dimension prefix: one or more dims joined by ``x``, each dim
-#             a decimal literal or ``?`` (dynamic).  Whitespace tolerated
-#             around each ``x`` for MLIR-pretty-printer output.
-#   group 2 — element type: anything up to the next ``,`` / ``>`` /
-#             whitespace.  Stops *before* a comma so an optional encoding
-#             attribute (``, #my_enc``) is not glued onto the dtype.
-#
-# Capturing dims and dtype as separate groups (rather than splitting the
-# inner text on ``'x'``) keeps dtypes whose name contains ``x`` —
-# ``index``, ``complex<...>`` — intact: ``"2xindex".split("x")`` would
-# otherwise yield ``["2", "inde", ""]`` and lose the dtype.
-#
-# Known limitation: dtypes whose own form contains ``>`` (e.g.
-# ``complex<f32>``, ``!tt.ptr<f32>``) are not parsed correctly because
-# Python ``re`` cannot count balanced brackets and the outer ``>`` cannot
-# be told apart from a nested one.  These do not appear in lowered KTIR
-# reaching this parser today (only in TTIR); ``test_parser_utils.py`` pins
-# the gap as ``xfail`` so it surfaces if it changes.
-_TENSOR_TYPE_RE = re.compile(
-    r'tensor<\s*'
-    r'((?:(?:\d+|\?)\s*x\s*)+)'
-    r'([^\s,>]+)'
-    r'\s*(?:,\s*[^>]+?)?'
-    r'\s*>'
-)
-
-
 def parse_tensor_type(type_str: str) -> Optional[Dict]:
     """Parse a tensor type string, returning shape and dtype if it matches.
 
     Args:
-        type_str: Type string (e.g., ``"tensor<256xf16>"``).  Trailing
-                  context after the closing ``>`` is ignored, matching the
-                  original ``re.match``-based behaviour.
+        type_str: Type string (e.g., "tensor<256xf16>")
 
     Returns:
-        ``{"shape": tuple, "dtype": str}`` if the input begins with a
-        ranked tensor type, else ``None``.
+        {"shape": tuple, "dtype": str} if tensor type, else None
 
-    Shape entries are ``int`` for static dims and ``-1`` for the dynamic
-    dim ``?``.  Rank-0 ``tensor<f32>`` returns ``None`` (matches prior
-    behaviour: a dimension prefix is required).  Element types whose own
-    form contains nested ``<...>`` (e.g. ``complex<f32>``) are not
-    supported — see the comment on ``_TENSOR_TYPE_RE``.
+    Walks the leading dim prefix by matching digit-tokens followed by 'x',
+    taking the remainder as dtype. Handles dtypes containing 'x' (e.g.
+    ``index``). Dynamic dims (``?``) are silently dropped, matching prior
+    behaviour.
     """
-    m = _TENSOR_TYPE_RE.match(type_str)
+    m = re.match(r'tensor<([^>]+)>', type_str)
     if not m:
         return None
-    raw_dims = re.split(r'\s*x\s*', m.group(1).rstrip())
-    shape = tuple(-1 if d == '?' else int(d) for d in raw_dims if d)
-    return {"shape": shape, "dtype": m.group(2)}
+    inner = m.group(1).strip()
+    # Match all ``NNN x`` dim tokens from the left. The dtype cannot start
+    # with a digit followed by 'x', so the pattern terminates at the right
+    # boundary even when the dtype itself contains 'x' (e.g. ``index``).
+    # Dynamic dims (``?``) are skipped, matching prior behaviour.
+    prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
+    if not prefix:
+        return None
+    dims = [int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1))]
+    if not dims:
+        return None
+    dtype = inner[prefix.end():].split(',')[0].strip()
+    if not dtype:
+        return None
+    return {"shape": tuple(dims), "dtype": dtype}
 
 def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to a Python int or float.
