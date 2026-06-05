@@ -58,16 +58,30 @@ def parse_tensor_type(type_str: str) -> Optional[Dict]:
 
     Returns:
         {"shape": tuple, "dtype": str} if tensor type, else None
+
+    Walks the leading dim prefix by matching digit-tokens followed by 'x',
+    taking the remainder as dtype. Handles dtypes containing 'x' (e.g.
+    ``index``). Dynamic dims (``?``) are silently dropped, matching prior
+    behaviour.
     """
-    tensor_match = re.match(r'tensor<([^>]+)>', type_str)
-    if tensor_match:
-        inner = tensor_match.group(1)
-        parts = inner.split('x')
-        if len(parts) >= 2:
-            shape = tuple(int(p) for p in parts[:-1] if p.isdigit())
-            dtype = parts[-1]
-            return {"shape": shape, "dtype": dtype}
-    return None
+    m = re.match(r'tensor<([^>]+)>', type_str)
+    if not m:
+        return None
+    inner = m.group(1).strip()
+    # Match all ``NNN x`` dim tokens from the left. The dtype cannot start
+    # with a digit followed by 'x', so the pattern terminates at the right
+    # boundary even when the dtype itself contains 'x' (e.g. ``index``).
+    # Dynamic dims (``?``) are skipped, matching prior behaviour.
+    prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
+    if not prefix:
+        return None
+    dims = [int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1))]
+    if not dims:
+        return None
+    dtype = inner[prefix.end():].split(',')[0].strip()
+    if not dtype:
+        return None
+    return {"shape": tuple(dims), "dtype": dtype}
 
 def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to a Python int or float.

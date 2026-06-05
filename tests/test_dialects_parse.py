@@ -720,12 +720,18 @@ class TestKtdpParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
         self.assert_attribute(op, "dtype", "f16")
-        # Only assert the concrete dim — the dynamic dim is represented as the
-        # SSA name string "%n" by the regex parser, and as the ShapedType
-        # sentinel by the MLIR frontend.
+        # The static dim is a concrete int; the dynamic dim must carry the SSA
+        # name (a string) of its sizes: operand so the executor can resolve it
+        # at runtime and bind it to symbol s0 of the coordinate_set. Both
+        # parsers must uphold this — the exact name differs (regex keeps "%n",
+        # the MLIR frontend renumbers positionally), so we assert the type, not
+        # the value.
         shape = op.attributes["shape"]
-        assert shape[0] == 1024
         assert len(shape) == 2
+        assert shape[0] == 1024
+        assert isinstance(shape[1], str), (
+            f"dynamic dim must be an SSA-name string, got {shape[1]!r}"
+        )
 
     @pytest.mark.regex_only
     def test_construct_memory_view_sizes_count_mismatch_rejected(self):
@@ -1056,6 +1062,45 @@ class TestParseAttrList:
     def test_single_element(self):
         result = parse_attr_list("[affine_map<(d0) -> (d0)>]")
         assert len(result) == 1
+
+
+from ktir_cpu.parser_utils import parse_tensor_type
+
+
+class TestParseTensorType:
+    def test_basic_float(self):
+        assert parse_tensor_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
+
+    def test_basic_int(self):
+        assert parse_tensor_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
+
+    def test_multi_dim(self):
+        assert parse_tensor_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
+
+    def test_index_dtype(self):
+        # Regression: 'index' contains 'x'; old split('x') would corrupt the dtype.
+        assert parse_tensor_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
+        assert parse_tensor_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
+
+    def test_dynamic_dims_dropped(self):
+        assert parse_tensor_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
+        assert parse_tensor_type("tensor<?xf16>") is None
+
+    def test_rank0_returns_none(self):
+        assert parse_tensor_type("tensor<f32>") is None
+
+    def test_non_tensor_returns_none(self):
+        assert parse_tensor_type("memref<10xf32>") is None
+        assert parse_tensor_type("f32") is None
+
+    @pytest.mark.xfail(strict=True, reason="nested '<>' in dtype unsupported; regex stops at first '>'")
+    @pytest.mark.parametrize("type_str,expected", [
+        ("tensor<4xcomplex<f32>>", {"shape": (4,), "dtype": "complex<f32>"}),
+        ("tensor<4x!tt.ptr<f32>>", {"shape": (4,), "dtype": "!tt.ptr<f32>"}),
+        ("tensor<4xvector<4xf32>>", {"shape": (4,), "dtype": "vector<4xf32>"}),
+    ])
+    def test_nested_bracket_dtype_unsupported(self, type_str, expected):
+        assert parse_tensor_type(type_str) == expected
 
 
 # ---------------------------------------------------------------------------

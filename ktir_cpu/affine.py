@@ -442,16 +442,17 @@ class BoxSet:
 
         Returns ``None`` when the set is not representable as an integer
         box.  Lowering succeeds iff every constraint has the form
-        ``c * d_i + k(syms) >= 0`` with ``c ∈ {+1, -1}`` (single dim,
-        unit coeff) and every axis is pinned on **both** sides (at least
-        one ``+d_i`` and one ``-d_i`` constraint).  ``k(syms)`` may be
-        an integer constant or a linear combination of symbol variables
-        and integers — in the symbolic case the resulting ``lo`` / ``hi``
-        carry an AST node (see :data:`Bound`) instead of a plain ``int``.
+        ``c * d_i + k(syms) >= 0`` or ``c * d_i + k(syms) == 0`` with
+        ``c ∈ {+1, -1}`` (single dim, unit coeff) and every axis is
+        pinned on **both** sides.  ``k(syms)`` may be an integer constant
+        or a linear combination of symbol variables — in the symbolic case
+        the resulting ``lo`` / ``hi`` carry an AST node (see :data:`Bound`)
+        instead of a plain ``int``.
 
-        Bounds on the same axis that come from multiple constraints are
-        combined with ``max`` (lo) / ``min`` (hi) — see
-        :func:`sym_max` / :func:`sym_min` for the MVP folding.
+        Equality constraints pin both ``lo[i]`` and ``hi[i]`` to the
+        solved value (``hi`` is exclusive, so ``hi = pin + 1``).
+        Inequality / equality bounds on the same axis are combined with
+        ``sym_max`` (lo) / ``sym_min`` (hi).
 
         Assumes all symbols ``s_i >= 0`` (matches dim-size semantics).
         Constraints with non-``±1`` dim coefficients, dim coefficients
@@ -466,7 +467,9 @@ class BoxSet:
         los: List[Optional["Bound"]] = [None] * n
         his: List[Optional["Bound"]] = [None] * n
         for c in aset.constraints:
-            lin = _constraint_to_linear_syms(c, n, n_syms)
+            is_eq = (c[0] == "eq")
+            expr = ("sub", c[1], c[2]) if is_eq else c
+            lin = _constraint_to_linear_syms(expr, n, n_syms)
             if lin is None:
                 return None
             dim_coeffs, sym_coeffs, const = lin
@@ -475,20 +478,32 @@ class BoxSet:
                 return None
             i = nz[0]
             k = dim_coeffs[i]
-            # Build k(syms) as a Bound: int constant + sum(sym_coeffs[j] * s_j).
+            if abs(k) != 1:
+                return None
+            # Build k(syms): int constant + sum(sym_coeffs[j] * s_j).
             sym_term = _build_sym_term(sym_coeffs, const)
-            if k == 1:
+            if is_eq:
+                # k*d_i + k(syms) == 0  →  d_i == pin
+                pin = sym_neg(sym_term) if k == 1 else sym_term
+                los[i] = pin             if los[i] is None else sym_max(los[i], pin)
+                his[i] = sym_add(pin, 1) if his[i] is None else sym_min(his[i], sym_add(pin, 1))
+            elif k == 1:
                 # d_i + k(syms) >= 0  →  d_i >= -k(syms)
                 candidate = sym_neg(sym_term)
                 los[i] = candidate if los[i] is None else sym_max(los[i], candidate)
-            elif k == -1:
-                # -d_i + k(syms) >= 0  →  d_i <= k(syms)  →  hi = k(syms) + 1
+            else:
+                # -d_i + k(syms) >= 0  →  d_i <= k(syms)  →  hi exclusive = k(syms) + 1
                 candidate = sym_add(sym_term, 1)
                 his[i] = candidate if his[i] is None else sym_min(his[i], candidate)
-            else:
-                return None
+
         if any(v is None for v in los) or any(v is None for v in his):
             return None
+        # For concrete boxes, detect contradictions early (e.g. d0 >= 5, d0 <= 3).
+        # Symbolic boxes may resolve to contradictions at specialize time; callers
+        # can detect that via is_empty(symbols=...) after specialising.
+        if all(isinstance(lo, int) and isinstance(hi, int) for lo, hi in zip(los, his)):
+            if any(los[i] >= his[i] for i in range(n)):  # type: ignore[operator]
+                return None
         return cls(lo=tuple(los), hi=tuple(his))  # type: ignore[arg-type]
 
 

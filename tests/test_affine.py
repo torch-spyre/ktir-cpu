@@ -378,10 +378,32 @@ class TestTryFromAffineSet:
         aset = self._parse_aset("affine_set<(d0) : (2 * d0 >= 0, -d0 + 3 >= 0)>")
         assert BoxSet.try_from_affine_set(aset) is None
 
+    def test_accept_eq_and_range(self):
+        """d0 == 2, 1 <= d1 <= 3  →  BoxSet(lo=(2, 1), hi=(3, 4))."""
+        aset = self._parse_aset(
+            "affine_set<(d0, d1) : (d0 - 2 == 0, d1 - 1 >= 0, -d1 + 3 >= 0)>"
+        )
+        box = BoxSet.try_from_affine_set(aset)
+        assert box == BoxSet(lo=(2, 1), hi=(3, 4))
+
     def test_reject_one_axis_unpinned(self):
         """2D set where d1 has no upper bound."""
         aset = self._parse_aset(
             "affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0)>"
+        )
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_axis_with_no_constraints(self):
+        """2D set where d1 has no constraints at all — both lo and hi missing."""
+        aset = self._parse_aset(
+            "affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0)>"
+        )
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_eq_pins_one_axis_other_unconstrained(self):
+        """2D set where d0 is pinned by eq but d1 has no constraints."""
+        aset = self._parse_aset(
+            "affine_set<(d0, d1) : (d0 == 0)>"
         )
         assert BoxSet.try_from_affine_set(aset) is None
 
@@ -523,3 +545,94 @@ def eval_bound_eq(b, symbols, expected):
     """Helper: evaluate a Bound and assert it matches *expected*."""
     from ktir_cpu.parser_ast import eval_bound
     return eval_bound(b, symbols) == expected
+
+
+class TestEqualityBoxSetLowering:
+    """BoxSet.try_from_affine_set handles ("eq", lhs, rhs) directly."""
+
+    def test_eq_pins_single_dim(self):
+        """affine_set<(g) : (g == 0)> lowers to BoxSet(lo=(0,), hi=(1,))."""
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        assert isinstance(s, BoxSet)
+        assert s == BoxSet(lo=(0,), hi=(1,))
+
+    def test_eq_i_equals_zero(self):
+        """Spec example: affine_set<(i) : (i == 0)>."""
+        s = parse_affine_set("affine_set<(i) : (i == 0)>")
+        assert isinstance(s, BoxSet)
+        assert s == BoxSet(lo=(0,), hi=(1,))
+
+    def test_eq_nonzero_pin(self):
+        """g == 3 lowers to BoxSet(lo=(3,), hi=(4,))."""
+        s = parse_affine_set("affine_set<(g) : (g - 3 == 0)>")
+        assert isinstance(s, BoxSet)
+        assert s == BoxSet(lo=(3,), hi=(4,))
+
+    def test_eq_pin_and_ineq_intersection(self):
+        """g == 0 combined with inequality g <= 5 — pin wins: lo=0, hi=1."""
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        from ktir_cpu.affine import BoxSet as _BoxSet
+        aset = parse_affine_set_raw("affine_set<(g) : (g == 0, -g + 5 >= 0)>")
+        box = _BoxSet.try_from_affine_set(aset)
+        assert box == BoxSet(lo=(0,), hi=(1,))
+
+    def test_eq_negative_coeff_pin(self):
+        """-g + 3 == 0 means g == 3 → BoxSet(lo=(3,), hi=(4,))."""
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        from ktir_cpu.affine import BoxSet as _BoxSet
+        aset = parse_affine_set_raw("affine_set<(g) : (-g + 3 == 0)>")
+        box = _BoxSet.try_from_affine_set(aset)
+        assert box == BoxSet(lo=(3,), hi=(4,))
+
+    def test_eq_multi_dim_rejected(self):
+        """p - c == 0 involves two dims — cannot lower to BoxSet.
+
+        TODO: remove or update when PR #69 lands (symbolic/multi-dim eq support).
+        """
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        from ktir_cpu.affine import BoxSet as _BoxSet
+        aset = parse_affine_set_raw("affine_set<(p, c) : (p - c == 0)>")
+        assert _BoxSet.try_from_affine_set(aset) is None
+
+    def test_spec_example_g_eq_0(self):
+        """Full spec example: affine_set<(g) : (g == 0)>."""
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        assert isinstance(s, BoxSet)
+        assert s.lo == (0,)
+        assert s.hi == (1,)
+
+    def test_symbolic_eq_pin(self):
+        """d0 == s0 lowers to a symbolic BoxSet that specialises to a point."""
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        from ktir_cpu.affine import BoxSet as _BoxSet
+        aset = parse_affine_set_raw("affine_set<(d0)[s0] : (d0 - s0 == 0)>")
+        box = _BoxSet.try_from_affine_set(aset)
+        assert box is not None
+        assert not box.is_concrete
+        assert box.specialize([3]) == BoxSet(lo=(3,), hi=(4,))
+        assert box.specialize([7]) == BoxSet(lo=(7,), hi=(8,))
+
+    def test_symbolic_eq_with_offset(self):
+        """p - c + 2 == 0  →  p == c - 2; specialise([5]) → BoxSet(lo=(3,), hi=(4,))."""
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        from ktir_cpu.affine import BoxSet as _BoxSet
+        aset = parse_affine_set_raw("affine_set<(p)[c] : (p - c + 2 == 0)>")
+        box = _BoxSet.try_from_affine_set(aset)
+        assert box is not None
+        assert not box.is_concrete
+        assert box.specialize([5]) == BoxSet(lo=(3,), hi=(4,))
+
+    def test_reject_conflicting_eq_constraints(self):
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw("affine_set<(d0) : (d0 == 2, d0 == 3)>")
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_eq_ineq_conflict(self):
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw("affine_set<(d0) : (d0 == 2, d0 >= 5)>")
+        assert BoxSet.try_from_affine_set(aset) is None
+
+    def test_reject_conflicting_inequalities(self):
+        from ktir_cpu.parser_ast import parse_affine_set_raw
+        aset = parse_affine_set_raw("affine_set<(d0) : (d0 >= 5, -d0 + 3 >= 0)>")
+        assert BoxSet.try_from_affine_set(aset) is None

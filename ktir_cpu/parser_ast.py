@@ -95,7 +95,7 @@ _TOKEN_RE = re.compile(
     r'(%[a-zA-Z_]\w*)'               # named reference %name (group 1)
     r'|([a-zA-Z_]\w*)'               # bare identifier  (group 2)
     r'|(-?\d+)'                      # integer literal, possibly negative (group 3)
-    r'|(>=|<=|->|[+\-*(),:[\]])'     # operator / punctuation incl. [ ]  (group 4)
+    r'|(==|>=|<=|->|[+\-*(),:[\]])'  # operator / punctuation; == before >= (group 4)
     r')'
 )
 
@@ -284,27 +284,27 @@ class _Parser:
         return exprs
 
     def parse_constraint_list(self) -> List[_Node]:
-        """Parse ``(lhs >= rhs, lhs <= rhs, ...)`` and return normalised nodes.
+        """Parse ``(lhs >= rhs, lhs <= rhs, lhs == rhs, ...)`` and return nodes.
 
-        Each constraint is normalised to ``lhs - rhs >= 0``:
+        Inequality constraints are normalised to ``lhs - rhs >= 0``:
           - ``lhs >= rhs``  → stored as ``("sub", lhs, rhs)``
           - ``lhs <= rhs``  → stored as ``("sub", rhs, lhs)``
 
-        The special case ``expr >= 0`` / ``expr <= 0`` is handled naturally
-        since ``("sub", expr, 0_const)`` evaluates identically to ``expr``.
+        Equality constraints are stored as a first-class 3-tuple:
+          - ``lhs == rhs``  → stored as ``("eq", lhs, rhs)``
         """
         self.consume("(")
         constraints: List[_Node] = []
         while self.peek() != ")":
             lhs = self.parse_expr()
-            op = self.consume()  # ">=" or "<="
+            op = self.consume()  # ">=", "<=", or "=="
             rhs = self.parse_expr()
             if op == ">=":
-                # lhs >= rhs  →  lhs - rhs >= 0
                 node = ("sub", lhs, rhs)
             elif op == "<=":
-                # lhs <= rhs  →  rhs - lhs >= 0
                 node = ("sub", rhs, lhs)
+            elif op == "==":
+                node = ("eq", lhs, rhs)
             else:
                 raise ValueError(f"Unsupported constraint operator: {op!r}")
             constraints.append(node)
@@ -481,7 +481,11 @@ def affine_set_contains(aset: AffineSet, point: Sequence[int], symbols: Sequence
     """Return True if *point* satisfies all constraints in *aset*."""
     env = list(point)
     syms = list(symbols)
-    return all(_eval_node(c, env, syms) >= 0 for c in aset.constraints)
+    return all(
+        _eval_node(c[1], env, syms) == _eval_node(c[2], env, syms) if c[0] == "eq"
+        else _eval_node(c, env, syms) >= 0
+        for c in aset.constraints
+    )
 
 
 def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...], symbols: Sequence[int] = ()) -> List[Tuple[int, ...]]:

@@ -39,6 +39,7 @@ try:
         IntegerAttr,
         IntegerSetAttr,
         Module,
+        ShapedType,
     )
     from mlir_ktdp.passmanager import PassManager
     from tools_ktdp.ir_utils import ktdp_context, walk_module
@@ -255,9 +256,38 @@ def _adapt_construct_access_tile(mlir_op, attributes, result_type, operands):
 
 @MLIRTypeAdapter.install("ktdp.construct_memory_view")
 def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
-    """Map static_sizes→shape, static_strides→strides; extract dtype, memory_space from result/attrs."""
-    attributes["shape"] = tuple(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
-    attributes["strides"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+    """Map static_sizes→shape, static_strides→strides; extract dtype, memory_space from result/attrs.
+
+    Dynamic dims/strides are encoded in static_sizes/static_strides as the
+    ShapedType dynamic sentinel (INT64_MIN), with their runtime values supplied
+    as SSA operands. The executor (ktdp__construct_memory_view) expects each
+    dynamic slot to instead carry the SSA-name *string* of its operand: dynamic
+    sizes are resolved at runtime, and their names also bind the symbols of the
+    coordinate_set (per the ODS contract). We mirror the regex parser by
+    substituting those names into the sentinel slots, left to right.
+
+    operandSegmentSizes splits the operands into [base, dynamic_sizes,
+    dynamic_strides]; the dynamic_sizes/strides segments line up one-to-one
+    (in order) with the sentinel slots in static_sizes/static_strides.
+    """
+    sizes = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
+    strides = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+
+    seg = list(DenseI32ArrayAttr(mlir_op.attributes["operandSegmentSizes"]))
+    n_base, n_dyn_sizes, n_dyn_strides = seg[0], seg[1], seg[2]
+    dyn_size_names = operands[n_base:n_base + n_dyn_sizes]
+    dyn_stride_names = operands[n_base + n_dyn_sizes:n_base + n_dyn_sizes + n_dyn_strides]
+
+    sentinel = ShapedType.get_dynamic_size()
+
+    def _splice(static_vals, names):
+        out, it = [], iter(names)
+        for v in static_vals:
+            out.append(next(it) if v == sentinel else v)
+        return out
+
+    attributes["shape"] = tuple(_splice(sizes, dyn_size_names))
+    attributes["strides"] = _splice(strides, dyn_stride_names)
     m = re.search(r'x([a-zA-Z]\w*)(?:[,>])', result_type)
     if not m:
         raise ValueError(f"ktdp.construct_memory_view: cannot parse dtype from {result_type!r}")
