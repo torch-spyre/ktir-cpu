@@ -720,12 +720,18 @@ class TestKtdpParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
         self.assert_attribute(op, "dtype", "f16")
-        # Only assert the concrete dim — the dynamic dim is represented as the
-        # SSA name string "%n" by the regex parser, and as the ShapedType
-        # sentinel by the MLIR frontend.
+        # The static dim is a concrete int; the dynamic dim must carry the SSA
+        # name (a string) of its sizes: operand so the executor can resolve it
+        # at runtime and bind it to symbol s0 of the coordinate_set. Both
+        # parsers must uphold this — the exact name differs (regex keeps "%n",
+        # the MLIR frontend renumbers positionally), so we assert the type, not
+        # the value.
         shape = op.attributes["shape"]
-        assert shape[0] == 1024
         assert len(shape) == 2
+        assert shape[0] == 1024
+        assert isinstance(shape[1], str), (
+            f"dynamic dim must be an SSA-name string, got {shape[1]!r}"
+        )
 
     @pytest.mark.regex_only
     def test_construct_memory_view_sizes_count_mismatch_rejected(self):
