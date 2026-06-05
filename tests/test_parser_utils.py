@@ -95,3 +95,71 @@ def test_parse_tensor_type_index_dtype(type_str, expected_shape):
 def test_parse_tensor_type_rejects_non_tensor(type_str):
     """Inputs that are not a ranked tensor type return ``None``."""
     assert parse_tensor_type(type_str) is None
+
+
+# ---------------------------------------------------------------------------
+# Real-MLIR forms: dynamic dims, encoding attribute, whitespace,
+# trailing context after the closing '>'
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "type_str, expected_shape, expected_dtype",
+    [
+        # Dynamic dim: '?' becomes -1 (NumPy-style sentinel).
+        ("tensor<?x4xf32>", (-1, 4), "f32"),
+        ("tensor<?xf16>", (-1,), "f16"),
+        ("tensor<2x?x4xindex>", (2, -1, 4), "index"),
+        # Encoding attribute (RFC-allowed second positional).
+        ("tensor<4x4xf32, #my_enc>", (4, 4), "f32"),
+        ("tensor<8xf16, dense<0> : tensor<8xi1>>", (8,), "f16"),
+        # MLIR pretty-printer whitespace tolerance.
+        ("tensor< 2 x f32 >", (2,), "f32"),
+        ("tensor<1 x 64 x i32>", (1, 64), "i32"),
+        # Trailing context after the closing '>' — ignored, matching the
+        # original ``re.match``-based behaviour. Calls inside the parser
+        # rely on this when they pass un-stripped MLIR fragments.
+        ("tensor<4xf32> loc(unknown)", (4,), "f32"),
+        ("tensor<4xf32>, %arg0", (4,), "f32"),
+    ],
+)
+def test_parse_tensor_type_real_mlir_forms(type_str, expected_shape, expected_dtype):
+    """Forms that the upstream MLIR pretty-printer can produce."""
+    info = parse_tensor_type(type_str)
+    assert info == {"shape": expected_shape, "dtype": expected_dtype}
+
+
+# ---------------------------------------------------------------------------
+# Known limitation: nested-bracket element types
+# ---------------------------------------------------------------------------
+
+@pytest.mark.xfail(
+    reason=(
+        "Nested-bracket element types (complex<f32>, !tt.ptr<f32>, "
+        "vector<4xf32>) cannot be parsed with a single Python regex — "
+        "``re`` does not count balanced ``<>`` so the outer ``>`` is "
+        "indistinguishable from a nested one. These types do not appear "
+        "in lowered KTIR reaching this parser today (only in TTIR). "
+        "Promote to a real test if a depth-counting parser replaces the "
+        "regex, or if the parser starts to consume TTIR fragments."
+    ),
+    strict=True,
+)
+@pytest.mark.parametrize(
+    "type_str, expected_shape, expected_dtype",
+    [
+        ("tensor<4xcomplex<f32>>", (4,), "complex<f32>"),
+        ("tensor<4x!tt.ptr<f32>>", (4,), "!tt.ptr<f32>"),
+        ("tensor<4xvector<4xf32>>", (4,), "vector<4xf32>"),
+    ],
+)
+def test_parse_tensor_type_nested_bracket_dtype(type_str, expected_shape, expected_dtype):
+    """xfail: dtypes whose own form contains ``<...>`` are not supported.
+
+    The regex stops at the first ``>``, so ``complex<f32>`` is parsed
+    with the inner ``>`` mistaken for the closing bracket of the tensor
+    type, leaving the dtype truncated to ``complex<f32`` (no closing
+    bracket) and the trailing ``>`` unconsumed. A depth-counting parser
+    is needed to fix this — out of scope for the current change.
+    """
+    info = parse_tensor_type(type_str)
+    assert info == {"shape": expected_shape, "dtype": expected_dtype}
