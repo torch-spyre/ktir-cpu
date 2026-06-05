@@ -19,9 +19,13 @@ Pure element-wise and scalar arithmetic on Tiles and ints/floats,
 used by dialect handlers in ``ktir_cpu.dialects``.
 """
 
+import math
+import operator
+
 import numpy as np
 from ..ir_types import Tile
 from ..dtypes import _REVERSE_MAP, to_np_dtype
+from ._helpers import tile_binop_int
 
 
 def arith_cast(value, target_np_dtype, expect_floating, op_name):
@@ -133,68 +137,18 @@ class ArithOps:
 
     @staticmethod
     def addi(val1, val2):
-        """Integer addition. Works on both scalars and Tiles.
-
-        When both are Tiles, performs element-wise integer addition.
-        When one is a scalar and the other a Tile, broadcasts the scalar.
-
-        Args:
-            val1, val2: Input integers or Tiles
-
-        Returns:
-            int or Tile result
-        """
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data + val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data + int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) + val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return int(val1) + int(val2)
+        """Integer addition. Works on both scalars and Tiles."""
+        return tile_binop_int(operator.add, val1, val2)
 
     @staticmethod
     def subi(val1, val2):
         """Integer subtraction. Works on both scalars and Tiles."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data - val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data - int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) - val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return val1 - val2
+        return tile_binop_int(operator.sub, val1, val2)
 
     @staticmethod
     def muli(val1, val2):
-        """Integer multiplication. Works on both scalars and Tiles.
-
-        When both are Tiles, performs element-wise integer multiplication.
-        When one is a scalar and the other a Tile, broadcasts the scalar.
-
-        Args:
-            val1, val2: Input integers or Tiles
-
-        Returns:
-            int or Tile result
-        """
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data * val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data * int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) * val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return int(val1) * int(val2)
+        """Integer multiplication. Works on both scalars and Tiles."""
+        return tile_binop_int(operator.mul, val1, val2)
 
     @staticmethod
     def cmpi(val1, val2, predicate: str = "slt"):
@@ -335,32 +289,12 @@ class ArithOps:
     @staticmethod
     def divsi(val1, val2):
         """Signed integer floor division. Works on both scalars and Tiles."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data // val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data // int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) // val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return int(val1) // int(val2)
+        return tile_binop_int(operator.floordiv, val1, val2)
 
     @staticmethod
     def remsi(val1, val2):
         """Signed integer remainder. Works on both scalars and Tiles."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data % val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data % int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) % val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return int(val1) % int(val2)
+        return tile_binop_int(operator.mod, val1, val2)
 
     @staticmethod
     def fptosi(value):
@@ -372,32 +306,12 @@ class ArithOps:
     @staticmethod
     def divui(val1, val2):
         """Unsigned integer floor division. Works on both scalars and Tiles."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data // val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data // int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) // val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return val1 // val2
+        return tile_binop_int(operator.floordiv, val1, val2)
 
     @staticmethod
     def remui(val1, val2):
         """Unsigned integer remainder. Works on both scalars and Tiles."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            result_data = val1.data % val2.data
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val1, Tile):
-            result_data = val1.data % int(val2)
-            return Tile(result_data, val1.dtype, result_data.shape)
-        elif isinstance(val2, Tile):
-            result_data = int(val1) % val2.data
-            return Tile(result_data, val2.dtype, result_data.shape)
-        else:
-            return val1 % val2
+        return tile_binop_int(operator.mod, val1, val2)
 
     @staticmethod
     def matmul(tile_a: Tile, tile_b: Tile) -> Tile:
@@ -463,7 +377,7 @@ class ArithOps:
             rhs = val2.data if isinstance(val2, Tile) else val2
             result = fn(lhs, rhs)
             ref = val1 if isinstance(val1, Tile) else val2
-            return Tile(result, ref.dtype, result.shape)
+            return Tile(result, "i1", result.shape)
         return bool(fn(val1, val2))
 
     # -----------------------------------------------------------------------
@@ -514,80 +428,40 @@ class ArithOps:
     @staticmethod
     def ceildivsi(val1, val2):
         """Signed integer ceiling division."""
-        import math
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(np.ceil(val1.data / val2.data).astype(val1.data.dtype), val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(np.ceil(val1.data / int(val2)).astype(val1.data.dtype), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(np.ceil(int(val1) / val2.data).astype(val2.data.dtype), val2.dtype, val2.shape)
-        return math.ceil(val1 / val2)
+        def _ceildiv(a, b):
+            result = np.ceil(a / b)
+            return result.astype(a.dtype) if isinstance(a, np.ndarray) else math.ceil(result)
+        return tile_binop_int(_ceildiv, val1, val2)
 
     @staticmethod
     def floordivsi(val1, val2):
         """Signed integer floor division (same as divsi for negative numbers in Python)."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(val1.data // val2.data, val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(val1.data // int(val2), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(int(val1) // val2.data, val2.dtype, val2.shape)
-        return val1 // val2
+        return tile_binop_int(operator.floordiv, val1, val2)
 
     @staticmethod
     def andi(val1, val2):
         """Bitwise AND."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(val1.data & val2.data, val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(val1.data & int(val2), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(int(val1) & val2.data, val2.dtype, val2.shape)
-        return int(val1) & int(val2)
+        return tile_binop_int(operator.and_, val1, val2)
 
     @staticmethod
     def ori(val1, val2):
         """Bitwise OR."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(val1.data | val2.data, val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(val1.data | int(val2), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(int(val1) | val2.data, val2.dtype, val2.shape)
-        return int(val1) | int(val2)
+        return tile_binop_int(operator.or_, val1, val2)
 
     @staticmethod
     def xori(val1, val2):
         """Bitwise XOR."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(val1.data ^ val2.data, val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(val1.data ^ int(val2), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(int(val1) ^ val2.data, val2.dtype, val2.shape)
-        return int(val1) ^ int(val2)
+        return tile_binop_int(operator.xor, val1, val2)
 
     @staticmethod
     def shli(val1, val2):
         """Left shift."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(val1.data << val2.data, val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(val1.data << int(val2), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(int(val1) << val2.data, val2.dtype, val2.shape)
-        return int(val1) << int(val2)
+        return tile_binop_int(operator.lshift, val1, val2)
 
     @staticmethod
     def shrsi(val1, val2):
         """Arithmetic (signed) right shift."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(val1.data >> val2.data, val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(val1.data >> int(val2), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(int(val1) >> val2.data, val2.dtype, val2.shape)
-        return int(val1) >> int(val2)
+        return tile_binop_int(operator.rshift, val1, val2)
 
     @staticmethod
     def shrui(val1, val2):
@@ -603,58 +477,30 @@ class ArithOps:
     @staticmethod
     def minsi(val1, val2):
         """Signed integer minimum."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(np.minimum(val1.data, val2.data), val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(np.minimum(val1.data, int(val2)), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(np.minimum(int(val1), val2.data), val2.dtype, val2.shape)
-        return min(int(val1), int(val2))
+        return tile_binop_int(np.minimum, val1, val2)
 
     @staticmethod
     def maxsi(val1, val2):
         """Signed integer maximum."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(np.maximum(val1.data, val2.data), val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(np.maximum(val1.data, int(val2)), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(np.maximum(int(val1), val2.data), val2.dtype, val2.shape)
-        return max(int(val1), int(val2))
+        return tile_binop_int(np.maximum, val1, val2)
 
     @staticmethod
     def minui(val1, val2):
         """Unsigned integer minimum."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(np.minimum(val1.data, val2.data), val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(np.minimum(val1.data, int(val2)), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(np.minimum(int(val1), val2.data), val2.dtype, val2.shape)
-        return min(int(val1), int(val2))
+        return tile_binop_int(np.minimum, val1, val2)
 
     @staticmethod
     def maxui(val1, val2):
         """Unsigned integer maximum."""
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(np.maximum(val1.data, val2.data), val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(np.maximum(val1.data, int(val2)), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(np.maximum(int(val1), val2.data), val2.dtype, val2.shape)
-        return max(int(val1), int(val2))
+        return tile_binop_int(np.maximum, val1, val2)
 
     @staticmethod
     def ceildivui(val1, val2):
         """Unsigned integer ceiling division."""
-        import math
-        if isinstance(val1, Tile) and isinstance(val2, Tile):
-            return Tile(np.ceil(val1.data / val2.data).astype(val1.data.dtype), val1.dtype, val1.shape)
-        if isinstance(val1, Tile):
-            return Tile(np.ceil(val1.data / int(val2)).astype(val1.data.dtype), val1.dtype, val1.shape)
-        if isinstance(val2, Tile):
-            return Tile(np.ceil(int(val1) / val2.data).astype(val2.data.dtype), val2.dtype, val2.shape)
-        return math.ceil(int(val1) / int(val2))
+        def _ceildiv(a, b):
+            result = np.ceil(a / b)
+            return result.astype(a.dtype) if isinstance(a, np.ndarray) else math.ceil(result)
+        return tile_binop_int(_ceildiv, val1, val2)
 
     @staticmethod
     def convertf(value):

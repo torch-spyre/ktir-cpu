@@ -111,18 +111,6 @@ def arith__minnumf(op, context, env):
 
 
 # ---------------------------------------------------------------------------
-# Float comparison
-# ---------------------------------------------------------------------------
-
-@register("arith.cmpf", latency_category=LC.COMPUTE_FLOAT)
-def arith__cmpf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    predicate = op.attributes.get("predicate", "oeq")
-    return ArithOps.cmpf(a, b, predicate)
-
-
-# ---------------------------------------------------------------------------
 # Integer binary ops
 # ---------------------------------------------------------------------------
 

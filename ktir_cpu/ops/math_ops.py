@@ -21,208 +21,82 @@ handlers in ``ktir_cpu.dialects``.
 
 import numpy as np
 from ..ir_types import Tile
+from ._helpers import tile_unary_float, tile_unary_int
 
 
 class MathOps:
     """Transcendental math on tiles and scalars."""
 
     @staticmethod
-    def exp(tile: Tile) -> Tile:
-        """Element-wise exponential (e^x).
-
-        Computes e raised to the power of each element in the input tile.
-
-        Args:
-            tile: Input tile with f16 data
-
-        Returns:
-            Result tile where each element is exp(input_element)
-        """
-        result_data = np.exp(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+    def exp(val):
+        """Element-wise exponential (e^x)."""
+        return tile_unary_float(np.exp, val)
 
     @staticmethod
-    def exp_scalar(value: np.floating) -> np.floating:
-        """Scalar exponential.
-
-        Args:
-            value: Input scalar
-
-        Returns:
-            exp(value) in the same type
-        """
-        return type(value)(np.exp(float(value)))
+    def sqrt(val):
+        """Element-wise square root."""
+        return tile_unary_float(np.sqrt, val)
 
     @staticmethod
-    def sqrt(tile: Tile) -> Tile:
-        """Element-wise square root.
-
-        Computes the square root of each element in the input tile.
-
-        Args:
-            tile: Input tile with f16 data
-
-        Returns:
-            Result tile where each element is sqrt(input_element)
-        """
-        result_data = np.sqrt(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
-
-    @staticmethod
-    def sqrt_scalar(value: np.floating) -> np.floating:
-        """Scalar square root.
-
-        Args:
-            value: Input scalar
-
-        Returns:
-            sqrt(value) in the same type
-        """
-        return type(value)(np.sqrt(float(value)))
-
-    @staticmethod
-    def rsqrt(tile: Tile) -> Tile:
+    def rsqrt(val):
         """Element-wise reciprocal square root (1/sqrt(x))."""
-        result_data = (1.0 / np.sqrt(tile.data.astype(np.float32))).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(lambda x: 1.0 / np.sqrt(x), val)
 
     @staticmethod
-    def rsqrt_scalar(value: np.floating) -> np.floating:
-        """Scalar reciprocal square root."""
-        return type(value)(1.0 / np.sqrt(float(value)))
+    def log(val):
+        """Element-wise natural logarithm."""
+        return tile_unary_float(np.log, val)
 
     @staticmethod
-    def log(tile: Tile) -> Tile:
-        """Element-wise logarithm.
-
-        Computes the log of each element in the input tile.
-
-        Args:
-            tile: Input tile with f16 data
-
-        Returns:
-            Result tile where each element is log(input_element)
-        """
-        result_data = np.log(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
-
-    @staticmethod
-    def log_scalar(value: np.floating) -> np.floating:
-        """Scalar logarithm.
-
-        Args:
-            value: Input scalar
-
-        Returns:
-            log(value) in the same type
-        """
-        return type(value)(np.log(float(value)))
-
-    @staticmethod
-    def log2(tile: Tile) -> Tile:
+    def log2(val):
         """Element-wise base-2 logarithm."""
-        result_data = np.log2(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.log2, val)
 
     @staticmethod
-    def log2_scalar(value: np.floating) -> np.floating:
-        """Scalar base-2 logarithm."""
-        return type(value)(np.log2(float(value)))
-
-    @staticmethod
-    def log1p(tile: Tile) -> Tile:
+    def log1p(val):
         """Element-wise log(1 + x)."""
-        result_data = np.log1p(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.log1p, val)
 
     @staticmethod
-    def log1p_scalar(value: np.floating) -> np.floating:
-        """Scalar log(1 + x)."""
-        return type(value)(np.log1p(float(value)))
-
-    @staticmethod
-    def tanh(tile: Tile) -> Tile:
+    def tanh(val):
         """Element-wise hyperbolic tangent."""
-        result_data = np.tanh(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.tanh, val)
 
     @staticmethod
-    def tanh_scalar(value: np.floating) -> np.floating:
-        """Scalar hyperbolic tangent."""
-        return type(value)(np.tanh(float(value)))
-
-    @staticmethod
-    def sin(tile: Tile) -> Tile:
+    def sin(val):
         """Element-wise sine."""
-        result_data = np.sin(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.sin, val)
 
     @staticmethod
-    def sin_scalar(value: np.floating) -> np.floating:
-        """Scalar sine."""
-        return type(value)(np.sin(float(value)))
-
-    @staticmethod
-    def cos(tile: Tile) -> Tile:
+    def cos(val):
         """Element-wise cosine."""
-        result_data = np.cos(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.cos, val)
 
     @staticmethod
-    def cos_scalar(value: np.floating) -> np.floating:
-        """Scalar cosine."""
-        return type(value)(np.cos(float(value)))
-
-    @staticmethod
-    def absf(tile: Tile) -> Tile:
-        """Element-wise absolute value (float)."""
-        result_data = np.abs(tile.data)
-        return Tile(result_data, tile.dtype, tile.shape)
-
-    @staticmethod
-    def absf_scalar(value: np.floating) -> np.floating:
-        """Scalar absolute value (float)."""
-        return type(value)(abs(float(value)))
-
-    @staticmethod
-    def absi(tile: Tile) -> Tile:
-        """Element-wise absolute value (integer)."""
-        result_data = np.abs(tile.data)
-        return Tile(result_data, tile.dtype, tile.shape)
-
-    @staticmethod
-    def absi_scalar(value: np.integer) -> np.integer:
-        """Scalar absolute value (integer)."""
-        return type(value)(abs(int(value)))
-
-    @staticmethod
-    def ceil(tile: Tile) -> Tile:
+    def ceil(val):
         """Element-wise ceiling."""
-        result_data = np.ceil(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.ceil, val)
 
     @staticmethod
-    def ceil_scalar(value: np.floating) -> np.floating:
-        """Scalar ceiling."""
-        return type(value)(np.ceil(float(value)))
-
-    @staticmethod
-    def floor(tile: Tile) -> Tile:
+    def floor(val):
         """Element-wise floor."""
-        result_data = np.floor(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
+        return tile_unary_float(np.floor, val)
 
     @staticmethod
-    def floor_scalar(value: np.floating) -> np.floating:
-        """Scalar floor."""
-        return type(value)(np.floor(float(value)))
+    def absf(val):
+        """Element-wise absolute value (float)."""
+        if isinstance(val, Tile):
+            return Tile(np.abs(val.data), val.dtype, val.shape)
+        return type(val)(abs(float(val)))
+
+    @staticmethod
+    def absi(val):
+        """Element-wise absolute value (integer)."""
+        return tile_unary_int(np.abs, val)
 
     @staticmethod
     def _erf_f32(x: np.ndarray) -> np.ndarray:
-        """Vectorized erf via Abramowitz & Stegun 7.1.26 (max error < 1.5e-7).
-
-        Uses a polynomial approximation to avoid a scipy dependency.
-        """
+        """Vectorized erf via Abramowitz & Stegun 7.1.26 (max error < 1.5e-7)."""
         a = np.abs(x)
         t = 1.0 / (1.0 + 0.3275911 * a)
         poly = t * (0.254829592 + t * (-0.284496736 + t * (
@@ -230,15 +104,9 @@ class MathOps:
         return np.sign(x) * (1.0 - poly * np.exp(-a * a))
 
     @staticmethod
-    def erf(tile: Tile) -> Tile:
+    def erf(val):
         """Element-wise error function."""
-        result_data = MathOps._erf_f32(tile.data.astype(np.float32)).astype(tile.data.dtype)
-        return Tile(result_data, tile.dtype, tile.shape)
-
-    @staticmethod
-    def erf_scalar(value: np.floating) -> np.floating:
-        """Scalar error function."""
-        return type(value)(MathOps._erf_f32(np.array([float(value)]))[0])
+        return tile_unary_float(MathOps._erf_f32, val)
 
     @staticmethod
     def powf(tile: Tile, exponent: Tile) -> Tile:

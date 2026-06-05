@@ -253,6 +253,19 @@ class TestArithOpsSelect:
         assert np.array_equal(result.data, np.array([1, 5, 3], dtype=np.float16))
 
 # ---------------------------------------------------------------------------
+# ArithOps (Cmpf)
+# ---------------------------------------------------------------------------
+
+class TestArithOpsCmpf:
+    def test_result_dtype_is_i1(self):
+        # cmpf must return i1 regardless of input dtype — not propagate the float dtype
+        t1 = _tile([1.0, 2.0, 3.0])  # f16
+        t2 = _tile([3.0, 2.0, 1.0])  # f16
+        result = ArithOps.cmpf(t1, t2, "olt")
+        assert result.dtype == "i1"
+        assert result.data.dtype == np.bool_
+
+# ---------------------------------------------------------------------------
 # MathOps
 # ---------------------------------------------------------------------------
 
@@ -266,7 +279,7 @@ class TestMathOps:
     def test_exp_scalar(self):
         # scalar exp preserves type
         val = np.float16(1.0)
-        assert abs(float(MathOps.exp_scalar(val)) - np.e) < 0.01
+        assert abs(float(MathOps.exp(val)) - np.e) < 0.01
 
     def test_sqrt_tile(self):
         # element-wise sqrt on a tile
@@ -277,7 +290,7 @@ class TestMathOps:
     def test_sqrt_scalar(self):
         # scalar sqrt preserves type
         val = np.float16(4.0)
-        assert abs(float(MathOps.sqrt_scalar(val)) - 2.0) < 0.01
+        assert abs(float(MathOps.sqrt(val)) - 2.0) < 0.01
 
 # ---------------------------------------------------------------------------
 # GridOps
