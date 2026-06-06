@@ -1085,6 +1085,26 @@ class TestScfFunc:
         dispatch("scf.if")(op, ctx, env)
         assert ran == ["else"]
 
+    def test_if_then_else_yield_result(self):
+        # scf.if with a yielding then-branch returns the unwrapped value, not a _YieldResult wrapper
+        ctx = _ctx_with(**{"%cond": True, "%val": 42})
+        op = Operation(op_type="scf.if", operands=["%cond"], attributes={},
+                       result="%res", result_type=None,
+                       regions=[[Operation(op_type="scf.yield", operands=["%val"],
+                                           attributes={}, result=None, result_type=None)],
+                                 []])
+        env = _make_env()
+
+        def real_execute_region(ctx, ops):
+            result = None
+            for o in ops:
+                result = dispatch(o.op_type)(o, ctx, env)
+            return result
+
+        env.execute_region = real_execute_region
+        result = dispatch("scf.if")(op, ctx, env)
+        assert result == 42, f"expected 42, got {result!r}"
+
 # ---------------------------------------------------------------------------
 # ktdp dialect parsers
 # ---------------------------------------------------------------------------
