@@ -261,133 +261,6 @@ def _resolve_idx_reads(
     return per_view_values, total_sticks
 
 
-def _eval_subscript_vectorized(expr: tuple, pts: np.ndarray) -> np.ndarray:
-    """NumPy-vectorised dual of :func:`eval_subscript_expr`.
-
-    *pts* is an ``(N, n_vars)`` int array; the return is an ``(N,)`` int64
-    array.  Mirrors the AST grammar in :func:`parser_ast._eval_node` plus
-    the legacy ``floordiv`` / ``mod`` forms in
-    :func:`eval_subscript_expr`.
-
-    Used only by the BoxSet fast path in :func:`_build_indirect_coords` —
-    the slow path keeps the per-point :func:`eval_subscript_expr` call.
-    """
-    tag = expr[0]
-    if tag == "const":
-        return np.full(pts.shape[0], expr[1], dtype=np.int64)
-    if tag == "dim":
-        return pts[:, expr[1]].astype(np.int64, copy=False)
-    if tag == "sym":
-        # The IAT is concrete by construction at this layer; symbol
-        # bindings are resolved upstream in the memory-view parser
-        # before they reach the indirect coord builder.
-        raise ValueError(
-            "symbolic subscript is not supported on the BoxSet fast path"
-        )
-    if tag == "neg":
-        return -_eval_subscript_vectorized(expr[1], pts)
-    if tag == "add":
-        return _eval_subscript_vectorized(expr[1], pts) + _eval_subscript_vectorized(expr[2], pts)
-    if tag == "sub":
-        return _eval_subscript_vectorized(expr[1], pts) - _eval_subscript_vectorized(expr[2], pts)
-    if tag == "mul":
-        # Affine grammar: ``mul`` carries a scalar coefficient on side 1
-        # and a sub-expression on side 2; mirrors ``_eval_node``.
-        return expr[1] * _eval_subscript_vectorized(expr[2], pts)
-    if tag == "max":
-        return np.maximum(
-            _eval_subscript_vectorized(expr[1], pts),
-            _eval_subscript_vectorized(expr[2], pts),
-        )
-    if tag == "min":
-        return np.minimum(
-            _eval_subscript_vectorized(expr[1], pts),
-            _eval_subscript_vectorized(expr[2], pts),
-        )
-    if tag == "floordiv":
-        # Legacy form: expr[1] is a dim *index*, not a sub-expression.
-        return pts[:, expr[1]].astype(np.int64, copy=False) // expr[2]
-    if tag == "mod":
-        return pts[:, expr[1]].astype(np.int64, copy=False) % expr[2]
-    raise ValueError(f"Unknown subscript kind: {tag!r}")
-
-
-def _enumerate_box_pts(box: BoxSet) -> np.ndarray:
-    """Row-major variable-space enumeration as an ``(N, ndim)`` int array.
-
-    Matches the order of ``BoxSet.enumerate`` (``itertools.product`` over
-    ``range(lo, hi)`` per axis), so callers that consume idx_values from
-    :func:`_resolve_idx_reads` (which iterates in :func:`_enumerate_in_vso_order`
-    order — identical to row-major when ``vso`` is identity) stay in
-    lockstep.  Empty boxes return a ``(0, ndim)`` array.
-    """
-    if box.is_empty():
-        return np.empty((0, box.n_dims), dtype=np.int64)
-    extent = tuple(box.hi[d] - box.lo[d] for d in range(box.n_dims))
-    grid = np.indices(extent, dtype=np.int64).reshape(box.n_dims, -1).T
-    return grid + np.array(box.lo, dtype=np.int64)
-
-
-def _build_indirect_coords_box(
-    iat: "IndirectAccessTile",
-    idx_values: Dict[int, np.ndarray],
-    box: BoxSet,
-) -> List[Tuple[int, ...]]:
-    """Vectorised coord builder for the BoxSet variable-space fast path.
-
-    Constructs an ``(N, n_dims)`` coord matrix column-by-column:
-    * ``direct`` dims slice the variable-space point array;
-    * ``direct_expr`` dims call :func:`_eval_subscript_vectorized`;
-    * ``indirect`` dims slice ``idx_values[iv_idx]`` with the per-sub
-      stride/offset that mirrors the pt-major / dim-minor consumption
-      order of the slow path (so behaviour is identical when multiple
-      indirect dims share the same index view).
-
-    Returns ``List[Tuple[int, ...]]`` for downstream
-    :func:`MemoryOps.load`/``store`` parity — the structural win is in
-    column-wise vectorised construction, not in the downstream offset
-    gather which still iterates per coord.
-    """
-    pts = _enumerate_box_pts(box)
-    n_pts = pts.shape[0]
-    n_dims = len(iat.dim_subscripts)
-    coord_array = np.empty((n_pts, n_dims), dtype=np.int64)
-
-    view_groups: Dict[int, List[int]] = {}
-    for d, sub in enumerate(iat.dim_subscripts):
-        if sub["kind"] == "indirect":
-            view_groups.setdefault(sub["index_view_idx"], []).append(d)
-
-    for d, sub in enumerate(iat.dim_subscripts):
-        kind = sub["kind"]
-        if kind == "direct":
-            coord_array[:, d] = pts[:, sub["var_index"]]
-        elif kind == "direct_expr":
-            coord_array[:, d] = _eval_subscript_vectorized(sub["subscript"], pts)
-        elif kind == "indirect":
-            iv_idx = sub["index_view_idx"]
-            group = view_groups[iv_idx]
-            stride = len(group)
-            offset = group.index(d)
-            vals = np.asarray(idx_values[iv_idx])[offset::stride]
-            neg_mask = vals < 0
-            if neg_mask.any():
-                bad = int(vals[neg_mask][0])
-                raise IndexError(
-                    f"indirect index {bad} from "
-                    f"{iat.index_views[iv_idx]} is negative"
-                )
-            coord_array[:, d] = vals
-        else:
-            raise ValueError(f"Unknown indirect subscript kind: {kind}")
-    # ``tolist()`` is C-implemented and ~10x faster than a Python comprehension
-    # over rows; the per-row ``tuple(...)`` is still pure Python but unavoidable
-    # while ``MemoryOps.load(coords=...)`` consumes ``List[Tuple]``.  A future
-    # ndarray-coords API on the load side could let the box variant skip this
-    # conversion entirely.
-    return [tuple(row) for row in coord_array.tolist()]
-
-
 def _build_indirect_coords(
     iat: "IndirectAccessTile", idx_values: Dict[int, np.ndarray],
 ) -> List[Tuple[int, ...]]:
@@ -402,12 +275,6 @@ def _build_indirect_coords(
       ``idx_values[iv_idx]`` (set up by :func:`_resolve_idx_reads` in the
       same pt-major, dim-minor order).
 
-    BoxSet variable-space + identity ``variables_space_order`` routes
-    through :func:`_build_indirect_coords_box`, which constructs the
-    ``(N, n_dims)`` coord matrix column-by-column with NumPy.  Other
-    cases (AffineSet variable space, or non-identity vso permutation)
-    keep the per-point Python loop below.
-
     Raises ``IndexError`` on a negative idx value — NumPy fancy-indexing
     silently wraps negatives, so we reject them here.  The check survives
     ``python -O`` (uses ``raise``, not ``assert``).
@@ -415,11 +282,6 @@ def _build_indirect_coords(
     Shared by ``indirect_load`` and ``indirect_store`` so their coord
     construction stays in lockstep (guard symmetry).
     """
-    vss = iat.variables_space_set
-    vso = iat.variables_space_order
-    if isinstance(vss, BoxSet) and (vso is None or vso.is_identity()):
-        return _build_indirect_coords_box(iat, idx_values, vss)
-
     points = _enumerate_in_vso_order(iat)
     idx_iters = {iv_idx: iter(values) for iv_idx, values in idx_values.items()}
 
@@ -572,73 +434,6 @@ class MemoryOps:
             if sticks is not None:
                 sticks.add((base_ptr + o * bpe) // stick_bytes)
         return offsets, len(sticks) if sticks is not None else None
-
-    @staticmethod
-    def boxed_load(
-        context: CoreContext,
-        parent_ref: TileRef,
-        box: BoxSet,
-    ) -> Tile:
-        """Load a rectangular sub-region described by *box* (in local coords).
-
-        Mirrors the BoxSet branch in :meth:`distributed_load`: build a
-        sub-TileRef covering exactly the box, then delegate to
-        :meth:`load`, which takes its own contiguous/strided fast path on
-        a single read.  Skips the per-element offset gather that the
-        coord-list path needs for non-rectangular AffineSet access.
-
-        ``box`` is in *parent_ref-local* coordinates (``box.lo[d]`` is
-        the offset within ``parent_ref`` along axis ``d``).  Reuses
-        :meth:`_subtile_ref` whose ``survivor.partition_origin or (0,)``
-        fallback collapses to plain ``box.lo · strides`` on a
-        non-distributed parent (``partition_origin is None``); the
-        no-trample tests pin this contract.
-
-        Result shape always equals the box extent — the iteration ↔
-        data-tile-shape contract is the dialect handler's responsibility,
-        not this helper's.  Empty boxes (any axis with ``hi[d] <= lo[d]``)
-        short-circuit to a zero-element tile so degenerate slices never
-        fabricate an offset pointer or hit a 0-length downstream read.
-        """
-        if box.is_empty():
-            ndim = len(parent_ref.shape)
-            extent = tuple(box.hi[d] - box.lo[d] for d in range(ndim))
-            empty = np.zeros(extent, dtype=_to_np_dtype(parent_ref.dtype))
-            return Tile(empty, parent_ref.dtype, extent, None)
-        sub_ref = MemoryOps._subtile_ref(parent_ref, box)
-        return MemoryOps.load(context, sub_ref)
-
-    @staticmethod
-    def boxed_store(
-        context: CoreContext,
-        tile: Tile,
-        parent_ref: TileRef,
-        box: BoxSet,
-    ) -> int:
-        """Store a tile to the rectangular sub-region described by *box*.
-
-        Symmetric to :meth:`boxed_load`: build a sub-TileRef covering the
-        box, reshape the source tile to the box extent if needed, and
-        delegate to :meth:`store`.  Skips the read-modify-write that the
-        coord-list scatter path needs.
-
-        Mirrors the BoxSet branch in :meth:`distributed_store` (uses
-        :func:`np.ascontiguousarray` to materialise the slice when the
-        caller supplied a non-contiguous view).
-
-        Empty boxes short-circuit to ``0`` unique_sticks (no write).
-        """
-        if box.is_empty():
-            return 0
-        ndim = len(parent_ref.shape)
-        extent = tuple(box.hi[d] - box.lo[d] for d in range(ndim))
-        sub_ref = MemoryOps._subtile_ref(parent_ref, box)
-        if tuple(tile.data.shape) != extent:
-            src = np.ascontiguousarray(tile.data.reshape(extent))
-        else:
-            src = np.ascontiguousarray(tile.data)
-        sub_tile = Tile(src, parent_ref.dtype, extent)
-        return MemoryOps.store(context, sub_tile, sub_ref)
 
     @staticmethod
     def load(

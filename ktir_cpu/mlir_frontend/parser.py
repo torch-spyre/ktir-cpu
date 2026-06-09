@@ -238,12 +238,20 @@ def _adapt_construct_access_tile(mlir_op, attributes, result_type, operands):
     canonical = str(AffineMapAttr(mlir_op.attributes["base_map"]).value)
     attributes["base_map"] = parse_affine_map(f"affine_map<{canonical}>")
 
-    # access_tile_set → coordinate_set; normalize full sets to None
-    if "access_tile_set" in mlir_op.attributes:
-        # str(IntegerSetAttr) → "affine_set<(d0) : ...>"
-        cs = parse_affine_set(str(mlir_op.attributes["access_tile_set"]))
-        if not cs.is_full(shape):
-            attributes["coordinate_set"] = cs
+    # access_tile_set → coordinate_set.  Required attribute per ODS
+    # (Builtin_IntegerSetAttr:$access_tile_set, no OptionalAttr); absence
+    # is invalid IR.  ``parse_affine_set`` lowers axis-aligned sets to
+    # ``BoxSet`` automatically, so the full-rectangle case naturally
+    # comes out as ``BoxSet([0, shape))`` and routes through the
+    # BoxSet fast path in the dialect handler — no normalisation needed.
+    if "access_tile_set" not in mlir_op.attributes:
+        raise ValueError(
+            "construct_access_tile: access_tile_set is required (per ODS)"
+        )
+    # str(IntegerSetAttr) → "affine_set<(d0) : ...>"
+    attributes["coordinate_set"] = parse_affine_set(
+        str(mlir_op.attributes["access_tile_set"])
+    )
 
     # access_tile_order → coordinate_order; normalize identity maps to None
     if "access_tile_order" in mlir_op.attributes:
