@@ -214,14 +214,12 @@ class KTIRInterpreter:
         # Other result types — TileRef (metadata), AccessTile (coordinates),
         # int/index (scalars) — are bookkeeping and use no scratchpad memory.
         if op.result and result is not None:
-            # Multi-result ops return a tuple and have a list of result names.
-            if isinstance(op.result, list) and isinstance(result, tuple):
-                for name, val in zip(op.result, result):
-                    context.set_value(name, val)
-            else:
-                context.set_value(op.result, result)
-                if isinstance(result, Tile):
-                    context.track_lx(op.result, result.size_bytes())
+            names = op.result if isinstance(op.result, list) else [op.result]
+            values = result if isinstance(result, tuple) else [result]
+            for name, val in zip(names, values):
+                context.set_value(name, val)
+                if isinstance(val, Tile):
+                    context.track_lx(name, val.size_bytes())
 
         # Record latency
         if self._latency_tracker is not None:
