@@ -221,12 +221,9 @@ module {
 
 
 def test_multi_result_single_value_raises_error():
-    """When op.result is a list but handler returns a non-tuple, a TypeError is raised.
+    """When op.result is a list but handler returns a non-tuple, an AssertionError is raised.
 
-    This documents the current (unguarded) behavior: the interpreter tries to
-    use the list as a dict key in set_value, which is unhashable.  This is a
-    known edge-case that callers must avoid by always returning a tuple from
-    multi-result handlers.
+    The arity guard catches the mismatch before any set_value call.
     """
     from unittest.mock import patch
     from ktir_cpu.dialects import registry
@@ -255,5 +252,5 @@ module {
             result_type=None,
             regions=[],
         )
-        with pytest.raises(TypeError):
+        with pytest.raises(AssertionError):
             interp._execute_op(op, core)
