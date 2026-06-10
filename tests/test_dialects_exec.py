@@ -945,6 +945,17 @@ class TestLinalg:
         result = _call("linalg.matmul", ctx, _make_env(), operands=["%a", "%b"])
         assert np.allclose(result.data, b.data, rtol=1e-2)
 
+    def test_batch_matmul(self):
+        # batched identity: for each batch, I @ B == B
+        eye = np.broadcast_to(np.eye(2, dtype=np.float16), (3, 2, 2)).copy()
+        bdata = np.arange(3 * 2 * 2, dtype=np.float16).reshape(3, 2, 2)
+        a = Tile(eye, "f16", (3, 2, 2))
+        b = Tile(bdata, "f16", (3, 2, 2))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("linalg.batch_matmul", ctx, _make_env(), operands=["%a", "%b"])
+        assert result.shape == (3, 2, 2)
+        assert np.allclose(result.data, bdata, rtol=1e-2)
+
     def test_generic_reads_outs_arg(self):
         # linalg.generic where the body reads the outs bb0 arg.
         # outs is non-zero — the body adds the input to the existing outs value.
@@ -1152,6 +1163,26 @@ class TestScfFunc:
         env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
         dispatch("scf.if")(op, ctx, env)
         assert ran == ["else"]
+
+    def test_if_then_else_yield_result(self):
+        # scf.if with a yielding then-branch returns the unwrapped value, not a _YieldResult wrapper
+        ctx = _ctx_with(**{"%cond": True, "%val": 42})
+        op = Operation(op_type="scf.if", operands=["%cond"], attributes={},
+                       result="%res", result_type=None,
+                       regions=[[Operation(op_type="scf.yield", operands=["%val"],
+                                           attributes={}, result=None, result_type=None)],
+                                 []])
+        env = _make_env()
+
+        def real_execute_region(ctx, ops):
+            result = None
+            for o in ops:
+                result = dispatch(o.op_type)(o, ctx, env)
+            return result
+
+        env.execute_region = real_execute_region
+        result = dispatch("scf.if")(op, ctx, env)
+        assert result == 42, f"expected 42, got {result!r}"
 
 # ---------------------------------------------------------------------------
 # ktdp dialect parsers

@@ -23,6 +23,7 @@ from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
 from ..parser_ast import parse_affine_map
 from ..parser_utils import find_ssa_names, parse_attr_list
+from ._helpers import unwrap_yield
 from .registry import register, register_parser
 
 
@@ -309,8 +310,6 @@ def linalg__generic(op, context, env):
     (np.expand_dims for missing dims), binds bb0 block-arg names, then
     executes the region body once with full arrays.
     """
-    from ..ops.control_ops import _YieldResult
-
     n_ins = op.attributes.get("n_ins", 0)
     indexing_maps = op.attributes.get("indexing_maps", [])
 
@@ -357,10 +356,7 @@ def linalg__generic(op, context, env):
     result = env.execute_region(context, body_ops)
     context.pop_scope()
 
-    if isinstance(result, _YieldResult):
-        out_data = result.values[0]
-    else:
-        out_data = result
+    out_data = unwrap_yield(result)
 
     if isinstance(out_data, Tile):
         data = np.broadcast_to(out_data.data, out_shape).copy().astype(out_np_dtype)
@@ -381,9 +377,9 @@ def linalg__index(op, context, env):
 
 @register("linalg.yield")
 def linalg__yield(op, context, env):
-    from ..ops.control_ops import _YieldResult
+    from ..ops.control_ops import ControlOps
     values = [context.get_value(n) for n in op.operands]
-    return _YieldResult(values)
+    return ControlOps.yield_op(values)
 
 
 @register("linalg.transpose")

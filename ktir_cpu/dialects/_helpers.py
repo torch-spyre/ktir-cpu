@@ -24,6 +24,7 @@ _is_scalar(v)                  — True if v is a numeric scalar (not Tile)
 _float_binop(op, context, fn)  — fetch two operands, dispatch float binop
 _int_binop(op, context, fn)    — fetch two operands, dispatch int binop
 _unary(op, context, tile_fn, scalar_fn) — fetch one operand, dispatch unary
+unwrap_yield(result)           — unwrap a _YieldResult sentinel; pass through anything else
 """
 
 import numpy as np
@@ -80,3 +81,22 @@ def _unary(op, context, tile_fn, scalar_fn=None):
     if isinstance(val, Tile):
         return tile_fn(val)
     return (scalar_fn or tile_fn)(val)
+
+
+def unwrap_yield(result):
+    """Unwrap a _YieldResult sentinel produced by scf.yield / linalg.yield.
+
+    Dialect region drivers (scf.if, scf.for, linalg.generic) call this on
+    the value returned by execute_region so they always receive plain values.
+    Returns the single value for a 1-element yield, a tuple for multi-value,
+    None for an empty yield, or *result* unchanged if it is not a _YieldResult.
+    """
+    from ..ops.control_ops import _YieldResult
+    if not isinstance(result, _YieldResult):
+        return result
+    values = result.values
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    return tuple(values)

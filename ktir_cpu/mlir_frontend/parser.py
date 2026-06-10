@@ -158,8 +158,10 @@ MLIRTypeAdapter.install(
     "func.return",
     "linalg.fill",
     "linalg.matmul",
+    "linalg.batch_matmul",
     "linalg.yield",
     "scf.yield",
+    "scf.if",
     # float binary
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf",
     # float unary
@@ -183,6 +185,8 @@ MLIRTypeAdapter.install(
     "arith.extf", "arith.truncf",
     "arith.extsi", "arith.extui", "arith.trunci",
     "arith.index_cast",
+    "arith.index_castui",
+    "arith.ceildivui",
     "arith.maxnumf",
     "arith.maximumf",
     "arith.minimumf",

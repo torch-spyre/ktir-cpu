@@ -111,6 +111,25 @@ class TestKtdpAdapt(MLIRFrontendParseTestMixin, _TestKtdpParsers):
 class TestScfAdapt(MLIRFrontendParseTestMixin, _TestScfParsers):
     """Scf tests via MLIRFrontendParser."""
 
+    def test_if_then_else(self):
+        # scf.if is supported by the MLIR frontend (the regex parser does not
+        # parse it, so this test is frontend-only rather than in the shared
+        # base class). operand[0] is the condition; then/else are regions
+        # [0]/[1]; no execution-relevant attributes.
+        op = self._parse(
+            "%r = scf.if %c -> (i32) {\n"
+            "      %a = arith.constant 1 : i32\n"
+            "      scf.yield %a : i32\n"
+            "    } else {\n"
+            "      %b = arith.constant 2 : i32\n"
+            "      scf.yield %b : i32\n"
+            "    }",
+            args={"%c": "i1"},
+        )
+        self.assert_op_type(op, "scf.if")
+        self.assert_num_operands(op, 1)
+        assert len(op.regions) == 2
+
 
 # ---------------------------------------------------------------------------
 # Math
