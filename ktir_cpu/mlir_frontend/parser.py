@@ -509,7 +509,7 @@ def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
     is_list = False
     if isinstance(val_attr, DenseElementsAttr):
         if val_attr.is_splat:
-            val_attr = val_attr.get_splat_value()
+            attributes["value"] = val_attr.get_splat_value().value
         else:
             # Iterating DenseElementsAttr yields Python scalars (int/float)
             # directly, not wrapped IntegerAttr/FloatAttr.
@@ -517,10 +517,10 @@ def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
                 e.value if hasattr(e, "value") else e for e in val_attr
             ]
             is_list = True
-    if not is_list:
-        if not isinstance(val_attr, (IntegerAttr, FloatAttr)):
-            raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
+    elif isinstance(val_attr, (IntegerAttr, FloatAttr)):
         attributes["value"] = val_attr.value
+    else:
+        raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
     if result_type and "tensor<" in result_type:
         from ..parser_utils import parse_tensor_type
         info = parse_tensor_type(result_type)
