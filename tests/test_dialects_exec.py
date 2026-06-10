@@ -463,6 +463,23 @@ class TestArithCastsConstants:
         assert result.shape == (4,)
         assert np.all(result.data == 0)
 
+    def test_constant_dense_list(self):
+        """``arith.constant dense<[16, 32]>`` materializes the list element-by-element.
+
+        Pins the regression where the parser called ``parse_numeric`` on
+        ``[16, 32]`` and produced a splat-of-zero tensor.
+        """
+        result = _call("arith.constant", _make_ctx(), _make_env(),
+                       attributes={
+                           "value": [16, 32],
+                           "shape": (2,),
+                           "dtype": "index",
+                           "is_tensor": True,
+                           "dense_list": True,
+                       })
+        assert result.shape == (2,)
+        assert list(result.data) == [16, 32]
+
     def test_extsi(self):
         # sign-extend integer — returns Python int
         ctx = _ctx_with(**{"%a": 5})
@@ -1062,6 +1079,83 @@ class TestTensor:
                        operands=["%t"], attributes={"target_shape": (4,)})
         assert result.shape == (4,)
         assert np.array_equal(result.data, [1, 2, 3, 4])
+
+    def test_reshape(self):
+        """1D -> 2D reshape preserves element order and total count."""
+        t = Tile(np.arange(8, dtype=np.float16), "f16", (8,))
+        shape_tile = Tile(np.array([2, 4], dtype=np.intp), "index", (2,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        result = _call("tensor.reshape", ctx, _make_env(),
+                       operands=["%t", "%s"],
+                       attributes={"target_shape": (2, 4), "dtype": "f16"})
+        assert result.shape == (2, 4)
+        assert np.array_equal(result.data, np.arange(8).reshape(2, 4))
+
+    def test_reshape_non_square_target(self):
+        """Rank-changing reshape with a non-square target preserves row-major order.
+
+        Pins that 1-D[12] -> 2-D[3,4] places elements as
+        ``[[0,1,2,3],[4,5,6,7],[8,9,10,11]]`` (rightmost index varies fastest),
+        not column-major.
+        """
+        t = Tile(np.arange(12, dtype=np.float16), "f16", (12,))
+        shape_tile = Tile(np.array([3, 4], dtype=np.intp), "index", (2,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        result = _call("tensor.reshape", ctx, _make_env(),
+                       operands=["%t", "%s"],
+                       attributes={"target_shape": (3, 4), "dtype": "f16"})
+        assert result.shape == (3, 4)
+        assert np.array_equal(result.data, np.arange(12).reshape(3, 4))
+
+    def test_reshape_size_mismatch_raises(self):
+        """Element-count mismatch must fail loud, not silently truncate.
+
+        Source has 7 elements; target shape (3, 3) demands 9. NumPy's
+        ``ndarray.reshape`` raises ``ValueError``; the executor propagates it
+        rather than returning a partial result.
+        """
+        t = Tile(np.arange(7, dtype=np.float16), "f16", (7,))
+        shape_tile = Tile(np.array([3, 3], dtype=np.intp), "index", (2,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        with pytest.raises(ValueError, match="cannot reshape"):
+            _call("tensor.reshape", ctx, _make_env(),
+                  operands=["%t", "%s"],
+                  attributes={"target_shape": (3, 3), "dtype": "f16"})
+
+    def test_reshape_to_3d(self):
+        """Rank-3 endpoint: 1-D[24] -> 3-D[2,3,4] preserves row-major order."""
+        t = Tile(np.arange(24, dtype=np.float16), "f16", (24,))
+        shape_tile = Tile(np.array([2, 3, 4], dtype=np.intp), "index", (3,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        result = _call("tensor.reshape", ctx, _make_env(),
+                       operands=["%t", "%s"],
+                       attributes={"target_shape": (2, 3, 4), "dtype": "f16"})
+        assert result.shape == (2, 3, 4)
+        assert np.array_equal(result.data, np.arange(24).reshape(2, 3, 4))
+
+    def test_from_elements(self):
+        """Stack scalar SSA operands into a 1-D index tensor."""
+        ctx = _ctx_with(**{"%a": 16, "%b": 32})
+        result = _call("tensor.from_elements", ctx, _make_env(),
+                       operands=["%a", "%b"],
+                       attributes={"shape": (2,), "dtype": "index"})
+        assert result.shape == (2,)
+        assert list(result.data) == [16, 32]
+
+    def test_from_elements_n1(self):
+        """N=1 endpoint: single-element 1-D shape tensor.
+
+        Guards the smallest legal grammar match (one operand). Useful when a
+        ``tensor.reshape`` collapses a 2-D tensor to 1-D via a 1-element shape
+        operand (e.g. ``tensor.from_elements %total : tensor<1xindex>``).
+        """
+        ctx = _ctx_with(**{"%a": 128})
+        result = _call("tensor.from_elements", ctx, _make_env(),
+                       operands=["%a"],
+                       attributes={"shape": (1,), "dtype": "index"})
+        assert result.shape == (1,)
+        assert list(result.data) == [128]
+
 
 # ---------------------------------------------------------------------------
 # tensor.generate exec

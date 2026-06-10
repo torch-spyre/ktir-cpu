@@ -454,6 +454,33 @@ def _adapt_tensor_collapse_shape(mlir_op, attributes, result_type, operands):
     attributes["dtype"] = info["dtype"]
 
 
+@MLIRTypeAdapter.install("tensor.reshape")
+def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
+    """Synthesize target_shape/dtype from the result type annotation.
+
+    The shape operand (operands[1]) is left in place so the IR remains
+    well-formed; only the result type is consulted, since it always pins
+    the target shape statically.
+    """
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.reshape: cannot parse result type {result_type!r}")
+    attributes["target_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+
+
+@MLIRTypeAdapter.install("tensor.from_elements")
+def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
+    """Synthesize shape/dtype from result type — operands carry the values."""
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.from_elements: cannot parse result type {result_type!r}")
+    attributes["shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+
+
 @MLIRTypeAdapter.install("tensor.splat")
 def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
@@ -467,19 +494,41 @@ def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
 
 @MLIRTypeAdapter.install("arith.constant")
 def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
-    """Extract value: unwrap splat tensors, convert int/float attrs."""
+    """Extract value: unwrap splat tensors, iterate dense lists, convert int/float attrs.
+
+    Three cases for the ``value`` attribute:
+
+    - splat ``DenseElementsAttr`` (e.g. ``dense<0.0> : tensor<4xf16>``):
+      unwrap to the single splat value via ``get_splat_value()``.
+    - non-splat ``DenseElementsAttr`` (e.g. ``dense<[16, 32]> : tensor<2xindex>``):
+      iterate the elements; record ``dense_list = True`` so the executor
+      builds the array element-by-element rather than splatting one value.
+    - scalar ``IntegerAttr`` / ``FloatAttr`` (e.g. ``42 : index``): use directly.
+    """
     val_attr = mlir_op.attributes["value"]
-    if isinstance(val_attr, DenseElementsAttr) and val_attr.is_splat:
-        val_attr = val_attr.get_splat_value()
-    if not isinstance(val_attr, (IntegerAttr, FloatAttr)):
-        raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
-    attributes["value"] = val_attr.value
+    is_list = False
+    if isinstance(val_attr, DenseElementsAttr):
+        if val_attr.is_splat:
+            val_attr = val_attr.get_splat_value()
+        else:
+            # Iterating DenseElementsAttr yields Python scalars (int/float)
+            # directly, not wrapped IntegerAttr/FloatAttr.
+            attributes["value"] = [
+                e.value if hasattr(e, "value") else e for e in val_attr
+            ]
+            is_list = True
+    if not is_list:
+        if not isinstance(val_attr, (IntegerAttr, FloatAttr)):
+            raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
+        attributes["value"] = val_attr.value
     if result_type and "tensor<" in result_type:
         from ..parser_utils import parse_tensor_type
         info = parse_tensor_type(result_type)
         attributes["shape"] = info["shape"]
         attributes["dtype"] = info["dtype"]
         attributes["is_tensor"] = True
+        if is_list:
+            attributes["dense_list"] = True
 
 
 @MLIRTypeAdapter.install("linalg.broadcast")

@@ -331,6 +331,10 @@ def arith__constant(op, context, env):
         shape = op.attributes["shape"]
         dtype_str = op.attributes.get("dtype", "f16")
         np_dtype = to_np_dtype(dtype_str)
+        # dense<[v0, v1, ...]> list form: each element is distinct, so
+        # build the array element-by-element rather than splatting one value.
+        if op.attributes.get("dense_list"):
+            return Tile(np.array(value, dtype=np_dtype).reshape(shape), dtype_str, shape)
         return Tile(np.full(shape, value, dtype=np_dtype), dtype_str, shape)
     return value
 
@@ -448,6 +452,27 @@ def arith__select(op, context, env):
 # Parsers
 # ---------------------------------------------------------------------------
 
+def _parse_dense_payload(payload, elem_dtype):
+    """Parse the inside of `dense<...>`.
+
+    Returns ``(value, is_list)``. Two forms appear in MLIR:
+
+    - splat:  ``dense<0.0>``         -> single scalar broadcast across the shape
+    - list:   ``dense<[16, 32]>``    -> one value per element
+
+    The list form shows up as the shape operand of folded ``tensor.reshape``
+    ops (e.g. ``dense<[16, 32]> : tensor<2xindex>``); the splat form covers
+    plain zero-/constant-init tensors.
+    """
+    from ..parser_utils import parse_numeric
+
+    payload = payload.strip()
+    if payload.startswith("[") and payload.endswith("]"):
+        parts = [p.strip() for p in payload[1:-1].split(",") if p.strip()]
+        return [parse_numeric(p, dtype=elem_dtype) for p in parts], True
+    return parse_numeric(payload, dtype=elem_dtype), False
+
+
 @register_parser("arith.constant")
 def parse_arith_constant(op_text, parse_ctx):
     from ..parser_utils import parse_numeric, parse_tensor_type
@@ -486,7 +511,9 @@ def parse_arith_constant(op_text, parse_ctx):
 
         dense_match = re.match(r'dense<([^>]+)>', inner)
         if dense_match:
-            value = parse_numeric(dense_match.group(1), dtype=elem_dtype)
+            value, is_list = _parse_dense_payload(dense_match.group(1), elem_dtype)
+            if is_list:
+                attributes["dense_list"] = True
         else:
             typed_val = re.match(r'(.+?)\s*:\s*\S+', inner)
             if typed_val:
@@ -514,10 +541,12 @@ def parse_arith_constant(op_text, parse_ctx):
             result_type = dense_match.group(2).strip()
             type_info = parse_tensor_type(result_type)
             elem_dtype = type_info.get("dtype") if type_info else None
-            value = parse_numeric(dense_match.group(1), dtype=elem_dtype)
+            value, is_list = _parse_dense_payload(dense_match.group(1), elem_dtype)
             attributes["shape"] = type_info["shape"]
             attributes["dtype"] = type_info["dtype"]
             attributes["is_tensor"] = True
+            if is_list:
+                attributes["dense_list"] = True
         elif simple_match:
             result_type = simple_match.group(2).strip()
             value = parse_numeric(simple_match.group(1), dtype=result_type)
