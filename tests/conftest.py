@@ -173,6 +173,29 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    "reduce_multiop": [
+        {
+            "path": "ktir/reduce_multiop.mlir",
+            # linalg.reduce with a MULTI-OP combiner region (max via cmpf+select).
+            # Exercises the general tree fold: every region op runs and is
+            # charged, with no single-combiner-name assumption.
+            "execute_kwargs": {},
+        },
+    ],
+    "softmax_kernel_small_explicit": [
+        {
+            "path": "latency/softmax_small_explicit.mlir",
+            # softmax_small with the linalg.reduce combiners written as explicit
+            # (%in, %out){ ... yield } regions instead of the { op } shorthand.
+            "execute_kwargs": {
+                "input_row_stride": 64,
+                "output_row_stride": 64,
+                "n_rows": 64,
+                "BLOCK_SIZE": 64,
+                "n_cols": None,
+            },
+        },
+    ],
     "sdpa_kernel_2d": [
         {
             "path": "triton-ktir/sdpa_2d.mlir",

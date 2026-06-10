@@ -58,16 +58,30 @@ def parse_tensor_type(type_str: str) -> Optional[Dict]:
 
     Returns:
         {"shape": tuple, "dtype": str} if tensor type, else None
+
+    Walks the leading dim prefix by matching digit-tokens followed by 'x',
+    taking the remainder as dtype. Handles dtypes containing 'x' (e.g.
+    ``index``). Dynamic dims (``?``) are silently dropped, matching prior
+    behaviour.
     """
-    tensor_match = re.match(r'tensor<([^>]+)>', type_str)
-    if tensor_match:
-        inner = tensor_match.group(1)
-        parts = inner.split('x')
-        if len(parts) >= 2:
-            shape = tuple(int(p) for p in parts[:-1] if p.isdigit())
-            dtype = parts[-1]
-            return {"shape": shape, "dtype": dtype}
-    return None
+    m = re.match(r'tensor<([^>]+)>', type_str)
+    if not m:
+        return None
+    inner = m.group(1).strip()
+    # Match all ``NNN x`` dim tokens from the left. The dtype cannot start
+    # with a digit followed by 'x', so the pattern terminates at the right
+    # boundary even when the dtype itself contains 'x' (e.g. ``index``).
+    # Dynamic dims (``?``) are skipped, matching prior behaviour.
+    prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
+    if not prefix:
+        return None
+    dims = [int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1))]
+    if not dims:
+        return None
+    dtype = inner[prefix.end():].split(',')[0].strip()
+    if not dtype:
+        return None
+    return {"shape": tuple(dims), "dtype": dtype}
 
 def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to a Python int or float.
@@ -222,6 +236,57 @@ def parse_attr_list(op_text: str, aliases: Optional[Dict] = None,
         result.append(raw)
 
     return result
+
+
+def extract_named_attr(op_text: str, key: str,
+                       aliases: Optional[Dict] = None) -> Optional[str]:
+    """Extract a single bare ``key = value`` attribute from ``op_text``.
+
+    Sibling to :func:`parse_attr_block` for ops that carry attributes
+    *outside* a ``{ ... }`` block — e.g. ops whose attribute list lives
+    on the op header itself rather than wrapped in braces:
+    ``producer_tiles_per_group = #all_tiles, groups = #one_group``.
+
+    Returns the resolved value string (alias-resolved when applicable),
+    or ``None`` if not found.  Caller-driven: caller names the key it
+    expects.
+    """
+    m = re.search(rf'\b{re.escape(key)}\s*=\s*', op_text)
+    if not m:
+        return None
+    rest = op_text[m.end():].lstrip()
+
+    # #alias reference
+    if rest.startswith('#'):
+        end = re.search(r'[,\n}]|\s+:|\s*->', rest)
+        raw = rest[:end.start()].strip() if end else rest.strip()
+        return aliases.get(raw, raw) if aliases else raw
+
+    # keyword<...> values — count <> depth, skip >= and ->
+    kw_m = re.match(r'[\w.]+<', rest)
+    if kw_m:
+        i = kw_m.end() - 1
+        depth = 0
+        while i < len(rest):
+            ch = rest[i]
+            if ch == '>' and i + 1 < len(rest) and rest[i + 1] == '=':
+                i += 2
+                continue
+            if ch == '-' and i + 1 < len(rest) and rest[i + 1] == '>':
+                i += 2
+                continue
+            if ch == '<':
+                depth += 1
+            elif ch == '>':
+                depth -= 1
+                if depth == 0:
+                    return rest[:i + 1]
+            i += 1
+        return rest
+
+    # Plain token up to next comma / newline / brace / colon / arrow.
+    end = re.search(r'[,\n}]|\s+:|\s*->', rest)
+    return rest[:end.start()].strip() if end else rest.strip()
 
 
 def _extract_attr_value(text: str, aliases: Optional[Dict]) -> tuple:

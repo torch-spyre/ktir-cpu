@@ -59,12 +59,19 @@ def _make_env(grid_shape=(1, 1, 1)):
     grid = GridExecutor(grid_shape=grid_shape, memory=memory)
 
     def execute_region(context, ops):
+        # Mirror the real ExecutionEnv contract (interpreter._execute_op):
+        # dispatch each Operation through its registered handler.
         result = None
         for op in ops:
-            result = op(context)
+            handler = dispatch(op.op_type)
+            assert handler is not None, f"No handler for {op.op_type!r}"
+            result = handler(op, context, env)
+            if op.result and result is not None:
+                context.set_value(op.result, result)
         return result
 
-    return ExecutionEnv(grid_executor=grid, execute_region=execute_region)
+    env = ExecutionEnv(grid_executor=grid, execute_region=execute_region)
+    return env
 
 
 def _call(op_type, context, env, **op_kwargs):
@@ -838,6 +845,78 @@ class TestLinalg:
         result = _call("linalg.reduce", ctx, _make_env(),
                        operands=["%x"], attributes={"reduce_fn": "arith.addf"})
         assert float(result) == pytest.approx(5.0, rel=1e-2)
+
+    def test_reduce_explicit_region_single_op(self):
+        # Explicit combiner region (%in, %out){ %s = addf %in,%out; yield %s }
+        # computes the same sum as the shorthand form via the tree fold.
+        data = np.array([[1, 2, 3, 4]], dtype=np.float16)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+        region = [
+            _op("arith.addf", operands=["%in", "%out"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": None, "dim": 1, "outs_var": "%init"},
+                       regions=[region])
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert abs(val - 10.0) < 0.1
+
+    def test_reduce_multiop_combiner(self):
+        # MULTI-OP combiner: max expressed as cmpf(ogt) + select. The general
+        # tree fold must run BOTH region ops — there is no single combiner name
+        # to map to a NumPy reduction — and still return the correct max.
+        data = np.array([[0.1, 0.9, 0.3, 0.2, 0.5, 0.05, 0.7, 0.05]], dtype=np.float16)
+        neg_inf = np.float16("-inf")
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.full((1,), neg_inf, dtype=np.float16), "f16", (1,))})
+        region = [
+            _op("arith.cmpf", operands=["%in", "%out"], result="%cmp",
+                attributes={"predicate": "ogt"}),
+            _op("arith.select", operands=["%cmp", "%in", "%out"], result="%m"),
+            _op("linalg.yield", operands=["%m"]),
+        ]
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": None, "dim": 1, "outs_var": "%init"},
+                       regions=[region])
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(float(data.max()), abs=1e-2)
+
+    @pytest.mark.xfail(reason="multi-axis reduce not supported: parser keeps only "
+                              "dims[0] and the tree fold indexes a single axis. "
+                              "Tracked in issue #85.",
+                       strict=True)
+    def test_reduce_multi_axis(self):
+        # dimensions = [0, 1] should reduce BOTH axes (2x3 -> scalar 15).
+        data = np.arange(6, dtype=np.float16).reshape(2, 3)  # sum = 15
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dim": [0, 1],
+                                   "outs_var": "%init"})
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(15.0, abs=1e-2)
+
+    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
+                              "the tree fold seeds from the input only. Harmless "
+                              "while the frontend inits outs to the identity. "
+                              "Tracked in issue #85.",
+                       strict=True)
+    def test_reduce_folds_outs_init(self):
+        # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
+        # outs init = 100 should be 110, not 10.
+        data = np.array([[1, 2, 3, 4]], dtype=np.float16)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.array([100.0], dtype=np.float16), "f16", (1,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dim": 1,
+                                   "outs_var": "%init"})
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(110.0, abs=1e-1)
 
     def test_fill(self):
         # fill a tile with a scalar value

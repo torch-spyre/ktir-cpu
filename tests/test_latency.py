@@ -92,6 +92,31 @@ def _run_matmul(path, func_name, entry, cfg, trace=False):
     return interp.get_latency_report()
 
 
+def _run_vector_reduce(path, func_name, entry, cfg, trace=False):
+    """Run a vector reduce (per-core tile) and return report."""
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+    # Build tensor args using the interpreter's declared arg names so we
+    # match the parser's normalization (arg0, arg1, ...).
+    arg_names = interp.arg_names(func_name)
+    sizes = interp.tensor_input_output_sizes(func_name)
+
+    # Use the first argument as the input tensor for the reduce example.
+    arg0 = arg_names[0]
+    shape = sizes[arg0]["shape"]
+    # shape may be a tuple like (1, 4)
+    rng = np.random.default_rng(42)
+    inp = rng.standard_normal(tuple(shape)).astype(np.float16)
+
+    scalars = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+    overlap = set(scalars.keys()) & {arg0}
+    assert not overlap, f"duplicate keys in tensors and scalars: {overlap}"
+
+    kwargs = {**scalars, **{arg0: inp}}
+    interp.execute_function(func_name, **kwargs)
+    return interp.get_latency_report()
+
+
 # ---------------------------------------------------------------------------
 # Vector add latency — memory-dominated
 # ---------------------------------------------------------------------------
@@ -231,6 +256,14 @@ class TestRoofline:
         # AI should be well below the ridge point (memory-bound)
         assert rf["arithmetic_intensity"] < rf["ridge_point"]
 
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
+    def test_vector_reduce_is_memory_bound(self, path, func_name, entry):
+        """A simple vector reduce should be memory-bound on the roofline."""
+        report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
+        rf = report.roofline()
+        assert "arithmetic_intensity" in rf
+        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_roofline_in_report_str(self, path, func_name, entry):
         """Roofline section should appear in report __str__."""
@@ -361,6 +394,114 @@ class TestSoftmaxLatency:
 
         # exp cycles should scale linearly with penalty
         assert scaled_exp == pytest.approx(baseline_exp * penalty, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Reduce latency
+# ---------------------------------------------------------------------------
+
+class TestReduceLatency:
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("softmax_kernel_small"))
+    def test_reduce_defers_cost_to_combiner(self, path, func_name, entry):
+        """linalg.reduce is a zero-cost orchestrator (like linalg.generic); the
+        reduction cost is charged to the combiner ops executed by the tree fold.
+        Folding N elements pairwise processes N/2 + N/4 + … = N-1 elements total,
+        so the combiner's *summed* cost scales with input size (~N/simd_width),
+        not the reduced output shape.  Holds for the shorthand form (softmax
+        uses ``linalg.reduce { arith.maximumf }`` and ``{ arith.addf }``)."""
+        cfg = HardwareConfig()
+        report = _run_softmax(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        # The orchestrator op itself charges nothing.
+        reduce_entries = [e for e in core0.trace if e.op_type == "linalg.reduce"]
+        assert len(reduce_entries) > 0, "expected at least one linalg.reduce in softmax"
+        for e in reduce_entries:
+            assert e.category == "zero" and e.cycles == 0.0, (
+                f"linalg.reduce must be zero-cost, got {e.category}/{e.cycles}"
+            )
+
+        # Combiner ops carry the cost. Core 0 processes 2 rows; per row a max
+        # (arith.maximumf) and a sum (arith.addf) each fold a 1×64 tile → the
+        # tree fold processes 63 elements per reduce. Summed per op across both
+        # rows: 2 × 63 / simd_elements_per_cycle.
+        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        for combiner in ("arith.maximumf", "arith.addf"):
+            total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
+            assert total == pytest.approx(2 * per_reduce), (
+                f"{combiner} should total {2 * per_reduce} cyc over 2 rows "
+                f"(tree fold of 1×64 → N-1 elems each); got {total}"
+            )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
+    def test_reduce_explicit_region_charges_combiner(self, path, func_name, entry):
+        """Explicit-region form routes through the same tree-fold path: the
+        combiner op in the region (arith.addf) carries the cycles and
+        linalg.reduce itself is zero-cost."""
+        cfg = HardwareConfig()
+        report = _run_vector_reduce(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        reduce_entries = [e for e in core0.trace if e.op_type == "linalg.reduce"]
+        assert reduce_entries and all(
+            e.category == "zero" and e.cycles == 0.0 for e in reduce_entries
+        ), "linalg.reduce must be zero-cost in the explicit-region form too"
+
+        # reduce_generic.mlir folds a 1×4 input tile with arith.addf. A pairwise
+        # tree fold of 4 elements processes 2 + 1 = 3 elements total →
+        # 3 / simd_elements_per_cycle cycles, charged to the combiner.
+        expected = 3 / cfg.simd_elements_per_cycle  # N-1 for N=4
+        total = sum(e.cycles for e in core0.trace if e.op_type == "arith.addf")
+        assert total == pytest.approx(expected), (
+            f"combiner arith.addf should total {expected} cyc "
+            f"(tree fold of 1×4 → N-1 elems); got {total}"
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
+    def test_reduce_kernel_is_memory_bound(self, path, func_name, entry):
+        """Vector reduce per-core tile should be memory-dominated."""
+        report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
+        core0 = report.counters[0]
+        assert report.bottleneck == "memory"
+        assert core0.memory_cycles > core0.compute_cycles
+
+    @pytest.mark.parametrize("path,func_name,entry",
+                             get_test_params("softmax_kernel_small_explicit"))
+    def test_explicit_region_softmax_matches_shorthand(self, path, func_name, entry):
+        """Softmax with explicit (%in,%out){...} combiner regions charges the
+        same combiner cost as the shorthand softmax — proving both forms feed
+        the identical tree-fold path. linalg.reduce stays zero-cost."""
+        cfg = HardwareConfig()
+        report = _run_softmax(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
+        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        for combiner in ("arith.maximumf", "arith.addf"):
+            total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
+            assert total == pytest.approx(2 * per_reduce), (
+                f"{combiner} should total {2 * per_reduce} cyc (explicit-region "
+                f"softmax, 2 rows of 1×64 tree fold); got {total}"
+            )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_multiop"))
+    def test_multiop_combiner_charges_all_region_ops(self, path, func_name, entry):
+        """A multi-op combiner (max via cmpf+select) charges EVERY op in the
+        region — there is no single-combiner-name shortcut. Both arith.cmpf and
+        arith.select carry the tree-fold cost; linalg.reduce is zero."""
+        cfg = HardwareConfig()
+        report = _run_vector_reduce(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
+        # 1×8 tree fold → 7 elements processed; each region op charged 7/simd.
+        expected = 7 / cfg.simd_elements_per_cycle  # N-1 for N=8
+        for region_op in ("arith.cmpf", "arith.select"):
+            total = sum(e.cycles for e in core0.trace if e.op_type == region_op)
+            assert total == pytest.approx(expected), (
+                f"{region_op} should total {expected} cyc (1×8 tree fold); "
+                f"got {total}"
+            )
 
 
 # ---------------------------------------------------------------------------
