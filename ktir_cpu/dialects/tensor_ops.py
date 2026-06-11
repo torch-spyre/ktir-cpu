@@ -121,6 +121,61 @@ def tensor__collapse_shape(op, context, env):
     return src
 
 
+@register("tensor.reshape")
+def tensor__reshape(op, context, env):
+    """Reinterpret a tensor with the same total element count under a new shape.
+
+    The MLIR op carries two operands: the source tensor and a 1-D shape tensor
+    (typically ``tensor<Nxindex>``) holding the target dimensions. The result
+    type annotation always pins the target shape statically, so the executor
+    reads ``target_shape`` from attributes (synthesized by the parser from the
+    result type) rather than reading the runtime shape operand — matching how
+    ``tensor.expand_shape`` / ``tensor.collapse_shape`` already behave.
+    """
+    src = context.get_value(op.operands[0])
+    target_shape = op.attributes.get("target_shape")
+    if target_shape is None:
+        raise ValueError(
+            f"tensor.reshape: missing 'target_shape' attribute on op {op}"
+        )
+    if not isinstance(src, Tile):
+        return src
+    reshaped = src.data.reshape(target_shape)
+    return Tile(reshaped, src.dtype, target_shape)
+
+
+@register("tensor.from_elements")
+def tensor__from_elements(op, context, env):
+    """Build a 1-D tensor from N scalar SSA operands.
+
+    Used as the shape-operand producer for tensor.reshape. Each operand is
+    fetched from the context, coerced to a Python scalar, and stacked into a
+    NumPy array of the result type. Scalars from arith.constant arrive as
+    plain ints/floats; those from another tensor (rare) arrive as Tiles —
+    flatten the first element in that case.
+    """
+    shape_attr = op.attributes.get("shape")
+    if shape_attr is None:
+        raise ValueError(
+            f"tensor.from_elements: missing 'shape' attribute on op {op}"
+        )
+    shape = tuple(shape_attr)
+    dtype_str = op.attributes.get("dtype")
+    if dtype_str is None:
+        raise ValueError(
+            f"tensor.from_elements: missing 'dtype' attribute on op {op}"
+        )
+    np_dtype = to_np_dtype(dtype_str)
+    values = []
+    for name in op.operands:
+        v = context.get_value(name)
+        if isinstance(v, Tile):
+            v = v.data.flat[0]
+        values.append(v)
+    data = np.array(values, dtype=np_dtype).reshape(shape)
+    return Tile(data, dtype_str, shape)
+
+
 @register("tensor.yield")
 def tensor__yield(op, context, env):
     """Yield a value from a tensor.generate body — same semantics as scf.yield."""
@@ -405,3 +460,73 @@ def parse_tensor_expand_shape(op_text, parse_ctx):
 @register_parser("tensor.collapse_shape")
 def parse_tensor_collapse_shape(op_text, parse_ctx):
     return _parse_reshape_op(op_text, "collapse_shape")
+
+
+@register_parser("tensor.reshape")
+def parse_tensor_reshape(op_text, parse_ctx):
+    """Parse `%out = tensor.reshape %src(%shape) : (...) -> tensor<...>`.
+
+    Two SSA operands: source tensor and shape tensor. Target shape is read
+    from the trailing result-type annotation (after `->`), since that is
+    always statically pinned, while the shape operand may be runtime.
+    """
+    from ..parser_utils import parse_tensor_type
+    m = re.match(
+        r'(%\w+)\s*=\s*tensor\.reshape\s+(%\w+)\s*\(\s*(%\w+)\s*\)', op_text
+    )
+    if not m:
+        return None
+    result_name, src, shape_operand = m.group(1), m.group(2), m.group(3)
+
+    arrow = re.search(r'->\s*(tensor<[^>]+>)', op_text)
+    if not arrow:
+        raise ValueError(f"tensor.reshape: missing result type in '{op_text}'")
+    result_type = arrow.group(1)
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(
+            f"tensor.reshape: cannot parse result type {result_type!r} in '{op_text}'"
+        )
+
+    return Operation(
+        result=result_name,
+        op_type="tensor.reshape",
+        operands=[src, shape_operand],
+        attributes={
+            "target_shape": info["shape"],
+            "dtype": info["dtype"],
+        },
+        result_type=result_type,
+    )
+
+
+@register_parser("tensor.from_elements")
+def parse_tensor_from_elements(op_text, parse_ctx):
+    """Parse `%shape = tensor.from_elements %d0, %d1, ... : tensor<NxT>`."""
+    from ..parser_utils import parse_tensor_type
+    m = re.match(
+        r'(%\w+)\s*=\s*tensor\.from_elements\s+(.*?)\s*:\s*(tensor<[^>]+>)', op_text
+    )
+    if not m:
+        return None
+    result_name = m.group(1)
+    operand_text = m.group(2)
+    type_str = m.group(3)
+    operands = find_ssa_names(operand_text)
+
+    info = parse_tensor_type(type_str)
+    if info is None:
+        raise ValueError(
+            f"tensor.from_elements: cannot parse result type {type_str!r} in '{op_text}'"
+        )
+
+    return Operation(
+        result=result_name,
+        op_type="tensor.from_elements",
+        operands=operands,
+        attributes={
+            "shape": info["shape"],
+            "dtype": info["dtype"],
+        },
+        result_type=type_str,
+    )

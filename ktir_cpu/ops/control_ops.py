@@ -70,7 +70,8 @@ class ControlOps:
         context.push_scope()
         result = region_executor(context, region)
         context.pop_scope()
-        return result
+        from ..dialects._helpers import unwrap_yield
+        return unwrap_yield(result)
 
     @staticmethod
     def for_op(

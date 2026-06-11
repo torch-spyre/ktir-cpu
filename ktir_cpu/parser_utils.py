@@ -127,6 +127,22 @@ def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     return 0
 
 
+def parse_dense_payload(payload: str, elem_dtype: Optional[str] = None):
+    """Parse the content already extracted from inside ``dense<...>``.
+
+    Returns ``(value, is_list)``:
+    - scalar payload ``0.0``       → ``(scalar, False)``
+    - list payload   ``[16, 32]``  → ``([16, 32], True)``
+    """
+    payload = payload.strip()
+    is_list = payload.startswith("[")
+    if is_list:
+        assert payload.endswith("]"), f"malformed dense list payload: {payload!r}"
+        parts = [p.strip() for p in payload[1:-1].split(",") if p.strip()]
+        return [parse_numeric(p, dtype=elem_dtype) for p in parts], True
+    return parse_numeric(payload, dtype=elem_dtype), False
+
+
 def _extract_bracket_content(op_text: str, brackets: str = '{}') -> Optional[str]:
     """Return the content inside the outermost matched bracket pair.
 
