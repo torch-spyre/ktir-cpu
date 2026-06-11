@@ -902,21 +902,55 @@ class TestLinalg:
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(float(data.max()), abs=1e-2)
 
-    @pytest.mark.xfail(reason="multi-axis reduce not supported: parser keeps only "
-                              "dims[0] and the tree fold indexes a single axis. "
-                              "Tracked in issue #85.",
-                       strict=True)
     def test_reduce_multi_axis(self):
         # dimensions = [0, 1] should reduce BOTH axes (2x3 -> scalar 15).
         data = np.arange(6, dtype=np.float16).reshape(2, 3)  # sum = 15
         ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
-                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+                           "%init": Tile(np.zeros((), dtype=np.float16), "f16", ())})
         result = _call("linalg.reduce", ctx, _make_env(),
                        operands=["%x"],
-                       attributes={"reduce_fn": "arith.addf", "dim": [0, 1],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 1],
                                    "outs_var": "%init"})
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(15.0, abs=1e-2)
+
+    def test_reduce_multi_axis_3d_disjoint_2d(self):
+        # dimensions = [0, 2] on a (3, 4, 2) tensor — disjoint axes.
+        # Output shape (4,): for each dim1 slot, sum over dim0 and dim2.
+        data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
+        expected = data.sum(axis=(0, 2))  # shape (4,)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
+                                   "outs_var": "%init"})
+        assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
+    @pytest.mark.xfail(reason="tree-fold (pairwise halving) breaks the "
+                              "linalg.reduce associativity-only contract: "
+                              "partial sums across axes reorder elements, "
+                              "producing different f16 rounding than the "
+                              "left-associative sequential reduction MLIR "
+                              "semantics prescribe.",
+                       strict=True)
+    def test_reduce_multi_axis_treefold_bug(self):
+        # (3,4,2) reduce dims=[0,2]. Large cancelling values at [0,:,0] and
+        # [2,:,0] expose the reordering: tree fold pairs partial sums from
+        # dim2 before folding dim0, changing which elements cancel first.
+        data = np.ones((3, 4, 2), dtype=np.float16)
+        data[0, :, 0] = 10000
+        data[2, :, 0] = -10000
+        expected = data.sum(axis=(0, 2))  # numpy left-associative: [1,1,1,1]
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
+                                   "outs_var": "%init"})
+        assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
 
     def test_reduce_folds_outs_init(self):
         # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with

@@ -467,7 +467,7 @@ class TestLinalgParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "linalg.reduce")
         self.assert_attribute(op, "reduce_fn", "arith.maxnumf")
-        self.assert_attribute(op, "dim", 1)
+        self.assert_attribute(op, "dims", [1])
         self.assert_num_operands(op, 1)
         self.assert_operand_names(op, "%x")
 
