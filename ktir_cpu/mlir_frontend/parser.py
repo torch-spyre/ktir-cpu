@@ -156,6 +156,7 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 
 MLIRTypeAdapter.install(
     "func.return",
+    "linalg.add",
     "linalg.fill",
     "linalg.matmul",
     "linalg.batch_matmul",
