@@ -29,6 +29,11 @@ from ktir_cpu.parser_ast import (
     eval_affine_map,
     affine_set_contains,
     enumerate_affine_set,
+    eval_bound,
+    sym_add,
+    sym_neg,
+    sym_max,
+    sym_min,
 )
 
 
@@ -397,6 +402,97 @@ class TestEnumerateAffineSet:
 
 
 # ===========================================================================
+# Equality constraints — ("eq", lhs, rhs) node
+# ===========================================================================
+
+class TestEqualityConstraints:
+    """Tests for the ("eq", lhs, rhs) first-class AST node."""
+
+    # --- tokeniser ---
+
+    def test_tokenise_eq_operator(self):
+        tokens = _tokenise("(g == 0)")
+        assert "==" in tokens
+
+    def test_tokenise_eq_before_geq(self):
+        """== must be tokenised as a single token, not as two separate tokens."""
+        tokens = _tokenise("(d0 == 1, d1 >= 0)")
+        assert "==" in tokens
+        assert ">=" in tokens
+        # Ensure == was not split into two tokens
+        assert "=" not in tokens
+
+    # --- parse → AST structure ---
+
+    def test_parse_eq_simple(self):
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        assert len(s.constraints) == 1
+        c = s.constraints[0]
+        assert c[0] == "eq"
+        assert c[1] == ("dim", 0)
+        assert c[2] == ("const", 0)
+
+    def test_parse_eq_one_node_not_two(self):
+        """A single == must produce one constraint node, not two sub nodes."""
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        assert len(s.constraints) == 1
+        assert s.constraints[0][0] == "eq"
+
+    def test_parse_eq_with_expression(self):
+        # p - c + 2 == 0
+        s = parse_affine_set("affine_set<(p)[c] : (p - c + 2 == 0)>")
+        assert len(s.constraints) == 1
+        assert s.constraints[0][0] == "eq"
+
+    def test_parse_eq_complex_lhs_rhs(self):
+        # p + c - 8*g - 3 == 0
+        s = parse_affine_set("affine_set<(p)[c, g] : (p + c - 8*g - 3 == 0)>")
+        assert len(s.constraints) == 1
+        assert s.constraints[0][0] == "eq"
+
+    def test_parse_mixed_eq_and_ineq(self):
+        s = parse_affine_set("affine_set<(d0, d1) : (d0 == 0, d1 >= 0)>")
+        assert len(s.constraints) == 2
+        assert s.constraints[0][0] == "eq"
+        assert s.constraints[1][0] == "sub"
+
+    # --- evaluation ---
+
+    def test_eq_contains_matching_point(self):
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        assert affine_set_contains(s, [0])
+
+    def test_eq_contains_nonmatching_point(self):
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        assert not affine_set_contains(s, [1])
+        assert not affine_set_contains(s, [-1])
+
+    def test_eq_enumerate_single_point(self):
+        s = parse_affine_set("affine_set<(g) : (g == 0)>")
+        pts = enumerate_affine_set(s, (4,))
+        assert pts == [(0,)]
+
+    def test_eq_i_equals_zero(self):
+        """Spec example: affine_set<(i) : (i == 0)>"""
+        s = parse_affine_set("affine_set<(i) : (i == 0)>")
+        assert affine_set_contains(s, [0])
+        assert not affine_set_contains(s, [1])
+
+    def test_eq_symbolic_constraint(self):
+        """p - c + 2 == 0 with symbol c=3 means p == 1."""
+        s = parse_affine_set("affine_set<(p)[c] : (p - c + 2 == 0)>")
+        assert affine_set_contains(s, [1], symbols=[3])   # 1 - 3 + 2 == 0
+        assert not affine_set_contains(s, [2], symbols=[3])
+
+    def test_eq_complex_symbolic(self):
+        """p + c - 8*g - 3 == 0 with c=5, g=1 means p == 6."""
+        s = parse_affine_set("affine_set<(p)[c, g] : (p + c - 8*g - 3 == 0)>")
+        # p + 5 - 8 - 3 == 0  →  p == 6
+        assert affine_set_contains(s, [6], symbols=[5, 1])
+        assert not affine_set_contains(s, [5], symbols=[5, 1])
+
+
+# ===========================================================================
 # Edge-case tests — non-rectangular sets, conflicting constraints, zero-dim maps
 # ===========================================================================
 
@@ -486,3 +582,54 @@ class TestAffineEdgeCases:
         assert m.n_dims == 0
         assert len(m.exprs) == 3
         assert eval_affine_map(m, []) == (1, 2, 3)
+
+
+# ===========================================================================
+# Symbolic bound helpers (Bound = int | _Node, used by symbolic BoxSet)
+# ===========================================================================
+
+class TestSymBoundHelpers:
+    """``sym_*`` constructors + ``eval_bound`` round-trip.
+
+    These helpers underpin :class:`BoxSet` symbolic bounds.  Tests focus on
+    the contract: (a) concrete operands fold to a plain ``int``, (b) the
+    advertised MVP simplifications fire, (c) AST nodes evaluate to what
+    plain Python arithmetic would give once symbols are bound.
+    """
+
+    def test_concrete_operands_fold_to_int(self):
+        assert sym_add(2, 3) == 5
+        assert sym_neg(5) == -5
+        assert sym_max(3, 7) == 7
+        assert sym_min(3, 7) == 3
+
+    def test_mvp_simplifications(self):
+        s0 = ("sym", 0)
+        # additive identity
+        assert sym_add(0, s0) is s0
+        assert sym_add(s0, 0) is s0
+        # double negation collapses
+        assert sym_neg(("neg", s0)) is s0
+        # max/min idempotent on same SymRef (compare-by-value)
+        assert sym_max(s0, ("sym", 0)) == s0
+        assert sym_min(s0, ("sym", 0)) == s0
+
+    def test_int_operand_wrapped_as_const_node(self):
+        # When one side is symbolic, the int side gets wrapped so the AST
+        # is well-formed for ``_eval_node``.
+        s0 = ("sym", 0)
+        assert sym_add(5, s0) == ("add", ("const", 5), s0)
+        assert sym_max(0, s0) == ("max", ("const", 0), s0)
+        assert sym_min(s0, 10) == ("min", s0, ("const", 10))
+
+    def test_eval_bound_round_trip(self):
+        # eval_bound on plain int short-circuits (no ``symbols`` needed).
+        assert eval_bound(7, ()) == 7
+        # AST nodes evaluate to the same value as plain Python on the
+        # resolved symbols.  Covers sym, add, max, min, neg in one walk.
+        s0, s1 = ("sym", 0), ("sym", 1)
+        assert eval_bound(sym_add(s0, 1), [128]) == 129
+        assert eval_bound(sym_neg(s0), [3]) == -3
+        for a, b in [(3, 7), (-2, 0), (10, 5)]:
+            assert eval_bound(sym_max(s0, s1), [a, b]) == max(a, b)
+            assert eval_bound(sym_min(s0, s1), [a, b]) == min(a, b)

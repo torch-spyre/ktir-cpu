@@ -246,6 +246,15 @@ class Tile:
     # so that ``coalescing_efficiency`` retains its data-layout meaning.
     # None for direct loads (no index tensors) and compute-produced tiles.
     index_unique_sticks: Optional[int] = None
+    # Total bytes moved across cores by the comm op that produced this
+    # tile.  Set by ``ktdp.inter_tile_reduce`` (and future delivery ops)
+    # from the transport backend's accumulated send total.  None for any
+    # tile not produced by a comm op.  The latency tracker reads this
+    # off the result for stick-granular comm bandwidth accounting,
+    # mirroring how ``unique_sticks`` carries memory provenance.  Not
+    # propagated by ``copy()`` — the bytes belong to the production
+    # event, not to copies of the data.
+    comm_bytes: Optional[int] = None
 
     def copy(self) -> 'Tile':
         """Create a deep copy of this tile.
@@ -315,6 +324,50 @@ class IndirectAccessTile:
     index_views: List[MemRef]                   # index memrefs for indirect dims (used for byte_address)
     variables_space_set: AffineSet              # domain of intermediate variables
     variables_space_order: Optional[AffineMap]  # iteration order; None = default
+
+
+@dataclass
+class TileFuture:
+    """Per-core handle produced by ``ktdp.inter_tile_produce``.
+
+    Holds *this* core's contribution to the inter-tile op.  SPMD:
+    each core has its own ``TileFuture`` instance bound to its local
+    ``%fut`` SSA value; cross-core data movement happens via the
+    scheduler's mailbox once the matching delivery op runs, not by
+    reading other cores' futures.
+
+    Def-use simulation
+    ------------------
+    The KTIR spec uses the SSA def-use edge ``%fut → consume(%fut)``
+    to (1) order produce before consume on each core and (2) pair a
+    delivery op with its matching produce.  This simulator does not
+    walk the IR's def-use graph for either role.  Both are absorbed
+    by ``TileFuture`` itself:
+      - ordering: ordinary SSA scoping (``ctx.get_value`` only
+        succeeds after produce has bound the name);
+      - pairing: the ``TileFuture`` instance the consume handler
+        receives *is* the edge — the producer-side data already
+        lives on the future the consumer holds.
+
+    Fields:
+      ``partial_tensor_types``: declared T_p_1, ..., T_p_N (verbatim).
+      ``local_partial``: this core's yielded tile(s) — the seed for
+          the transport.  ``None`` when the core is in
+          ``groups_set`` but outside ``producer_set`` (non-producer
+          cores still run the delivery op so they participate in the
+          workgroup-wide protocol; the backend substitutes
+          ``identity`` for them).
+      ``producer_set`` / ``groups_set``: parsed IR sets, kept on the
+          future so the consumer handler can build a ``CommPlan``
+          without re-parsing.
+      ``group_idx``: the group this core belongs to, computed once
+          at produce time.
+    """
+    partial_tensor_types: Tuple[str, ...]
+    local_partial: Optional[Tuple['Tile', ...]]
+    producer_set: AffineSet
+    groups_set: AffineSet
+    group_idx: int
 
 
 @dataclass

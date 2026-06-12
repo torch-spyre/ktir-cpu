@@ -265,6 +265,37 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "shape", (4,))
         self.assert_attribute(op, "dtype", "f16")
 
+    def test_constant_dense_list(self):
+        """dense<[16, 32]> : tensor<2xindex> — list form, one value per element.
+
+        Folded ``tensor.from_elements`` of constant ``index`` values appears
+        as the shape operand of ``tensor.reshape``. Without per-element
+        parsing this would mis-parse to a splat-of-zero tensor.
+        """
+        op = self._parse("%c = arith.constant dense<[16, 32]> : tensor<2xindex>")
+        self.assert_op_type(op, "arith.constant")
+        self.assert_attribute(op, "is_tensor", True)
+        self.assert_attribute(op, "shape", (2,))
+        self.assert_attribute(op, "dtype", "index")
+        self.assert_attribute(op, "value", [16, 32])
+        self.assert_attribute(op, "dense_list", True)
+
+    def test_constant_dense_list_float(self):
+        """dense<[1.5, 2.5]> : tensor<2xf32> — list form with float dtype.
+
+        Confirms the dense-list path is dtype-generic: ``_parse_dense_payload``
+        runs each token through ``parse_numeric`` with the element dtype, so
+        floats parse correctly even though the splat path was the original
+        motivating case for index-only shape operands.
+        """
+        op = self._parse("%c = arith.constant dense<[1.5, 2.5]> : tensor<2xf32>")
+        self.assert_op_type(op, "arith.constant")
+        self.assert_attribute(op, "is_tensor", True)
+        self.assert_attribute(op, "shape", (2,))
+        self.assert_attribute(op, "dtype", "f32")
+        self.assert_attribute(op, "value", [1.5, 2.5])
+        self.assert_attribute(op, "dense_list", True)
+
     @pytest.mark.parametrize("op_name", [
         "arith.addi", "arith.subi", "arith.muli",
         "arith.divsi", "arith.divui",
@@ -312,6 +343,22 @@ class TestArithParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "arith.index_cast")
         self.assert_num_operands(op, 1)
+
+    def test_index_castui(self):
+        op = self._parse(
+            "%r = arith.index_castui %a : i32 to index",
+            args={"%a": "i32"},
+        )
+        self.assert_op_type(op, "arith.index_castui")
+        self.assert_num_operands(op, 1)
+
+    def test_ceildivui(self):
+        op = self._parse(
+            "%r = arith.ceildivui %a, %b : i32",
+            args={"%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, "arith.ceildivui")
+        self.assert_num_operands(op, 2)
 
     def test_select(self):
         op = self._parse(
@@ -441,6 +488,31 @@ class TestLinalgParsers(ParseTestMixin):
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%buf")
 
+    def test_matmul(self):
+        # matmul carries no attributes; operands are [A, B, C] (ins then outs)
+        op = self._parse(
+            "%r = linalg.matmul ins(%a, %b : tensor<4x8xf16>, tensor<8x16xf16>)"
+            " outs(%c : tensor<4x16xf16>) -> tensor<4x16xf16>",
+            args={"%a": "tensor<4x8xf16>", "%b": "tensor<8x16xf16>", "%c": "tensor<4x16xf16>"},
+        )
+        self.assert_op_type(op, "linalg.matmul")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
+    def test_batch_matmul(self):
+        # batch_matmul has the same operand structure as matmul: [A, B, C].
+        # Added in #81 on the executor side; this verifies both parser
+        # backends handle it (the MLIR frontend needs an installed handler).
+        op = self._parse(
+            "%r = linalg.batch_matmul"
+            " ins(%a, %b : tensor<2x4x8xf16>, tensor<2x8x16xf16>)"
+            " outs(%c : tensor<2x4x16xf16>) -> tensor<2x4x16xf16>",
+            args={"%a": "tensor<2x4x8xf16>", "%b": "tensor<2x8x16xf16>", "%c": "tensor<2x4x16xf16>"},
+        )
+        self.assert_op_type(op, "linalg.batch_matmul")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
 
 # ---------------------------------------------------------------------------
 # tensor dialect parsers
@@ -516,6 +588,74 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_num_operands(yield_op, 1)
         self.assert_operand_names(yield_op, "%val")
         assert yield_op.result is None
+
+    def test_reshape(self):
+        """1D -> 2D reshape, primary form emitted by Spyre's LowerComputeOps.
+
+        Two SSA operands (source and shape tensor); target shape is read from
+        the result type after ``->``.
+        """
+        op = self._parse(
+            "%out = tensor.reshape %src(%shape) : "
+            "(tensor<512xf32>, tensor<2xindex>) -> tensor<16x32xf32>",
+            args={"%src": "tensor<512xf32>", "%shape": "tensor<2xindex>"},
+        )
+        self.assert_op_type(op, "tensor.reshape")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%src", "%shape")
+        self.assert_attribute(op, "target_shape", (16, 32))
+        self.assert_attribute(op, "dtype", "f32")
+
+    def test_reshape_to_1d(self):
+        """Endpoint test: rank-reducing reshape (2D -> 1D)."""
+        op = self._parse(
+            "%out = tensor.reshape %src(%shape) : "
+            "(tensor<8x16xf16>, tensor<1xindex>) -> tensor<128xf16>",
+            args={"%src": "tensor<8x16xf16>", "%shape": "tensor<1xindex>"},
+        )
+        self.assert_op_type(op, "tensor.reshape")
+        self.assert_attribute(op, "target_shape", (128,))
+        self.assert_attribute(op, "dtype", "f16")
+
+    def test_from_elements(self):
+        """``tensor.from_elements %d0, %d1 : tensor<2xindex>`` — shape-operand
+        producer for ``tensor.reshape``."""
+        op = self._parse(
+            "%shape = tensor.from_elements %d0, %d1 : tensor<2xindex>",
+            args={"%d0": "index", "%d1": "index"},
+        )
+        self.assert_op_type(op, "tensor.from_elements")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%d0", "%d1")
+        self.assert_attribute(op, "shape", (2,))
+        self.assert_attribute(op, "dtype", "index")
+
+    def test_from_elements_n1(self):
+        """N=1 endpoint: single-operand form.
+
+        The grammar ``tensor.from_elements %a, ... : tensor<NxT>`` admits N>=1;
+        this guards the smallest legal match. Used when a reshape needs a
+        rank-1 target with a single dimension (e.g. flatten).
+        """
+        op = self._parse(
+            "%shape = tensor.from_elements %a : tensor<1xindex>",
+            args={"%a": "index"},
+        )
+        self.assert_op_type(op, "tensor.from_elements")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%a")
+        self.assert_attribute(op, "shape", (1,))
+        self.assert_attribute(op, "dtype", "index")
+
+    def test_from_elements_three(self):
+        """N>2 endpoint: rank-3 shape producer (e.g. for tensor<2x2x16xT>)."""
+        op = self._parse(
+            "%shape = tensor.from_elements %a, %b, %c : tensor<3xindex>",
+            args={"%a": "index", "%b": "index", "%c": "index"},
+        )
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+        self.assert_attribute(op, "shape", (3,))
 
 
 # ---------------------------------------------------------------------------
@@ -720,12 +860,18 @@ class TestKtdpParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
         self.assert_attribute(op, "dtype", "f16")
-        # Only assert the concrete dim — the dynamic dim is represented as the
-        # SSA name string "%n" by the regex parser, and as the ShapedType
-        # sentinel by the MLIR frontend.
+        # The static dim is a concrete int; the dynamic dim must carry the SSA
+        # name (a string) of its sizes: operand so the executor can resolve it
+        # at runtime and bind it to symbol s0 of the coordinate_set. Both
+        # parsers must uphold this — the exact name differs (regex keeps "%n",
+        # the MLIR frontend renumbers positionally), so we assert the type, not
+        # the value.
         shape = op.attributes["shape"]
-        assert shape[0] == 1024
         assert len(shape) == 2
+        assert shape[0] == 1024
+        assert isinstance(shape[1], str), (
+            f"dynamic dim must be an SSA-name string, got {shape[1]!r}"
+        )
 
     @pytest.mark.regex_only
     def test_construct_memory_view_sizes_count_mismatch_rejected(self):
@@ -1056,6 +1202,45 @@ class TestParseAttrList:
     def test_single_element(self):
         result = parse_attr_list("[affine_map<(d0) -> (d0)>]")
         assert len(result) == 1
+
+
+from ktir_cpu.parser_utils import parse_tensor_type
+
+
+class TestParseTensorType:
+    def test_basic_float(self):
+        assert parse_tensor_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
+
+    def test_basic_int(self):
+        assert parse_tensor_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
+
+    def test_multi_dim(self):
+        assert parse_tensor_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
+
+    def test_index_dtype(self):
+        # Regression: 'index' contains 'x'; old split('x') would corrupt the dtype.
+        assert parse_tensor_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
+        assert parse_tensor_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
+
+    def test_dynamic_dims_dropped(self):
+        assert parse_tensor_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
+        assert parse_tensor_type("tensor<?xf16>") is None
+
+    def test_rank0_returns_none(self):
+        assert parse_tensor_type("tensor<f32>") is None
+
+    def test_non_tensor_returns_none(self):
+        assert parse_tensor_type("memref<10xf32>") is None
+        assert parse_tensor_type("f32") is None
+
+    @pytest.mark.xfail(strict=True, reason="nested '<>' in dtype unsupported; regex stops at first '>'")
+    @pytest.mark.parametrize("type_str,expected", [
+        ("tensor<4xcomplex<f32>>", {"shape": (4,), "dtype": "complex<f32>"}),
+        ("tensor<4x!tt.ptr<f32>>", {"shape": (4,), "dtype": "!tt.ptr<f32>"}),
+        ("tensor<4xvector<4xf32>>", {"shape": (4,), "dtype": "vector<4xf32>"}),
+    ])
+    def test_nested_bracket_dtype_unsupported(self, type_str, expected):
+        assert parse_tensor_type(type_str) == expected
 
 
 # ---------------------------------------------------------------------------

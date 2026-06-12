@@ -39,6 +39,7 @@ try:
         IntegerAttr,
         IntegerSetAttr,
         Module,
+        ShapedType,
     )
     from mlir_ktdp.passmanager import PassManager
     from tools_ktdp.ir_utils import ktdp_context, walk_module
@@ -155,10 +156,13 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 
 MLIRTypeAdapter.install(
     "func.return",
+    "linalg.add",
     "linalg.fill",
     "linalg.matmul",
+    "linalg.batch_matmul",
     "linalg.yield",
     "scf.yield",
+    "scf.if",
     # float binary
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf",
     # float unary
@@ -182,6 +186,8 @@ MLIRTypeAdapter.install(
     "arith.extf", "arith.truncf",
     "arith.extsi", "arith.extui", "arith.trunci",
     "arith.index_cast",
+    "arith.index_castui",
+    "arith.ceildivui",
     "arith.maxnumf",
     "arith.maximumf",
     "arith.minimumf",
@@ -255,9 +261,38 @@ def _adapt_construct_access_tile(mlir_op, attributes, result_type, operands):
 
 @MLIRTypeAdapter.install("ktdp.construct_memory_view")
 def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
-    """Map static_sizes→shape, static_strides→strides; extract dtype, memory_space from result/attrs."""
-    attributes["shape"] = tuple(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
-    attributes["strides"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+    """Map static_sizes→shape, static_strides→strides; extract dtype, memory_space from result/attrs.
+
+    Dynamic dims/strides are encoded in static_sizes/static_strides as the
+    ShapedType dynamic sentinel (INT64_MIN), with their runtime values supplied
+    as SSA operands. The executor (ktdp__construct_memory_view) expects each
+    dynamic slot to instead carry the SSA-name *string* of its operand: dynamic
+    sizes are resolved at runtime, and their names also bind the symbols of the
+    coordinate_set (per the ODS contract). We mirror the regex parser by
+    substituting those names into the sentinel slots, left to right.
+
+    operandSegmentSizes splits the operands into [base, dynamic_sizes,
+    dynamic_strides]; the dynamic_sizes/strides segments line up one-to-one
+    (in order) with the sentinel slots in static_sizes/static_strides.
+    """
+    sizes = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
+    strides = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+
+    seg = list(DenseI32ArrayAttr(mlir_op.attributes["operandSegmentSizes"]))
+    n_base, n_dyn_sizes, n_dyn_strides = seg[0], seg[1], seg[2]
+    dyn_size_names = operands[n_base:n_base + n_dyn_sizes]
+    dyn_stride_names = operands[n_base + n_dyn_sizes:n_base + n_dyn_sizes + n_dyn_strides]
+
+    sentinel = ShapedType.get_dynamic_size()
+
+    def _splice(static_vals, names):
+        out, it = [], iter(names)
+        for v in static_vals:
+            out.append(next(it) if v == sentinel else v)
+        return out
+
+    attributes["shape"] = tuple(_splice(sizes, dyn_size_names))
+    attributes["strides"] = _splice(strides, dyn_stride_names)
     m = re.search(r'x([a-zA-Z]\w*)(?:[,>])', result_type)
     if not m:
         raise ValueError(f"ktdp.construct_memory_view: cannot parse dtype from {result_type!r}")
@@ -420,6 +455,33 @@ def _adapt_tensor_collapse_shape(mlir_op, attributes, result_type, operands):
     attributes["dtype"] = info["dtype"]
 
 
+@MLIRTypeAdapter.install("tensor.reshape")
+def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
+    """Synthesize target_shape/dtype from the result type annotation.
+
+    The shape operand (operands[1]) is left in place so the IR remains
+    well-formed; only the result type is consulted, since it always pins
+    the target shape statically.
+    """
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.reshape: cannot parse result type {result_type!r}")
+    attributes["target_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+
+
+@MLIRTypeAdapter.install("tensor.from_elements")
+def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
+    """Synthesize shape/dtype from result type — operands carry the values."""
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.from_elements: cannot parse result type {result_type!r}")
+    attributes["shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+
+
 @MLIRTypeAdapter.install("tensor.splat")
 def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
@@ -433,19 +495,41 @@ def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
 
 @MLIRTypeAdapter.install("arith.constant")
 def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
-    """Extract value: unwrap splat tensors, convert int/float attrs."""
+    """Extract value: unwrap splat tensors, iterate dense lists, convert int/float attrs.
+
+    Three cases for the ``value`` attribute:
+
+    - splat ``DenseElementsAttr`` (e.g. ``dense<0.0> : tensor<4xf16>``):
+      unwrap to the single splat value via ``get_splat_value()``.
+    - non-splat ``DenseElementsAttr`` (e.g. ``dense<[16, 32]> : tensor<2xindex>``):
+      iterate the elements; record ``dense_list = True`` so the executor
+      builds the array element-by-element rather than splatting one value.
+    - scalar ``IntegerAttr`` / ``FloatAttr`` (e.g. ``42 : index``): use directly.
+    """
     val_attr = mlir_op.attributes["value"]
-    if isinstance(val_attr, DenseElementsAttr) and val_attr.is_splat:
-        val_attr = val_attr.get_splat_value()
-    if not isinstance(val_attr, (IntegerAttr, FloatAttr)):
+    is_list = False
+    if isinstance(val_attr, DenseElementsAttr):
+        if val_attr.is_splat:
+            attributes["value"] = val_attr.get_splat_value().value
+        else:
+            # Iterating DenseElementsAttr yields Python scalars (int/float)
+            # directly, not wrapped IntegerAttr/FloatAttr.
+            attributes["value"] = [
+                e.value if hasattr(e, "value") else e for e in val_attr
+            ]
+            is_list = True
+    elif isinstance(val_attr, (IntegerAttr, FloatAttr)):
+        attributes["value"] = val_attr.value
+    else:
         raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
-    attributes["value"] = val_attr.value
     if result_type and "tensor<" in result_type:
         from ..parser_utils import parse_tensor_type
         info = parse_tensor_type(result_type)
         attributes["shape"] = info["shape"]
         attributes["dtype"] = info["dtype"]
         attributes["is_tensor"] = True
+        if is_list:
+            attributes["dense_list"] = True
 
 
 @MLIRTypeAdapter.install("linalg.broadcast")

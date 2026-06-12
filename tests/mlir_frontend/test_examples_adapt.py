@@ -11,6 +11,7 @@ from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser
 
 from test_examples import (
     TestVectorAddExecution as _TestVectorAddExecution,
+    TestVectorAddDynamicExecution as _TestVectorAddDynamicExecution,
     TestSoftmaxExecution as _TestSoftmaxExecution,
     TestLayerNormExecution as _TestLayerNormExecution,
     TestReduceExplicitRegion as _TestReduceExplicitRegion,
@@ -30,6 +31,10 @@ class MLIRFrontendInterpMixin:
 
 class TestVectorAddAdapt(MLIRFrontendInterpMixin, _TestVectorAddExecution):
     """Vector add tests via MLIRFrontendParser."""
+
+
+class TestVectorAddDynamicAdapt(MLIRFrontendInterpMixin, _TestVectorAddDynamicExecution):
+    """Dynamic vector add (memref<?>, symbolic coordinate set) via MLIRFrontendParser."""
 
 
 class TestSoftmaxAdapt(MLIRFrontendInterpMixin, _TestSoftmaxExecution):

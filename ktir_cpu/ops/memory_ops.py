@@ -167,6 +167,25 @@ class _MemAccessor:
         self._sim.write(*self._args, data, **self._kwargs)
 
 
+def _enumerate_in_vso_order(iat: "IndirectAccessTile") -> List[Tuple[int, ...]]:
+    """Enumerate variable-space points in ``variables_space_order``-permuted order.
+
+    Identity (or absent) ``vso`` returns the natural row-major enumeration;
+    otherwise points are sorted by ``vso.eval(pt)`` per RFC 0682 §473.
+
+    Both :func:`_resolve_idx_reads` and :func:`_build_indirect_coords` route
+    through this so their pt iteration stays in lockstep — they consume
+    ``idx_values`` positionally, so any divergence would silently mismatch
+    indirect dims to coords.  Callers are expected to have already rejected
+    non-permutation ``vso`` upstream; this function trusts the guard.
+    """
+    points = iat.variables_space_set.enumerate(iat.shape)
+    vso = iat.variables_space_order
+    if vso is not None and not vso.is_identity():
+        points = sorted(points, key=lambda pt: vso.eval(pt))
+    return points
+
+
 def _resolve_idx_reads(
     context: CoreContext, iat: "IndirectAccessTile",
 ) -> Tuple[Dict[int, np.ndarray], int]:
@@ -195,7 +214,7 @@ def _resolve_idx_reads(
     ``indirect_store`` both call it so their stick accounting stays in
     sync (guard symmetry).
     """
-    points = iat.variables_space_set.enumerate(iat.shape)
+    points = _enumerate_in_vso_order(iat)
     indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
 
     # Hoist per-view loop-invariants once before enumerating points.
@@ -263,7 +282,7 @@ def _build_indirect_coords(
     Shared by ``indirect_load`` and ``indirect_store`` so their coord
     construction stays in lockstep (guard symmetry).
     """
-    points = iat.variables_space_set.enumerate(iat.shape)
+    points = _enumerate_in_vso_order(iat)
     idx_iters = {iv_idx: iter(values) for iv_idx, values in idx_values.items()}
 
     coords: List[Tuple[int, ...]] = []
@@ -579,17 +598,26 @@ class MemoryOps:
         (direct dims use the variable value, indirect dims look up the
         index in an index memref), then delegates to :meth:`load`.
 
-        Raises NotImplementedError if ``variables_space_order`` is non-identity.
+        ``variables_space_order``, when non-identity, sets a permuted
+        iteration order over the variable space: enumerated points are
+        sorted by the map's image and visited in that order.  Subscript
+        resolution evaluates each ``idx_exprs`` against the variable-space
+        point.  The map must be a coordinate permutation; non-permutation
+        maps are rejected with ``ValueError``.  See RFC 0682 §473.
         """
         vso = iat.variables_space_order
-        if vso is not None and not vso.is_identity():
-            raise NotImplementedError(
-                "indirect_load: output tile permutation via non-identity "
-                "variables_space_order is not yet implemented"
+        if vso is not None and not vso.is_permutation():
+            raise ValueError(
+                f"indirect_load: variables_space_order must permute its input "
+                f"dimensions; got non-permutation map: {vso.source}"
             )
 
         # Resolve every idx-tensor read up front: one accessor per index
         # view, one read_scattered call, sticks deduped inside the accessor.
+        # Both helpers route their pt enumeration through
+        # _enumerate_in_vso_order, so non-identity vso permutes the
+        # iteration order consistently across idx reads and coord build
+        # (RFC 0682 §473).
         idx_values, idx_unique_sticks = _resolve_idx_reads(context, iat)
         coords = _build_indirect_coords(iat, idx_values)
 
@@ -649,6 +677,16 @@ class MemoryOps:
         ``MemRef`` can only describe a strided rectangle, so any
         non-rectangular ``B_i`` is stored BB-padded inside the
         partition's ``shape`` (see ``MemRef.coordinate_set``).
+
+        Contract on dynamic shapes: callers must supply concrete
+        coordinate sets — symbol resolution happens upstream at
+        ``construct_memory_view`` (per partition) and
+        ``construct_access_tile`` boundaries.  A symbolic ``BoxSet``
+        leaking through here will surface as ``IndexError`` from
+        ``eval_bound`` rather than a silently wrong answer.  Keeping
+        symbol handling out of this function makes the specialise
+        boundary single-layer and avoids dead-code on the integration
+        path.
         """
         global_base = tuple(base_map.eval(indices))
         x = global_base
@@ -669,20 +707,22 @@ class MemoryOps:
             """Slow-path membership test: point ∈ x + A."""
             if access_tile_set is None:
                 return all(0 <= p[d] - x[d] < access_shape[d] for d in range(ndim))
-            return access_tile_set.contains(tuple(p[d] - x[d] for d in range(ndim)))
+            return access_tile_set.contains(
+                tuple(p[d] - x[d] for d in range(ndim))
+            )
 
         survivors: List[TileRef] = []
         for part in dist_ref.partitions:
             B_i = part.coordinate_set
             if isinstance(B_i, BoxSet) and xA_box is not None:
-                # Fast path: O(ndim) intersect
+                # Fast path: O(ndim) intersect on concrete bounds.
                 C_i = B_i.intersect(xA_box)
                 if C_i.is_empty():
                     continue
                 p_i = B_i.lower_bounds()
                 coordinate_set_out: CoordinateSet = C_i
             else:
-                # Slow path: brute-force enumerate + filter
+                # Slow path: brute-force enumerate + filter.
                 B_i_pts = B_i.enumerate(dist_ref.shape)
                 if not B_i_pts:
                     continue
@@ -907,15 +947,17 @@ class MemoryOps:
             )
 
         vso = iat.variables_space_order
-        if vso is not None and not vso.is_identity():
-            raise NotImplementedError(
-                "indirect_store: output tile permutation via non-identity "
-                "variables_space_order is not yet implemented"
+        if vso is not None and not vso.is_permutation():
+            raise ValueError(
+                f"indirect_store: variables_space_order must permute its input "
+                f"dimensions; got non-permutation map: {vso.source}"
             )
 
         # Resolve idx reads (returns idx_unique_sticks: int, 0 for all-LX
         # views) and delegate the data write to MemoryOps.store (returns
-        # int: HBM stick count, 0 for LX).
+        # int: HBM stick count, 0 for LX).  Both helpers enumerate via
+        # _enumerate_in_vso_order so non-identity vso permutes the
+        # iteration order consistently with indirect_load (RFC 0682 §473).
         idx_values, idx_unique_sticks = _resolve_idx_reads(context, iat)
         coords = _build_indirect_coords(iat, idx_values)
         data_sticks = MemoryOps.store(

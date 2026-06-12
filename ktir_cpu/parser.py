@@ -342,7 +342,29 @@ class KTIRParser(KTIRParserBase):
                 starts_ssa = re.match(
                     r'(?:%\w+\s*,\s*)*%\w+\s*=\s', stripped
                 )
-                if self._is_op_complete(accumulated) or starts_ssa:
+                # Two-stage flush decision:
+                #
+                #   Stage 1 — positive *evidence* the previous op is
+                #   complete: either it has a terminal type annotation
+                #   (``: T`` / ``-> T``) or the new line starts a fresh
+                #   SSA assignment (``%name = ...``).  Evidence, not
+                #   proof — see Stage 2.
+                #
+                #   Stage 2 — negative evidence the next line *cannot*
+                #   start a new op.  A bare ``{`` is a region-body
+                #   opener, not an op header — emitting a flush here
+                #   would orphan a region-bearing op (the region would
+                #   attach to whatever follows instead).  This lets
+                #   ops like ``ktdp.inter_tile_produce`` whose type
+                #   annotation lands on the last attribute line keep
+                #   their trailing ``{ ... }`` region attached.
+                #
+                # Stage 2 is a veto over Stage 1.  As more "can't start
+                # an op" shapes turn up, extend ``next_cannot_start_op``
+                # rather than complicating the flush condition.
+                prev_op_probably_done = self._is_op_complete(accumulated) or starts_ssa
+                next_cannot_start_op = stripped == '{'
+                if prev_op_probably_done and not next_cannot_start_op:
                     results.append((accumulated, current_regions))
                     current_op_lines = []
                     current_regions = []

@@ -93,6 +93,104 @@ def _run_matmul(path, func_name, entry, cfg, trace=False):
     return interp.get_latency_report()
 
 
+def _run_vector_reduce(path, func_name, entry, cfg, trace=False):
+    """Run a vector reduce (per-core tile) and return report."""
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+    arg_names = interp.arg_names(func_name)
+    sizes = interp.tensor_input_output_sizes(func_name)
+
+    arg0 = arg_names[0]
+    shape = sizes[arg0]["shape"]
+    rng = np.random.default_rng(42)
+    inp = rng.standard_normal(tuple(shape)).astype(np.float16)
+
+    scalars = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+    overlap = set(scalars.keys()) & {arg0}
+    assert not overlap, f"duplicate keys in tensors and scalars: {overlap}"
+
+    kwargs = {**scalars, **{arg0: inp}}
+    interp.execute_function(func_name, **kwargs)
+    return interp.get_latency_report()
+
+
+def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
+    """Run ring_reduce on its 4-core grid and return ``(report, rows, n_cols)``.
+
+    Differs from the other ``_run_*`` helpers because ``ring_reduce.mlir``
+    takes raw stick-index pointers (``in_ptr`` / ``out_ptr``) rather than
+    ndarray kwargs.  We patch ``_prepare_execution`` to seed the input
+    rows after HBM allocation; this mirrors
+    ``test_examples.py::TestRingReduceExecution::test_ring_reduce_sum``.
+    Returning ``rows`` and ``n_cols`` lets callers compute the expected
+    ring-traffic byte count without re-deriving it.
+    """
+    meta = parse_example(path, func_name)
+    num_cores = math.prod(meta.grid)
+    n_cols = entry["n_cols"]
+    in_ptr = entry["execute_kwargs"]["in_ptr"]
+    out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+    rng = np.random.default_rng(42)
+    rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
+
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    _orig = interp._prepare_execution
+
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        interp.memory.hbm.write(in_ptr,  rows.flatten())
+        interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+
+    interp._prepare_execution = _prepare_and_seed
+    interp.execute_function(func_name, **entry["execute_kwargs"])
+    return interp.get_latency_report(), rows, n_cols
+
+
+def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
+    """Run the multi-group ring_reduce on its 16-core grid and return
+    ``(report, rows, n_cols, n_groups, group_size)``.
+
+    Mirrors ``_run_ring_reduce`` but for the 16-core, 4-group kernel
+    in ``examples/latency/ring_reduce_multi_group.mlir``.  Every core
+    holds its own 1×128 partial; the kernel runs four concurrent
+    in-group all-reduces and writes one output row per group.
+    """
+    meta = parse_example(path, func_name)
+    num_cores = math.prod(meta.grid)
+    n_cols = entry["n_cols"]
+    n_groups = entry["n_groups"]
+    group_size = entry["group_size"]
+    in_ptr = entry["execute_kwargs"]["in_ptr"]
+    out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+    rng = np.random.default_rng(42)
+    rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
+
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    _orig = interp._prepare_execution
+
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        interp.memory.hbm.write(in_ptr,  rows.flatten())
+        interp.memory.hbm.write(out_ptr, np.zeros(n_groups * n_cols, dtype=np.float16))
+
+    interp._prepare_execution = _prepare_and_seed
+    interp.execute_function(func_name, **entry["execute_kwargs"])
+    return (
+        interp.get_latency_report(),
+        rows,
+        n_cols,
+        n_groups,
+        group_size,
+        interp.memory.hbm.read(out_ptr, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vector add latency — memory-dominated
 # ---------------------------------------------------------------------------
@@ -232,6 +330,14 @@ class TestRoofline:
         # AI should be well below the ridge point (memory-bound)
         assert rf["arithmetic_intensity"] < rf["ridge_point"]
 
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
+    def test_vector_reduce_is_memory_bound(self, path, func_name, entry):
+        """A simple vector reduce should be memory-bound on the roofline."""
+        report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
+        rf = report.roofline()
+        assert "arithmetic_intensity" in rf
+        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_roofline_in_report_str(self, path, func_name, entry):
         """Roofline section should appear in report __str__."""
@@ -362,6 +468,114 @@ class TestSoftmaxLatency:
 
         # exp cycles should scale linearly with penalty
         assert scaled_exp == pytest.approx(baseline_exp * penalty, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Reduce latency
+# ---------------------------------------------------------------------------
+
+class TestReduceLatency:
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("softmax_kernel_small"))
+    def test_reduce_defers_cost_to_combiner(self, path, func_name, entry):
+        """linalg.reduce is a zero-cost orchestrator (like linalg.generic); the
+        reduction cost is charged to the combiner ops executed by the tree fold.
+        Folding N elements pairwise processes N/2 + N/4 + … = N-1 elements total,
+        so the combiner's *summed* cost scales with input size (~N/simd_width),
+        not the reduced output shape.  Holds for the shorthand form (softmax
+        uses ``linalg.reduce { arith.maximumf }`` and ``{ arith.addf }``)."""
+        cfg = HardwareConfig()
+        report = _run_softmax(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        # The orchestrator op itself charges nothing.
+        reduce_entries = [e for e in core0.trace if e.op_type == "linalg.reduce"]
+        assert len(reduce_entries) > 0, "expected at least one linalg.reduce in softmax"
+        for e in reduce_entries:
+            assert e.category == "zero" and e.cycles == 0.0, (
+                f"linalg.reduce must be zero-cost, got {e.category}/{e.cycles}"
+            )
+
+        # Combiner ops carry the cost. Core 0 processes 2 rows; per row a max
+        # (arith.maximumf) and a sum (arith.addf) each fold a 1×64 tile → the
+        # tree fold processes 63 elements per reduce. Summed per op across both
+        # rows: 2 × 63 / simd_elements_per_cycle.
+        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        for combiner in ("arith.maximumf", "arith.addf"):
+            total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
+            assert total == pytest.approx(2 * per_reduce), (
+                f"{combiner} should total {2 * per_reduce} cyc over 2 rows "
+                f"(tree fold of 1×64 → N-1 elems each); got {total}"
+            )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
+    def test_reduce_explicit_region_charges_combiner(self, path, func_name, entry):
+        """Explicit-region form routes through the same tree-fold path: the
+        combiner op in the region (arith.addf) carries the cycles and
+        linalg.reduce itself is zero-cost."""
+        cfg = HardwareConfig()
+        report = _run_vector_reduce(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        reduce_entries = [e for e in core0.trace if e.op_type == "linalg.reduce"]
+        assert reduce_entries and all(
+            e.category == "zero" and e.cycles == 0.0 for e in reduce_entries
+        ), "linalg.reduce must be zero-cost in the explicit-region form too"
+
+        # reduce_generic.mlir folds a 1×4 input tile with arith.addf. A pairwise
+        # tree fold of 4 elements processes 2 + 1 = 3 elements total →
+        # 3 / simd_elements_per_cycle cycles, charged to the combiner.
+        expected = 3 / cfg.simd_elements_per_cycle  # N-1 for N=4
+        total = sum(e.cycles for e in core0.trace if e.op_type == "arith.addf")
+        assert total == pytest.approx(expected), (
+            f"combiner arith.addf should total {expected} cyc "
+            f"(tree fold of 1×4 → N-1 elems); got {total}"
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
+    def test_reduce_kernel_is_memory_bound(self, path, func_name, entry):
+        """Vector reduce per-core tile should be memory-dominated."""
+        report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
+        core0 = report.counters[0]
+        assert report.bottleneck == "memory"
+        assert core0.memory_cycles > core0.compute_cycles
+
+    @pytest.mark.parametrize("path,func_name,entry",
+                             get_test_params("softmax_kernel_small_explicit"))
+    def test_explicit_region_softmax_matches_shorthand(self, path, func_name, entry):
+        """Softmax with explicit (%in,%out){...} combiner regions charges the
+        same combiner cost as the shorthand softmax — proving both forms feed
+        the identical tree-fold path. linalg.reduce stays zero-cost."""
+        cfg = HardwareConfig()
+        report = _run_softmax(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
+        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        for combiner in ("arith.maximumf", "arith.addf"):
+            total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
+            assert total == pytest.approx(2 * per_reduce), (
+                f"{combiner} should total {2 * per_reduce} cyc (explicit-region "
+                f"softmax, 2 rows of 1×64 tree fold); got {total}"
+            )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_multiop"))
+    def test_multiop_combiner_charges_all_region_ops(self, path, func_name, entry):
+        """A multi-op combiner (max via cmpf+select) charges EVERY op in the
+        region — there is no single-combiner-name shortcut. Both arith.cmpf and
+        arith.select carry the tree-fold cost; linalg.reduce is zero."""
+        cfg = HardwareConfig()
+        report = _run_vector_reduce(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
+        # 1×8 tree fold → 7 elements processed; each region op charged 7/simd.
+        expected = 7 / cfg.simd_elements_per_cycle  # N-1 for N=8
+        for region_op in ("arith.cmpf", "arith.select"):
+            total = sum(e.cycles for e in core0.trace if e.op_type == region_op)
+            assert total == pytest.approx(expected), (
+                f"{region_op} should total {expected} cyc (1×8 tree fold); "
+                f"got {total}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1585,4 +1799,315 @@ class TestIndirectAccessLatency:
         assert load_idx_sticks == store_idx_sticks == 4, (
             f"load idx sticks={load_idx_sticks}, "
             f"store idx sticks={store_idx_sticks}, expected both to be 4"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ring reduce latency — comm-dominated path
+# ---------------------------------------------------------------------------
+# 🧪 Experimental — tracks ktir-mlir-frontend#23.  Validates the
+# inter-tile + scheduler + latency pipeline: ring bytes accumulated by
+# RingReduceBackend land on Tile.comm_bytes and flow into the per-core
+# LatencyReport.  Correctness counterpart:
+# tests/test_examples.py::TestRingReduceExecution.
+
+class TestRingReduceLatency:
+    """Per-core latency report from the 4-core ring reduce in
+    ``examples/ktir/ring_reduce.mlir``.
+
+    Scope of validity
+    -----------------
+    This test pins ``comm_cycles = ring_bytes / ring_bytes_per_cycle``
+    for the kernel as written.  That formula is exact **only** under two
+    conditions, both of which hold here:
+
+    1. **Single group, contiguous cores.**  The kernel uses
+       ``producer_tiles_per_group = (i)[g] : (i - 4*g >= 0,
+       -i + 4*g + 3 >= 0)`` with ``groups = (g) : (g == 0)``, so the
+       producer set for the single group is ``{0, 1, 2, 3}`` — exactly
+       the four physical cores in core-id order.  ``RingReduceBackend``
+       lays the ring out in that order, so ``send_to(next_core, ...)``
+       is always a 1-hop transfer to the *immediate* neighbor:
+       0 → 1 → 2 → 3 → 0.
+
+    2. **No per-hop overhead in the latency model today.**  ``LC.COMM``
+       in ``latency.py`` charges ``bytes / ring_bytes_per_cycle`` and
+       nothing else.  No constant per-hop latency, no multi-hop scaling.
+
+    For any pattern where the producer set's logical order does **not**
+    match physical wire order — e.g. multi-group with strided membership
+    like ``{g, g+8, g+16, g+24}``, butterfly mirror, or one-to-many
+    broadcast — the model would underestimate and this test's cycle
+    assertion would no longer reflect the real cost.  The structural
+    assertions (per-core counts, category buckets, store-only-on-core-0)
+    remain valid regardless.  A multi-group latency test will need to
+    pin per-hop costs once that part of the model is added.
+
+    Ring layout — 4 cores, 3 rounds
+    -------------------------------
+    Each arrow ``→`` is one ``send_to`` of one ``1x128 f16`` payload
+    (256 bytes) to the *immediate* core-id neighbor.  The wire wraps
+    3 → 0.  Each core does ``N - 1 = 3`` rounds.  After round 3 every
+    core's accumulator has folded in every starting tile exactly once,
+    so all four cores hold ``t0 + t1 + t2 + t3``.
+
+    Each cell shows ``acc | fwd``: the accumulator value on that core
+    *after* the round's reduce, and the tile that core will *forward*
+    in the next round (= the tile it just received this round).
+    ``send`` annotations on the arrows show the round-1 payloads.
+
+                        round 1               round 2          round 3
+
+      core 0  start:t0  ┌── send t0 ─→┐    ┌── send t3 ─→┐    ┌── send t2 ─→┐
+                        │ recv t3      │    │ recv t2      │    │ recv t1      │
+                        │ acc=t0+t3    │    │ acc=t0+t3+t2 │    │ acc=Σt       │
+                        │ fwd=t3       │    │ fwd=t2       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+      core 1  start:t1  ┌── send t1 ─→┐    ┌── send t0 ─→┐    ┌── send t3 ─→┐
+                        │ recv t0      │    │ recv t3      │    │ recv t2      │
+                        │ acc=t1+t0    │    │ acc=t1+t0+t3 │    │ acc=Σt       │
+                        │ fwd=t0       │    │ fwd=t3       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+      core 2  start:t2  ┌── send t2 ─→┐    ┌── send t1 ─→┐    ┌── send t0 ─→┐
+                        │ recv t1      │    │ recv t0      │    │ recv t3      │
+                        │ acc=t2+t1    │    │ acc=t2+t1+t0 │    │ acc=Σt       │
+                        │ fwd=t1       │    │ fwd=t0       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+      core 3  start:t3  ┌── send t3 ─→┐    ┌── send t2 ─→┐    ┌── send t1 ─→┐
+                        │ recv t2      │    │ recv t1      │    │ recv t0      │
+                        │ acc=t3+t2    │    │ acc=t3+t2+t1 │    │ acc=Σt       │
+                        │ fwd=t2       │    │ fwd=t1       │    │              │
+                        └──────────────┘    └──────────────┘    └──────────────┘
+
+    Wire usage per core: 3 sends × 256 bytes = 768 bytes/core, all over
+    1-hop neighbor edges.  That's the byte total ``RingReduceBackend``
+    accumulates into ``self.bytes_moved`` and the consume handler stamps
+    onto ``Tile.comm_bytes``.
+
+    Per-core trace (each core, in order)
+    ------------------------------------
+    With ``HardwareConfig()`` defaults — ``simd_elements_per_cycle = 64``,
+    ``hbm_bandwidth_tb_s = 1.0``, ``ring_bandwidth_tb_s = 4.0``,
+    ``num_cores = 32`` — and a ``1 x 128 f16`` partial (256 bytes,
+    occupying 2 HBM sticks)::
+
+      arith.constant                  zero    cycles=0.0
+      arith.constant                  zero    cycles=0.0
+      ktdp.get_compute_tile_id        zero    cycles=0.0
+      arith.muli                      compute cycles=0.0   (scalar index)
+      arith.addi                      compute cycles=0.0   (scalar index)
+      ktdp.construct_memory_view      zero    cycles=0.0
+      ktdp.construct_access_tile      zero    cycles=0.0
+      ktdp.load                       memory  cycles=8.192 (256 bytes / 31.25 B/cyc)
+      ktdp.yield_partial              zero    cycles=0.0
+      ktdp.inter_tile_produce         zero    cycles=0.0   (no LC.COMM)
+      arith.constant                  zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.fill                     zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.add                      compute cycles=2.0   (128 elems / 64 simd)
+      ktdp.yield_reduced              zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.add                      compute cycles=2.0   <- combiner round 2
+      ktdp.yield_reduced              zero    cycles=0.0
+      tensor.empty                    zero    cycles=0.0
+      linalg.add                      compute cycles=2.0   <- combiner round 3
+      ktdp.yield_reduced              zero    cycles=0.0
+      ktdp.inter_tile_reduce          comm    cycles=0.192 (768 bytes / 4000 B/cyc)
+      arith.cmpi                      compute cycles=0.015625 (1 elem / 64 simd)
+      [core 0 only:  tensor.expand_shape  zero    cycles=0.0]
+      [core 0 only:  ktdp.construct_memory_view  zero    cycles=0.0]
+      [core 0 only:  ktdp.construct_access_tile  zero    cycles=0.0]
+      [core 0 only:  ktdp.store              memory  cycles=8.192 (256 bytes)]
+      scf.if                          zero    cycles=0.0
+      return                          zero    cycles=0.0
+
+    The ring reduce contributes ``(N_ring - 1) * partial_bytes = 3 * 256
+    = 768`` bytes per core.  The combiner region (``linalg.add``) runs
+    ``N_ring - 1 = 3`` times on each core, once per ring round (the
+    backend's ``reduce_fn`` invocation; see
+    ``RingReduceBackend.run`` in ``ktir_cpu/ops/comm_ops.py``).
+
+    Per-core totals
+    ---------------
+    - All cores: ``compute = 2.0 * 3 + 0.015625 = 6.015625`` cycles,
+      ``comm = 0.192`` cycles.
+    - Cores 1, 2, 3: ``memory = 8.192`` cycles (one ``ktdp.load``).
+    - Core 0:       ``memory = 16.384`` cycles (``ktdp.load`` +
+      ``ktdp.store``).
+    - ``rep.kernel_cycles = max(total_cycles)`` is on core 0, since it
+      carries the extra HBM store.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce"))
+    def test_ring_reduce_per_core_breakdown(self, path, func_name, entry):
+        cfg = HardwareConfig()
+        rep, rows, n_cols = _run_ring_reduce(
+            path, func_name, entry, cfg, trace=True
+        )
+
+        assert rep is not None, (
+            "latency report should be present when latency_config is set"
+        )
+
+        N_ring = rows.shape[0]                  # 4 producers per group
+        partial_bytes = n_cols * 2              # 1 x 128 f16 = 256 bytes
+        per_core_ring_bytes = (N_ring - 1) * partial_bytes
+        expected_comm_cycles = per_core_ring_bytes / cfg.ring_bytes_per_cycle
+
+        # Every core should have a counters record.
+        assert set(rep.counters.keys()) == set(range(N_ring))
+
+        # ---- Per-core invariants ----
+        for core_id, cc in rep.counters.items():
+            ops = [t.op_type for t in cc.trace]
+
+            # Each core runs the produce + reduce pair exactly once.
+            assert ops.count("ktdp.inter_tile_produce") == 1
+            assert ops.count("ktdp.inter_tile_reduce") == 1
+
+            # Produce is a metadata-only op now (no LC.COMM): cycles=0.
+            produce_entry = next(
+                t for t in cc.trace if t.op_type == "ktdp.inter_tile_produce"
+            )
+            assert produce_entry.cycles == 0
+            assert produce_entry.category == "zero"
+
+            # Reduce is the comm-charged op.  Bytes stamped onto
+            # Tile.comm_bytes by RingReduceBackend flow into the
+            # tracker via _comm_size; cycles = bytes /
+            # ring_bytes_per_cycle, with no log2(num_cores) multiplier
+            # (dropped in the per-message accounting redesign).
+            reduce_entry = next(
+                t for t in cc.trace if t.op_type == "ktdp.inter_tile_reduce"
+            )
+            assert reduce_entry.category == "comm"
+            assert reduce_entry.cycles == pytest.approx(expected_comm_cycles)
+
+            # Total per-core comm equals exactly the reduce charge —
+            # no other op in the trace contributes to the comm bucket.
+            assert cc.comm_cycles == pytest.approx(expected_comm_cycles)
+
+            # Cumulative comm bytes for this core (the only comm op is
+            # the reduce, so total_bytes - HBM-side load/store bytes
+            # equals the ring's per-core wire load).  We pin the comm
+            # bytes via the cycle assertion above; this asserts the
+            # aggregate counter agrees: ring bytes contribute exactly
+            # ``per_core_ring_bytes`` to ``total_bytes``.
+            # Note ``total_bytes`` also includes HBM bytes from
+            # ``ktdp.load`` / ``ktdp.store``, so we can't pin it on its
+            # own — we just assert it's at least the ring bytes.
+            assert cc.total_bytes >= per_core_ring_bytes
+
+            # Each core loads its own row from HBM exactly once.
+            assert ops.count("ktdp.load") == 1
+
+        # ---- Cross-core invariants ----
+        # Only core 0 writes back (gated by ``scf.if %is_writer``).
+        store_cores = [
+            cid for cid, cc in rep.counters.items()
+            if any(t.op_type == "ktdp.store" for t in cc.trace)
+        ]
+        assert store_cores == [0], (
+            f"expected only core 0 to ktdp.store, got {store_cores}"
+        )
+
+        # Kernel wall-clock = max of per-core total cycles.  Core 0
+        # carries the extra HBM store, so it must be the heaviest.
+        per_core_total = {cid: cc.total_cycles for cid, cc in rep.counters.items()}
+        assert rep.kernel_cycles == max(per_core_total.values())
+        assert per_core_total[0] >= max(per_core_total[c] for c in (1, 2, 3))
+
+
+# ---------------------------------------------------------------------------
+# Multi-group ring reduce — comm-dominated, 4 groups of 4 on a 16-core grid
+# ---------------------------------------------------------------------------
+# 🧪 Experimental — tracks ktir-mlir-frontend#23.  Validates two
+# things the single-group test cannot:
+#   1. Correctness of the plan-aware fold in ``RingReduceBackend.run``
+#      — every group's accumulator must contain only its own four
+#      tiles, even though the ring spans the whole 16-core
+#      workgroup.  Out-of-plan tiles flow through but are discarded
+#      at fold time; misbehaviour here would smear values across
+#      groups.
+#   2. Per-core ring bytes scale with ``ctx.num_cores``, not group
+#      size — the ring is over the whole workgroup, so a 16-core
+#      workgroup with 4 groups of 4 sends ``num_cores - 1 = 15``
+#      messages per core, not ``group_size - 1 = 3``.
+
+class TestRingReduceMultiGroupLatency:
+    """4 concurrent groups of 4 cores on a 16-core workgroup.
+
+    Hardware-config defaults: ``ring_bandwidth_tb_s = 4.0``,
+    ``ring_bytes_per_cycle = 4000``.  Workgroup geometry:
+
+    - 16 cores, 4 groups of 4: group ``g`` is ``{4g, 4g+1, 4g+2, 4g+3}``.
+    - Each core holds a ``tensor<1x128xf16>`` partial (256 bytes).
+    - Per-core ring traffic = ``(num_cores - 1) * partial_bytes`` =
+      ``15 * 256 = 3840`` bytes.
+    - Per-core comm cycles = ``3840 / 4000 = 0.96``.
+
+    Note the difference from the single-group test: the ring's size
+    is ``num_cores - 1``, *not* ``group_size - 1``.  Multi-group does
+    not shrink the per-op ring; it just narrows the fold via the
+    plan.
+    """
+
+    @pytest.mark.parametrize(
+        "path,func_name,entry",
+        get_test_params("ring_reduce_multi_group"),
+    )
+    def test_multi_group_correctness_and_bytes(self, path, func_name, entry):
+        cfg = HardwareConfig()
+        rep, rows, n_cols, n_groups, group_size, output = (
+            _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=True)
+        )
+
+        num_cores = n_groups * group_size
+        partial_bytes = n_cols * 2          # 1 x 128 f16 = 256 bytes
+        per_core_ring_bytes = (num_cores - 1) * partial_bytes
+        expected_comm_cycles = per_core_ring_bytes / cfg.ring_bytes_per_cycle
+
+        # ---- Correctness: each group's writer holds the in-group sum ----
+        # ``output[g]`` was written by core ``4*g``; expected value is
+        # the sum of rows[4g..4g+3].  If the plan-aware fold slipped
+        # and folded out-of-group tiles, this assertion would catch it.
+        for g in range(n_groups):
+            expected = rows[g * group_size:(g + 1) * group_size].sum(axis=0)
+            np.testing.assert_allclose(
+                output[g], expected, rtol=1e-2,
+                err_msg=f"group {g}: output does not match in-group sum",
+            )
+
+        # ---- Latency: every core's comm bucket = (num_cores-1) * partial_bytes ----
+        # Includes non-writer cores (most of the 16) — they all run the
+        # ring; only the comm bucket varies, not store traffic.
+        assert set(rep.counters.keys()) == set(range(num_cores))
+        for core_id, cc in rep.counters.items():
+            assert cc.comm_cycles == pytest.approx(expected_comm_cycles), (
+                f"core {core_id}: comm_cycles {cc.comm_cycles} "
+                f"!= expected {expected_comm_cycles}"
+            )
+
+            ops = [t.op_type for t in cc.trace]
+            assert ops.count("ktdp.inter_tile_produce") == 1
+            assert ops.count("ktdp.inter_tile_reduce") == 1
+
+            reduce_entry = next(
+                t for t in cc.trace if t.op_type == "ktdp.inter_tile_reduce"
+            )
+            assert reduce_entry.category == "comm"
+            assert reduce_entry.cycles == pytest.approx(expected_comm_cycles)
+
+        # ---- Cross-core invariants: only group writers store ----
+        store_cores = sorted(
+            cid for cid, cc in rep.counters.items()
+            if any(t.op_type == "ktdp.store" for t in cc.trace)
+        )
+        expected_writers = [g * group_size for g in range(n_groups)]
+        assert store_cores == expected_writers, (
+            f"expected writers {expected_writers}, got {store_cores}"
         )

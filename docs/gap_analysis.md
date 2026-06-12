@@ -1,9 +1,9 @@
 # KTIR Spec RFC vs. `ktir_cpu` Implementation — Gap Analysis
 
-**Date**: 2026-04-22
+**Date**: 2026-05-30
 **Spec**: [RFC 0682 — KTIR Spec](https://github.com/torch-spyre/RFCs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md)
 
-**Legend**: ✅ implemented — 🟡 partial — ❌ not implemented
+**Legend**: ✅ implemented — 🟡 partial — ❌ not implemented — 🧪 experimental (tracks an unmerged upstream spec PR; semantics may change)
 
 ---
 
@@ -13,6 +13,10 @@
 |---|---------------|--------|-------|
 | 1 | `ktdp.construct_distributed_memory_view` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; produces `DistributedMemRef` (composition of N per-partition `MemRef`s). Per-partition routing at access time via `MemoryOps.distributed_tile_access` → `DistributedTileRef`. Tests in `tests/test_distributed_view.py`. |
 | 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. Both `ktdp.load` (gather, via `MemoryOps.indirect_load`) and `ktdp.store` (scatter, via `MemoryOps.indirect_store`) accept `IndirectAccessTile` (#44 closed). |
+| 2a | `ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce` (four-op design, reduce path) | 🧪 experimental | **Spec status: not yet merged** — the four-op design lives in [ktir-mlir-frontend PR #23](https://github.com/torch-spyre/ktir-mlir-frontend/pull/23). Implemented here ahead of merge so the simulator can exercise it. Op names, attribute keys, and `!ktdp.tile_future<...>` type may change to track the upstream PR. Implementation: handlers and parsers in `ktir_cpu/dialects/ktdp_ops.py`; `TileFuture` per-core handle binds the local partial and a not-yet-running `RingReduceBackend`; reduce delivery triggers the backend with the combiner region as `reduce_fn`. Per-core wire bytes flow to the latency tracker via `Tile.comm_bytes` (mirrors `unique_sticks`). End-to-end test: `tests/test_examples.py::TestRingReduceExecution`. Replaces the legacy `ktdp.reduce` / `ktdp.transfer` ops. See `docs/cross_core_scheduling.md`. |
+| 2b | `ktdp.inter_tile_consume` (broadcast delivery) | ❌ experimental | Same upstream PR. Not implemented. |
+| 2c | `ktdp.inter_tile_reduce_scatter` | ❌ experimental | Same upstream PR. Not implemented. |
+| 2d | `producer_dependency_per_consumer` (per-tile sync) | 🟡 experimental | Same upstream PR. Parsed and stored on the delivery op AST; runtime is full-barrier mode (waits for all producers). Per-tile mode unimplemented. |
 
 ## B. `ktdp` Types & Attributes
 
@@ -38,7 +42,7 @@ The spec lists these SCF operations as "currently contemplated":
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 9 | `scf.reduce` | ❌ | Only `ktdp.reduce` exists for inter-core comm, which is semantically different |
+| 9 | `scf.reduce` | ❌ | Inter-core reduction is covered by the experimental `ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce` pair (rows 2a–2d), which is semantically different from SCF-level reductions. |
 | 10 | `scf.reduce.return` | ❌ | |
 | 11 | `scf.parallel` | ❌ | |
 | 12 | `scf.forall` | ❌ | |
@@ -82,11 +86,11 @@ The spec references the [full Math dialect](https://mlir.llvm.org/docs/Dialects/
 
 ### Linalg dialect
 
-The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialects/Linalg/). Currently implemented: `linalg.reduce`, `linalg.matmul`, `linalg.generic`, `linalg.broadcast`, `linalg.transpose`.
+The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialects/Linalg/). Currently implemented: `linalg.reduce`, `linalg.matmul`, `linalg.generic`, `linalg.broadcast`, `linalg.transpose`, `linalg.add`, `linalg.fill`.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 25 | `linalg.add` | ❌ | Used in the spec's primary matrix-add example — won't execute today |
+| 25 | `linalg.add` | ✅ | Implemented in `ktir_cpu/dialects/linalg_ops.py` as elementwise `Tile + Tile`. Used by `ktdp.inter_tile_reduce`'s combiner region in the rewritten `ring_reduce.mlir` example. |
 | 26 | `linalg.generic` | ✅ | Full `bb0` block handling in `ktir_cpu/dialects/linalg_ops.py` |
 | 27 | `linalg.map`, `linalg.broadcast`, `linalg.transpose` | 🟡 | `broadcast` and `transpose` implemented; `map` still missing |
 
@@ -131,7 +135,6 @@ The spec explicitly mentions `memref.subview` for view-based transformations. **
 ### High Priority
 Blocks running spec-compliant KTIR programs:
 
-- **#25**: ❌ `linalg.add` — used in the spec's primary example and won't execute
 - **#5**: 🟡 `coordinate_set` on memory views preserved but not enforced
 
 ### Medium Priority
@@ -154,11 +157,15 @@ Extensibility and completeness:
 - **#2**: ✅ `construct_indirect_access_tile`
 - **#6, #7, #8**: ✅ `access_tile_set`, `access_tile_order`, `base_map`
 - **#20–24**: ✅ All math ops (rsqrt, log2, log1p, tanh, sin, cos, absf, ceil, floor, erf, powf, fma)
+- **#25**: ✅ `linalg.add`
 - **#26**: ✅ `linalg.generic`
 - **#33, #34, #35**: ✅ Access tile coordinate semantics
 - **#37, #38**: ✅ Affine expression evaluation and alias support
 
-## I. Status as of 2026-04-22
+### Experimental (tracks unmerged upstream spec PRs)
+- **#2a–2d**: 🧪 Inter-tile communication four-op design — see [ktir-mlir-frontend#23](https://github.com/torch-spyre/ktir-mlir-frontend/pull/23). Reduce path implemented; broadcast / reduce-scatter / per-tile sync not.
+
+## I. Status as of 2026-05-30
 
 Significant progress since the original writeup:
 
@@ -168,16 +175,24 @@ Significant progress since the original writeup:
   `ktdp.load`/`ktdp.store` to enumerate coordinate tuples.
 - `linalg.generic` (#26) is implemented with full `bb0` block handling.
 - `linalg.broadcast`, `linalg.transpose` (#27 partial), `tensor.collapse_shape`
-  (#29 partial), and `math.log` are now implemented.
+  (#29 partial), `math.log`, and **`linalg.add` (#25)** are now implemented.
+- 🧪 **Experimental** inter-tile reduce path (rows 2a, 2d): the four-op
+  design from [ktir-mlir-frontend#23](https://github.com/torch-spyre/ktir-mlir-frontend/pull/23)
+  is implemented for `inter_tile_produce` + `inter_tile_reduce` (reduce
+  delivery only) ahead of upstream merge. Per-core wire bytes flow to the
+  latency tracker via `Tile.comm_bytes`. End-to-end ring_reduce test
+  passes. Op surface may shift to track the upstream PR.
 
 Remaining notable gaps:
 
-- `linalg.add` (#25) is still missing — the RFC's canonical matrix-add example
-  cannot execute without it.
 - `coordinate_set` on memory views (#5) is preserved in the IR but not used
   to enforce coordinate constraints during dispatch.
 - SCF parallel/reduce ops (#9–12), `tensor.extract_slice` (#28), and the
   entire `memref` dialect (#30–31) remain unimplemented.
+- 🧪 Inter-tile broadcast (`inter_tile_consume`, row 2b) and reduce-scatter
+  (`inter_tile_reduce_scatter`, row 2c) not yet implemented; per-tile sync
+  (`producer_dependency_per_consumer`, row 2d) is parsed but runs in
+  full-barrier mode.
 
 ## J. Prioritized Conformance Roadmap
 
@@ -196,16 +211,16 @@ Goal: cover the RFC-defined `ktdp` surface.
 - Preserve dynamic `access_tile` dimensions (`?`) in the IR even if runtime
   support is initially partial.
 
-### Close The RFC-Explicit Non-KTDP Gaps ❌
+### Close The RFC-Explicit Non-KTDP Gaps 🟡
 
 Goal: support the rest of the ops the RFC explicitly calls out.
 
-- Add `linalg.add` so the RFC's canonical matrix-add example can execute
+- ✅ Add `linalg.add` so the RFC's canonical matrix-add example can execute
   without translation.
-- Add `tensor.extract_slice`.
-- Add `memref.subview` and the minimal `memref` dialect support required to
+- ❌ Add `tensor.extract_slice`.
+- ❌ Add `memref.subview` and the minimal `memref` dialect support required to
   interpret it.
-- Add the missing SCF ops explicitly named by the RFC:
+- ❌ Add the missing SCF ops explicitly named by the RFC:
   `scf.reduce`,
   `scf.reduce.return`,
   `scf.parallel`,
@@ -273,9 +288,12 @@ If we want the fastest path to meaningful conformance progress:
 2. ✅ Rework `ktdp.load` / `ktdp.store` around that representation.
 3. ✅ Add `construct_indirect_access_tile`.
 4. ✅ Add `construct_distributed_memory_view`.
-5. ❌ Add `linalg.add`, `tensor.extract_slice`, and `memref.subview`.
+5. 🟡 Add `linalg.add` (✅), `tensor.extract_slice` (❌), and `memref.subview` (❌).
 6. ❌ Fill in the missing RFC-listed SCF ops.
 7. ❌ Expand broader Arith/Math/Linalg coverage as compiler demand appears.
+8. 🧪 Track [ktir-mlir-frontend#23](https://github.com/torch-spyre/ktir-mlir-frontend/pull/23)
+   to upstream merge; reconcile any op-surface drift in the experimental
+   four-op inter-tile path (rows 2a–2d).
 
 ### Definition Of "Good Enough" For A First Conformance Milestone
 
@@ -284,5 +302,7 @@ A strong first milestone would be:
 - ✅ affine attributes are preserved and exercised in tests
 - ✅ `ktdp.load` / `ktdp.store` operate over real coordinate collections
 - ✅ all RFC-defined `ktdp` ops parse and execute
-- ❌ the RFC matrix-add example can run with only mechanical syntax adaptation
+- 🟡 the RFC matrix-add example can run with only mechanical syntax adaptation
+  (`linalg.add` ✅; pending `tensor.extract_slice` / `memref.subview` if the
+  example uses them)
 - ❌ the repo has explicit tests for unsupported versus supported RFC surface

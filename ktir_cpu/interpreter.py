@@ -227,13 +227,53 @@ class KTIRInterpreter:
                 if isinstance(result, Tile):
                     context.track_lx(op.result, result.size_bytes())
 
-        # Record latency
+        # Record latency.
+        # Sync handlers: charge now, with the final value.
+        # Generator handlers (comm ops): the handler returned a generator
+        # whose body has not yet run.  The "real" result is only known
+        # after the scheduler drives ``yield from`` to completion.  Wrap
+        # the generator so the record fires once it returns its final
+        # value.  Skip wrapping entirely when the tracker is off, so the
+        # cost-free path stays cost-free.
         if self._latency_tracker is not None:
-            self._latency_tracker.record_op(
-                context.core_id, op.op_type, result, resolved_operands
-            )
+            if inspect.isgenerator(result):
+                result = self._wrap_latency_counter(
+                    result, op, context, resolved_operands)
+            else:
+                self._latency_tracker.record_op(
+                    context.core_id, op.op_type, result, resolved_operands
+                )
 
         return result
+
+    def _wrap_latency_counter(
+        self,
+        gen: Generator,
+        op: Operation,
+        context: CoreContext,
+        resolved_operands: List[Any],
+    ) -> Generator:
+        """Wrap a handler-returned generator so ``record_op`` fires after
+        the generator yields its final value.
+
+        Used for comm ops (`ktdp.inter_tile_reduce`, etc.) whose handler
+        returns a generator whose body runs only after the scheduler
+        drives ``yield from``.  The wrapper preserves the original
+        generator's ``yield`` protocol (``RecvRequest``s flow through
+        unchanged via ``yield from``) and emits the latency record when
+        the inner generator returns, with the *real* final result rather
+        than the placeholder generator object.
+        """
+        tracker = self._latency_tracker
+        core_id = context.core_id
+        op_type = op.op_type
+
+        def _wrapped():
+            final = yield from gen
+            tracker.record_op(core_id, op_type, final, resolved_operands)
+            return final
+
+        return _wrapped()
 
     def arg_names(self, func_name: str) -> List[str]:
         """Return argument names for a function in declaration order (without %)."""

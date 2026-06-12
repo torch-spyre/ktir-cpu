@@ -23,71 +23,216 @@ from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
 from ..parser_ast import parse_affine_map
 from ..parser_utils import find_ssa_names, parse_attr_list
+from ._helpers import unwrap_yield
 from .registry import register, register_parser
 
 
-@register("linalg.reduce", latency_category=LC.COMPUTE_FLOAT)
+def _resolve_region_body(op):
+    """Resolve a linalg op's region into ``(bb0_names, body_ops)``.
+
+    Shared by ``linalg.generic`` and ``linalg.reduce`` so both capture block
+    arguments uniformly, whether the source wrote an explicit ``^bb0`` label
+    or used inline block args / shorthand.  Block-argument names are found in
+    priority order:
+
+      1. a synthetic ``region.bb0_args`` op (from the ``^bb0(...)`` parser);
+      2. an ``op.attributes["bb0_names"]`` list (mlir_frontend path);
+      3. the operand names of the region's first non-yield op — this is the
+         ``linalg.reduce`` explicit form ``(%in, %out) { %s = addf %in, %out }``,
+         where the block args appear only as the combiner's operands.
+
+    Returns ``([], [])`` when the op has no region (e.g. reduce shorthand);
+    callers synthesize a region in that case.
+    """
+    region = op.regions[0] if op.regions else []
+    body_ops = [o for o in region if o.op_type != "region.bb0_args"]
+
+    bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
+    if bb0_op is not None:
+        return bb0_op.attributes.get("names", []), body_ops
+    if "bb0_names" in op.attributes:
+        return op.attributes["bb0_names"], body_ops
+    if body_ops:
+        # Inline-block form: block args are the first body op's operands.
+        return list(body_ops[0].operands), body_ops
+    return [], []
+
+
+def _run_combiner(bb0_names, body_ops, lhs, rhs, context, env):
+    """Run the combiner region once on two equal-shaped operands.
+
+    Binds the block args to ``lhs``/``rhs`` (Tiles or scalars) in an isolated
+    scope and dispatches the region via ``execute_region`` — so each combiner
+    op fires through ``record_op`` and is charged latency under its own
+    category.  Returns the yielded value.
+    """
+    from ..ops.control_ops import _YieldResult
+
+    context.push_scope()
+    try:
+        if bb0_names:
+            context.set_value(bb0_names[0], lhs)
+        if len(bb0_names) > 1:
+            context.set_value(bb0_names[1], rhs)
+        result = env.execute_region(context, body_ops)
+    finally:
+        context.pop_scope()
+
+    if isinstance(result, _YieldResult):
+        return result.values[0]
+    return result
+
+
+def _tree_fold(tile, dim, bb0_names, body_ops, context, env):
+    """Reduce ``tile`` along ``dim`` by folding the combiner region pairwise.
+
+    MLIR legalizes ``linalg.reduce`` only for an **associative** combiner, so
+    the fold order is free to choose.  We fold pairwise (tree reduction): split
+    the reduced axis in half, combine the two halves with one *vectorised*
+    region call, and repeat.  This needs ``ceil(log2(N))`` region executions
+    instead of ``N`` sequential steps — each call combines whole sub-arrays in
+    a single op, so a 1×262144 reduce is ~18 vectorised passes, not 262k scalar
+    folds.  Odd lengths carry the unpaired slice forward to the next round.
+
+    The value *and* the latency both come from these region calls — there is no
+    NumPy reduction shortcut and no mapping from combiner name to a NumPy op;
+    whatever ops the region contains are executed and charged as-is.
+    """
+    data = tile.data
+
+    # Reduce to scalar (no dim) → flatten everything onto one axis first.
+    if dim is None:
+        data = data.reshape(-1)
+        dim = 0
+    n = data.shape[dim]
+
+    def slice_along(arr, lo, hi):
+        idx = [slice(None)] * arr.ndim
+        idx[dim] = slice(lo, hi)
+        return arr[tuple(idx)]
+
+    # Current accumulator is the full tile; collapse `dim` from n → 1 pairwise.
+    acc = data
+    while n > 1:
+        half = n // 2
+        left = slice_along(acc, 0, half)
+        right = slice_along(acc, half, 2 * half)
+        combined = _run_combiner(
+            bb0_names, body_ops,
+            Tile(left.copy(), tile.dtype, left.shape),
+            Tile(right.copy(), tile.dtype, right.shape),
+            context, env,
+        )
+        combined = combined.data if isinstance(combined, Tile) else np.asarray(combined)
+        if n % 2:  # odd: carry the leftover slice into the next round
+            tail = slice_along(acc, 2 * half, n)
+            combined = np.concatenate([combined, tail], axis=dim)
+        acc = combined
+        n = acc.shape[dim]
+
+    return acc  # extent 1 along `dim`
+
+
+@register("linalg.reduce", latency_category=LC.ZERO)
 def linalg__reduce(op, context, env):
-    """Standard linalg.reduce — removes the reduced dimension."""
+    """Standard linalg.reduce — removes the reduced dimension.
+
+    Like ``linalg.generic``, ``linalg.reduce`` is a zero-cost orchestrator: the
+    cost belongs to the ops in its combiner *region*, not to the reduce op
+    itself.  Rather than mapping the combiner to a hardcoded NumPy reduction
+    (which only covers the handful of combiners we anticipated), we **execute
+    the region** to compute the result — so the data value and the latency both
+    come from the real combiner ops, whatever they are.
+
+    Both surface forms feed the same region path:
+
+      * explicit form — use the region as parsed, capturing bb0 args via
+        :func:`_resolve_region_body`;
+      * shorthand form (``linalg.reduce { arith.addf }``) — *build* a one-op
+        region from the named combiner so it goes through the identical path.
+        (We read the combiner *name* to construct the op — that is the
+        shorthand syntax itself, not a semantic interpretation of it.)
+
+    The reduction is computed by a pairwise tree fold of the combiner region
+    (:func:`_tree_fold`); this relies on the combiner being associative, which
+    MLIR's ``linalg.reduce`` legalization already requires.
+    """
     # operands[0] is the ins tensor; the outs tensor is handled separately via outs_var
     tile = context.get_value(op.operands[0])
-    # Resolve the combiner op name.  The shorthand form stores it in
-    # attributes; the explicit-region form has it in op.regions.
+
+    # --- Resolve the combiner region (capturing bb0 args) ------------------
+    bb0_names, body_ops = _resolve_region_body(op)
+
+    # Combiner op name: explicit form has it as the region's first op;
+    # shorthand form stores it in the reduce_fn attribute.
     reduce_fn = op.attributes.get("reduce_fn")
-    if reduce_fn is None and op.regions:
-        for region_op in op.regions[0]:
-            if region_op.op_type != "linalg.yield":
-                reduce_fn = region_op.op_type
-                break
+    if reduce_fn is None and body_ops:
+        reduce_fn = next(
+            (o.op_type for o in body_ops if o.op_type != "linalg.yield"), None
+        )
     if reduce_fn is None:
         reduce_fn = "arith.addf"
-    # axis to reduce along; None means reduce all elements to a scalar
-    dim = op.attributes.get("dim")
 
-    # Map MLIR combiner names to NumPy reduction functions
-    np_reduce = {
-        "arith.addf": np.sum,
-        "arith.maxf": np.max,
-        "arith.maxnumf": np.fmax.reduce,
-        "arith.maximumf": np.maximum.reduce,
-        "arith.minf": np.min,
-        "arith.minimumf": np.minimum.reduce,
-        "arith.minnumf": np.fmin.reduce,
-        "arith.mulf": np.prod,
-    }.get(reduce_fn)
+    # Shorthand has no region — build one so it goes through the same fold.
+    # The synthesized block mirrors the explicit form:
+    #   (%in, %out) { %s = <reduce_fn> %in, %out; linalg.yield %s }
+    if not body_ops:
+        bb0_names = ["__reduce_in__", "__reduce_acc__"]
+        body_ops = [
+            Operation(
+                result="__reduce_combined__",
+                op_type=reduce_fn,
+                operands=bb0_names,
+                attributes={},
+                result_type="unknown",
+            ),
+            Operation(
+                result=None, op_type="linalg.yield",
+                operands=["__reduce_combined__"], attributes={},
+                result_type=None,
+            ),
+        ]
 
-    if np_reduce is None:
-        raise ValueError(f"Unknown linalg.reduce combiner: {reduce_fn}")
+    dim = op.attributes.get("dim")  # axis to reduce; None → collapse all
 
     if isinstance(tile, Tile):
-        if dim is not None:
-            # Reduce along the specified axis; promote to f32 to avoid overflow
-            reduced = np_reduce(tile.data.astype(np.float32), axis=dim, keepdims=False)
-            # Cast back to the original element dtype
-            reduced = reduced.astype(tile.data.dtype)
+        folded = _tree_fold(tile, dim, bb0_names, body_ops, context, env)
+        if dim is None:
+            result = folded.reshape(()).astype(tile.data.dtype).item()
+        else:
+            reduced = np.squeeze(folded, axis=dim).astype(tile.data.dtype)
             if reduced.ndim == 0:
-                # Fully reduced to a Python scalar
                 result = reduced.item()
             else:
-                # Partial reduction — wrap remaining dimensions back into a Tile
                 result = Tile(reduced, tile.dtype, reduced.shape)
-        else:
-            # No dim specified — collapse everything to a scalar
-            result = np_reduce(tile.data).astype(tile.data.dtype)
     else:
-        # Already a scalar, nothing to reduce
+        # Already a scalar, nothing to reduce.
         result = tile
 
     # In MLIR linalg semantics the result is written back into the outs buffer,
     # so downstream ops may reference it by the outs SSA name rather than the
     # result name. Bind both so either reference resolves correctly.
-    # Note: this is a pure context-dict write — no latency is charged here;
-    # the cost was already recorded by the dispatcher when the handler ran.
     outs_var = op.attributes.get("outs_var")
     if outs_var and result is not None:
         context.set_value(outs_var, result)
 
     return result
+
+
+@register("linalg.add", latency_category=LC.COMPUTE_FLOAT)
+def linalg__add(op, context, env):
+    """Elementwise tensor add — ``%c = linalg.add ins(%a, %b) outs(%init)``.
+
+    Standard MLIR named op: result = a + b (the outs buffer provides the
+    destination shape only; its values are not accumulated into in v1).
+    """
+    tile_a = context.get_value(op.operands[0])
+    tile_b = context.get_value(op.operands[1])
+    if not isinstance(tile_a, Tile) or not isinstance(tile_b, Tile):
+        raise TypeError(
+            f"linalg.add: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
+        )
+    return Tile(tile_a.data + tile_b.data, tile_a.dtype, tile_a.shape)
 
 
 @register("linalg.fill")
@@ -152,6 +297,27 @@ def linalg__matmul(op, context, env):
     return result
 
 
+@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL)
+def linalg__batch_matmul(op, context, env):
+    """Execute linalg.batch_matmul: result = outs + ins[0] @ ins[1] (batched).
+
+    MLIR linalg.batch_matmul syntax:
+        %result = linalg.batch_matmul
+                    ins(%A, %B : tensor<BxMxKxf32>, tensor<BxKxNxf32>)
+                    outs(%C    : tensor<BxMxNxf32>) -> tensor<BxMxNxf32>
+
+    Operands = [%A, %B, %C] (fallback parser order).
+    """
+    tile_a = context.get_value(op.operands[0])  # ins[0] = A  (B×M×K)
+    tile_b = context.get_value(op.operands[1])  # ins[1] = B  (B×K×N)
+    result = Tile(tile_a.data @ tile_b.data, tile_a.dtype, (tile_a.data @ tile_b.data).shape)
+    if len(op.operands) > 2:
+        acc = context.get_value(op.operands[2])
+        if isinstance(acc, Tile):
+            result = Tile(acc.data + result.data, acc.dtype, acc.shape)
+    return result
+
+
 @register("linalg.generic", latency_category=LC.COMPUTE_FLOAT)
 def linalg__generic(op, context, env):
     """Vectorised linalg.generic executor.
@@ -160,26 +326,16 @@ def linalg__generic(op, context, env):
     (np.expand_dims for missing dims), binds bb0 block-arg names, then
     executes the region body once with full arrays.
     """
-    from ..ops.control_ops import _YieldResult
-
     n_ins = op.attributes.get("n_ins", 0)
     indexing_maps = op.attributes.get("indexing_maps", [])
 
     ins_vals = [context.get_value(op.operands[i]) for i in range(n_ins)]
     outs_val = context.get_value(op.operands[n_ins])
 
-    region = op.regions[0] if op.regions else []
-
-    # Resolve bb0 block-argument names.
-    # Path 1: synthetic region.bb0_args op prepended to the region (from ^bb0 parser).
-    # Path 2: names stored directly in op.attributes["bb0_names"].
-    bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
-    body_ops = [o for o in region if o.op_type != "region.bb0_args"]
-    if bb0_op is not None:
-        bb0_names = bb0_op.attributes.get("names", [])
-    elif "bb0_names" in op.attributes:
-        bb0_names = op.attributes["bb0_names"]
-    else:
+    # Resolve bb0 block-argument names and body via the shared helper
+    # (also used by linalg.reduce).
+    bb0_names, body_ops = _resolve_region_body(op)
+    if not bb0_names:
         raise ValueError("linalg.generic: cannot determine bb0 argument names")
 
     if not isinstance(outs_val, Tile):
@@ -216,10 +372,7 @@ def linalg__generic(op, context, env):
     result = env.execute_region(context, body_ops)
     context.pop_scope()
 
-    if isinstance(result, _YieldResult):
-        out_data = result.values[0]
-    else:
-        out_data = result
+    out_data = unwrap_yield(result)
 
     if isinstance(out_data, Tile):
         data = np.broadcast_to(out_data.data, out_shape).copy().astype(out_np_dtype)
@@ -240,9 +393,9 @@ def linalg__index(op, context, env):
 
 @register("linalg.yield")
 def linalg__yield(op, context, env):
-    from ..ops.control_ops import _YieldResult
+    from ..ops.control_ops import ControlOps
     values = [context.get_value(n) for n in op.operands]
-    return _YieldResult(values)
+    return ControlOps.yield_op(values)
 
 
 @register("linalg.transpose")

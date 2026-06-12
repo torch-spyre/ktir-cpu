@@ -60,12 +60,19 @@ def _make_env(grid_shape=(1, 1, 1)):
     grid = GridExecutor(grid_shape=grid_shape, memory=memory)
 
     def execute_region(context, ops):
+        # Mirror the real ExecutionEnv contract (interpreter._execute_op):
+        # dispatch each Operation through its registered handler.
         result = None
         for op in ops:
-            result = op(context)
+            handler = dispatch(op.op_type)
+            assert handler is not None, f"No handler for {op.op_type!r}"
+            result = handler(op, context, env)
+            if op.result and result is not None:
+                context.set_value(op.result, result)
         return result
 
-    return ExecutionEnv(grid_executor=grid, execute_region=execute_region)
+    env = ExecutionEnv(grid_executor=grid, execute_region=execute_region)
+    return env
 
 
 def _call(op_type, context, env, **op_kwargs):
@@ -457,6 +464,23 @@ class TestArithCastsConstants:
         assert result.shape == (4,)
         assert np.all(result.data == 0)
 
+    def test_constant_dense_list(self):
+        """``arith.constant dense<[16, 32]>`` materializes the list element-by-element.
+
+        Pins the regression where the parser called ``parse_numeric`` on
+        ``[16, 32]`` and produced a splat-of-zero tensor.
+        """
+        result = _call("arith.constant", _make_ctx(), _make_env(),
+                       attributes={
+                           "value": [16, 32],
+                           "shape": (2,),
+                           "dtype": "index",
+                           "is_tensor": True,
+                           "dense_list": True,
+                       })
+        assert result.shape == (2,)
+        assert list(result.data) == [16, 32]
+
     def test_extsi(self):
         # sign-extend integer — returns Python int
         ctx = _ctx_with(**{"%a": 5})
@@ -840,6 +864,78 @@ class TestLinalg:
                        operands=["%x"], attributes={"reduce_fn": "arith.addf"})
         assert float(result) == pytest.approx(5.0, rel=1e-2)
 
+    def test_reduce_explicit_region_single_op(self):
+        # Explicit combiner region (%in, %out){ %s = addf %in,%out; yield %s }
+        # computes the same sum as the shorthand form via the tree fold.
+        data = np.array([[1, 2, 3, 4]], dtype=np.float16)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+        region = [
+            _op("arith.addf", operands=["%in", "%out"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": None, "dim": 1, "outs_var": "%init"},
+                       regions=[region])
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert abs(val - 10.0) < 0.1
+
+    def test_reduce_multiop_combiner(self):
+        # MULTI-OP combiner: max expressed as cmpf(ogt) + select. The general
+        # tree fold must run BOTH region ops — there is no single combiner name
+        # to map to a NumPy reduction — and still return the correct max.
+        data = np.array([[0.1, 0.9, 0.3, 0.2, 0.5, 0.05, 0.7, 0.05]], dtype=np.float16)
+        neg_inf = np.float16("-inf")
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.full((1,), neg_inf, dtype=np.float16), "f16", (1,))})
+        region = [
+            _op("arith.cmpf", operands=["%in", "%out"], result="%cmp",
+                attributes={"predicate": "ogt"}),
+            _op("arith.select", operands=["%cmp", "%in", "%out"], result="%m"),
+            _op("linalg.yield", operands=["%m"]),
+        ]
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": None, "dim": 1, "outs_var": "%init"},
+                       regions=[region])
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(float(data.max()), abs=1e-2)
+
+    @pytest.mark.xfail(reason="multi-axis reduce not supported: parser keeps only "
+                              "dims[0] and the tree fold indexes a single axis. "
+                              "Tracked in issue #85.",
+                       strict=True)
+    def test_reduce_multi_axis(self):
+        # dimensions = [0, 1] should reduce BOTH axes (2x3 -> scalar 15).
+        data = np.arange(6, dtype=np.float16).reshape(2, 3)  # sum = 15
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dim": [0, 1],
+                                   "outs_var": "%init"})
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(15.0, abs=1e-2)
+
+    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
+                              "the tree fold seeds from the input only. Harmless "
+                              "while the frontend inits outs to the identity. "
+                              "Tracked in issue #85.",
+                       strict=True)
+    def test_reduce_folds_outs_init(self):
+        # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
+        # outs init = 100 should be 110, not 10.
+        data = np.array([[1, 2, 3, 4]], dtype=np.float16)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.array([100.0], dtype=np.float16), "f16", (1,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dim": 1,
+                                   "outs_var": "%init"})
+        val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
+        assert val == pytest.approx(110.0, abs=1e-1)
+
     def test_fill(self):
         # fill a tile with a scalar value
         out = Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))
@@ -866,6 +962,17 @@ class TestLinalg:
         ctx = _ctx_with(**{"%a": a, "%b": b})
         result = _call("linalg.matmul", ctx, _make_env(), operands=["%a", "%b"])
         assert np.allclose(result.data, b.data, rtol=1e-2)
+
+    def test_batch_matmul(self):
+        # batched identity: for each batch, I @ B == B
+        eye = np.broadcast_to(np.eye(2, dtype=np.float16), (3, 2, 2)).copy()
+        bdata = np.arange(3 * 2 * 2, dtype=np.float16).reshape(3, 2, 2)
+        a = Tile(eye, "f16", (3, 2, 2))
+        b = Tile(bdata, "f16", (3, 2, 2))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("linalg.batch_matmul", ctx, _make_env(), operands=["%a", "%b"])
+        assert result.shape == (3, 2, 2)
+        assert np.allclose(result.data, bdata, rtol=1e-2)
 
     def test_generic_reads_outs_arg(self):
         # linalg.generic where the body reads the outs bb0 arg.
@@ -974,6 +1081,83 @@ class TestTensor:
         assert result.shape == (4,)
         assert np.array_equal(result.data, [1, 2, 3, 4])
 
+    def test_reshape(self):
+        """1D -> 2D reshape preserves element order and total count."""
+        t = Tile(np.arange(8, dtype=np.float16), "f16", (8,))
+        shape_tile = Tile(np.array([2, 4], dtype=np.intp), "index", (2,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        result = _call("tensor.reshape", ctx, _make_env(),
+                       operands=["%t", "%s"],
+                       attributes={"target_shape": (2, 4), "dtype": "f16"})
+        assert result.shape == (2, 4)
+        assert np.array_equal(result.data, np.arange(8).reshape(2, 4))
+
+    def test_reshape_non_square_target(self):
+        """Rank-changing reshape with a non-square target preserves row-major order.
+
+        Pins that 1-D[12] -> 2-D[3,4] places elements as
+        ``[[0,1,2,3],[4,5,6,7],[8,9,10,11]]`` (rightmost index varies fastest),
+        not column-major.
+        """
+        t = Tile(np.arange(12, dtype=np.float16), "f16", (12,))
+        shape_tile = Tile(np.array([3, 4], dtype=np.intp), "index", (2,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        result = _call("tensor.reshape", ctx, _make_env(),
+                       operands=["%t", "%s"],
+                       attributes={"target_shape": (3, 4), "dtype": "f16"})
+        assert result.shape == (3, 4)
+        assert np.array_equal(result.data, np.arange(12).reshape(3, 4))
+
+    def test_reshape_size_mismatch_raises(self):
+        """Element-count mismatch must fail loud, not silently truncate.
+
+        Source has 7 elements; target shape (3, 3) demands 9. NumPy's
+        ``ndarray.reshape`` raises ``ValueError``; the executor propagates it
+        rather than returning a partial result.
+        """
+        t = Tile(np.arange(7, dtype=np.float16), "f16", (7,))
+        shape_tile = Tile(np.array([3, 3], dtype=np.intp), "index", (2,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        with pytest.raises(ValueError, match="cannot reshape"):
+            _call("tensor.reshape", ctx, _make_env(),
+                  operands=["%t", "%s"],
+                  attributes={"target_shape": (3, 3), "dtype": "f16"})
+
+    def test_reshape_to_3d(self):
+        """Rank-3 endpoint: 1-D[24] -> 3-D[2,3,4] preserves row-major order."""
+        t = Tile(np.arange(24, dtype=np.float16), "f16", (24,))
+        shape_tile = Tile(np.array([2, 3, 4], dtype=np.intp), "index", (3,))
+        ctx = _ctx_with(**{"%t": t, "%s": shape_tile})
+        result = _call("tensor.reshape", ctx, _make_env(),
+                       operands=["%t", "%s"],
+                       attributes={"target_shape": (2, 3, 4), "dtype": "f16"})
+        assert result.shape == (2, 3, 4)
+        assert np.array_equal(result.data, np.arange(24).reshape(2, 3, 4))
+
+    def test_from_elements(self):
+        """Stack scalar SSA operands into a 1-D index tensor."""
+        ctx = _ctx_with(**{"%a": 16, "%b": 32})
+        result = _call("tensor.from_elements", ctx, _make_env(),
+                       operands=["%a", "%b"],
+                       attributes={"shape": (2,), "dtype": "index"})
+        assert result.shape == (2,)
+        assert list(result.data) == [16, 32]
+
+    def test_from_elements_n1(self):
+        """N=1 endpoint: single-element 1-D shape tensor.
+
+        Guards the smallest legal grammar match (one operand). Useful when a
+        ``tensor.reshape`` collapses a 2-D tensor to 1-D via a 1-element shape
+        operand (e.g. ``tensor.from_elements %total : tensor<1xindex>``).
+        """
+        ctx = _ctx_with(**{"%a": 128})
+        result = _call("tensor.from_elements", ctx, _make_env(),
+                       operands=["%a"],
+                       attributes={"shape": (1,), "dtype": "index"})
+        assert result.shape == (1,)
+        assert list(result.data) == [128]
+
+
 # ---------------------------------------------------------------------------
 # tensor.generate exec
 # ---------------------------------------------------------------------------
@@ -1075,6 +1259,26 @@ class TestScfFunc:
         dispatch("scf.if")(op, ctx, env)
         assert ran == ["else"]
 
+    def test_if_then_else_yield_result(self):
+        # scf.if with a yielding then-branch returns the unwrapped value, not a _YieldResult wrapper
+        ctx = _ctx_with(**{"%cond": True, "%val": 42})
+        op = Operation(op_type="scf.if", operands=["%cond"], attributes={},
+                       result="%res", result_type=None,
+                       regions=[[Operation(op_type="scf.yield", operands=["%val"],
+                                           attributes={}, result=None, result_type=None)],
+                                 []])
+        env = _make_env()
+
+        def real_execute_region(ctx, ops):
+            result = None
+            for o in ops:
+                result = dispatch(o.op_type)(o, ctx, env)
+            return result
+
+        env.execute_region = real_execute_region
+        result = dispatch("scf.if")(op, ctx, env)
+        assert result == 42, f"expected 42, got {result!r}"
+
 # ---------------------------------------------------------------------------
 # ktdp dialect parsers
 # ---------------------------------------------------------------------------
@@ -1105,6 +1309,128 @@ class TestKtdp:
                                    "memory_space": "HBM", "dtype": "f16"})
         assert result.base_ptr == ptr
         assert result.shape == (256,)
+
+    def test_construct_memory_view_specializes_symbolic_coord_set_leading_dyn(self):
+        """Symbolic coordinate_set with the dynamic dim in axis 0.
+
+        Goes through the dialect handler — verifies the eager
+        specialise step turns ``[0, s_0)`` into a concrete BoxSet
+        ``[0, n)`` using the resolved value of ``%n``.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        coord_set = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>"
+        )
+        assert isinstance(coord_set, BoxSet) and not coord_set._all_concrete
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(256 * 2)
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%n", 100)
+        result = _call(
+            "ktdp.construct_memory_view", ctx, _make_env(),
+            operands=["%ptr"],
+            attributes={
+                "shape": ("%n",),     # one dynamic dim → s_0 binds to it
+                "strides": [1],
+                "memory_space": "HBM", "dtype": "f16",
+                "coordinate_set": coord_set,
+            },
+        )
+        assert isinstance(result.coordinate_set, BoxSet)
+        assert result.coordinate_set._all_concrete
+        assert result.coordinate_set == BoxSet(lo=(0,), hi=(100,))
+
+    def test_construct_access_tile_rejects_symbolic_access_tile_set(self):
+        """Symbolic ``access_tile_set`` is rejected at the handler boundary.
+
+        Defensive fail-fast for a case that does not arise in real IR.
+        In practice ``access_tile_set`` is always concrete: dynamic
+        symbols on memory views are bound and eliminated at
+        ``construct_memory_view`` via the ``sizes:`` operands, and
+        ``!ktdp.access_tile<NxMxindex>`` carries no symbols at the type
+        level.  This guard preserves a clear error if a future lowering
+        pass ever regresses that invariant.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_map, parse_affine_set
+
+        sym_set = parse_affine_set(
+            "affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>"
+        )
+        assert isinstance(sym_set, BoxSet) and not sym_set._all_concrete
+
+        ctx = _make_ctx()
+        parent = MemRef(
+            base_ptr=0, shape=(64,), strides=[1],
+            memory_space="HBM", dtype="f16",
+        )
+        ctx.set_value("%view", parent)
+        ctx.set_value("%c0", 0)
+        with pytest.raises(NotImplementedError, match=r"symbolic access_tile_set"):
+            _call(
+                "ktdp.construct_access_tile", ctx, _make_env(),
+                operands=["%view", "%c0"],
+                attributes={
+                    "shape": (64,),
+                    "base_map": parse_affine_map("affine_map<(d0) -> (d0)>"),
+                    "coordinate_set": sym_set,
+                },
+            )
+
+    def test_construct_memory_view_specializes_symbolic_coord_set_trailing_dyn(self):
+        """Regression: silent miscompile when the dynamic dim is *not* axis 0.
+
+        ``memref<64x?xf16>`` has only one dynamic operand but it's at
+        axis 1.  Symbol ``s_0`` in the coordinate_set must bind to that
+        single dynamic operand (= the column count), NOT to ``shape[0]``
+        (= the static row count 64).  An earlier version specialised
+        with the full resolved ``shape`` tuple, which would silently
+        have bound ``s_0 = 64`` here and produced a column extent of 64
+        rather than the intended ``%n``.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        # Column extent ``[0, s_0)`` symbolic on axis 1; row extent
+        # ``[0, 64)`` static on axis 0.
+        coord_set = parse_affine_set(
+            "affine_set<(d0, d1)[s0] : ("
+            "d0 >= 0, -d0 + 63 >= 0, "
+            "d1 >= 0, -d1 + s0 - 1 >= 0)>"
+        )
+        assert isinstance(coord_set, BoxSet) and not coord_set._all_concrete
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(64 * 100 * 2)
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        ctx.set_value("%ptr", ptr)
+        ctx.set_value("%n", 100)
+        result = _call(
+            "ktdp.construct_memory_view", ctx, _make_env(),
+            operands=["%ptr"],
+            attributes={
+                # axis 0 is static (64); axis 1 is dynamic (%n).  The
+                # only SSA-name entry is the axis-1 dynamic operand, so
+                # symbol s_0 must bind to %n=100 — not to shape[0]=64.
+                "shape": (64, "%n"),
+                "strides": [100, 1],
+                "memory_space": "HBM", "dtype": "f16",
+                "coordinate_set": coord_set,
+            },
+        )
+        assert isinstance(result.coordinate_set, BoxSet)
+        assert result.coordinate_set._all_concrete
+        # Correct binding: s_0 = 100 → column extent [0, 100).
+        # Buggy binding (specialise with full shape): s_0 = 64 → would
+        # give column extent [0, 64), which this assertion would catch.
+        assert result.coordinate_set == BoxSet(lo=(0, 0), hi=(64, 100))
 
     def test_load_store_roundtrip(self):
         # load reads data from HBM; store writes it back modified

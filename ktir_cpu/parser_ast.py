@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 from .affine import AffineMap, AffineSet, BoxSet
 
@@ -75,6 +75,12 @@ from .affine import AffineMap, AffineSet, BoxSet
 #   ("sub",   node, node)
 #   ("neg",   node)           — unary negation
 #   ("mul",   int,  node)     — constant-coefficient multiplication
+#   ("max",   node, node)     — pointwise maximum (constructed by sym_max,
+#                               not the surface parser; used to express
+#                               symbolic ``BoxSet.lo`` after intersect)
+#   ("min",   node, node)     — pointwise minimum (constructed by sym_min,
+#                               not the surface parser; used to express
+#                               symbolic ``BoxSet.hi`` after intersect)
 # ---------------------------------------------------------------------------
 
 _Node = tuple
@@ -89,7 +95,7 @@ _TOKEN_RE = re.compile(
     r'(%[a-zA-Z_]\w*)'               # named reference %name (group 1)
     r'|([a-zA-Z_]\w*)'               # bare identifier  (group 2)
     r'|(-?\d+)'                      # integer literal, possibly negative (group 3)
-    r'|(>=|<=|->|[+\-*(),:[\]])'     # operator / punctuation incl. [ ]  (group 4)
+    r'|(==|>=|<=|->|[+\-*(),:[\]])'  # operator / punctuation; == before >= (group 4)
     r')'
 )
 
@@ -278,27 +284,27 @@ class _Parser:
         return exprs
 
     def parse_constraint_list(self) -> List[_Node]:
-        """Parse ``(lhs >= rhs, lhs <= rhs, ...)`` and return normalised nodes.
+        """Parse ``(lhs >= rhs, lhs <= rhs, lhs == rhs, ...)`` and return nodes.
 
-        Each constraint is normalised to ``lhs - rhs >= 0``:
+        Inequality constraints are normalised to ``lhs - rhs >= 0``:
           - ``lhs >= rhs``  → stored as ``("sub", lhs, rhs)``
           - ``lhs <= rhs``  → stored as ``("sub", rhs, lhs)``
 
-        The special case ``expr >= 0`` / ``expr <= 0`` is handled naturally
-        since ``("sub", expr, 0_const)`` evaluates identically to ``expr``.
+        Equality constraints are stored as a first-class 3-tuple:
+          - ``lhs == rhs``  → stored as ``("eq", lhs, rhs)``
         """
         self.consume("(")
         constraints: List[_Node] = []
         while self.peek() != ")":
             lhs = self.parse_expr()
-            op = self.consume()  # ">=" or "<="
+            op = self.consume()  # ">=", "<=", or "=="
             rhs = self.parse_expr()
             if op == ">=":
-                # lhs >= rhs  →  lhs - rhs >= 0
                 node = ("sub", lhs, rhs)
             elif op == "<=":
-                # lhs <= rhs  →  rhs - lhs >= 0
                 node = ("sub", rhs, lhs)
+            elif op == "==":
+                node = ("eq", lhs, rhs)
             else:
                 raise ValueError(f"Unsupported constraint operator: {op!r}")
             constraints.append(node)
@@ -443,6 +449,10 @@ def _eval_node(node: _Node, dims: List[int], syms: Optional[List[int]] = None) -
         return -_eval_node(node[1], dims, syms)
     if tag == "mul":
         return node[1] * _eval_node(node[2], dims, syms)
+    if tag == "max":
+        return max(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
+    if tag == "min":
+        return min(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
     raise ValueError(f"Unknown AST node tag: {tag!r}")  # pragma: no cover
 
 
@@ -471,7 +481,11 @@ def affine_set_contains(aset: AffineSet, point: Sequence[int], symbols: Sequence
     """Return True if *point* satisfies all constraints in *aset*."""
     env = list(point)
     syms = list(symbols)
-    return all(_eval_node(c, env, syms) >= 0 for c in aset.constraints)
+    return all(
+        _eval_node(c[1], env, syms) == _eval_node(c[2], env, syms) if c[0] == "eq"
+        else _eval_node(c, env, syms) >= 0
+        for c in aset.constraints
+    )
 
 
 def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...], symbols: Sequence[int] = ()) -> List[Tuple[int, ...]]:
@@ -494,6 +508,151 @@ def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...], symbols: Seque
         )
     ranges = [range(s) for s in shape]
     return [pt for pt in itertools.product(*ranges) if affine_set_contains(aset, pt, symbols)]
+
+
+def enumerate_membership_keys(
+    family: AffineSet,
+    domain: AffineSet,
+    point: Sequence[int],
+    bound: int,
+) -> List[int]:
+    """Return keys ``k ∈ domain ∩ [0, bound)`` for which ``point`` is in
+    ``family(k)``.
+
+    Treats *family* as a parameterised affine set ``(d)[k]`` — i.e. a
+    family of integer sets indexed by ``k``.  *domain* is an
+    unparameterised 1-D set restricting the legal keys.  For each
+    candidate ``k`` enumerated from *domain* over ``[0, bound)``, this
+    function asks whether *point* (a tuple of dim values) is contained
+    in ``family`` with the symbol slot bound to ``k``.
+
+    Naming uses ``family`` / ``domain`` / ``key`` rather than the
+    affine-grammar word "symbol" — this is a higher-level question
+    (which family member contains the point?) than the raw
+    ``[s0, s1, ...]`` symbol slot of an affine set, even if the
+    implementation maps the key onto symbol 0 underneath.
+
+    Args:
+        family: Parameterised set with at least one symbol (the key).
+        domain: Unparameterised 1-D set of legal keys.
+        point:  Concrete dim values for *family*; ``len(point)`` must
+                equal ``family.n_dims``.
+        bound:  Search range for ``k`` (exclusive upper bound).
+
+    Returns:
+        Keys ``k`` (integers) at which ``family`` admits *point*.
+
+    Raises:
+        ValueError: from underlying ``enumerate`` / ``contains`` if
+            shapes do not match (e.g. *domain* is not 1-D, or
+            ``len(point) != family.n_dims``).
+    """
+    return [
+        k for (k,) in domain.enumerate((bound,))
+        if family.contains(list(point), [k])
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Symbolic bound helpers
+#
+# A ``Bound`` is either a Python ``int`` (concrete leaf) or an AST node
+# tuple representing an expression over symbol variables only (no ``dim``
+# nodes — bounds in :class:`BoxSet` are pure expressions of ``symbols``).
+# Concrete ints stay unwrapped so structural fast paths can identify them
+# with ``isinstance(b, int)`` rather than walking the AST.
+#
+# ``sym_*`` constructors apply the minimum constant folding needed to keep
+# ``intersect`` / ``translate`` from accumulating trivially redundant AST
+# nodes per partition (concrete fold of two ints; idempotence on the same
+# ``("sym", k)`` reference; additive identity).  Deeper canonicalisation
+# (commutativity, nested absorption) is intentionally out of scope — it
+# would need a structural-equality engine and the realistic candidate
+# count per axis is ≤ 2, so deep nesting does not arise.
+# ---------------------------------------------------------------------------
+
+Bound = Union[int, tuple]
+
+
+def eval_bound(b, symbols: Sequence[int]) -> int:
+    """Evaluate a :data:`Bound` against concrete *symbols*.
+
+    Concrete ``int`` bounds short-circuit without touching the AST.
+    Symbolic bounds delegate to :func:`_eval_node` with an empty ``dims``
+    environment — :class:`BoxSet` bounds never reference dimension
+    variables by construction.
+    """
+    if isinstance(b, int):
+        return b
+    return _eval_node(b, dims=[], syms=list(symbols))
+
+
+def sym_add(a, b):
+    """Build ``a + b`` over :data:`Bound` operands with constant folding.
+
+    Folds when both operands are concrete; absorbs additive identity
+    (``a + 0 → a``).  Otherwise constructs an ``("add", ...)`` AST node.
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return a + b
+    if isinstance(a, int) and a == 0:
+        return b
+    if isinstance(b, int) and b == 0:
+        return a
+    a_node = ("const", a) if isinstance(a, int) else a
+    b_node = ("const", b) if isinstance(b, int) else b
+    return ("add", a_node, b_node)
+
+
+def sym_neg(a):
+    """Build ``-a`` over a :data:`Bound` operand with constant folding."""
+    if isinstance(a, int):
+        return -a
+    # Double-negation collapses: -(-x) → x.  Cheap and avoids gratuitous
+    # nesting from ``-k`` on already-negative symbolic constants.
+    if a[0] == "neg":
+        return a[1]
+    return ("neg", a)
+
+
+def sym_max(a, b):
+    """Build ``max(a, b)`` over :data:`Bound` operands with MVP folding.
+
+    Folds when both operands are concrete.  Recognises identical
+    ``("sym", k)`` references as idempotent (``max(s_k, s_k) → s_k``).
+    No commutativity / nested-absorption rewriting — those would require
+    structural equality with canonicalisation (out of scope; per-axis
+    candidate count is ≤ 2 so deep nesting does not arise in practice).
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return max(a, b)
+    if (
+        not isinstance(a, int)
+        and not isinstance(b, int)
+        and a[0] == "sym" and b[0] == "sym" and a[1] == b[1]
+    ):
+        return a
+    a_node = ("const", a) if isinstance(a, int) else a
+    b_node = ("const", b) if isinstance(b, int) else b
+    return ("max", a_node, b_node)
+
+
+def sym_min(a, b):
+    """Build ``min(a, b)`` over :data:`Bound` operands with MVP folding.
+
+    Mirror of :func:`sym_max`; see that function for the folding rules.
+    """
+    if isinstance(a, int) and isinstance(b, int):
+        return min(a, b)
+    if (
+        not isinstance(a, int)
+        and not isinstance(b, int)
+        and a[0] == "sym" and b[0] == "sym" and a[1] == b[1]
+    ):
+        return a
+    a_node = ("const", a) if isinstance(a, int) else a
+    b_node = ("const", b) if isinstance(b, int) else b
+    return ("min", a_node, b_node)
 
 
 # ---------------------------------------------------------------------------
