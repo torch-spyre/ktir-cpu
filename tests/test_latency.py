@@ -261,7 +261,8 @@ class TestRoofline:
         report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
         assert "arithmetic_intensity" in rf
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_roofline_in_report_str(self, path, func_name, entry):
