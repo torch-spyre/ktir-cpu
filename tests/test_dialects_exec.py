@@ -1156,6 +1156,78 @@ class TestTensor:
         assert result.shape == (1,)
         assert list(result.data) == [128]
 
+    def test_extract_slice(self):
+        # slice rows 2-3, cols 1-3 (offsets=[2,1], sizes=[2,2], strides=[1,1])
+        data = np.arange(16, dtype=np.float16).reshape(4, 4)
+        t = Tile(data, "f16", (4, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [2, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (2, 2),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (2, 2)
+        assert np.array_equal(result.data, data[2:4, 1:3])
+
+    def test_extract_slice_rank_reduce(self):
+        # size-1 leading dim dropped: result_shape (4,) from a (1,4) sub-slice
+        data = np.arange(8, dtype=np.float16).reshape(2, 4)
+        t = Tile(data, "f16", (2, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1, 0],
+                           "static_sizes": [1, 4],
+                           "static_strides": [1, 1],
+                           "result_shape": (4,),
+                           "dtype": "f16",
+                       })
+        assert result.shape == (4,)
+        assert np.array_equal(result.data, data[1, :])
+
+    def test_insert_slice(self):
+        # insert a 2x2 patch at offset [1, 1] into a 4x4 tensor
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (4, 4),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (4, 4)
+        expected = np.zeros((4, 4), dtype=np.float16)
+        expected[1:3, 1:3] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_insert_slice_no_alias(self):
+        # insert_slice must not mutate the original destination tile
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base_data = np.zeros((4, 4), dtype=np.float16)
+        base = Tile(base_data.copy(), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        _call("tensor.insert_slice", ctx, _make_env(),
+              operands=["%patch", "%base"],
+              attributes={
+                  "static_offsets": [0, 0],
+                  "static_sizes": [2, 2],
+                  "static_strides": [1, 1],
+                  "result_shape": (4, 4),
+                  "dtype": "f16",
+              })
+        assert np.array_equal(base.data, base_data)
+
 
 # ---------------------------------------------------------------------------
 # tensor.generate exec

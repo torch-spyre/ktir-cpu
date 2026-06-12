@@ -184,6 +184,65 @@ def tensor__yield(op, context, env):
     return ControlOps.yield_op(values)
 
 
+@register("tensor.extract_slice")
+def tensor__extract_slice(op, context, env):
+    """Slice a sub-tensor and reshape to the result type's shape.
+
+    Implements MLIR's tensor.extract_slice: all offsets/sizes/strides are
+    static (dynamic dims are not supported here). The NumPy slice covers the
+    full static extent; the result is then reshaped to the declared result
+    shape (dropping size-1 dims as extract_slice does in MLIR).
+    """
+    src = context.get_value(op.operands[0])
+    if not isinstance(src, Tile):
+        raise ValueError(f"tensor.extract_slice: expected Tile source, got {type(src)}")
+
+    offsets = op.attributes["static_offsets"]
+    sizes = op.attributes["static_sizes"]
+    strides = op.attributes["static_strides"]
+    result_shape = tuple(op.attributes["result_shape"])
+    dtype_str = op.attributes["dtype"]
+
+    idx = tuple(
+        slice(int(off), int(off) + int(sz), int(st))
+        for off, sz, st in zip(offsets, sizes, strides)
+    )
+    sliced = src.data[idx]
+    reshaped = sliced.reshape(result_shape)
+    return Tile(reshaped, dtype_str, result_shape)
+
+
+@register("tensor.insert_slice")
+def tensor__insert_slice(op, context, env):
+    """Insert a sub-tensor into a destination tensor and return the result.
+
+    Implements MLIR's tensor.insert_slice: operands[0] is the source (slice),
+    operands[1] is the destination. All offsets/sizes/strides are static.
+    Returns a copy of dest with the source inserted at the given region.
+    """
+    src = context.get_value(op.operands[0])
+    dst = context.get_value(op.operands[1])
+
+    if not isinstance(src, Tile):
+        raise ValueError(f"tensor.insert_slice: expected Tile source, got {type(src)}")
+    if not isinstance(dst, Tile):
+        raise ValueError(f"tensor.insert_slice: expected Tile dest, got {type(dst)}")
+
+    offsets = op.attributes["static_offsets"]
+    sizes = op.attributes["static_sizes"]
+    strides = op.attributes["static_strides"]
+    result_shape = tuple(op.attributes["result_shape"])
+    dtype_str = op.attributes["dtype"]
+
+    idx = tuple(
+        slice(int(off), int(off) + int(sz), int(st))
+        for off, sz, st in zip(offsets, sizes, strides)
+    )
+    result_data = dst.data.copy()
+    result_data[idx] = src.data.reshape([int(sz) for sz in sizes])
+    return Tile(result_data, dtype_str, result_shape)
+
+
 @register("tensor.generate")
 def tensor__generate(op, context, env):
     """Generate a tensor by evaluating a region body at each index.
@@ -305,7 +364,7 @@ def parse_tensor_splat(op_text, parse_ctx):
     )
 
 
-@register_parser("tensor.extract")
+@register_parser("tensor.extract ")
 def parse_tensor_extract(op_text, parse_ctx):
     # %scalar = tensor.extract %tensor[%i0, %i1] : tensor<...>
     result_match = re.match(r'(%\w+)\s*=\s*tensor\.extract\s+(%\w+)', op_text)
@@ -529,4 +588,105 @@ def parse_tensor_from_elements(op_text, parse_ctx):
             "dtype": info["dtype"],
         },
         result_type=type_str,
+    )
+
+
+def _parse_static_index_lists(op_text):
+    """Parse all [...] bracket groups in op_text as lists of integers.
+
+    Returns a list-of-lists, one per bracket group found.
+    """
+    groups = []
+    for m in re.finditer(r'\[([^\]]*)\]', op_text):
+        content = m.group(1).strip()
+        groups.append([int(x.strip()) for x in content.split(',') if x.strip()])
+    return groups
+
+
+@register_parser("tensor.extract_slice")
+def parse_tensor_extract_slice(op_text, parse_ctx):
+    """Parse `%r = tensor.extract_slice %src[offsets][sizes][strides] : T to T`."""
+    from ..parser_utils import parse_tensor_type
+    m = re.match(
+        r'(%\w+)\s*=\s*tensor\.extract_slice\s+(%\w+)', op_text
+    )
+    if not m:
+        return None
+    result_name = m.group(1)
+    src_operand = m.group(2)
+
+    groups = _parse_static_index_lists(op_text)
+    if len(groups) < 3:
+        raise ValueError(
+            f"tensor.extract_slice: expected [offsets][sizes][strides], got {op_text!r}"
+        )
+    offsets, sizes, strides = groups[0], groups[1], groups[2]
+
+    result_type_m = re.search(r'\bto\s+(tensor<[^>]+>)\s*$', op_text)
+    if not result_type_m:
+        raise ValueError(f"tensor.extract_slice: missing result type in {op_text!r}")
+    result_type = result_type_m.group(1)
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(
+            f"tensor.extract_slice: cannot parse result type {result_type!r}"
+        )
+
+    return Operation(
+        result=result_name,
+        op_type="tensor.extract_slice",
+        operands=[src_operand],
+        attributes={
+            "static_offsets": offsets,
+            "static_sizes": sizes,
+            "static_strides": strides,
+            "result_shape": info["shape"],
+            "dtype": info["dtype"],
+        },
+        result_type=result_type,
+    )
+
+
+@register_parser("tensor.insert_slice")
+def parse_tensor_insert_slice(op_text, parse_ctx):
+    """Parse `%r = tensor.insert_slice %src into %dst[offsets][sizes][strides] : T into T`."""
+    from ..parser_utils import parse_tensor_type
+    m = re.match(
+        r'(%\w+)\s*=\s*tensor\.insert_slice\s+(%\w+)\s+into\s+(%\w+)', op_text
+    )
+    if not m:
+        return None
+    result_name = m.group(1)
+    src_operand = m.group(2)
+    dst_operand = m.group(3)
+
+    groups = _parse_static_index_lists(op_text)
+    if len(groups) < 3:
+        raise ValueError(
+            f"tensor.insert_slice: expected [offsets][sizes][strides], got {op_text!r}"
+        )
+    offsets, sizes, strides = groups[0], groups[1], groups[2]
+
+    result_type_m = re.search(r'\binto\s+(tensor<[^>]+>)\s*$', op_text)
+    if not result_type_m:
+        raise ValueError(f"tensor.insert_slice: missing result type in {op_text!r}")
+    result_type = result_type_m.group(1)
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(
+            f"tensor.insert_slice: cannot parse result type {result_type!r}"
+        )
+
+    return Operation(
+        result=result_name,
+        op_type="tensor.insert_slice",
+        operands=[src_operand, dst_operand],
+        attributes={
+            "static_offsets": offsets,
+            "static_sizes": sizes,
+            "static_strides": strides,
+            "result_shape": info["shape"],
+            "dtype": info["dtype"],
+        },
+        result_type=result_type,
     )
