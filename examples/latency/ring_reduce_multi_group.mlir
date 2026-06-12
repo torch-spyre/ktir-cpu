@@ -1,6 +1,6 @@
-// Ring reduce: 4 cores, each holds a 1×128 row in HBM, reduce-sum across all 4.
+// Multi-group ring reduce: 16 cores split into 4 groups of 4.
 //
-// Grid: [4, 1, 1] — axis 0 distributes work.
+// Grid: [16, 1, 1] — axis 0 distributes work across 16 cores.
 //
 // HBM addressing.  ``%in_ptr`` / ``%out_ptr`` are *stick* indices on
 // HBM; one stick is 128 bytes (= 64 f16 elements), so each 1×128 f16
@@ -10,31 +10,42 @@
 //   1. Constructs a memory view for its row at in_ptr + c*2 sticks.
 //   2. Loads it into a tensor<1x128xf16> partial.
 //   3. Calls ktdp.inter_tile_produce + ktdp.inter_tile_reduce — every
-//      core ends up holding the full sum (all-reduce).
-//   4. Core 0 (pid == 0) stores the reduced tile back to HBM output.
+//      core in group g (= c / 4) ends up holding the sum of that
+//      group's 4 partials (all-reduce within the group).
+//   4. The first core of each group (c % 4 == 0) stores the reduced
+//      tile to its group's output slot at out_ptr + g*2 sticks.
 //
-// After execution, output[0..127] = sum of all 4 input rows.
+// After execution, output[g, 0..127] = sum of group g's 4 input rows
+// for g in [0, 4).
+//
+// This kernel is the multi-group analogue of
+// ``examples/ktir/ring_reduce.mlir``; the latency-test harness uses
+// it to validate that ``RingReduceBackend.run`` produces correct
+// per-group results when the workgroup hosts multiple concurrent
+// reductions, and that the ring still spans the whole 16-core
+// workgroup.
 
 #row_set    = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 127 >= 0)>
 #identity   = affine_map<(d0, d1) -> (d0, d1)>
 
-// Single group containing all 4 cores: i in [4*g, 4*g+3], with g == 0.
+// 4 groups of 4 cores: i in [4*g, 4*g+3], with g in [0, 3].
 #all_tiles  = affine_set<(i)[g] : (i - 4*g >= 0, -i + 4*g + 3 >= 0)>
-#one_group  = affine_set<(g) : (g == 0)>
+#all_groups = affine_set<(g) : (g >= 0, -g + 3 >= 0)>
 
 module {
-  func.func @ring_reduce(%in_ptr: index, %out_ptr: index)
-      attributes {grid = [4]} {
+  func.func @ring_reduce_multi_group(%in_ptr: index, %out_ptr: index)
+      attributes {grid = [16, 1, 1]} {
 
-    %c0   = arith.constant 0 : index
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
     // 1×128 f16 = 256 bytes = 2 HBM sticks per row.
     %row_sticks = arith.constant 2 : index
 
     %pid = ktdp.get_compute_tile_id : index
 
     // Stick-index of this core's input row: in_ptr + pid * 2.
-    %offs = arith.muli %pid, %row_sticks : index
-    %row_ptr = arith.addi %in_ptr, %offs : index
+    %in_offs = arith.muli %pid, %row_sticks : index
+    %row_ptr = arith.addi %in_ptr, %in_offs : index
 
     // (1) Memory view over this core's 1×128 row
     %row_view = ktdp.construct_memory_view %row_ptr,
@@ -53,17 +64,20 @@ module {
                 : !ktdp.access_tile<1x128xindex> -> tensor<1x128xf16>
 
     // (3a) Produce: every core contributes its 1×128 partial.
+    //      ``groups`` defines 4 groups; each core's group is derived
+    //      from its position in ``producer_tiles_per_group``.
     %fut = ktdp.inter_tile_produce
         producer_tiles_per_group = #all_tiles,
-        groups                   = #one_group
+        groups                   = #all_groups
         : tensor<1x128xf16> -> !ktdp.tile_future<tensor<1x128xf16>>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %partial : tensor<1x128xf16>
     }
 
-    // (3b) Reduce: every core (consumer set == producer set) ends up holding
-    //      the same 128-element group sum.
+    // (3b) Reduce: within each group of 4, every core holds the same
+    //      group sum.  consumer_tiles_per_group = producer_tiles_per_group
+    //      → in-group all-reduce.
     %c_zero    = arith.constant 0.0 : f16
     %id_init   = tensor.empty() : tensor<1x128xf16>
     %add_id    = linalg.fill ins(%c_zero : f16) outs(%id_init : tensor<1x128xf16>)
@@ -71,7 +85,7 @@ module {
 
     %reduced = ktdp.inter_tile_reduce(%fut)
         consumer_tiles_per_group = #all_tiles,
-        groups                   = #one_group,
+        groups                   = #all_groups,
         identity(%add_id : tensor<1x128xf16>)
         : !ktdp.tile_future<tensor<1x128xf16>> -> tensor<128xf16>
     {
@@ -82,13 +96,22 @@ module {
         ktdp.yield_reduced %sum : tensor<1x128xf16>
     }
 
-    // (4) Only core 0 stores the result back as a 1×128 row
-    %is_writer = arith.cmpi eq, %pid, %c0 : index
+    // (4) The first core of each group writes its group's result.
+    //     Writer condition: pid % 4 == 0.  Output offset: g * 2 sticks
+    //     where g = pid / 4.  So core 0 writes to out_ptr+0, core 4
+    //     writes to out_ptr+2, core 8 writes to out_ptr+4, core 12
+    //     writes to out_ptr+6.
+    %lane      = arith.remui %pid, %c4 : index
+    %is_writer = arith.cmpi eq, %lane, %c0 : index
     scf.if %is_writer {
       %reduced_2d = tensor.expand_shape %reduced [[0, 1]] output_shape [1, 128]
                       : tensor<128xf16> into tensor<1x128xf16>
 
-      %out_view = ktdp.construct_memory_view %out_ptr,
+      %group_idx = arith.divui %pid, %c4 : index
+      %out_offs  = arith.muli %group_idx, %row_sticks : index
+      %group_out = arith.addi %out_ptr, %out_offs : index
+
+      %out_view = ktdp.construct_memory_view %group_out,
                     sizes: [1, 128], strides: [128, 1] {
         coordinate_set = #row_set,
         memory_space   = #ktdp.spyre_memory_space<HBM>

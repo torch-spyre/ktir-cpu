@@ -54,10 +54,19 @@ FRONTEND_UNSUPPORTED = {
     # to reconcile to the real op form or remove — NOT frontend gaps to fill.
     "arith.convertf": "not a real upstream arith op — unknown to the MLIR "
                       "parser; reconcile to a real cast op or remove.",
-    "ktdp.reduce": "non-spec op (not in the ktdp dialect). Reconcile to the "
-                   "real cross-core reduce form or remove. See issue #88.",
     "ktdp.coreid": "non-spec op (not in the ktdp dialect). Reconcile to the "
                    "real core-identity form or remove. See issue #88.",
+
+    # Real spec ops missing a frontend adapter handler — pending
+    # ktir-mlir-frontend#23 (inter-tile communication ops).
+    "ktdp.inter_tile_produce": "🧪 experimental op; no frontend adapter yet. "
+                               "Blocked on ktir-mlir-frontend#23.",
+    "ktdp.inter_tile_reduce": "🧪 experimental op; no frontend adapter yet. "
+                              "Blocked on ktir-mlir-frontend#23.",
+    "ktdp.yield_partial": "🧪 experimental terminator; no frontend adapter yet. "
+                          "Blocked on ktir-mlir-frontend#23.",
+    "ktdp.yield_reduced": "🧪 experimental terminator; no frontend adapter yet. "
+                          "Blocked on ktir-mlir-frontend#23.",
 
     # Real spec op missing only a frontend adapter handler (distinct from the
     # non-spec ops above).

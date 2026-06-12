@@ -129,6 +129,7 @@ from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.memory import SpyreMemoryHierarchy
 from ktir_cpu.ops.comm_ops import (
     CommOps,
+    CommPlan,
     RingReduceBackend,
     get_reduce_backend,
     register_reduce_backend,
@@ -184,16 +185,21 @@ def _sum_tiles(a: Tile, b: Tile) -> Tile:
 
 @register_reduce_backend("test.reduce", RingReduceBackend)
 def _h_reduce(op: Operation, ctx) -> Any:
-    """test.reduce — wraps CommOps.reduce with the registered backend.
+    """test.reduce — wraps RingReduceBackend.run with the registered backend.
 
-    Returns the generator produced by ``RingReduceBackend.run`` (via
-    ``CommOps.reduce``). The scheduler drives ``N-1`` ``RecvRequest``
-    yields per core; the final accumulator is bound to ``op.result``.
+    Builds a ``CommPlan`` from the ``group`` attribute (treated as both
+    the producer set and the consumer set — synthetic all-reduce
+    semantics) and an identity tile of zeros matching the input shape.
+    Returns the generator produced by ``RingReduceBackend.run``; the
+    scheduler drives the per-round ``RecvRequest`` yields and the
+    final accumulator is bound to ``op.result``.
     """
     tile = ctx.get_value(op.operands[0])
-    group = op.attributes["group"]
+    group = tuple(op.attributes["group"])
+    plan = CommPlan(producers=group, consumers=group)
+    identity = Tile(np.zeros_like(tile.data), tile.dtype, tile.shape)
     backend_cls = get_reduce_backend(op.op_type)
-    return CommOps.reduce(ctx, tile, group, backend_cls(_sum_tiles))
+    return backend_cls().run(ctx, tile, plan, _sum_tiles, identity)
 
 
 _STUB_HANDLERS: Dict[str, Callable[[Operation, Any], Any]] = {
@@ -456,52 +462,48 @@ def test_ring_reduce(spec, execute_fn):
 # deadlock cases automatically.
 # ---------------------------------------------------------------------------
 
-def _broken_recv_only(self, ctx, tile, group):
-    """Recv from the previous neighbor, never send. Every participating
-    core blocks on round 1 → flat mutual-recv deadlock.
+def _broken_recv_only(self, ctx, tile, plan, reduce_fn, identity):
+    """Recv from the previous neighbor, never send. Every core in
+    the workgroup blocks on round 1 → flat mutual-recv deadlock.
+
+    Ring spans the whole workgroup; ``plan`` is informational only
+    in the broken stubs (the bug is in send/recv pairing, not in
+    the fold).
     """
-    if ctx.core_id not in group:
-        return tile
-    n = len(group)
-    my_idx = group.index(ctx.core_id)
-    prev = group[(my_idx - 1) % n]
+    n = ctx.num_cores
+    prev = (ctx.core_id - 1) % n
     yield RecvRequest(src=prev)
     return tile
 
 
-def _broken_wrong_dest(self, ctx, tile, group):
-    """Send to (idx+2) % n while recv-ing from (idx-1) % n. Every core's
-    send lands in a queue no one reads from; every core's recv waits
-    on a queue no one writes to. Deadlock at round 1.
+def _broken_wrong_dest(self, ctx, tile, plan, reduce_fn, identity):
+    """Send to ``(my_id + 2) % n`` while recv-ing from
+    ``(my_id - 1) % n``. Every core's send lands in a queue no one
+    reads from; every core's recv waits on a queue no one writes to.
+    Deadlock at round 1.
     """
-    if ctx.core_id not in group:
-        return tile
-    n = len(group)
-    my_idx = group.index(ctx.core_id)
-    wrong_dst = group[(my_idx + 2) % n]
-    prev = group[(my_idx - 1) % n]
+    n = ctx.num_cores
+    wrong_dst = (ctx.core_id + 2) % n
+    prev = (ctx.core_id - 1) % n
     ctx.send_to(wrong_dst, tile)
     yield RecvRequest(src=prev)
     return tile
 
 
-def _broken_extra_recv(self, ctx, tile, group):
+def _broken_extra_recv(self, ctx, tile, plan, reduce_fn, identity):
     """Run N-1 ring rounds correctly, then dangle one extra recv. The
     final recv has no matching send → deadlock after the algorithm
     has otherwise made progress.
     """
-    if ctx.core_id not in group:
-        return tile
-    n = len(group)
-    my_idx = group.index(ctx.core_id)
-    next_core = group[(my_idx + 1) % n]
-    prev_core = group[(my_idx - 1) % n]
+    n = ctx.num_cores
+    next_core = (ctx.core_id + 1) % n
+    prev_core = (ctx.core_id - 1) % n
     result = tile.copy()
     to_forward = tile.copy()
     for _ in range(n - 1):
         ctx.send_to(next_core, to_forward)
         received = yield RecvRequest(src=prev_core)
-        result = self.reduce_fn(result, received)
+        result = reduce_fn(result, received)
         to_forward = received
     # Dangling recv — no one sent for this round.
     yield RecvRequest(src=prev_core)
