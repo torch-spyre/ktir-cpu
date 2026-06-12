@@ -221,7 +221,7 @@ module {
 
 
 def test_multi_result_single_value_raises_error():
-    """When op.result is a list but handler returns a non-tuple, an AssertionError is raised.
+    """When op.result is a list but handler returns a non-tuple, a RuntimeError is raised.
 
     The arity guard catches the mismatch before any set_value call.
     """
@@ -252,5 +252,5 @@ module {
             result_type=None,
             regions=[],
         )
-        with pytest.raises(AssertionError):
+        with pytest.raises(RuntimeError):
             interp._execute_op(op, core)

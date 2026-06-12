@@ -216,9 +216,10 @@ class KTIRInterpreter:
         if op.result and result is not None:
             names = op.result if isinstance(op.result, list) else [op.result]
             values = result if isinstance(result, tuple) else [result]
-            assert len(names) == len(values), (
-                f"{op.op_type}: expected {len(names)} result(s), got {len(values)}"
-            )
+            if len(names) != len(values):
+                raise RuntimeError(
+                    f"{op.op_type}: expected {len(names)} result(s), got {len(values)}"
+                )
             for name, val in zip(names, values):
                 context.set_value(name, val)
                 if isinstance(val, Tile):
