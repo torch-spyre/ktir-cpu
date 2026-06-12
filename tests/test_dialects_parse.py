@@ -926,6 +926,44 @@ class TestKtdpParsers(ParseTestMixin):
                 args={"%ptr": "index"},
             )
 
+    @pytest.mark.regex_only
+    def test_construct_distributed_memory_view_concrete_shape(self):
+        # Sanity: the existing concrete-shape path is untouched by the '?' fix.
+        op = self._parse(
+            "%dv = ktdp.construct_distributed_memory_view"
+            " (%a0, %a1 : memref<64x16xf16>, memref<64x16xf16>)"
+            " : memref<64x32xf16>",
+            args={"%a0": "memref<64x16xf16>", "%a1": "memref<64x16xf16>"},
+        )
+        self.assert_op_type(op, "ktdp.construct_distributed_memory_view")
+        self.assert_attribute(op, "shape", (64, 32))
+        self.assert_attribute(op, "dtype", "f16")
+        self.assert_result_type(op, "memref<64x32xf16>")
+
+    @pytest.mark.regex_only
+    def test_construct_distributed_memory_view_dynamic_dim(self):
+        # '?' in result type: parser stores None in shape attr; the handler
+        # resolves it from partition coordinate sets (see exec test).
+        op = self._parse(
+            "%dv = ktdp.construct_distributed_memory_view"
+            " (%a0, %a1 : memref<64x?xf16>, memref<64x?xf16>)"
+            " : memref<64x?xf16>",
+            args={"%a0": "memref<64x?xf16>", "%a1": "memref<64x?xf16>"},
+        )
+        self.assert_attribute(op, "shape", (64, None))
+        self.assert_result_type(op, "memref<64x?xf16>")
+
+    @pytest.mark.regex_only
+    def test_construct_distributed_memory_view_all_dynamic(self):
+        op = self._parse(
+            "%dv = ktdp.construct_distributed_memory_view"
+            " (%a0, %a1 : memref<?x?xf16>, memref<?x?xf16>)"
+            " : memref<?x?xf16>",
+            args={"%a0": "memref<?x?xf16>", "%a1": "memref<?x?xf16>"},
+        )
+        self.assert_attribute(op, "shape", (None, None))
+        self.assert_result_type(op, "memref<?x?xf16>")
+
     def test_construct_access_tile_dynamic_memref(self):
         # construct_access_tile already handles memref<?xf32> correctly:
         # it reads shape only from the !ktdp.access_tile<...> result type,
