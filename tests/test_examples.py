@@ -587,21 +587,26 @@ class TestRingReduceExecution:
         interp = KTIRInterpreter()
         interp.load(path)
 
-        # ``in_ptr`` and ``out_ptr`` are HBM stick indices (matching the
-        # convention ``KTIRInterpreter.execute_function`` uses for ndarray
-        # kwargs).  Seed / read directly with them — no element-to-stick
-        # translation needed.
+        # ``in_ptr`` and ``out_ptr`` are f16 element indices (base_ptr
+        # convention).  hbm.write/read take stick indices, so convert.
+        from ktir_cpu.dtypes import stick_to_elem_idx
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES  # 64
+        in_stick  = in_ptr  // elems_per_stick
+        out_stick = out_ptr // elems_per_stick
+
         _orig = interp._prepare_execution
 
         def _prepare_and_seed(grid_shape):
             _orig(grid_shape)
-            interp.memory.hbm.write(in_ptr,  rows.flatten())
-            interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+            interp.memory.hbm.write(in_stick,  rows.flatten())
+            interp.memory.hbm.write(out_stick, np.zeros(n_cols, dtype=np.float16))
 
         interp._prepare_execution = _prepare_and_seed
         interp.execute_function(func_name, **entry["execute_kwargs"])
 
-        result = interp.memory.hbm.read(out_ptr, n_cols, "f16")
+        result = interp.memory.hbm.read(out_stick, n_cols, "f16")
         expected = rows.sum(axis=0)
         np.testing.assert_allclose(result, expected, rtol=1e-2,
                                    err_msg="Core 0 output does not match element-wise sum")

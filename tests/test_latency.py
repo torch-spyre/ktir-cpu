@@ -118,7 +118,7 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     """Run ring_reduce on its 4-core grid and return ``(report, rows, n_cols)``.
 
     Differs from the other ``_run_*`` helpers because ``ring_reduce.mlir``
-    takes raw stick-index pointers (``in_ptr`` / ``out_ptr``) rather than
+    takes f16 element-index pointers (``in_ptr`` / ``out_ptr``) rather than
     ndarray kwargs.  We patch ``_prepare_execution`` to seed the input
     rows after HBM allocation; this mirrors
     ``test_examples.py::TestRingReduceExecution::test_ring_reduce_sum``.
@@ -131,6 +131,11 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     in_ptr = entry["execute_kwargs"]["in_ptr"]
     out_ptr = entry["execute_kwargs"]["out_ptr"]
 
+    # hbm.write/read take stick indices; convert from element indices.
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    in_stick  = in_ptr  // _elems_per_stick
+    out_stick = out_ptr // _elems_per_stick
+
     rng = np.random.default_rng(42)
     rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
 
@@ -141,8 +146,8 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
 
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
-        interp.memory.hbm.write(in_ptr,  rows.flatten())
-        interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+        interp.memory.hbm.write(in_stick,  rows.flatten())
+        interp.memory.hbm.write(out_stick, np.zeros(n_cols, dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name, **entry["execute_kwargs"])
@@ -166,6 +171,11 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
     in_ptr = entry["execute_kwargs"]["in_ptr"]
     out_ptr = entry["execute_kwargs"]["out_ptr"]
 
+    # hbm.write/read take stick indices; convert from element indices.
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    in_stick  = in_ptr  // _elems_per_stick
+    out_stick = out_ptr // _elems_per_stick
+
     rng = np.random.default_rng(42)
     rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
 
@@ -176,8 +186,8 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
 
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
-        interp.memory.hbm.write(in_ptr,  rows.flatten())
-        interp.memory.hbm.write(out_ptr, np.zeros(n_groups * n_cols, dtype=np.float16))
+        interp.memory.hbm.write(in_stick,  rows.flatten())
+        interp.memory.hbm.write(out_stick, np.zeros(n_groups * n_cols, dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name, **entry["execute_kwargs"])
@@ -187,7 +197,7 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
         n_cols,
         n_groups,
         group_size,
-        interp.memory.hbm.read(out_ptr, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
+        interp.memory.hbm.read(out_stick, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
     )
 
 
