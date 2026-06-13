@@ -689,6 +689,38 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_attribute(op, "result_shape", (8, 8))
         self.assert_attribute(op, "dtype", "f16")
 
+    def test_extract_slice_dynamic_offset(self):
+        """Dynamic offset %off becomes kDynamic sentinel + extra operand."""
+        _KDYNAMIC = -(1 << 63)
+        op = self._parse(
+            "%sl = tensor.extract_slice %src[0, %off][1, 64][1, 1]"
+            " : tensor<1x128x64xf32> to tensor<64xf32>",
+            args={"%src": "tensor<1x128x64xf32>", "%off": "index"},
+        )
+        self.assert_op_type(op, "tensor.extract_slice")
+        # operands: source + dynamic offset name
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%src", "%off")
+        assert op.attributes["static_offsets"] == [0, _KDYNAMIC]
+        self.assert_attribute(op, "static_sizes", [1, 64])
+        self.assert_attribute(op, "static_strides", [1, 1])
+
+    def test_insert_slice_dynamic_offset(self):
+        """Dynamic offset %off becomes kDynamic sentinel + extra operand."""
+        _KDYNAMIC = -(1 << 63)
+        op = self._parse(
+            "%out = tensor.insert_slice %src into %dst[0, %off][1, 64][1, 1]"
+            " : tensor<1x64xf32> into tensor<1x128xf32>",
+            args={"%src": "tensor<1x64xf32>", "%dst": "tensor<1x128xf32>", "%off": "index"},
+        )
+        self.assert_op_type(op, "tensor.insert_slice")
+        # operands: src + dst + dynamic offset name
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%src", "%dst", "%off")
+        assert op.attributes["static_offsets"] == [0, _KDYNAMIC]
+        self.assert_attribute(op, "static_sizes", [1, 64])
+        self.assert_attribute(op, "static_strides", [1, 1])
+
 
 # ---------------------------------------------------------------------------
 # ktdp dialect parsers

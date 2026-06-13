@@ -1228,6 +1228,51 @@ class TestTensor:
               })
         assert np.array_equal(base.data, base_data)
 
+    def test_extract_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array).
+
+        Mirrors the Spyre matmul lowering pattern:
+            %sl = tensor.extract_slice %b[0, %off, 0][1, 64, 64][1, 1, 1]
+                    : tensor<1x128x64xf32> to tensor<64x64xf32>
+        where %off = k * 64 is a runtime value.
+        """
+        _KDYNAMIC = -(1 << 63)
+        data = np.arange(128 * 64, dtype=np.float32).reshape(1, 128, 64)
+        t = Tile(data, "f32", (1, 128, 64))
+        ctx = _ctx_with(**{"%t": t, "%off": 64})  # second stick: offset=64
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t", "%off"],
+                       attributes={
+                           "static_offsets": [0, _KDYNAMIC, 0],
+                           "static_sizes":   [1, 64, 64],
+                           "static_strides": [1, 1, 1],
+                           "result_shape": (64, 64),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (64, 64)
+        assert np.array_equal(result.data, data[0, 64:128, :])
+
+    def test_insert_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array)."""
+        _KDYNAMIC = -(1 << 63)
+        patch = Tile(np.ones((64,), dtype=np.float32), "f32", (64,))
+        base_data = np.zeros((128,), dtype=np.float32)
+        base = Tile(base_data.copy(), "f32", (128,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base, "%off": 64})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base", "%off"],
+                       attributes={
+                           "static_offsets": [_KDYNAMIC],
+                           "static_sizes":   [64],
+                           "static_strides": [1],
+                           "result_shape": (128,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (128,)
+        expected = np.zeros((128,), dtype=np.float32)
+        expected[64:] = 1.0
+        assert np.array_equal(result.data, expected)
+
 
 # ---------------------------------------------------------------------------
 # tensor.generate exec
