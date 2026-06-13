@@ -694,8 +694,8 @@ class TestTensorParsers(ParseTestMixin):
         _KDYNAMIC = -(1 << 63)
         op = self._parse(
             "%sl = tensor.extract_slice %src[0, %off][1, 64][1, 1]"
-            " : tensor<1x128x64xf32> to tensor<64xf32>",
-            args={"%src": "tensor<1x128x64xf32>", "%off": "index"},
+            " : tensor<1x128xf32> to tensor<64xf32>",
+            args={"%src": "tensor<1x128xf32>", "%off": "index"},
         )
         self.assert_op_type(op, "tensor.extract_slice")
         # operands: source + dynamic offset name
