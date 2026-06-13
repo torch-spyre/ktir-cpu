@@ -138,7 +138,7 @@ class CoreLatencyCounters:
 
     def record(self, category: str, cycles: float, op_type: str = "",
                flops: float = 0.0, nbytes: int = 0):
-        if category == "compute" or category.startswith("compute_"):
+        if category.startswith("compute_"):
             self.cycles_by_category[category] = self.cycles_by_category.get(category, 0.0) + cycles
             self.flops_by_category[category] = self.flops_by_category.get(category, 0.0) + flops
         elif category == "memory":
