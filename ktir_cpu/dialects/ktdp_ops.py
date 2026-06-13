@@ -16,7 +16,7 @@
 
 import re
 
-from .ktdp_helpers import parse_subscript_expr
+from .ktdp_helpers import attach_reshape, parse_subscript_expr
 from ..affine import BoxSet
 from ..ir_types import (
     AccessTile,
@@ -26,19 +26,15 @@ from ..ir_types import (
     MemRef,
     Operation,
     Tile,
+    TileFuture,
 )
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
-from ..ops.comm_ops import (
-    CommOps,
-    RingReduceBackend,
-    get_reduce_backend,
-    register_reduce_backend,
-)
+from ..ops.comm_ops import CommPlan, RingReduceBackend
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
-from ..parser_ast import parse_affine_map, parse_affine_set
-from ..parser_utils import _extract_bracket_content, find_ssa_names, parse_attr_block, parse_multi_result_lhs, split_top_level
+from ..parser_ast import enumerate_membership_keys, parse_affine_map, parse_affine_set
+from ..parser_utils import _extract_bracket_content, extract_named_attr, find_ssa_names, parse_attr_block, parse_multi_result_lhs, parse_tensor_type, split_top_level
 from .registry import ParseContext, register, register_parser
 
 
@@ -826,14 +822,387 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
 
 
 # ---------------------------------------------------------------------------
-# Communication ops (moved from scf_ops.py)
+# Inter-tile communication — `ktdp.inter_tile_produce` / `inter_tile_reduce`
+# ---------------------------------------------------------------------------
+# 🧪 EXPERIMENTAL — TRACKS UNMERGED UPSTREAM SPEC PR
+#
+# The four-op inter-tile design (produce + consume / reduce / reduce_scatter)
+# lives in ktir-mlir-frontend PR #23:
+#   https://github.com/torch-spyre/ktir-mlir-frontend/pull/23
+#
+# The spec PR is not yet merged.  Op names, attribute keys (e.g.
+# ``producer_tiles_per_group``, ``consumer_tiles_per_group``,
+# ``producer_dependency_per_consumer``), and the ``!ktdp.tile_future<...>``
+# type may shift to track the upstream PR before it lands on main.  Avoid
+# baking these names into stable APIs until the spec is final.
+#
+# Implemented here: the reduce path only — `ktdp.inter_tile_produce` +
+# `ktdp.inter_tile_reduce`, with `yield_partial` / `yield_reduced` region
+# terminators.  Production returns a `!ktdp.tile_future<T_p>`; the delivery
+# op consumes it.  v1 supports a single partial role (N=1) and the
+# full-barrier sync model (no `producer_dependency_per_consumer` execution
+# semantics — parsed but not honoured at runtime).
+#
+# Not implemented: `inter_tile_consume` (broadcast),
+# `inter_tile_reduce_scatter`, per-tile sync runtime.
+#
+# Def-use edge — how it's simulated.  The spec uses the SSA def-use
+# edge ``%fut → consume(%fut)`` to pin produce-then-consume ordering
+# and identify which produce a delivery op is paired with.  In this
+# simulator we don't walk the def-use graph: each core's
+# ``inter_tile_produce`` returns a per-core ``TileFuture`` instance
+# bound to that core's local ``%fut``; the consume handler reads
+# ``%fut`` via ``ctx.get_value`` and dispatches.  The TileFuture
+# *is* the def-use edge for our purposes — its identity per core
+# substitutes for tracing the IR-level chain.
+#
+# Verification — deferred until the upstream spec is final.  Once
+# ktir-mlir-frontend#23 lands, add:
+#
+#   A2. ``groups`` match between produce and consume.
+#       Bounded-enumeration equality over ``ctx.num_cores`` —
+#       compare ``{g : groups_a.contains([g])}`` and
+#       ``{g : groups_b.contains([g])}`` once at consume-handler
+#       entry.  No polyhedral set difference needed.
+#
+#   B1. Subset.  ``producer_dependency_per_consumer ⊆
+#       producer_tiles_per_group`` for every (p, c) the deps name.
+#       Trivial post-check on ``CommPlan.for_reduce`` — every
+#       producer-id mentioned in ``deps`` must be in ``producers``.
+#
+#   B2. Coverage.  Every producer in ``producer_tiles_per_group(g)``
+#       must be the dependency of at least one consumer in
+#       ``consumer_tiles_per_group(g)``.  Same place as B1, post
+#       ``CommPlan.for_reduce``.
+#
+# These are spec invariants the runtime currently trusts.  They
+# should be enforced when the upstream surface stabilises so we
+# don't lock in error messages keyed on names that may yet change.
+#
+# See `docs/cross_core_scheduling.md` for the simulator design and
+# `docs/gap_analysis.md` rows 2a–2d for status.
 # ---------------------------------------------------------------------------
 
-@register("ktdp.reduce", latency_category=LC.COMM)
-@register_reduce_backend("ktdp.reduce", RingReduceBackend)
-def ktdp__reduce(op, context, env):
-    tile = context.get_value(op.operands[0])
-    core_group = context.get_value(op.operands[1])
-    backend_cls = get_reduce_backend(op.op_type)
-    reduce_fn = lambda t1, t2: ArithOps.addf(t1, t2)
-    return CommOps.reduce(context, tile, core_group, backend_cls(reduce_fn))
+
+def _find_tile_group(tile_id, producer_set, groups_set, num_cores):
+    """Return the unique group index ``g`` whose membership set
+    contains ``tile_id``.
+
+    Thin wrapper over :func:`enumerate_membership_keys`: ``producer_set``
+    is the family ``(i)[g]``, ``groups_set`` is the key domain, and
+    we want the keys ``g`` for which ``tile_id`` is in the family.
+    Group count is upper-bounded by ``num_cores`` (every group must
+    contain at least one core).  Raises if zero or more than one
+    match — the spec's disjointness invariant says exactly one.
+    """
+    matches = enumerate_membership_keys(
+        family=producer_set,
+        domain=groups_set,
+        point=(tile_id,),
+        bound=num_cores,
+    )
+    if not matches:
+        raise RuntimeError(
+            f"tile {tile_id} is not contained in any producer group "
+            f"(producer_set={producer_set.source!r}, groups_set={groups_set.source!r})"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"tile {tile_id} matched multiple groups {matches} — "
+            f"violates the disjointness invariant"
+        )
+    return matches[0]
+
+
+# ---------------------------------------------------------------------------
+# ktdp.inter_tile_produce
+# ---------------------------------------------------------------------------
+
+@register("ktdp.inter_tile_produce")
+def ktdp__inter_tile_produce(op, context, env):
+    """Materialise this core's partial and stash it on a per-core
+    TileFuture.
+
+    Every core in the workgroup runs this handler once with its own
+    ``CoreContext``; each call returns a separate ``TileFuture``
+    bound to that core's local ``%fut`` SSA value.  No cross-core
+    shared state — partials reach consumers via the scheduler's
+    mailbox once the matching delivery op runs.  See
+    ``docs/cross_core_scheduling.md``, "Inter-tile communication:
+    produce + reduce, end to end".
+
+    Backend selection happens at consume time, not here — the future
+    just carries the producer/groups affine sets and the bound
+    group index alongside the local partial.
+
+    Steps:
+      1. Resolve this core's group index ``gid`` from the IR sets.
+      2. Execute the producer region with ``%gid`` bound; capture
+         the ``yield_partial`` value(s) as the local partial.
+      3. Wrap everything in a ``TileFuture`` and return.
+    """
+    producer_set = op.attributes["producer_tiles_per_group"]
+    groups_set = op.attributes["groups"]
+    partial_types = op.attributes["partial_tensor_types"]
+
+    tile_id = context.core_id
+    gid = _find_tile_group(tile_id, producer_set, groups_set, context.num_cores)
+
+    region = op.regions[0] if op.regions else []
+    bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
+    body = [o for o in region if o.op_type != "region.bb0_args"]
+    if bb0_op is not None:
+        names = bb0_op.attributes.get("names", [])
+        if names:
+            context.set_value(names[0], gid)
+
+    yielded = env.execute_region(context, body)
+    if isinstance(yielded, Tile):
+        yielded = (yielded,)
+    local_partial = tuple(yielded) if yielded is not None else None
+
+    return TileFuture(
+        partial_tensor_types=partial_types,
+        local_partial=local_partial,
+        producer_set=producer_set,
+        groups_set=groups_set,
+        group_idx=gid,
+    )
+
+
+@register_parser("ktdp.inter_tile_produce")
+def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
+    m = re.match(r'(%\w+)\s*=\s*ktdp\.inter_tile_produce\b', op_text)
+    if not m:
+        return None
+    result_name = m.group(1)
+
+    producer_set_str = extract_named_attr(
+        op_text, "producer_tiles_per_group", parse_ctx.aliases
+    )
+    if producer_set_str is None:
+        raise ValueError("ktdp.inter_tile_produce: missing producer_tiles_per_group")
+    groups_str = extract_named_attr(op_text, "groups", parse_ctx.aliases)
+    if groups_str is None:
+        raise ValueError("ktdp.inter_tile_produce: missing groups")
+
+    producer_set = parse_affine_set(producer_set_str)
+    groups_set = parse_affine_set(groups_str)
+
+    # Result type:  !ktdp.tile_future<T_p_1, ..., T_p_N>
+    fut_match = re.search(r'!ktdp\.tile_future<(.+)>', op_text)
+    if not fut_match:
+        raise ValueError(
+            "ktdp.inter_tile_produce: missing !ktdp.tile_future<...> result type"
+        )
+    inner = fut_match.group(1).strip()
+    # split_top_level handles commas inside nested tensor<...> brackets.
+    partial_types = tuple(p.strip() for p in split_top_level(inner))
+
+    return Operation(
+        result=result_name,
+        op_type="ktdp.inter_tile_produce",
+        operands=[],
+        attributes={
+            "producer_tiles_per_group": producer_set,
+            "groups": groups_set,
+            "partial_tensor_types": partial_types,
+        },
+        result_type=f"!ktdp.tile_future<{inner}>",
+    )
+
+
+# ---------------------------------------------------------------------------
+# ktdp.yield_partial / ktdp.yield_reduced — region terminators
+# ---------------------------------------------------------------------------
+
+@register("ktdp.yield_partial")
+def ktdp__yield_partial(op, context, env):
+    values = [context.get_value(name) for name in op.operands]
+    return values[0] if len(values) == 1 else tuple(values)
+
+
+@register("ktdp.yield_reduced")
+def ktdp__yield_reduced(op, context, env):
+    values = [context.get_value(name) for name in op.operands]
+    return values[0] if len(values) == 1 else tuple(values)
+
+
+def _parse_yield(op_text, op_name):
+    m = re.match(rf'{re.escape(op_name)}\s+(.*)', op_text)
+    if not m:
+        return None
+    rest = m.group(1)
+    # Strip trailing type annotation
+    if ':' in rest:
+        rest = rest[:rest.rindex(':')]
+    operands = find_ssa_names(rest)
+    return Operation(
+        result=None,
+        op_type=op_name,
+        operands=operands,
+        attributes={},
+        result_type=None,
+    )
+
+
+@register_parser("ktdp.yield_partial")
+def parse_yield_partial(op_text, parse_ctx: ParseContext):
+    return _parse_yield(op_text, "ktdp.yield_partial")
+
+
+@register_parser("ktdp.yield_reduced")
+def parse_yield_reduced(op_text, parse_ctx: ParseContext):
+    return _parse_yield(op_text, "ktdp.yield_reduced")
+
+
+# ---------------------------------------------------------------------------
+# ktdp.inter_tile_reduce
+# ---------------------------------------------------------------------------
+
+def _select_reduce_backend(plan: CommPlan, op_attrs):
+    """Pick a ``ReduceBackend`` for an ``inter_tile_reduce`` op.
+
+    Today: a single fixed strategy (``RingReduceBackend``).  When
+    other strategies (tree, point-to-point for sparse deps, …) land,
+    this dispatcher pattern-matches on ``plan`` shape and selects.
+    """
+    return RingReduceBackend()
+
+
+@register("ktdp.inter_tile_reduce", latency_category=LC.COMM)
+def ktdp__inter_tile_reduce(op, context, env):
+    """Build a ``CommPlan``, pick a backend, run it.
+
+    Every core in the workgroup runs this handler, even cores not in
+    ``consumer_tiles_per_group`` — the backend's ring spans the whole
+    workgroup; ``CommPlan`` masks contributions and outputs.  See
+    ``docs/cross_core_scheduling.md`` §"Inter-tile communication".
+
+    Steps:
+      1. Validate the ``%fut`` operand and resolve the ``identity``
+         operand to a Tile.
+      2. Build a ``CommPlan`` from the future's producer set (plus
+         this op's consumer set + optional dep set) at
+         ``ctx.num_cores``.
+      3. Build a ``reduce_fn`` from the combiner region
+         (``^bb0(%lhs, %rhs) → yield_reduced``).
+      4. Pick a backend and run it; ``attach_reshape`` collapses
+         ``T_p → T_r`` on the result tile.
+    """
+    fut = context.get_value(op.operands[0])
+    if not isinstance(fut, TileFuture):
+        raise TypeError(
+            f"ktdp.inter_tile_reduce: operand 0 must be a TileFuture, got {type(fut)}"
+        )
+
+    # Producers see local_partial; non-producers seed the ring with
+    # the identity tensor instead.  ``RingReduceBackend.run`` does the
+    # mask check via ``plan.is_producer``.
+    local_tile = fut.local_partial[0] if fut.local_partial else None
+    identity = context.get_value(op.operands[1])
+
+    # Build the logical plan.
+    plan = CommPlan.for_reduce(
+        producer_set=fut.producer_set,
+        consumer_set=op.attributes["consumer_tiles_per_group"],
+        group_idx=fut.group_idx,
+        num_cores=context.num_cores,
+        dep_set=op.attributes.get("producer_dependency_per_consumer"),
+    )
+
+    # Build reduce_fn from the combiner region.
+    region = op.regions[0] if op.regions else []
+    bb0_op = next((o for o in region if o.op_type == "region.bb0_args"), None)
+    body = [o for o in region if o.op_type != "region.bb0_args"]
+    if bb0_op is None:
+        raise ValueError("ktdp.inter_tile_reduce: combiner region missing ^bb0 args")
+    bb0_names = bb0_op.attributes.get("names", [])
+    if len(bb0_names) < 2:
+        raise ValueError(
+            f"ktdp.inter_tile_reduce: combiner region needs >=2 block args "
+            f"(lhs, rhs), got {bb0_names}"
+        )
+    lhs_name, rhs_name = bb0_names[0], bb0_names[1]
+
+    def reduce_fn(t1: Tile, t2: Tile) -> Tile:
+        context.push_scope()
+        context.set_value(lhs_name, t1)
+        context.set_value(rhs_name, t2)
+        result = env.execute_region(context, body)
+        context.pop_scope()
+        if not isinstance(result, Tile):
+            raise TypeError(
+                f"ktdp.inter_tile_reduce: combiner did not yield a Tile, got {type(result)}"
+            )
+        return result
+
+    backend = _select_reduce_backend(plan, op.attributes)
+    target_shape = op.attributes.get("_result_shape")
+    raw = backend.run(context, local_tile, plan, reduce_fn, identity)
+    return attach_reshape(raw, target_shape)
+
+
+@register_parser("ktdp.inter_tile_reduce")
+def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext):
+    m = re.match(
+        r'(%\w+)\s*=\s*ktdp\.inter_tile_reduce\s*\(\s*(%\w+)\s*\)',
+        op_text,
+    )
+    if not m:
+        return None
+    result_name = m.group(1)
+    fut_operand = m.group(2)
+
+    consumer_set_str = extract_named_attr(
+        op_text, "consumer_tiles_per_group", parse_ctx.aliases
+    )
+    if consumer_set_str is None:
+        raise ValueError("ktdp.inter_tile_reduce: missing consumer_tiles_per_group")
+    consumer_set = parse_affine_set(consumer_set_str)
+
+    groups_str = extract_named_attr(op_text, "groups", parse_ctx.aliases)
+    if groups_str is None:
+        raise ValueError("ktdp.inter_tile_reduce: missing groups")
+    groups_set = parse_affine_set(groups_str)
+
+    pdpc_str = extract_named_attr(
+        op_text, "producer_dependency_per_consumer", parse_ctx.aliases
+    )
+    pdpc = parse_affine_set(pdpc_str) if pdpc_str is not None else None
+
+    # identity(%add_id : T_p_1, ...): SSA operands hoisted before the op.
+    id_match = re.search(r'identity\s*\(([^)]*)\)', op_text)
+    identity_operands = []
+    if id_match:
+        for part in split_top_level(id_match.group(1)):
+            for name in find_ssa_names(part):
+                identity_operands.append(name)
+
+    # Result type: T_r (after collapsing within-group tile axes).
+    arrow_match = re.search(r'->\s*(.+?)\s*\{?\s*$', op_text)
+    result_type = arrow_match.group(1).strip() if arrow_match else None
+    result_shape = None
+    if result_type is not None:
+        parsed = parse_tensor_type(result_type)
+        if parsed is not None:
+            result_shape = parsed["shape"]
+
+    attributes = {
+        "consumer_tiles_per_group": consumer_set,
+        "groups": groups_set,
+    }
+    if pdpc is not None:
+        attributes["producer_dependency_per_consumer"] = pdpc
+    if result_shape is not None:
+        attributes["_result_shape"] = result_shape
+
+    operands = [fut_operand] + identity_operands
+
+    return Operation(
+        result=result_name,
+        op_type="ktdp.inter_tile_reduce",
+        operands=operands,
+        attributes=attributes,
+        result_type=result_type,
+    )

@@ -286,13 +286,31 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
     "ring_reduce": [
         {
             "path": "ktir/ring_reduce.mlir",
-            # 4-core ring reduce: ktdp.reduce (reduce_to_core<0>, sum, grid_axis<0>)
-            # grid = [4, 1, 1] → 4 cores; n_cols = 128 (from construct_memory_view sizes)
-            # HBM layout: in_ptr=0 (4×128×2=1024 bytes), out_ptr=1024 (128×2=256 bytes)
-            # xfail: parser support for #ktdp.reduce_kind / reduce_mode / grid_axis
-            # attributes not yet upstream (torch-spyre/ktir-mlir-frontend#21).
-            "execute_kwargs": {"in_ptr": 0, "out_ptr": 1024},
+            # 4-core all-reduce sum via ktdp.inter_tile_produce +
+            # ktdp.inter_tile_reduce; only core 0 writes back.
+            # grid = [4, 1, 1] → 4 cores; n_cols = 128 (from construct_memory_view sizes).
+            # HBM stick layout (1 stick = 128 bytes = 64 f16):
+            #   sticks [0..7]  → 4 input rows × 2 sticks each (1024 bytes total)
+            #   sticks [8..9]  → 1 output row × 2 sticks (256 bytes)
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 8},
             "n_cols": 128,
+        },
+    ],
+    "ring_reduce_multi_group": [
+        {
+            "path": "latency/ring_reduce_multi_group.mlir",
+            # 16-core workgroup partitioned into 4 groups of 4; each
+            # group does an in-group all-reduce; the first core of
+            # each group (pid % 4 == 0) writes back to a per-group
+            # output row.
+            # grid = [16, 1, 1] → 16 cores; n_cols = 128.
+            # HBM stick layout:
+            #   sticks [0..31]  → 16 input rows × 2 sticks each (4096 bytes)
+            #   sticks [32..39] → 4 output rows × 2 sticks each (1024 bytes)
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 32},
+            "n_cols": 128,
+            "n_groups": 4,
+            "group_size": 4,
         },
     ],
 }

@@ -331,6 +331,10 @@ def arith__constant(op, context, env):
         shape = op.attributes["shape"]
         dtype_str = op.attributes.get("dtype", "f16")
         np_dtype = to_np_dtype(dtype_str)
+        # dense<[v0, v1, ...]> list form: each element is distinct, so
+        # build the array element-by-element rather than splatting one value.
+        if op.attributes.get("dense_list"):
+            return Tile(np.array(value, dtype=np_dtype).reshape(shape), dtype_str, shape)
         return Tile(np.full(shape, value, dtype=np_dtype), dtype_str, shape)
     return value
 
@@ -450,7 +454,7 @@ def arith__select(op, context, env):
 
 @register_parser("arith.constant")
 def parse_arith_constant(op_text, parse_ctx):
-    from ..parser_utils import parse_numeric, parse_tensor_type
+    from ..parser_utils import parse_numeric, parse_tensor_type, parse_dense_payload
 
     result_match = re.match(r'(%\w+)\s*=\s*arith\.constant\s*(.*)', op_text)
     if not result_match:
@@ -459,7 +463,6 @@ def parse_arith_constant(op_text, parse_ctx):
     result_name = result_match.group(1)
     rest = result_match.group(2).strip()
 
-    value = None
     result_type = None
     attributes = {}
 
@@ -474,34 +477,44 @@ def parse_arith_constant(op_text, parse_ctx):
     # All forms pass dtype to parse_numeric so hex literals are correctly
     # interpreted as IEEE 754 bit patterns for float types.
 
+    def _set_dense(payload, elem_dtype):
+        # Handles both forms inside dense<...>: splat scalar and [v0, v1, ...] list.
+        value, is_list = parse_dense_payload(payload, elem_dtype)
+        attributes["value"] = value
+        if is_list:
+            attributes["dense_list"] = True
+
+    def _set_tensor_attrs(type_info, type_str):
+        # Used by Form 1 (braced) and Form 2 (dense) only — scalar Form 3
+        # has no tensor result type so these attributes are not set there.
+        if type_info and "tensor<" in type_str:
+            attributes["shape"] = type_info["shape"]
+            attributes["dtype"] = type_info.get("dtype", "f16")
+            attributes["is_tensor"] = True
+
     braced_match = re.match(r'\{([^}]+)\}\s*:\s*(.+)$', rest)
     if braced_match:
         # Form 1: {inner} : result_type
         inner = braced_match.group(1).strip()
         result_type = braced_match.group(2).strip()
 
-        # Resolve element dtype from result_type (could be "f32" or "tensor<4xf32>")
         _type_info = parse_tensor_type(result_type)
         elem_dtype = _type_info.get("dtype") if _type_info else result_type
 
         dense_match = re.match(r'dense<([^>]+)>', inner)
         if dense_match:
-            value = parse_numeric(dense_match.group(1), dtype=elem_dtype)
+            _set_dense(dense_match.group(1), elem_dtype)
         else:
             typed_val = re.match(r'(.+?)\s*:\s*\S+', inner)
-            if typed_val:
-                value = parse_numeric(typed_val.group(1).strip(), dtype=elem_dtype)
-            else:
-                value = parse_numeric(inner, dtype=elem_dtype)
+            raw = typed_val.group(1).strip() if typed_val else inner
+            attributes["value"] = parse_numeric(raw, dtype=elem_dtype)
 
-        if _type_info and 'tensor<' in result_type:
-            attributes["shape"] = _type_info["shape"]
-            attributes["dtype"] = _type_info.get("dtype", "f16")
-            attributes["is_tensor"] = True
+        _set_tensor_attrs(_type_info, result_type)
     else:
         # Form 2: dense<value> : type.  Covers:
         #   dense<0.0> : tensor<4xf16>       (splat tensor constant)
         #   dense<42> : tensor<1xi32>         (scalar tensor constant)
+        #   dense<[16, 32]> : tensor<2xindex> (list — one value per element)
         dense_match = re.match(r'dense<([^>]+)>\s*:\s*(.+)$', rest)
         # Form 3: scalar value : type.  Covers:
         #   42 : index              (decimal integer)
@@ -514,33 +527,22 @@ def parse_arith_constant(op_text, parse_ctx):
             result_type = dense_match.group(2).strip()
             type_info = parse_tensor_type(result_type)
             elem_dtype = type_info.get("dtype") if type_info else None
-            value = parse_numeric(dense_match.group(1), dtype=elem_dtype)
-            attributes["shape"] = type_info["shape"]
-            attributes["dtype"] = type_info["dtype"]
-            attributes["is_tensor"] = True
+            _set_dense(dense_match.group(1), elem_dtype)
+            _set_tensor_attrs(type_info, result_type)
         elif simple_match:
             result_type = simple_match.group(2).strip()
-            value = parse_numeric(simple_match.group(1), dtype=result_type)
+            attributes["value"] = parse_numeric(simple_match.group(1), dtype=result_type)
         else:
             # Defensive fallback: type-only with no parseable value — defaults to 0.
             # No known MLIR examples hit this path; kept for robustness.
             #   : tensor<1x64xf16>     (zero-initialized tensor)
             #   : index                (zero scalar)
-
             type_only_match = re.match(r':\s*(.+)$', rest)
             if type_only_match:
                 result_type = type_only_match.group(1).strip()
-                if result_type and 'tensor<' in result_type:
-                    type_info = parse_tensor_type(result_type)
-                    if type_info:
-                        attributes["shape"] = type_info["shape"]
-                        attributes["dtype"] = type_info.get("dtype", "f16")
-                        attributes["is_tensor"] = True
-
-    if value is None:
-        value = 0
-
-    attributes["value"] = value
+                type_info = parse_tensor_type(result_type) if result_type and "tensor<" in result_type else None
+                _set_tensor_attrs(type_info, result_type or "")
+            attributes.setdefault("value", 0)
 
     return Operation(
         result=result_name,

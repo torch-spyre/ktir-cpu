@@ -80,9 +80,6 @@ def _return_alias(op, context, env):
     return func__return(op, context, env)
 
 
-# ktdp.transfer / ktdp.reduce moved to ktdp_ops.py (alongside other ktdp.* ops).
-
-
 # ---------------------------------------------------------------------------
 # Parsers
 # ---------------------------------------------------------------------------

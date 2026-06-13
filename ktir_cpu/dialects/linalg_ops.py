@@ -219,6 +219,22 @@ def linalg__reduce(op, context, env):
     return result
 
 
+@register("linalg.add", latency_category=LC.COMPUTE_FLOAT)
+def linalg__add(op, context, env):
+    """Elementwise tensor add — ``%c = linalg.add ins(%a, %b) outs(%init)``.
+
+    Standard MLIR named op: result = a + b (the outs buffer provides the
+    destination shape only; its values are not accumulated into in v1).
+    """
+    tile_a = context.get_value(op.operands[0])
+    tile_b = context.get_value(op.operands[1])
+    if not isinstance(tile_a, Tile) or not isinstance(tile_b, Tile):
+        raise TypeError(
+            f"linalg.add: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
+        )
+    return Tile(tile_a.data + tile_b.data, tile_a.dtype, tile_a.shape)
+
+
 @register("linalg.fill")
 def linalg__fill(op, context, env):
     """Fill a tensor with a scalar value."""

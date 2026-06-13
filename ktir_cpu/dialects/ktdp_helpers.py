@@ -13,20 +13,27 @@
 # limitations under the License.
 
 """
-KTDP subscript-expression helpers.
-
-These functions parse and evaluate subscript descriptors used by
-``construct_indirect_access_tile`` and ``load``/``store``.  They live in
-this separate module (rather than in ``ktdp_ops`` or ``affine``) to avoid
-circular imports: ``ktdp_ops`` imports ``MemoryOps`` from
-``ops/memory_ops``, which in turn needs ``eval_subscript_expr``.
+KTDP dialect helpers.
 
 Functions
 ---------
-parse_subscript_expr  — parse one subscript token into an AST tuple
-eval_subscript_expr   — evaluate a subscript tuple against a variable point
-_classify_refs        — post-process ("ref", ...) nodes from the text-parser path
-_reclassify_dims      — post-process ("dim", N) nodes from the MLIR-frontend-parser path
+Subscript-expression helpers — parse and evaluate subscript
+descriptors used by ``construct_indirect_access_tile`` and
+``load``/``store``.  They live in this module (rather than in
+``ktdp_ops`` or ``affine``) to avoid circular imports: ``ktdp_ops``
+imports ``MemoryOps`` from ``ops/memory_ops``, which in turn needs
+``eval_subscript_expr``.
+
+  parse_subscript_expr  — parse one subscript token into an AST tuple
+  eval_subscript_expr   — evaluate a subscript tuple against a variable point
+  _classify_refs        — post-process ``("ref", ...)`` nodes (text parser path)
+  _reclassify_dims      — post-process ``("dim", N)`` nodes (frontend path)
+
+Region- and post-processing helpers — small utilities used by
+region-bearing inter-tile op handlers.
+
+  reshape_tile_to_target  — collapse a tile to its declared ``T_r`` shape
+  attach_reshape          — drive a backend generator and reshape its return
 """
 
 from __future__ import annotations
@@ -156,3 +163,63 @@ def eval_subscript_expr(expr: tuple, pt: tuple) -> int:
     if expr[0] == "mod":
         return pt[expr[1]] % expr[2]
     return _eval_node(expr, list(pt))
+
+
+# ---------------------------------------------------------------------------
+# Region / post-processing helpers
+# ---------------------------------------------------------------------------
+
+
+def reshape_tile_to_target(reduced, target_shape):
+    """Reshape a ``Tile`` to ``target_shape``, validating element count.
+
+    Returns ``reduced`` unchanged when ``target_shape`` is ``None`` or
+    already matches.  Used by inter-tile reduce to collapse the
+    within-group tile axis (``T_p → T_r``) on the post-ring tile.
+
+    Raises:
+        TypeError: if ``reduced`` is not a ``Tile`` (the backend's
+            return contract is violated).
+        ValueError: if reshape is requested but element counts differ.
+    """
+    from ..ir_types import Tile
+    if not isinstance(reduced, Tile):
+        raise TypeError(
+            f"reshape_tile_to_target: expected Tile, got {type(reduced).__name__}"
+        )
+    if target_shape is None or reduced.shape == tuple(target_shape):
+        return reduced
+    from numpy import prod
+    if int(prod(reduced.shape)) != int(prod(target_shape)):
+        raise ValueError(
+            f"reshape_tile_to_target: result shape {reduced.shape} and "
+            f"declared shape {target_shape} have different element counts"
+        )
+    new_tile = Tile(
+        reduced.data.reshape(target_shape),
+        reduced.dtype,
+        tuple(target_shape),
+        unique_sticks=reduced.unique_sticks,
+        index_unique_sticks=reduced.index_unique_sticks,
+    )
+    # Tile() doesn't construct comm_bytes (mirrors how copy() leaves
+    # it None for produced-from-data copies).  Reshape is a structural
+    # rewrite of an already-comm-stamped tile, so propagate explicitly.
+    new_tile.comm_bytes = reduced.comm_bytes
+    return new_tile
+
+
+def attach_reshape(gen, target_shape):
+    """Drive ``gen`` to completion and reshape its return value.
+
+    Returns a generator that proxies every ``yield`` from ``gen`` and
+    post-processes the return through :func:`reshape_tile_to_target`.
+    The handler that wants its backend's output reshaped writes::
+
+        return attach_reshape(backend.run(...), target_shape)
+
+    instead of an inline ``def _gen(): reduced = yield from ...``
+    closure.
+    """
+    reduced = yield from gen
+    return reshape_tile_to_target(reduced, target_shape)
