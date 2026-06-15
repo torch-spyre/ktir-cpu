@@ -1434,6 +1434,7 @@ class TestKtdp:
 
     def test_load_store_roundtrip(self):
         # load reads data from HBM; store writes it back modified
+        from ktir_cpu.affine import BoxSet
         from ktir_cpu.ir_types import AccessTile, MemRef
         from ktir_cpu.parser_ast import parse_affine_map
 
@@ -1450,7 +1451,7 @@ class TestKtdp:
         tile_ref = memref.to_tile_ref()
         access_tile = AccessTile(parent_ref=tile_ref, shape=(8,),
                                  base_map=identity_map,
-                                 coordinate_set=None,
+                                 coordinate_set=BoxSet(lo=(0,), hi=(8,)),
                                  coordinate_order=None)
         ctx.set_value("%acc", access_tile)
         env = _make_env()
