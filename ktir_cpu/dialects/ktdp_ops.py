@@ -148,6 +148,19 @@ def _resolve_dynamic_dist_shape(
     ``coordinate_set`` to be a fully-resolved ``BoxSet``;
     ``construct_memory_view`` specialises symbolic ``BoxSet`` partitions
     against runtime symbols before they reach this point.
+
+    Scope cut — ``AffineSet`` partitions are intentionally rejected on this
+    path only.  ``construct_distributed_memory_view`` itself accepts
+    ``AffineSet`` partitions in the concrete-shape path: they are stored
+    in ``DistributedMemRef`` and dispatched at access time via
+    ``find_partition`` / ``.contains()`` exactly like ``BoxSet``.  The
+    rejection here is specific to dynamic-shape *resolution*: the
+    ``max(upper_bounds)`` strategy only recovers the true extent for
+    axis-aligned ``BoxSet`` partitions; on a non-axis-aligned constraint
+    set the bounding-box upper bound over-approximates.  Concrete-shape
+    callers are unaffected.  Lifting this would require a different
+    resolution strategy (e.g. enumerating the set or computing
+    ``global_extent()`` per axis).
     """
     if not any(s is None for s in raw_shape):
         return tuple(raw_shape)  # type: ignore[arg-type]
@@ -167,9 +180,13 @@ def _resolve_dynamic_dist_shape(
         if not isinstance(cs, BoxSet):
             raise ValueError(
                 f"construct_distributed_memory_view: dynamic-shape result "
-                f"requires axis-aligned BoxSet partitions; partition {i} is "
-                f"{type(cs).__name__}, whose union extent is not recoverable "
-                f"by max(upper_bounds) on a non-axis-aligned constraint set"
+                f"resolution does not support {type(cs).__name__} "
+                f"partitions (partition {i} on this op).  This is a "
+                f"limitation of the dynamic-shape path only — the "
+                f"concrete-shape path of construct_distributed_memory_view "
+                f"accepts AffineSet partitions normally (they dispatch via "
+                f"find_partition at access time).  Declare the result "
+                f"memref with concrete dims to use this partition."
             )
         assert cs.is_concrete, (
             f"construct_distributed_memory_view: partition {i} coordinate_set "

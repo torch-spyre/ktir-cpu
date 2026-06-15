@@ -1534,7 +1534,10 @@ class TestKtdp:
             memory_space="HBM", dtype="f16",
             coordinate_set=affine_cs,
         ))
-        with pytest.raises(ValueError, match=r"axis-aligned BoxSet partitions"):
+        with pytest.raises(
+            ValueError,
+            match=r"dynamic-shape result resolution does not support AffineSet partitions",
+        ):
             _call(
                 "ktdp.construct_distributed_memory_view", ctx, _make_env(),
                 operands=["%a0", "%a1"],
