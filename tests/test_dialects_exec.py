@@ -963,15 +963,16 @@ class TestLinalg:
         assert np.allclose(result.data, b.data, rtol=1e-2)
 
     def test_batch_matmul(self):
-        # batched identity: for each batch, I @ B == B
-        eye = np.broadcast_to(np.eye(2, dtype=np.float16), (3, 2, 2)).copy()
-        bdata = np.arange(3 * 2 * 2, dtype=np.float16).reshape(3, 2, 2)
-        a = Tile(eye, "f16", (3, 2, 2))
+        # non-identity A so index transposition bugs would produce wrong values
+        adata = np.array([[[1, 2], [3, 4]], [[2, 0], [1, 3]], [[1, 1], [0, 2]]], dtype=np.float16)
+        bdata = np.array([[[5, 6], [7, 8]], [[1, 2], [3, 4]], [[2, 3], [1, 0]]], dtype=np.float16)
+        expected = np.einsum("bij,bjk->bik", adata, bdata).astype(np.float16)
+        a = Tile(adata, "f16", (3, 2, 2))
         b = Tile(bdata, "f16", (3, 2, 2))
         ctx = _ctx_with(**{"%a": a, "%b": b})
         result = _call("linalg.batch_matmul", ctx, _make_env(), operands=["%a", "%b"])
         assert result.shape == (3, 2, 2)
-        assert np.allclose(result.data, bdata, rtol=1e-2)
+        assert np.allclose(result.data, expected, rtol=1e-2)
 
     def test_generic_reads_outs_arg(self):
         # linalg.generic where the body reads the outs bb0 arg.
