@@ -40,26 +40,33 @@ def _tile_binop(fn, val1, val2, *, scalar_cast):
     if isinstance(val2, Tile):
         r = fn(scalar_cast(val1), val2.data)
         return Tile(r, val2.dtype, r.shape)
-    return fn(scalar_cast(val1), scalar_cast(val2))
+    return scalar_cast(fn(scalar_cast(val1), scalar_cast(val2)))
 
 
 tile_binop_int = partial(_tile_binop, scalar_cast=int)
-tile_binop_float = partial(_tile_binop, scalar_cast=float)
+tile_binop_float = partial(_tile_binop, scalar_cast=lambda x: x)
 
 
-def _tile_unary(fn, val, *, scalar_cast):
-    """Generic unary dispatch for Tile or scalar.
+def tile_unary_float(fn, val):
+    """Apply a float unary fn to a Tile or scalar.
 
-    For Tiles: casts to float32, applies fn, casts back to the tile's
-    original dtype, and wraps in a new Tile. For scalars: casts via
-    scalar_cast, applies fn, and returns a value of the same type as
-    the input.
+    Tiles: apply fn directly on the tile's data, preserving its dtype.
+    Scalars: apply fn; preserve numpy float types, coerce plain int to float.
     """
     if isinstance(val, Tile):
-        data = fn(val.data.astype(np.float32)).astype(val.data.dtype)
+        data = fn(val.data).astype(val.data.dtype)
         return Tile(data, val.dtype, data.shape)
-    return type(val)(fn(scalar_cast(val)))
+    cast = type(val) if isinstance(val, (float, np.floating)) else float
+    return cast(fn(val))
 
 
-tile_unary_float = partial(_tile_unary, scalar_cast=float)
-tile_unary_int = partial(_tile_unary, scalar_cast=int)
+def tile_unary_int(fn, val):
+    """Apply an integer unary fn to a Tile or scalar.
+
+    Tiles: apply fn directly on the integer data (no float cast).
+    Scalars: cast to int, apply fn, return same type as input.
+    """
+    if isinstance(val, Tile):
+        data = fn(val.data)
+        return Tile(data, val.dtype, data.shape)
+    return type(val)(fn(int(val)))

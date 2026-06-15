@@ -85,6 +85,8 @@ class MathOps:
     @staticmethod
     def absf(val):
         """Element-wise absolute value (float)."""
+        # Intentionally not using tile_unary_float: np.abs works on any dtype
+        # directly, so the float32 round-trip would be lossy without benefit.
         if isinstance(val, Tile):
             return Tile(np.abs(val.data), val.dtype, val.shape)
         return type(val)(abs(float(val)))

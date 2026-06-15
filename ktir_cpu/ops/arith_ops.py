@@ -28,6 +28,12 @@ from ..dtypes import _REVERSE_MAP, to_np_dtype
 from ._helpers import tile_binop_int
 
 
+def _ceildiv(a, b):
+    # np.ceil(a/b) for arrays; math.ceil for scalars.
+    result = np.ceil(a / b)
+    return result.astype(a.dtype) if isinstance(a, np.ndarray) else math.ceil(result)
+
+
 def arith_cast(value, target_np_dtype, expect_floating, op_name):
     """Shared implementation for arith dialect type-conversion ops.
 
@@ -428,9 +434,6 @@ class ArithOps:
     @staticmethod
     def ceildivsi(val1, val2):
         """Signed integer ceiling division."""
-        def _ceildiv(a, b):
-            result = np.ceil(a / b)
-            return result.astype(a.dtype) if isinstance(a, np.ndarray) else math.ceil(result)
         return tile_binop_int(_ceildiv, val1, val2)
 
     @staticmethod
@@ -471,8 +474,8 @@ class ArithOps:
         if isinstance(val1, Tile):
             return Tile(val1.data.view(np.uint32) >> int(val2), val1.dtype, val1.shape)
         if isinstance(val2, Tile):
-            return Tile(np.uint32(val1) >> val2.data, val2.dtype, val2.shape)
-        return int(np.uint32(val1) >> np.uint32(val2))
+            return Tile(np.array(val1, dtype=np.int32).view(np.uint32) >> val2.data, val2.dtype, val2.shape)
+        return int(np.array(val1, dtype=np.int32).view(np.uint32) >> np.uint32(val2))
 
     @staticmethod
     def minsi(val1, val2):
@@ -497,9 +500,6 @@ class ArithOps:
     @staticmethod
     def ceildivui(val1, val2):
         """Unsigned integer ceiling division."""
-        def _ceildiv(a, b):
-            result = np.ceil(a / b)
-            return result.astype(a.dtype) if isinstance(a, np.ndarray) else math.ceil(result)
         return tile_binop_int(_ceildiv, val1, val2)
 
     @staticmethod

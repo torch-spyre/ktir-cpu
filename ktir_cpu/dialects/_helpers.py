@@ -83,6 +83,17 @@ def _unary(op, context, fn, scalar_fn=None):
     return (scalar_fn or fn)(val)
 
 
+def _binop_via_op(op, context, fn):
+    """Fetch two operands and call fn(a, b) directly.
+
+    Use when *fn* is an ops-layer callable (e.g. ArithOps.minsi) that
+    already handles Tile/scalar dispatch internally.
+    """
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return fn(a, b)
+
+
 def unwrap_yield(result):
     """Unwrap a _YieldResult sentinel produced by scf.yield / linalg.yield.
 
