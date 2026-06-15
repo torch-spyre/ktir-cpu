@@ -852,3 +852,95 @@ def test_non_permutation_vso_raises(mlir_factory, func_name):
 
     with pytest.raises(ValueError, match="must permute its input dimensions"):
         interp.execute_function(func_name)
+
+
+# ---------------------------------------------------------------------------
+# parse_subscript_expr / eval_subscript_expr — unit tests
+# ---------------------------------------------------------------------------
+
+class TestSubscriptExpr:
+    """Unit tests for parse_subscript_expr and eval_subscript_expr.
+
+    These exercise the helpers in isolation, independent of any MLIR module.
+    var_names mirrors the intermediate_variables list; SSA refs are pre-resolved
+    to ("const", v) before eval (as _resolve_node does at construct time).
+    """
+
+    from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+
+    # --- single variable ---
+
+    def test_bare_dim(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        expr = parse_subscript_expr("%d0", ["d0", "d1"])
+        assert expr == ("dim", 0)
+        assert eval_subscript_expr(expr, (3, 7)) == 3
+
+    # --- floordiv ---
+
+    def test_floordiv_single_var(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        expr = parse_subscript_expr("%d0 floordiv 4", ["d0"])
+        assert expr == ("floordiv", ("dim", 0), 4)
+        assert eval_subscript_expr(expr, (8,)) == 2
+        assert eval_subscript_expr(expr, (7,)) == 1
+
+    def test_mod_single_var(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        expr = parse_subscript_expr("%d0 mod 64", ["d0"])
+        assert expr == ("mod", ("dim", 0), 64)
+        assert eval_subscript_expr(expr, (65,)) == 1
+        assert eval_subscript_expr(expr, (64,)) == 0
+
+    # --- compound LHS with SSA ref (pre-resolved to const) ---
+
+    def test_compound_floordiv_with_ssa(self):
+        # (%y_offset + %d_stick * 64 + %d_lane) floordiv 64
+        # y_offset is an outer SSA value; d_stick, d_lane are iteration vars.
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        var_names = ["d_stick", "d_lane"]
+        expr = parse_subscript_expr(
+            "(%y_offset + %d_stick * 64 + %d_lane) floordiv 64",
+            var_names,
+        )
+        # Pre-resolve %y_offset to ("const", 32) as _resolve_node would.
+        def resolve(node):
+            if node[0] == "ssa":
+                return ("const", 32)
+            if node[0] in ("add", "sub"):
+                return (node[0], resolve(node[1]), resolve(node[2]))
+            if node[0] == "mul":
+                return (node[0], node[1], resolve(node[2]))
+            if node[0] == "floordiv":
+                return (node[0], resolve(node[1]), node[2])
+            return node
+        expr = resolve(expr)
+        # (32 + d_stick*64 + d_lane) floordiv 64
+        assert eval_subscript_expr(expr, (0, 0))  == 0   # (32+0+0)//64 == 0
+        assert eval_subscript_expr(expr, (0, 32)) == 1   # (32+0+32)//64 == 1
+        assert eval_subscript_expr(expr, (1, 0))  == 1   # (32+64+0)//64 == 1
+        assert eval_subscript_expr(expr, (1, 32)) == 2   # (32+64+32)//64 == 2
+
+    def test_compound_mod_with_ssa(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        var_names = ["d_stick", "d_lane"]
+        expr = parse_subscript_expr(
+            "(%y_offset + %d_stick * 64 + %d_lane) mod 64",
+            var_names,
+        )
+        def resolve(node):
+            if node[0] == "ssa":
+                return ("const", 32)
+            if node[0] in ("add", "sub"):
+                return (node[0], resolve(node[1]), resolve(node[2]))
+            if node[0] == "mul":
+                return (node[0], node[1], resolve(node[2]))
+            if node[0] == "mod":
+                return (node[0], resolve(node[1]), node[2])
+            return node
+        expr = resolve(expr)
+        # (32 + d_stick*64 + d_lane) mod 64
+        assert eval_subscript_expr(expr, (0, 0))  == 32  # (32+0+0) % 64
+        assert eval_subscript_expr(expr, (0, 32)) == 0   # (32+0+32) % 64
+        assert eval_subscript_expr(expr, (1, 0))  == 32  # (32+64+0) % 64
+        assert eval_subscript_expr(expr, (1, 31)) == 63  # (32+64+31) % 64
