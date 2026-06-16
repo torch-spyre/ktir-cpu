@@ -318,6 +318,42 @@ class TestRoofline:
         for unit in rf["units"].values():
             assert unit["achieved_gflops"] <= unit["ceiling_gflops"]
 
+        # Chip-level fields (peak-based, Nsight SOL analogue).
+        assert "cores_used" in rf
+        assert "num_cores" in rf
+        assert "compute_utilization" in rf
+        assert rf["cores_used"] >= 1
+        assert rf["num_cores"] == report.config.num_cores
+        # Note: compute_utilization > 1.0 is possible if the kernel grid
+        # oversubscribes the modelled core count (e.g. running a 64-core
+        # kernel against HardwareConfig(num_cores=32)).
+        assert rf["compute_utilization"] > 0
+        for unit in rf["units"].values():
+            assert unit["peak_gflops"] > 0
+            assert unit["chip_peak_gflops"] == pytest.approx(
+                unit["peak_gflops"] * rf["num_cores"]
+            )
+            assert unit["chip_throughput"] >= 0
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
+    def test_chip_throughput_identity(self, path, func_name, entry):
+        """chip_throughput == compute_utilization × (achieved / peak).
+
+        Independent peak-based identity: avoids ``efficiency`` (which is
+        ceiling-based and diverges from peak in the memory-bound regime).
+        """
+        report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
+        rf = report.roofline()
+
+        for unit_name, unit in rf["units"].items():
+            expected = (rf["compute_utilization"]
+                        * unit["achieved_gflops"]
+                        / unit["peak_gflops"])
+            assert unit["chip_throughput"] == pytest.approx(expected, abs=1e-9), (
+                f"chip_throughput identity broken for unit {unit_name!r}: "
+                f"got {unit['chip_throughput']}, expected {expected}"
+            )
+
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_vector_add_is_memory_bound(self, path, func_name, entry):
         """vector_add has low arithmetic intensity → memory-bound on roofline."""

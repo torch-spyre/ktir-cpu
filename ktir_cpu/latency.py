@@ -501,8 +501,36 @@ class LatencyReport:
             peak_bw_gb_s: Per-core HBM bandwidth in GB/s.
             dominant_unit: ``"systolic"`` or ``"simd"`` (most FLOPs).
             efficiency: achieved / ceiling for the dominant unit (0..1).
+            cores_used: number of cores that produced counter entries.
+            num_cores: chip-wide hardware core count from ``HardwareConfig``.
+            compute_utilization: ``cores_used / num_cores`` — Nsight
+                Compute "SM Active %" analogue (resource coverage only,
+                does not reflect per-core throughput).
             units: per-unit dict, each with:
-                achieved_gflops, ceiling_gflops, ridge_point, efficiency.
+                achieved_gflops, ceiling_gflops, ridge_point, efficiency,
+                peak_gflops, chip_peak_gflops, chip_throughput.
+
+        Per-unit chip-level fields (peak-based, Nsight SOL analogue):
+            peak_gflops: per-core flat hardware peak (independent of AI).
+            chip_peak_gflops: ``peak_gflops × num_cores`` — chip-wide flat
+                peak. Distinct from ``ceiling_gflops`` which is the
+                roofline ceiling at this kernel's AI.
+            chip_throughput: ``achieved × cores_used / (peak × num_cores)``
+                — Nsight "Compute (SM) Throughput %" analogue. Folds idle
+                cores into the denominator. Identity::
+
+                    chip_throughput = compute_utilization
+                                      × (achieved_gflops / peak_gflops)
+
+                This uses ``peak_gflops`` (flat peak), not the existing
+                ``efficiency`` field which is normalised by ceiling at AI
+                — the two differ in the memory-bound regime.
+
+                Assumes equal disjoint work across active cores
+                (``critical = max(counters)`` represents the bound for
+                all). Holds for current anchor kernels with divisible
+                tiling; becomes an upper bound under split-K or uneven
+                tiles.
         """
         if not self.counters:
             return {}
@@ -514,6 +542,10 @@ class LatencyReport:
 
         ai = (critical.total_flops / critical.total_bytes
               if critical.total_bytes > 0 else float('inf'))
+
+        cores_used = len(self.counters)
+        num_cores = self.config.num_cores
+        compute_utilization = cores_used / num_cores if num_cores > 0 else 0.0
 
         # Per-unit hardware ceilings (hardware constants, not kernel-derived).
         unit_ceilings = {
@@ -535,11 +567,17 @@ class LatencyReport:
             achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
             # Roofline ceiling at this kernel's AI for this unit.
             ceiling = min(peak, peak_bw * ai)
+            chip_peak = peak * num_cores
+            chip_throughput = (achieved * cores_used / chip_peak
+                               if chip_peak > 0 else 0.0)
             units[unit_name] = {
                 "achieved_gflops": achieved / 1e9,
                 "ceiling_gflops": ceiling / 1e9,
                 "ridge_point": peak / peak_bw,
                 "efficiency": achieved / ceiling if ceiling > 0 else 0.0,
+                "peak_gflops": peak / 1e9,
+                "chip_peak_gflops": chip_peak / 1e9,
+                "chip_throughput": chip_throughput,
             }
 
         # Dominant unit = most FLOPs. Fall back to "simd" when no compute.
@@ -556,6 +594,9 @@ class LatencyReport:
             "peak_bw_gb_s": peak_bw / 1e9,
             "dominant_unit": dominant,
             "efficiency": units[dominant]["efficiency"],
+            "cores_used": cores_used,
+            "num_cores": num_cores,
+            "compute_utilization": compute_utilization,
             "units": units,
         }
 
@@ -599,13 +640,30 @@ class LatencyReport:
             lines.append("-" * 60)
             ai = rf["arithmetic_intensity"]
             ai_str = f"{ai:.2f} FLOP/B" if ai != float('inf') else "inf (no memory traffic)"
+            dom_unit = rf["units"][rf["dominant_unit"]]
             lines.append(f"  Arithmetic intensity : {ai_str}")
             lines.append(f"  Peak bandwidth       : {rf['peak_bw_gb_s']:.2f} GB/s")
             lines.append(f"  Dominant unit        : {rf['dominant_unit']}")
-            lines.append(f"  Efficiency           : {rf['efficiency']:.1%}  (dominant unit)")
+            lines.append(
+                f"  Cores used           : {rf['cores_used']}/{rf['num_cores']}  "
+                f"(compute_utilization {rf['compute_utilization']:.1%})"
+            )
+            lines.append(
+                f"  Efficiency           : {rf['efficiency']:.1%}  "
+                f"(per-active core, achieved/ceiling)"
+            )
+            lines.append(
+                f"  Chip throughput      : {dom_unit['chip_throughput']:.1%}  "
+                f"(chip-wide, achieved/peak with idle cores)"
+            )
             lines.append("")
-            lines.append(f"  {'Unit':>10}  {'Achieved':>12}  {'Ceiling':>12}  {'Ridge':>10}  {'Eff':>7}")
-            lines.append(f"  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*7}")
+            lines.append(
+                f"  {'Unit':>10}  {'Achieved':>12}  {'Ceiling':>12}  "
+                f"{'Ridge':>10}  {'Eff':>7}  {'ChipThru':>9}"
+            )
+            lines.append(
+                f"  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*7}  {'-'*9}"
+            )
             for unit_name, u in rf["units"].items():
                 marker = " *" if unit_name == rf["dominant_unit"] else "  "
                 lines.append(
@@ -613,7 +671,8 @@ class LatencyReport:
                     f"{u['achieved_gflops']:>10.2f} G  "
                     f"{u['ceiling_gflops']:>10.2f} G  "
                     f"{u['ridge_point']:>8.1f} F/B  "
-                    f"{u['efficiency']:>6.1%}"
+                    f"{u['efficiency']:>6.1%}  "
+                    f"{u['chip_throughput']:>8.2%}"
                 )
             lines.append("=" * 60)
 
