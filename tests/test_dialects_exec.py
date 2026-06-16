@@ -1515,6 +1515,30 @@ class TestKtdp:
         )
         assert result.shape == (192, 64)
 
+    def test_construct_distributed_memory_view_resolves_non_origin_to_max_hi(self):
+        """Non-origin tiling resolves to ``max(hi)``; coverage is not enforced.
+
+        Partitions [10, 20) and [20, 30) on axis 0 produce shape (30, 64) —
+        the smallest shape satisfying ``BoxSet.enumerate``'s
+        ``shape >= max(hi)`` precondition.  The unreachable [0, 10) prefix
+        is not validated here; accessing global coords in that range
+        surfaces as ``no partition covers`` at
+        ``distributed_tile_access`` time.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(10, 0), hi=(20, 64), shape=(10, 64),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(20, 0), hi=(30, 64), shape=(10, 64),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1"],
+            attributes={"shape": (None, 64), "dtype": "f16"},
+        )
+        assert result.shape == (30, 64)
+
     def test_construct_distributed_memory_view_dynamic_rejects_affine_set_partition(self):
         """Dynamic axis + non-BoxSet partition → ValueError naming partition + axis."""
         from ktir_cpu.ir_types import MemRef
@@ -1574,16 +1598,8 @@ class TestKtdp:
                 attributes={"shape": (64, None), "dtype": "f16"},
             )
 
-    @pytest.mark.skipif(not __debug__, reason="assert is stripped under python -O")
-    def test_construct_distributed_memory_view_dynamic_asserts_concrete_partition(self):
-        """Defensive contract: partition coord_set arriving non-concrete trips assert.
-
-        Skipped under ``python -O`` — the contract is internal-invariant
-        only (``construct_memory_view`` upstream has already specialised
-        symbolic partitions before they reach this handler), so callers
-        running optimised should never see this code path; user-facing
-        error paths (AffineSet, rank, empty-bound) all use ``ValueError``.
-        """
+    def test_construct_distributed_memory_view_dynamic_rejects_non_concrete_partition(self):
+        """Non-concrete partition coord_set raises ValueError (clean under -O too)."""
         from ktir_cpu.affine import BoxSet
         from ktir_cpu.ir_types import MemRef
 
@@ -1598,7 +1614,10 @@ class TestKtdp:
             memory_space="HBM", dtype="f16",
             coordinate_set=sym_cs,
         ))
-        with pytest.raises(AssertionError, match=r"specialised it against runtime symbols"):
+        with pytest.raises(
+            ValueError,
+            match=r"partition 0 coordinate_set is not concrete",
+        ):
             _call(
                 "ktdp.construct_distributed_memory_view", ctx, _make_env(),
                 operands=["%a0"],

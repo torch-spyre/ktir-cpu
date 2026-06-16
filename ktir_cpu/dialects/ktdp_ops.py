@@ -15,7 +15,7 @@
 """KTDP dialect handlers — grid, memory view, access tile, load/store."""
 
 import re
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from .ktdp_helpers import attach_reshape, parse_subscript_expr
 from ..affine import BoxSet
@@ -142,25 +142,35 @@ def _resolve_dynamic_dist_shape(
 ) -> Tuple[int, ...]:
     """Resolve ``None`` entries in a distributed-view shape via partition union.
 
-    Concrete ``raw_shape`` returns unchanged.  For each ``None`` axis:
-    ``max(partition.coordinate_set.hi[axis])`` across all partitions, where
-    ``hi`` is in global coordinates.  Requires every partition's
-    ``coordinate_set`` to be a fully-resolved ``BoxSet``;
-    ``construct_memory_view`` specialises symbolic ``BoxSet`` partitions
-    against runtime symbols before they reach this point.
+    Concrete ``raw_shape`` returns unchanged.  For each ``None`` axis the
+    resolved extent is ``max(hi[axis])`` across all partitions, where
+    ``hi`` is in global coordinates.  This is the smallest shape that
+    satisfies ``BoxSet.enumerate``'s ``shape >= max(hi)`` precondition
+    for every partition; ``max(hi) - min(lo)`` would under-size the
+    memref and break slow-path enumeration on tilings with
+    ``min(lo) > 0``.
+
+    Coverage is not enforced here.  Tilings with ``min(lo) > 0``
+    (non-origin) or interior gaps between partitions produce a memref
+    where uncovered global coordinates surface as ``no partition
+    covers`` at access time via ``MemoryOps.distributed_tile_access``.
+    This function's job is shape resolution; coverage is the
+    access-time contract.
+
+    Requires every partition's ``coordinate_set`` to be a fully-resolved
+    ``BoxSet``; ``construct_memory_view`` specialises symbolic ``BoxSet``
+    partitions against runtime symbols before they reach this point.
 
     Scope cut — ``AffineSet`` partitions are intentionally rejected on this
     path only.  ``construct_distributed_memory_view`` itself accepts
     ``AffineSet`` partitions in the concrete-shape path: they are stored
     in ``DistributedMemRef`` and dispatched at access time via
     ``find_partition`` / ``.contains()`` exactly like ``BoxSet``.  The
-    rejection here is specific to dynamic-shape *resolution*: the
-    ``max(upper_bounds)`` strategy only recovers the true extent for
-    axis-aligned ``BoxSet`` partitions; on a non-axis-aligned constraint
-    set the bounding-box upper bound over-approximates.  Concrete-shape
-    callers are unaffected.  Lifting this would require a different
-    resolution strategy (e.g. enumerating the set or computing
-    ``global_extent()`` per axis).
+    rejection here is an implementation cut, not a correctness one:
+    ``BoxSet`` exposes per-axis ``.hi`` directly, while extracting a
+    per-axis upper bound from a general ``AffineSet`` is bounding-box
+    derivation that this path does not do — tracked under #74.
+    Concrete-shape callers are unaffected.
     """
     if not any(s is None for s in raw_shape):
         return tuple(raw_shape)  # type: ignore[arg-type]
@@ -169,12 +179,9 @@ def _resolve_dynamic_dist_shape(
             "construct_distributed_memory_view: dynamic-shape result "
             "requires at least one partition to derive the global extent"
         )
-    # Partition pre-flight runs once even with multiple `None` axes.  AffineSet
-    # is rejected because non-orthogonal constraints can make the bounding-box
-    # upper bound an over-approximation rather than the tensor's true extent,
-    # so a single `max(hi)` doesn't recover the global shape.
+    # Single pass: validate each partition and track max(hi) per dynamic axis.
     ndim = len(raw_shape)
-    boxes = []
+    max_hi: List[Optional[int]] = [None] * ndim
     for i, part in enumerate(partitions):
         cs = part.coordinate_set
         if not isinstance(cs, BoxSet):
@@ -188,28 +195,35 @@ def _resolve_dynamic_dist_shape(
                 f"find_partition at access time).  Declare the result "
                 f"memref with concrete dims to use this partition."
             )
-        assert cs.is_concrete, (
-            f"construct_distributed_memory_view: partition {i} coordinate_set "
-            f"is not concrete; construct_memory_view should have specialised "
-            f"it against runtime symbols before reaching this handler"
-        )
+        if not cs.is_concrete:
+            # `ValueError` (not `assert`) so the failure is loud under `python -O`.
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} coordinate_set "
+                f"is not concrete; construct_memory_view should have specialised "
+                f"it against runtime symbols before reaching this handler"
+            )
         if cs.n_dims != ndim:
             raise ValueError(
                 f"construct_distributed_memory_view: partition {i} has rank "
                 f"{cs.n_dims}, expected {ndim} to match result memref rank"
             )
-        boxes.append(cs.hi)
+        for axis in range(ndim):
+            if raw_shape[axis] is not None:
+                continue
+            hi_a = cs.hi[axis]
+            if max_hi[axis] is None or hi_a > max_hi[axis]:
+                max_hi[axis] = hi_a
     resolved = list(raw_shape)
     for axis, dim in enumerate(raw_shape):
         if dim is not None:
             continue
-        global_hi = max(hi[axis] for hi in boxes)
-        if global_hi <= 0:
+        assert max_hi[axis] is not None  # ≥1 partition × every dynamic axis traversed
+        if max_hi[axis] <= 0:
             raise ValueError(
-                f"construct_distributed_memory_view: could not resolve dynamic "
-                f"axis {axis}: all partitions have non-positive upper bound"
+                f"construct_distributed_memory_view: could not resolve "
+                f"dynamic axis {axis}: max(hi)={max_hi[axis]} is non-positive"
             )
-        resolved[axis] = global_hi
+        resolved[axis] = max_hi[axis]
     return tuple(resolved)  # type: ignore[return-value]
 
 
