@@ -319,10 +319,10 @@ class TestRoofline:
             assert unit["achieved_gflops"] <= unit["ceiling_gflops"]
 
         # Chip-level fields (peak-based, Nsight SOL analogue).
-        assert "cores_used" in rf
+        assert "cores_active" in rf
         assert "num_cores" in rf
         assert "compute_utilization" in rf
-        assert rf["cores_used"] >= 1
+        assert rf["cores_active"] >= 1
         assert rf["num_cores"] == report.config.num_cores
         # Note: compute_utilization > 1.0 is possible if the kernel grid
         # oversubscribes the modelled core count (e.g. running a 64-core
@@ -423,6 +423,28 @@ class TestRoofline:
         rf = report.roofline()
         dominant = rf["dominant_unit"]
         assert rf["arithmetic_intensity"] > rf["units"][dominant]["ridge_point"]
+
+    def test_oversized_grid_does_not_inflate_cores_active(self):
+        """An over-large grid leaves some cores with zero loop iterations; those
+        idle cores still get a counter entry but must not count toward
+        cores_active / compute_utilization (else utilization is overstated)."""
+        from ktir_cpu.latency import CoreLatencyCounters
+
+        cfg = HardwareConfig(num_cores=32)
+        counters = {}
+        # 4 active cores: real matmul work + HBM traffic.
+        for cid in range(4):
+            c = CoreLatencyCounters()
+            c.record("compute_matmul", cycles=100.0, flops=2048.0)
+            c.record("memory", cycles=50.0, nbytes=1024)
+            counters[cid] = c
+        # 28 idle grid cores: counter entry exists, but zero cycles.
+        for cid in range(4, 32):
+            counters[cid] = CoreLatencyCounters()
+
+        rf = LatencyReport(config=cfg, counters=counters).roofline()
+        assert rf["cores_active"] == 4          # not 32 (idle cores excluded)
+        assert rf["compute_utilization"] == pytest.approx(4 / 32)
 
 
 # ---------------------------------------------------------------------------

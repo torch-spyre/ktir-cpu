@@ -501,9 +501,15 @@ class LatencyReport:
             peak_bw_gb_s: Per-core HBM bandwidth in GB/s.
             dominant_unit: ``"systolic"`` or ``"simd"`` (most FLOPs).
             efficiency: achieved / ceiling for the dominant unit (0..1).
-            cores_used: number of cores that produced counter entries.
+            cores_active: number of cores that consumed any cycle (nonzero
+                total_cycles). A core left idle by an oversized grid produces a
+                counter entry but spends zero cycles, so it is excluded and an
+                under-filled grid does not inflate utilization. A core busy only
+                on communication still counts as active — this matches Nsight's
+                "SM Active" sense (at least one warp resident, even if stalled),
+                not "doing useful compute".
             num_cores: chip-wide hardware core count from ``HardwareConfig``.
-            compute_utilization: ``cores_used / num_cores`` — Nsight
+            compute_utilization: ``cores_active / num_cores`` — Nsight
                 Compute "SM Active %" analogue (resource coverage only,
                 does not reflect per-core throughput).
             units: per-unit dict, each with:
@@ -515,7 +521,7 @@ class LatencyReport:
             chip_peak_gflops: ``peak_gflops × num_cores`` — chip-wide flat
                 peak. Distinct from ``ceiling_gflops`` which is the
                 roofline ceiling at this kernel's AI.
-            chip_throughput: ``achieved × cores_used / (peak × num_cores)``
+            chip_throughput: ``achieved × cores_active / (peak × num_cores)``
                 — Nsight "Compute (SM) Throughput %" analogue. Folds idle
                 cores into the denominator. Identity::
 
@@ -531,6 +537,12 @@ class LatencyReport:
                 all). Holds for current anchor kernels with divisible
                 tiling; becomes an upper bound under split-K or uneven
                 tiles.
+
+                Also assumes every active core does roofline-relevant work
+                (compute or memory). A communication-only core would be
+                counted in ``cores_active`` yet contributes nothing to either
+                roofline axis, overstating throughput. No current kernel
+                produces such a core; revisit this denominator if one does.
         """
         if not self.counters:
             return {}
@@ -543,9 +555,15 @@ class LatencyReport:
         ai = (critical.total_flops / critical.total_bytes
               if critical.total_bytes > 0 else float('inf'))
 
-        cores_used = len(self.counters)
+        # Count cores that consumed any cycle, not every grid core that produced
+        # a counter entry: an oversized grid leaves some cores with zero loop
+        # iterations (0 cycles), and those must not inflate utilization. Use
+        # total_cycles (compute+memory+comm) so memory-only kernels with 0 FLOPs
+        # (e.g. embedding gather) still count their active cores. A comm-only
+        # core also counts as active here — the Nsight "SM Active" sense.
+        cores_active = sum(1 for c in self.counters.values() if c.total_cycles > 0)
         num_cores = self.config.num_cores
-        compute_utilization = cores_used / num_cores if num_cores > 0 else 0.0
+        compute_utilization = cores_active / num_cores if num_cores > 0 else 0.0
 
         # Per-unit hardware ceilings (hardware constants, not kernel-derived).
         unit_ceilings = {
@@ -574,7 +592,7 @@ class LatencyReport:
             # separately in unit_ceilings; per precision/generation, captured by
             # the config values), never core-to-core.
             chip_peak = peak * num_cores
-            chip_throughput = (achieved * cores_used / chip_peak
+            chip_throughput = (achieved * cores_active / chip_peak
                                if chip_peak > 0 else 0.0)
             units[unit_name] = {
                 "achieved_gflops": achieved / 1e9,
@@ -600,7 +618,7 @@ class LatencyReport:
             "peak_bw_gb_s": peak_bw / 1e9,
             "dominant_unit": dominant,
             "efficiency": units[dominant]["efficiency"],
-            "cores_used": cores_used,
+            "cores_active": cores_active,
             "num_cores": num_cores,
             "compute_utilization": compute_utilization,
             "units": units,
@@ -651,7 +669,7 @@ class LatencyReport:
             lines.append(f"  Peak bandwidth       : {rf['peak_bw_gb_s']:.2f} GB/s")
             lines.append(f"  Dominant unit        : {rf['dominant_unit']}")
             lines.append(
-                f"  Cores used           : {rf['cores_used']}/{rf['num_cores']}  "
+                f"  Cores active         : {rf['cores_active']}/{rf['num_cores']}  "
                 f"(compute_utilization {rf['compute_utilization']:.1%})"
             )
             lines.append(
