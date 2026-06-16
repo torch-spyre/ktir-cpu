@@ -238,7 +238,7 @@ def tensor__extract_slice(op, context, env):
     strides = _resolve_dynamic(static_strides, dyn_st_ops,  context)
 
     idx = tuple(
-        slice(off, off + sz, st)
+        slice(off, off + sz * st, st)
         for off, sz, st in zip(offsets, sizes, strides)
     )
     sliced = src.data[idx]
@@ -282,7 +282,7 @@ def tensor__insert_slice(op, context, env):
     strides = _resolve_dynamic(static_strides, dyn_st_ops,  context)
 
     idx = tuple(
-        slice(off, off + sz, st)
+        slice(off, off + sz * st, st)
         for off, sz, st in zip(offsets, sizes, strides)
     )
     result_data = dst.data.copy()

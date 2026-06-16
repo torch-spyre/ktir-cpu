@@ -1273,6 +1273,43 @@ class TestTensor:
         expected[64:] = 1.0
         assert np.array_equal(result.data, expected)
 
+    def test_extract_slice_stride_gt1(self):
+        # stride=2: select every other element — requires stop = off + sz * st
+        data = np.arange(10, dtype=np.float32)
+        t = Tile(data, "f32", (10,))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (3,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (3,)
+        # off=1, sz=3, st=2 → elements at indices 1, 3, 5
+        assert np.array_equal(result.data, data[1:7:2])
+
+    def test_insert_slice_stride_gt1(self):
+        # stride=2: write to every other element — requires stop = off + sz * st
+        patch = Tile(np.array([10.0, 20.0, 30.0], dtype=np.float32), "f32", (3,))
+        base = Tile(np.zeros((10,), dtype=np.float32), "f32", (10,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (10,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (10,)
+        expected = np.zeros((10,), dtype=np.float32)
+        expected[1:7:2] = [10.0, 20.0, 30.0]
+        assert np.array_equal(result.data, expected)
+
 
 # ---------------------------------------------------------------------------
 # tensor.generate exec
