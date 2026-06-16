@@ -248,7 +248,7 @@ class TestVectorAddLatency:
 
         # Extract addf cycles from trace
         addf_cycles = sum(e.cycles for e in core0.trace
-                          if e.op_type == "arith.addf" and e.category == "compute")
+                          if e.op_type == "arith.addf" and e.category.startswith("compute_"))
         # Per-core tile is 128 elements (BLOCK_SIZE=128), addf costs tile_size / simd
         assert addf_cycles == pytest.approx(128.0 / simd)
 
@@ -320,25 +320,24 @@ class TestRoofline:
         rf = report.roofline()
 
         assert "arithmetic_intensity" in rf
-        assert "achieved_gflops" in rf
-        assert "peak_gflops" in rf
         assert "peak_bw_gb_s" in rf
-        assert "ridge_point" in rf
-        assert "ceiling_gflops" in rf
+        assert "dominant_unit" in rf
         assert "efficiency" in rf
+        assert "units" in rf
 
         assert 0 < rf["efficiency"] <= 1.0
-        assert rf["achieved_gflops"] <= rf["ceiling_gflops"]
-        assert rf["ceiling_gflops"] <= rf["peak_gflops"]
+        for unit in rf["units"].values():
+            assert unit["achieved_gflops"] <= unit["ceiling_gflops"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_vector_add_is_memory_bound(self, path, func_name, entry):
         """vector_add has low arithmetic intensity → memory-bound on roofline."""
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
+        dominant = rf["dominant_unit"]
 
-        # AI should be well below the ridge point (memory-bound)
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        # AI should be well below the dominant unit's ridge point (memory-bound)
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
     def test_vector_reduce_is_memory_bound(self, path, func_name, entry):
@@ -346,7 +345,8 @@ class TestRoofline:
         report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
         assert "arithmetic_intensity" in rf
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_roofline_in_report_str(self, path, func_name, entry):
@@ -381,21 +381,23 @@ class TestRoofline:
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_memory_bound_roofline_matches_bottleneck(self, path, func_name, entry):
-        """When bottleneck is memory, roofline AI should be below ridge point."""
+        """When bottleneck is memory, roofline AI should be below the dominant unit's ridge point."""
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         assert report.bottleneck == "memory"
         rf = report.roofline()
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("softmax_kernel_small"))
     def test_compute_bound_roofline_matches_bottleneck(self, path, func_name, entry):
-        """When bottleneck is compute, roofline AI should be above ridge point."""
+        """When bottleneck is compute, roofline AI should be above the dominant unit's ridge point."""
         # Single core + high HBM BW → compute-dominated
         cfg = HardwareConfig(num_cores=1, hbm_bandwidth_tb_s=100.0)
         report = _run_softmax(path, func_name, entry, cfg)
         assert report.bottleneck == "compute"
         rf = report.roofline()
-        assert rf["arithmetic_intensity"] > rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] > rf["units"][dominant]["ridge_point"]
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +426,7 @@ class TestSoftmaxLatency:
         core0 = report.counters[0]
         compute_by_op = Counter()
         for e in core0.trace:
-            if e.category == "compute":
+            if e.category.startswith("compute_"):
                 compute_by_op[e.op_type] += e.cycles
         top_op = compute_by_op.most_common(1)[0]
         assert top_op[0] == "math.exp"
@@ -769,7 +771,7 @@ class TestLatencyEdgeCases:
 
         # addf on 128 elements with SIMD=1024 → 128/1024 = 0.125 cycles
         addf_cycles = sum(e.cycles for e in core0.trace
-                          if e.op_type == "arith.addf" and e.category == "compute")
+                          if e.op_type == "arith.addf" and e.category.startswith("compute_"))
         assert addf_cycles == pytest.approx(128.0 / 1024)
         assert addf_cycles > 0
         assert not math.isnan(addf_cycles)

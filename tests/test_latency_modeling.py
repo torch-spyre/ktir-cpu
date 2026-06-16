@@ -197,8 +197,10 @@ def _patch_tile_size(interp, func_name, new_size: int):
     """Override all 1-D construct_memory_view sizes and access_tile shapes.
 
     Only touches 1-D ops so 2-D kernels (softmax, matmul) are unaffected.
-    Also updates coordinate_set / coordinate_space_set bounds to match the
-    new size, so future bound-checking passes the correct upper limit.
+    Also updates coordinate_set bounds on both ops to match the new size,
+    so future bound-checking passes the correct upper limit and the
+    BoxSet fast path in ktdp.load/store loads the patched extent rather
+    than the original.
     """
     func = interp.module.get_function(func_name)
     for op in _iter_ops(func.operations):
@@ -208,12 +210,8 @@ def _patch_tile_size(interp, func_name, new_size: int):
                 new_set = parse_affine_set(
                     f"affine_set<(d0) : (d0 >= 0, -d0 + {new_size - 1} >= 0)>"
                 )
-                if op.op_type == "ktdp.construct_memory_view":
-                    if op.attributes.get("coordinate_set") is not None:
-                        op.attributes["coordinate_set"] = new_set
-                else:
-                    if op.attributes.get("coordinate_space_set") is not None:
-                        op.attributes["coordinate_space_set"] = new_set
+                if op.attributes.get("coordinate_set") is not None:
+                    op.attributes["coordinate_set"] = new_set
 
 def _patch_tile_dim0(interp, func_name, old_dim0: int, new_dim0: int):
     """Scale dim-0 of all 2-D IR shapes whose current dim-0 equals *old_dim0*.
@@ -236,13 +234,15 @@ def _patch_tile_dim0(interp, func_name, old_dim0: int, new_dim0: int):
             shape = op.attributes.get("shape", ())
             if len(shape) == 2 and shape[0] == old_dim0:
                 op.attributes["shape"] = (new_dim0, shape[1])
-                if op.op_type == "ktdp.construct_access_tile":
-                    if op.attributes.get("coordinate_space_set") is not None:
-                        dim1 = shape[1]
-                        op.attributes["coordinate_space_set"] = parse_affine_set(
-                            f"affine_set<(d0, d1) : (d0 >= 0, -d0 + {new_dim0 - 1} >= 0, "
-                            f"d1 >= 0, -d1 + {dim1 - 1} >= 0)>"
-                        )
+                if (
+                    op.op_type == "ktdp.construct_access_tile"
+                    and op.attributes.get("coordinate_set") is not None
+                ):
+                    dim1 = shape[1]
+                    op.attributes["coordinate_set"] = parse_affine_set(
+                        f"affine_set<(d0, d1) : (d0 >= 0, -d0 + {new_dim0 - 1} >= 0, "
+                        f"d1 >= 0, -d1 + {dim1 - 1} >= 0)>"
+                    )
         elif op.op_type in ("arith.constant", "tensor.empty") and (
             op.op_type != "arith.constant" or op.attributes.get("is_tensor")
         ):

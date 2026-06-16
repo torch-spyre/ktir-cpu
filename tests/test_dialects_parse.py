@@ -168,9 +168,13 @@ class TestModuleParser:
           func.func @add(%a: index, %b: index, %c: index) -> index attributes { grid = [4, 4] } {
             %c0 = arith.constant 0 : index
             %grid0 = ktdp.get_compute_tile_id : index
-            %acc = ktdp.construct_access_tile %ref[%c0, %c0] : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
+            %acc = ktdp.construct_access_tile %ref[%c0, %c0] {
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+            } : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
             %tile = ktdp.load %acc : !ktdp.access_tile<128x256xindex> -> tensor<128x256xf16>
-            %out_acc = ktdp.construct_access_tile %out_ref[%c0, %c0] : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
+            %out_acc = ktdp.construct_access_tile %out_ref[%c0, %c0] {
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+            } : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
             ktdp.store %tile, %out_acc : tensor<128x256xf16>, !ktdp.access_tile<128x256xindex>
             return %c0 : index
           }

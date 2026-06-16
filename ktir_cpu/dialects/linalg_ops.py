@@ -310,7 +310,8 @@ def linalg__batch_matmul(op, context, env):
     """
     tile_a = context.get_value(op.operands[0])  # ins[0] = A  (B×M×K)
     tile_b = context.get_value(op.operands[1])  # ins[1] = B  (B×K×N)
-    result = Tile(tile_a.data @ tile_b.data, tile_a.dtype, (tile_a.data @ tile_b.data).shape)
+    product = tile_a.data @ tile_b.data
+    result = Tile(product, tile_a.dtype, product.shape)
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
