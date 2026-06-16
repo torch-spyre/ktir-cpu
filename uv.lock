@@ -1100,6 +1100,7 @@ mlir-frontend = [
 dev = [
     { name = "jupyter" },
     { name = "matplotlib" },
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -1115,6 +1116,7 @@ provides-extras = ["dev", "mlir-frontend"]
 dev = [
     { name = "jupyter", specifier = ">=1.1.1" },
     { name = "matplotlib", specifier = ">=3.10.9" },
+    { name = "pytest", specifier = ">=9.0.2" },
 ]
 
 [[package]]
