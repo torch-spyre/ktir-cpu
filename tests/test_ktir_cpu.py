@@ -294,6 +294,52 @@ def test_hbm_read_uninitialized_region():
     assert np.array_equal(result[2:], np.zeros(2, dtype=np.float16))
 
 
+def test_hbm_write_read_helpers_roundtrip():
+    """hbm_write/hbm_read: byte-addressed helpers round-trip data correctly."""
+    from ktir_cpu.ops.memory_ops import hbm_read, hbm_write
+    hbm = HBMSimulator()
+    data = np.arange(8, dtype=np.float16)
+    stick = hbm.allocate(data.nbytes)
+    byte_addr = stick * HBMSimulator.STICK_BYTES
+    hbm_write(hbm, byte_addr, data)
+    result = hbm_read(hbm, byte_addr, data.size, "f16")
+    np.testing.assert_array_equal(result, data)
+
+
+def test_hbm_write_read_helpers_intra_stick():
+    """hbm_write/hbm_read: byte_addr with non-zero intra-stick offset reads at correct position."""
+    from ktir_cpu.ops.memory_ops import hbm_read, hbm_write
+    from ktir_cpu.dtypes import bytes_per_elem
+    hbm = HBMSimulator()
+    data = np.arange(16, dtype=np.float16)
+    stick = hbm.allocate(data.nbytes)
+    byte_addr = stick * HBMSimulator.STICK_BYTES
+    hbm_write(hbm, byte_addr, data)
+    # Read starting at element 4 (byte offset 8)
+    offset_byte_addr = byte_addr + 4 * bytes_per_elem("f16")
+    result = hbm_read(hbm, offset_byte_addr, 4, "f16")
+    np.testing.assert_array_equal(result, data[4:8])
+
+
+def test_hbm_write_helper_matches_stick_write():
+    """hbm_write produces same memory state as hbm.write(stick, data) directly."""
+    from ktir_cpu.ops.memory_ops import hbm_read, hbm_write
+    hbm_direct = HBMSimulator()
+    hbm_helper = HBMSimulator()
+    data = np.array([1.5, 2.5, 3.5, 4.5], dtype=np.float16)
+
+    stick_d = hbm_direct.allocate(data.nbytes)
+    hbm_direct.write(stick_d, data)
+
+    stick_h = hbm_helper.allocate(data.nbytes)
+    byte_addr = stick_h * HBMSimulator.STICK_BYTES
+    hbm_write(hbm_helper, byte_addr, data)
+
+    result_direct = hbm_direct.read(stick_d, data.size, "f16")
+    result_helper = hbm_read(hbm_helper, byte_addr, data.size, "f16")
+    np.testing.assert_array_equal(result_direct, result_helper)
+
+
 def test_lx_interleaved_allocations():
     """LX scratchpad read/write correctly handles multiple interleaved allocations."""
     lx = LXScratchpad(size_mb=2, core_id=0)

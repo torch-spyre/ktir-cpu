@@ -179,8 +179,8 @@ def _patch_seed_lx(interp):
     def _prepare_and_seed(grid_shape):
         orig_prepare(grid_shape)
         orig_write = interp.memory.hbm.write
-        def _write_and_mirror(ptr, data):
-            orig_write(ptr, data)
+        def _write_and_mirror(ptr, data, **kwargs):
+            orig_write(ptr, data, **kwargs)
             lx_byte_addr = ptr * HBMSimulator.STICK_BYTES
             for core in interp.grid_executor.cores:
                 core.lx.write(lx_byte_addr, data)

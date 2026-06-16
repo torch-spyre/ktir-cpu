@@ -167,6 +167,18 @@ class _MemAccessor:
         self._sim.write(*self._args, data, **self._kwargs)
 
 
+def hbm_read(hbm: "HBMSimulator", byte_addr: int, n_elements: int, dtype: str) -> np.ndarray:
+    """Read n_elements of dtype from HBM at byte_addr (byte-addressed)."""
+    stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
+    return hbm.read(stick, n_elements, dtype, intra_byte=intra)
+
+
+def hbm_write(hbm: "HBMSimulator", byte_addr: int, data: np.ndarray) -> None:
+    """Write data to HBM at byte_addr (byte-addressed)."""
+    stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
+    hbm.write(stick, data, intra_byte=intra)
+
+
 def _enumerate_in_vso_order(iat: "IndirectAccessTile") -> List[Tuple[int, ...]]:
     """Enumerate variable-space points in ``variables_space_order``-permuted order.
 
