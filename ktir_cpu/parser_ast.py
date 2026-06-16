@@ -232,6 +232,10 @@ class _Parser:
                 raise ValueError(f"Expected integer constant after {op!r}, got {num_tok!r}")
             n = int(self.consume())
             tag, int_both_sides = _MULTIPLICATIVE_OPS[op]
+            if op in ("floordiv", "mod") and n <= 0:
+                raise ValueError(
+                    f"{op!r} requires a positive integer divisor, got {n}"
+                )
             primary = (tag, n, primary) if int_both_sides else (tag, primary, n)
         return primary
 

@@ -210,6 +210,24 @@ class TestFloorDivMod:
         assert eval_expr(node, [32, 0, 32]) == 0   # (32+0+32) % 64 == 0
         assert eval_expr(node, [32, 0, 10]) == 42  # (32+0+10) % 64 == 42
 
+    # --- Non-positive divisor guard ---
+
+    def test_floordiv_zero_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 floordiv 0")
+
+    def test_floordiv_negative_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 floordiv -4")
+
+    def test_mod_zero_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 mod 0")
+
+    def test_mod_negative_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 mod -1")
+
     # --- Keyword guard in _atom ---
 
     def test_keyword_as_atom_raises(self):

@@ -953,7 +953,9 @@ class TestSubscriptExpr:
 # ---------------------------------------------------------------------------
 
 # Kernel: copy src[i] -> dst[i floordiv 64][i mod 64]
-# src is a flat 128-element view; dst is a 2x64 view.
+# src is a flat 128-element view (stick 0); dst is a 2x64 view (stick 100).
+# Sticks are spaced far apart so the two allocations don't collide
+# (STICK_BYTES=128, f16=2 bytes → 64 f16 per stick; 128 f16 spans 2 sticks).
 # intermediate_variables(%page, %lane) iterate over [0,2) x [0,64).
 # src subscript: (%page * 64 + %lane)   — direct, compound mul+add
 # dst dim 0:     (%page * 64 + %lane) floordiv 64  — compound LHS floordiv
@@ -968,7 +970,7 @@ _COMPOUND_FLOORDIV_MOD_MLIR = """
 module {
   func.func @compound_floordiv_mod() attributes {grid = [1, 1]} {
     %src_addr = arith.constant 0 : index
-    %dst_addr = arith.constant 1 : index
+    %dst_addr = arith.constant 100 : index
 
     %src = ktdp.construct_memory_view %src_addr, sizes: [128], strides: [1] {
         coordinate_set = #src_set,
@@ -1017,12 +1019,12 @@ def test_compound_floordiv_mod_direct_subscript():
     def _prepare(grid_shape):
         _orig(grid_shape)
         hbm = interp.memory.hbm
-        hbm.write(0, np.arange(128, dtype=np.float16))   # src: 0..127
-        hbm.write(1, np.zeros(128, dtype=np.float16))    # dst: zeroed
+        hbm.write(0, np.arange(128, dtype=np.float16))    # src: stick 0
+        hbm.write(100, np.zeros(128, dtype=np.float16))  # dst: stick 100
     interp._prepare_execution = _prepare
 
     interp.execute_function("compound_floordiv_mod")
 
-    dst = interp.memory.hbm.read(1, 128, "f16").reshape(2, 64)
+    dst = interp.memory.hbm.read(100, 128, "f16").reshape(2, 64)
     expected = np.arange(128, dtype=np.float16).reshape(2, 64)
     np.testing.assert_array_equal(dst, expected)

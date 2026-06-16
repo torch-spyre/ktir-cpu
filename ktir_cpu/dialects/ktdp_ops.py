@@ -788,19 +788,15 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
             operands.append(view_name)
             index_view_idx += 1
         else:
-            # Direct: (%h) or (%tkv mod 64) etc.
-            inner = dim_text.strip('()')
-            var_ref = inner.strip().lstrip('%')
-            if var_ref in intermediate_vars:
-                dim_subscripts.append({
-                    "kind": "direct",
-                    "var_index": intermediate_vars.index(var_ref),
-                })
-            else:
-                dim_subscripts.append({
-                    "kind": "direct_expr",
-                    "subscript": parse_subscript_expr(inner, intermediate_vars),
-                })
+            # Direct subscript: bare variable (%h), parenthesised expression
+            # ((%tkv mod 64)), or compound expression ((%a + %b * 64) floordiv 64).
+            # Parenthesised forms like (expr) are valid affine syntax — _atom
+            # handles the outer parens, so pass dim_text directly rather than
+            # stripping, which would corrupt compound-LHS expressions.
+            dim_subscripts.append({
+                "kind": "direct_expr",
+                "subscript": parse_subscript_expr(dim_text, intermediate_vars),
+            })
 
     # Parse attribute block
     attrs = parse_attr_block(op_text, parse_ctx.aliases)
