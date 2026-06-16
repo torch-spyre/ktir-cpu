@@ -567,6 +567,12 @@ class LatencyReport:
             achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
             # Roofline ceiling at this kernel's AI for this unit.
             ceiling = min(peak, peak_bw * ai)
+            # Cores are homogeneous: every core shares the same clock and
+            # compute rates from HardwareConfig, so the chip peak is
+            # peak * num_cores, which equals summing identical per-core peaks.
+            # Heterogeneity lives on other axes (per functional unit, captured
+            # separately in unit_ceilings; per precision/generation, captured by
+            # the config values), never core-to-core.
             chip_peak = peak * num_cores
             chip_throughput = (achieved * cores_used / chip_peak
                                if chip_peak > 0 else 0.0)
