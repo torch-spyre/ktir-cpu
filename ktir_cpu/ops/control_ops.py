@@ -112,11 +112,11 @@ class ControlOps:
 
         # Bind initial iter_arg values in the *parent* scope.
         # These persist across iterations; body-local values do not.
+        # No track_lx here — every Tile is already tracked under its original
+        # SSA name by _execute_operation; tracking again would double-count.
         current_values = list(iter_init_values)
         for name, val in zip(iter_arg_names, current_values):
             context.set_value(name, val)
-            if isinstance(val, Tile):
-                context.track_lx(name, val.size_bytes())
 
         for i in range(int(lower_bound), int(upper_bound), max(int(step), 1)):
             # New scope for this iteration's body-local values.
@@ -150,16 +150,11 @@ class ControlOps:
             #     scf.yield %m_new, %l_new   // Tiles fed back as next %m_acc, %l_acc
             #   }
             #
-            # Here %m_init and %l_init are tensor<32x1xf16> — so the
-            # iter_args %m_acc and %l_acc are Tiles that occupy LX.
-            # When we re-bind them after yield, we must untrack the old
-            # Tile's LX and track the new one.
+            # No track_lx/untrack_lx here — LX ownership stays with the
+            # original SSA names; _execute_operation handles tracking.
             if yielded_values is not None:
                 for name, val in zip(iter_arg_names, yielded_values):
-                    context.untrack_lx(name)
                     context.set_value(name, val)
-                    if isinstance(val, Tile):
-                        context.track_lx(name, val.size_bytes())
                 current_values = yielded_values
 
         if current_values:

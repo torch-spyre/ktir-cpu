@@ -188,6 +188,399 @@ class TestLXTracking:
 # iter_args simulation
 # ---------------------------------------------------------------------------
 
+class TestForOpLXTracking:
+    """Regression tests for double-tracking in scf.for iter_args (issue #109)."""
+
+    def test_iter_arg_init_does_not_double_count(self):
+        """iter_arg init is a name alias, not a new allocation.
+
+        In a pattern like:
+            %accum_zero = arith.constant dense<0.0> : tensor<768x1024xf16>
+            scf.for %k = ... iter_args(%accum_itr = %accum_zero) { ... }
+
+        %accum_itr and %accum_zero are two SSA names for the same Python Tile
+        object — no new buffer is allocated.  _execute_operation tracks the
+        Tile under %accum_zero when arith.constant runs.  for_op must not
+        track it again under %accum_itr or lx.used will be double the actual
+        footprint, triggering a spurious MemoryError for tiles over half the
+        LX capacity.
+
+        LX state:
+            after arith.constant:
+              [%accum_zero: 1.5MB]   lx.used = 1.5MB
+
+            after iter_arg binding (correct):
+              [%accum_zero: 1.5MB]   lx.used = 1.5MB   ← same object, no new entry
+
+            after iter_arg binding (wrong):
+              [%accum_zero: 1.5MB, %accum_itr: 1.5MB]  lx.used = 3.0MB → MemoryError
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        # 768*1024*2 = 1_572_864 bytes — just under the 2 MB LX cap on its own,
+        # but over cap if double-counted.
+        tile = _make_tile((768, 1024))
+        ctx.set_value("%accum_zero", tile)
+        ctx.track_lx("%accum_zero", tile.size_bytes())
+        assert ctx.lx.used == 1_572_864
+
+        # for_op binds %accum_itr = %accum_zero (same object).
+        # The body just yields the same tile back unchanged each iteration.
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=4, step=1,
+            iter_var_name="%k",
+            body_region=[],
+            region_executor=lambda c, ops: _YieldResult([c.get_value("%accum_itr")]),
+            iter_arg_names=["%accum_itr"],
+            iter_init_values=[tile],
+        )
+
+        # lx.used must still reflect exactly one copy of the tile.
+        assert ctx.lx.used == 1_572_864, (
+            f"double-count: expected 1_572_864, got {ctx.lx.used}"
+        )
+
+    def test_iter_arg_does_not_leak_after_loop(self):
+        """lx.used is the same before and after for_op runs.
+
+        iter_arg names are scoped to the loop — they have no meaning once
+        for_op returns.  Any _lx_bytes entry left behind under an iter_arg
+        name inflates lx.used for the rest of the function, causing false
+        overflow errors in subsequent ops that have nothing to do with the loop.
+
+        LX state:
+            before loop:   [%init: N]           lx.used = N
+            inside loop:   [%init: N]           lx.used = N   ← %itr is just a name
+            after loop:    [%init: N]           lx.used = N   ← no dangling %itr entry
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        tile = _make_tile((32, 64))
+        ctx.set_value("%init", tile)
+        ctx.track_lx("%init", tile.size_bytes())
+        used_before = ctx.lx.used
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=3, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=lambda c, ops: _YieldResult([c.get_value("%itr")]),
+            iter_arg_names=["%itr"],
+            iter_init_values=[tile],
+        )
+
+        # After the loop, lx.used must be exactly what it was before.
+        # Any delta means for_op left a dangling _lx_bytes entry.
+        assert ctx.lx.used == used_before, (
+            f"leak: expected {used_before}, got {ctx.lx.used}"
+        )
+
+    def test_iter_arg_readable_inside_body(self):
+        """The iter_arg value is visible to the body on every iteration.
+
+        for_op binds the iter_arg name in the parent scope before entering
+        the loop.  The body reads it via get_value, which searches the scope
+        stack top-to-bottom and finds it in the parent scope.  This must hold
+        regardless of whether for_op does any LX tracking — the name binding
+        and the LX accounting are independent concerns.
+
+        Scope stack during body execution:
+            [0] function scope: {%acc: Tile, %itr: Tile}   ← iter_arg lives here
+            [1] body scope:     {%i: 0, ...}
+            get_value("%itr") finds it in scope[0]
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        tile = _make_tile((4, 4))
+        ctx.set_value("%acc", tile)
+        ctx.track_lx("%acc", tile.size_bytes())
+
+        seen = []
+
+        def body(c, ops):
+            # Record what the body sees as the current iter_arg value.
+            seen.append(c.get_value("%itr"))
+            # Yield the same tile back (no-op accumulation).
+            return _YieldResult([c.get_value("%itr")])
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=3, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=body,
+            iter_arg_names=["%itr"],
+            iter_init_values=[tile],
+        )
+
+        # Body ran 3 times and saw the tile each time.
+        assert len(seen) == 3
+        assert all(s is tile for s in seen)
+
+    def test_two_iter_args_neither_double_counted(self):
+        """Multiple iter_args from distinct already-tracked Tiles must not add to lx.used.
+
+        Each Tile is already tracked under its own SSA name.  for_op binds two
+        iter_arg names to those two objects.  lx.used must remain the sum of
+        the two original tiles, not double that sum.
+
+        LX state:
+            after setup:        [%a: 2048, %b: 512]                     lx.used = 2560
+            after iter binding: [%a: 2048, %b: 512]                     lx.used = 2560
+            wrong behavior:     [%a: 2048, %b: 512, %itr_a: 2048, %itr_b: 512]  lx.used = 5120
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        tile_a = _make_tile((32, 32))   # 32*32*2 = 2048 bytes
+        tile_b = _make_tile((16, 16))   # 16*16*2 = 512 bytes
+        ctx.set_value("%a", tile_a); ctx.track_lx("%a", tile_a.size_bytes())
+        ctx.set_value("%b", tile_b); ctx.track_lx("%b", tile_b.size_bytes())
+        assert ctx.lx.used == 2048 + 512
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=2, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=lambda c, ops: _YieldResult([
+                c.get_value("%itr_a"), c.get_value("%itr_b"),
+            ]),
+            iter_arg_names=["%itr_a", "%itr_b"],
+            iter_init_values=[tile_a, tile_b],
+        )
+
+        assert ctx.lx.used == 2048 + 512
+
+    def test_zero_iterations_lx_unchanged(self):
+        """A loop with zero iterations must not change lx.used at all.
+
+        lower_bound == upper_bound means the body never executes and no
+        yielded values are produced.  The iter_arg init binding is still
+        performed (the loop variable is valid in the enclosing scope) but
+        no LX should be charged or leaked.
+
+        LX state:
+            before loop:  [%init: N]   lx.used = N
+            (body never runs)
+            after loop:   [%init: N]   lx.used = N
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        tile = _make_tile((8, 8))
+        ctx.set_value("%init", tile)
+        ctx.track_lx("%init", tile.size_bytes())
+        used_before = ctx.lx.used
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=0, step=1,  # zero iterations
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=lambda c, ops: _YieldResult([c.get_value("%itr")]),
+            iter_arg_names=["%itr"],
+            iter_init_values=[tile],
+        )
+
+        assert ctx.lx.used == used_before
+
+    def test_scalar_iter_arg_no_lx_effect(self):
+        """A scalar (non-Tile) iter_arg must have no effect on lx.used.
+
+        Index counters and integer accumulators are common iter_args that
+        carry no LX backing.  for_op must handle them without error and
+        without touching lx.used.
+
+        LX state:
+            iter 0: %counter = 0   lx.used = 0
+            iter 1: %counter = 1   lx.used = 0
+            iter 2: %counter = 2   lx.used = 0
+            ...                    (scalars never enter _lx_bytes)
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        assert ctx.lx.used == 0
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=4, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=lambda c, ops: _YieldResult([c.get_value("%counter") + 1]),
+            iter_arg_names=["%counter"],
+            iter_init_values=[0],
+        )
+
+        assert ctx.lx.used == 0
+
+    def test_lx_stable_across_iterations(self):
+        """lx.used must not grow with each iteration when iter_args are Tiles.
+
+        If for_op were to track the iter_arg on every re-bind after yield,
+        lx.used would accumulate one tile's worth of bytes per iteration.
+        Measure lx.used at the end of each body invocation and confirm it
+        is the same every time.
+
+        LX state per iteration (correct):
+            iter 0 body: lx.used = N   (just %init)
+            iter 1 body: lx.used = N
+            iter 2 body: lx.used = N
+            ...
+
+        LX state per iteration (wrong — re-tracking on each yield):
+            iter 0 body: lx.used = N
+            iter 1 body: lx.used = 2N
+            iter 2 body: lx.used = 3N  → eventual MemoryError
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        tile = _make_tile((32, 32))
+        ctx.set_value("%init", tile)
+        ctx.track_lx("%init", tile.size_bytes())
+        baseline = ctx.lx.used
+
+        used_per_iter = []
+
+        def body(c, ops):
+            used_per_iter.append(c.lx.used)
+            return _YieldResult([c.get_value("%itr")])
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=5, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=body,
+            iter_arg_names=["%itr"],
+            iter_init_values=[tile],
+        )
+
+        assert len(used_per_iter) == 5
+        assert all(u == baseline for u in used_per_iter), (
+            f"lx.used grew across iterations: {used_per_iter}"
+        )
+
+    def test_new_tile_yielded_from_body_not_leaked(self):
+        """A genuinely new Tile yielded from the body must not leak LX.
+
+        When the body produces a new Tile each iteration (e.g. a running
+        reduction), that Tile is tracked inside the body scope by
+        _execute_operation and freed by pop_scope when the iteration ends.
+        for_op re-binds the iter_arg name to the new object but must not
+        re-track it — _execute_operation will track the final value under
+        the outer result name when scf.for returns.
+        lx.used after the loop must equal what it was before the loop.
+
+        LX state per iteration:
+            body entry:    [%init: N]                  lx.used = N
+            body scope:    [%init: N] | [%new: N]      lx.used = 2N
+            pop_scope:     [%init: N]                  lx.used = N   ← %new freed
+            re-bind %itr:  [%init: N]                  lx.used = N   ← no re-track
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        tile = _make_tile((4, 4))
+        ctx.set_value("%init", tile)
+        ctx.track_lx("%init", tile.size_bytes())
+        used_before = ctx.lx.used
+
+        def body(c, ops):
+            # Simulate _execute_operation creating a new Tile in the body scope
+            # and tracking it there (as ktdp.load or linalg.matmul would do).
+            new_tile = _make_tile((4, 4))
+            c.push_scope()
+            c.set_value("%new", new_tile)
+            c.track_lx("%new", new_tile.size_bytes())
+            result = _YieldResult([new_tile])
+            c.pop_scope()  # frees %new from LX
+            return result
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=3, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=body,
+            iter_arg_names=["%itr"],
+            iter_init_values=[tile],
+        )
+
+        assert ctx.lx.used == used_before, (
+            f"leak from yielded new tile: expected {used_before}, got {ctx.lx.used}"
+        )
+
+    def test_nested_loops_inner_does_not_leak_into_outer(self):
+        """Inner loop iter_args must not inflate lx.used seen by the outer loop.
+
+        In a tiled matmul, the outer loop carries the accumulator and the inner
+        loop iterates over K-tiles.  The inner loop's iter_args are scoped to
+        the inner loop and must not affect the outer loop's LX accounting.
+
+        LX state during outer iteration 1:
+            outer body entry:  [%outer_init: A]                  lx.used = A
+            inner loop runs:   [%outer_init: A, %inner_init: B]  lx.used = A+B
+            inner loop exits:  [%outer_init: A, %inner_init: B]  lx.used = A+B
+            after untrack:     [%outer_init: A]                  lx.used = A
+
+        outer iteration 2 must see lx.used = A, same as iteration 1.
+        """
+        from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
+
+        ctx = _make_context()
+        outer_tile = _make_tile((32, 32))
+        ctx.set_value("%outer_init", outer_tile)
+        ctx.track_lx("%outer_init", outer_tile.size_bytes())
+        used_at_outer_start = ctx.lx.used
+
+        outer_used_per_iter = []
+
+        def outer_body(c, ops):
+            outer_used_per_iter.append(c.lx.used)
+
+            # Inner loop with its own iter_arg.
+            inner_tile = _make_tile((8, 8))
+            c.set_value("%inner_init", inner_tile)
+            c.track_lx("%inner_init", inner_tile.size_bytes())
+
+            ControlOps.for_op(
+                context=c,
+                lower_bound=0, upper_bound=2, step=1,
+                iter_var_name="%j",
+                body_region=[],
+                region_executor=lambda c2, ops: _YieldResult([c2.get_value("%inner_itr")]),
+                iter_arg_names=["%inner_itr"],
+                iter_init_values=[inner_tile],
+            )
+
+            c.untrack_lx("%inner_init")
+            return _YieldResult([c.get_value("%outer_itr")])
+
+        ControlOps.for_op(
+            context=ctx,
+            lower_bound=0, upper_bound=3, step=1,
+            iter_var_name="%i",
+            body_region=[],
+            region_executor=outer_body,
+            iter_arg_names=["%outer_itr"],
+            iter_init_values=[outer_tile],
+        )
+
+        # lx.used seen at the start of each outer iteration must be stable —
+        # the inner loop must not have left any LX entries behind.
+        assert all(u == used_at_outer_start for u in outer_used_per_iter), (
+            f"inner loop leaked into outer: {outer_used_per_iter}"
+        )
+
+
 class TestIterArgsPersistence:
     """Simulate the for_op iter_arg flow: Tiles survive across iterations
     while body-local Tiles are freed each iteration."""
