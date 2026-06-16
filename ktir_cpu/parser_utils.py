@@ -127,6 +127,22 @@ def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     return 0
 
 
+def parse_dense_payload(payload: str, elem_dtype: Optional[str] = None):
+    """Parse the content already extracted from inside ``dense<...>``.
+
+    Returns ``(value, is_list)``:
+    - scalar payload ``0.0``       → ``(scalar, False)``
+    - list payload   ``[16, 32]``  → ``([16, 32], True)``
+    """
+    payload = payload.strip()
+    is_list = payload.startswith("[")
+    if is_list:
+        assert payload.endswith("]"), f"malformed dense list payload: {payload!r}"
+        parts = [p.strip() for p in payload[1:-1].split(",") if p.strip()]
+        return [parse_numeric(p, dtype=elem_dtype) for p in parts], True
+    return parse_numeric(payload, dtype=elem_dtype), False
+
+
 def _extract_bracket_content(op_text: str, brackets: str = '{}') -> Optional[str]:
     """Return the content inside the outermost matched bracket pair.
 
@@ -200,9 +216,11 @@ def parse_attr_block(op_text: str, aliases: Optional[Dict] = None,
             continue
         pos += eq_m.end()
 
-        # Extract raw value string
+        # Extract raw value string; skip entry if value is absent
         raw, consumed = _extract_attr_value(block[pos:], aliases)
         pos += consumed
+        if not raw:
+            continue
 
         result[key] = _coerce_attr_value(raw)
 
@@ -238,6 +256,68 @@ def parse_attr_list(op_text: str, aliases: Optional[Dict] = None,
     return result
 
 
+def _scan_angle_bracketed(text: str, start: int) -> int:
+    """Return the index one past the closing ``>`` of an angle-bracketed span.
+
+    *start* must point at the opening ``<``.  Skips ``>=`` (constraint
+    operator) and ``->`` (affine_map arrow) so they are not mistaken for
+    closing brackets.  Returns ``len(text)`` if no matching ``>`` is found.
+    """
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch == '>' and i + 1 < len(text) and text[i + 1] == '=':
+            i += 2
+            continue
+        if ch == '-' and i + 1 < len(text) and text[i + 1] == '>':
+            i += 2
+            continue
+        if ch == '<':
+            depth += 1
+        elif ch == '>':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def extract_named_attr(op_text: str, key: str,
+                       aliases: Optional[Dict] = None) -> Optional[str]:
+    """Extract a single bare ``key = value`` attribute from ``op_text``.
+
+    Sibling to :func:`parse_attr_block` for ops that carry attributes
+    *outside* a ``{ ... }`` block — e.g. ops whose attribute list lives
+    on the op header itself rather than wrapped in braces:
+    ``producer_tiles_per_group = #all_tiles, groups = #one_group``.
+
+    Returns the resolved value string (alias-resolved when applicable),
+    or ``None`` if not found.  Caller-driven: caller names the key it
+    expects.
+    """
+    m = re.search(rf'\b{re.escape(key)}\s*=\s*', op_text)
+    if not m:
+        return None
+    rest = op_text[m.end():].lstrip()
+
+    # #alias reference
+    if rest.startswith('#'):
+        end = re.search(r'[,\n}]|\s+:|\s*->', rest)
+        raw = rest[:end.start()].strip() if end else rest.strip()
+        return aliases.get(raw, raw) if aliases else raw
+
+    # keyword<...> values — count <> depth, skip >= and ->
+    kw_m = re.match(r'[\w.]+<', rest)
+    if kw_m:
+        end = _scan_angle_bracketed(rest, kw_m.end() - 1)
+        return rest[:end]
+
+    # Plain token up to next comma / newline / brace / colon / arrow.
+    end = re.search(r'[,\n}]|\s+:|\s*->', rest)
+    return rest[:end.start()].strip() if end else rest.strip()
+
+
 def _extract_attr_value(text: str, aliases: Optional[Dict]) -> tuple:
     """Extract one attribute value from the start of *text*.
 
@@ -260,26 +340,8 @@ def _extract_attr_value(text: str, aliases: Optional[Dict]) -> tuple:
     # keyword<...> values — count <> depth, skip >= and ->
     kw_m = re.match(r'[\w.]+<', stripped)
     if kw_m:
-        i = kw_m.end() - 1  # index of opening '<'
-        depth = 0
-        while i < len(stripped):
-            ch = stripped[i]
-            # >= is a constraint operator, not a closing bracket
-            if ch == '>' and i + 1 < len(stripped) and stripped[i + 1] == '=':
-                i += 2
-                continue
-            # -> is the affine_map result arrow, not a bracket pair
-            if ch == '-' and i + 1 < len(stripped) and stripped[i + 1] == '>':
-                i += 2
-                continue
-            if ch == '<':
-                depth += 1
-            elif ch == '>':
-                depth -= 1
-                if depth == 0:
-                    return stripped[:i + 1], skip + i + 1
-            i += 1
-        return stripped, skip + len(stripped)
+        end = _scan_angle_bracketed(stripped, kw_m.end() - 1)
+        return stripped[:end], skip + end
 
     # Plain token up to next comma or closing brace
     end = re.search(r'[,}]', stripped)

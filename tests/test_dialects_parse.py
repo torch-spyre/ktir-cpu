@@ -168,9 +168,13 @@ class TestModuleParser:
           func.func @add(%a: index, %b: index, %c: index) -> index attributes { grid = [4, 4] } {
             %c0 = arith.constant 0 : index
             %grid0 = ktdp.get_compute_tile_id : index
-            %acc = ktdp.construct_access_tile %ref[%c0, %c0] : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
+            %acc = ktdp.construct_access_tile %ref[%c0, %c0] {
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+            } : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
             %tile = ktdp.load %acc : !ktdp.access_tile<128x256xindex> -> tensor<128x256xf16>
-            %out_acc = ktdp.construct_access_tile %out_ref[%c0, %c0] : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
+            %out_acc = ktdp.construct_access_tile %out_ref[%c0, %c0] {
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 255 >= 0)>
+            } : memref<128x256xf16> -> !ktdp.access_tile<128x256xindex>
             ktdp.store %tile, %out_acc : tensor<128x256xf16>, !ktdp.access_tile<128x256xindex>
             return %c0 : index
           }
@@ -265,6 +269,37 @@ class TestArithParsers(ParseTestMixin):
         self.assert_attribute(op, "shape", (4,))
         self.assert_attribute(op, "dtype", "f16")
 
+    def test_constant_dense_list(self):
+        """dense<[16, 32]> : tensor<2xindex> — list form, one value per element.
+
+        Folded ``tensor.from_elements`` of constant ``index`` values appears
+        as the shape operand of ``tensor.reshape``. Without per-element
+        parsing this would mis-parse to a splat-of-zero tensor.
+        """
+        op = self._parse("%c = arith.constant dense<[16, 32]> : tensor<2xindex>")
+        self.assert_op_type(op, "arith.constant")
+        self.assert_attribute(op, "is_tensor", True)
+        self.assert_attribute(op, "shape", (2,))
+        self.assert_attribute(op, "dtype", "index")
+        self.assert_attribute(op, "value", [16, 32])
+        self.assert_attribute(op, "dense_list", True)
+
+    def test_constant_dense_list_float(self):
+        """dense<[1.5, 2.5]> : tensor<2xf32> — list form with float dtype.
+
+        Confirms the dense-list path is dtype-generic: ``_parse_dense_payload``
+        runs each token through ``parse_numeric`` with the element dtype, so
+        floats parse correctly even though the splat path was the original
+        motivating case for index-only shape operands.
+        """
+        op = self._parse("%c = arith.constant dense<[1.5, 2.5]> : tensor<2xf32>")
+        self.assert_op_type(op, "arith.constant")
+        self.assert_attribute(op, "is_tensor", True)
+        self.assert_attribute(op, "shape", (2,))
+        self.assert_attribute(op, "dtype", "f32")
+        self.assert_attribute(op, "value", [1.5, 2.5])
+        self.assert_attribute(op, "dense_list", True)
+
     @pytest.mark.parametrize("op_name", [
         "arith.addi", "arith.subi", "arith.muli",
         "arith.divsi", "arith.divui",
@@ -312,6 +347,22 @@ class TestArithParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "arith.index_cast")
         self.assert_num_operands(op, 1)
+
+    def test_index_castui(self):
+        op = self._parse(
+            "%r = arith.index_castui %a : i32 to index",
+            args={"%a": "i32"},
+        )
+        self.assert_op_type(op, "arith.index_castui")
+        self.assert_num_operands(op, 1)
+
+    def test_ceildivui(self):
+        op = self._parse(
+            "%r = arith.ceildivui %a, %b : i32",
+            args={"%a": "i32", "%b": "i32"},
+        )
+        self.assert_op_type(op, "arith.ceildivui")
+        self.assert_num_operands(op, 2)
 
     def test_select(self):
         op = self._parse(
@@ -441,6 +492,31 @@ class TestLinalgParsers(ParseTestMixin):
         self.assert_num_operands(op, 2)
         self.assert_operand_names(op, "%x", "%buf")
 
+    def test_matmul(self):
+        # matmul carries no attributes; operands are [A, B, C] (ins then outs)
+        op = self._parse(
+            "%r = linalg.matmul ins(%a, %b : tensor<4x8xf16>, tensor<8x16xf16>)"
+            " outs(%c : tensor<4x16xf16>) -> tensor<4x16xf16>",
+            args={"%a": "tensor<4x8xf16>", "%b": "tensor<8x16xf16>", "%c": "tensor<4x16xf16>"},
+        )
+        self.assert_op_type(op, "linalg.matmul")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
+    def test_batch_matmul(self):
+        # batch_matmul has the same operand structure as matmul: [A, B, C].
+        # Added in #81 on the executor side; this verifies both parser
+        # backends handle it (the MLIR frontend needs an installed handler).
+        op = self._parse(
+            "%r = linalg.batch_matmul"
+            " ins(%a, %b : tensor<2x4x8xf16>, tensor<2x8x16xf16>)"
+            " outs(%c : tensor<2x4x16xf16>) -> tensor<2x4x16xf16>",
+            args={"%a": "tensor<2x4x8xf16>", "%b": "tensor<2x8x16xf16>", "%c": "tensor<2x4x16xf16>"},
+        )
+        self.assert_op_type(op, "linalg.batch_matmul")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+
 
 # ---------------------------------------------------------------------------
 # tensor dialect parsers
@@ -516,6 +592,74 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_num_operands(yield_op, 1)
         self.assert_operand_names(yield_op, "%val")
         assert yield_op.result is None
+
+    def test_reshape(self):
+        """1D -> 2D reshape, primary form emitted by Spyre's LowerComputeOps.
+
+        Two SSA operands (source and shape tensor); target shape is read from
+        the result type after ``->``.
+        """
+        op = self._parse(
+            "%out = tensor.reshape %src(%shape) : "
+            "(tensor<512xf32>, tensor<2xindex>) -> tensor<16x32xf32>",
+            args={"%src": "tensor<512xf32>", "%shape": "tensor<2xindex>"},
+        )
+        self.assert_op_type(op, "tensor.reshape")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%src", "%shape")
+        self.assert_attribute(op, "target_shape", (16, 32))
+        self.assert_attribute(op, "dtype", "f32")
+
+    def test_reshape_to_1d(self):
+        """Endpoint test: rank-reducing reshape (2D -> 1D)."""
+        op = self._parse(
+            "%out = tensor.reshape %src(%shape) : "
+            "(tensor<8x16xf16>, tensor<1xindex>) -> tensor<128xf16>",
+            args={"%src": "tensor<8x16xf16>", "%shape": "tensor<1xindex>"},
+        )
+        self.assert_op_type(op, "tensor.reshape")
+        self.assert_attribute(op, "target_shape", (128,))
+        self.assert_attribute(op, "dtype", "f16")
+
+    def test_from_elements(self):
+        """``tensor.from_elements %d0, %d1 : tensor<2xindex>`` — shape-operand
+        producer for ``tensor.reshape``."""
+        op = self._parse(
+            "%shape = tensor.from_elements %d0, %d1 : tensor<2xindex>",
+            args={"%d0": "index", "%d1": "index"},
+        )
+        self.assert_op_type(op, "tensor.from_elements")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%d0", "%d1")
+        self.assert_attribute(op, "shape", (2,))
+        self.assert_attribute(op, "dtype", "index")
+
+    def test_from_elements_n1(self):
+        """N=1 endpoint: single-operand form.
+
+        The grammar ``tensor.from_elements %a, ... : tensor<NxT>`` admits N>=1;
+        this guards the smallest legal match. Used when a reshape needs a
+        rank-1 target with a single dimension (e.g. flatten).
+        """
+        op = self._parse(
+            "%shape = tensor.from_elements %a : tensor<1xindex>",
+            args={"%a": "index"},
+        )
+        self.assert_op_type(op, "tensor.from_elements")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%a")
+        self.assert_attribute(op, "shape", (1,))
+        self.assert_attribute(op, "dtype", "index")
+
+    def test_from_elements_three(self):
+        """N>2 endpoint: rank-3 shape producer (e.g. for tensor<2x2x16xT>)."""
+        op = self._parse(
+            "%shape = tensor.from_elements %a, %b, %c : tensor<3xindex>",
+            args={"%a": "index", "%b": "index", "%c": "index"},
+        )
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%a", "%b", "%c")
+        self.assert_attribute(op, "shape", (3,))
 
 
 # ---------------------------------------------------------------------------

@@ -591,14 +591,17 @@ class TestSdpaExecution(InterpreterTestMixin):
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Requires parser support for #ktdp.reduce_kind / reduce_mode / grid_axis "
-        "attributes (torch-spyre/ktir-mlir-frontend#21)."
-    )
-)
 class TestRingReduceExecution:
-    """End-to-end execution of ring_reduce.mlir (xfail until parser updated)."""
+    """End-to-end execution of ring_reduce.mlir.
+
+    Exercises the new inter-tile communication ops
+    (``ktdp.inter_tile_produce`` + ``ktdp.inter_tile_reduce``) — every
+    core ends up holding the all-reduced sum, but only core 0 writes it
+    back to HBM (gated by ``scf.if %is_writer``).
+
+    The latency-tracker breakdown for the same kernel lives in
+    ``tests/test_latency.py::TestRingReduceLatency``.
+    """
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce"))
     def test_ring_reduce_sum(self, path, func_name, entry):
@@ -616,11 +619,15 @@ class TestRingReduceExecution:
         interp = KTIRInterpreter()
         interp.load(path)
 
+        # ``in_ptr`` and ``out_ptr`` are HBM stick indices (matching the
+        # convention ``KTIRInterpreter.execute_function`` uses for ndarray
+        # kwargs).  Seed / read directly with them — no element-to-stick
+        # translation needed.
         _orig = interp._prepare_execution
 
         def _prepare_and_seed(grid_shape):
             _orig(grid_shape)
-            interp.memory.hbm.write(in_ptr, rows.flatten())
+            interp.memory.hbm.write(in_ptr,  rows.flatten())
             interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
 
         interp._prepare_execution = _prepare_and_seed

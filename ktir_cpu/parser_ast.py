@@ -510,6 +510,49 @@ def enumerate_affine_set(aset: AffineSet, shape: Tuple[int, ...], symbols: Seque
     return [pt for pt in itertools.product(*ranges) if affine_set_contains(aset, pt, symbols)]
 
 
+def enumerate_membership_keys(
+    family: AffineSet,
+    domain: AffineSet,
+    point: Sequence[int],
+    bound: int,
+) -> List[int]:
+    """Return keys ``k ∈ domain ∩ [0, bound)`` for which ``point`` is in
+    ``family(k)``.
+
+    Treats *family* as a parameterised affine set ``(d)[k]`` — i.e. a
+    family of integer sets indexed by ``k``.  *domain* is an
+    unparameterised 1-D set restricting the legal keys.  For each
+    candidate ``k`` enumerated from *domain* over ``[0, bound)``, this
+    function asks whether *point* (a tuple of dim values) is contained
+    in ``family`` with the symbol slot bound to ``k``.
+
+    Naming uses ``family`` / ``domain`` / ``key`` rather than the
+    affine-grammar word "symbol" — this is a higher-level question
+    (which family member contains the point?) than the raw
+    ``[s0, s1, ...]`` symbol slot of an affine set, even if the
+    implementation maps the key onto symbol 0 underneath.
+
+    Args:
+        family: Parameterised set with at least one symbol (the key).
+        domain: Unparameterised 1-D set of legal keys.
+        point:  Concrete dim values for *family*; ``len(point)`` must
+                equal ``family.n_dims``.
+        bound:  Search range for ``k`` (exclusive upper bound).
+
+    Returns:
+        Keys ``k`` (integers) at which ``family`` admits *point*.
+
+    Raises:
+        ValueError: from underlying ``enumerate`` / ``contains`` if
+            shapes do not match (e.g. *domain* is not 1-D, or
+            ``len(point) != family.n_dims``).
+    """
+    return [
+        k for (k,) in domain.enumerate((bound,))
+        if family.contains(list(point), [k])
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Symbolic bound helpers
 #

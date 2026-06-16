@@ -23,6 +23,7 @@ from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
 from ..parser_ast import parse_affine_map
 from ..parser_utils import find_ssa_names, parse_attr_list
+from ._helpers import unwrap_yield
 from .registry import register, register_parser
 
 
@@ -218,6 +219,22 @@ def linalg__reduce(op, context, env):
     return result
 
 
+@register("linalg.add", latency_category=LC.COMPUTE_FLOAT)
+def linalg__add(op, context, env):
+    """Elementwise tensor add — ``%c = linalg.add ins(%a, %b) outs(%init)``.
+
+    Standard MLIR named op: result = a + b (the outs buffer provides the
+    destination shape only; its values are not accumulated into in v1).
+    """
+    tile_a = context.get_value(op.operands[0])
+    tile_b = context.get_value(op.operands[1])
+    if not isinstance(tile_a, Tile) or not isinstance(tile_b, Tile):
+        raise TypeError(
+            f"linalg.add: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
+        )
+    return Tile(tile_a.data + tile_b.data, tile_a.dtype, tile_a.shape)
+
+
 @register("linalg.fill")
 def linalg__fill(op, context, env):
     """Fill a tensor with a scalar value."""
@@ -293,7 +310,8 @@ def linalg__batch_matmul(op, context, env):
     """
     tile_a = context.get_value(op.operands[0])  # ins[0] = A  (B×M×K)
     tile_b = context.get_value(op.operands[1])  # ins[1] = B  (B×K×N)
-    result = Tile(tile_a.data @ tile_b.data, tile_a.dtype, (tile_a.data @ tile_b.data).shape)
+    product = tile_a.data @ tile_b.data
+    result = Tile(product, tile_a.dtype, product.shape)
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
@@ -309,8 +327,6 @@ def linalg__generic(op, context, env):
     (np.expand_dims for missing dims), binds bb0 block-arg names, then
     executes the region body once with full arrays.
     """
-    from ..ops.control_ops import _YieldResult
-
     n_ins = op.attributes.get("n_ins", 0)
     indexing_maps = op.attributes.get("indexing_maps", [])
 
@@ -357,10 +373,7 @@ def linalg__generic(op, context, env):
     result = env.execute_region(context, body_ops)
     context.pop_scope()
 
-    if isinstance(result, _YieldResult):
-        out_data = result.values[0]
-    else:
-        out_data = result
+    out_data = unwrap_yield(result)
 
     if isinstance(out_data, Tile):
         data = np.broadcast_to(out_data.data, out_shape).copy().astype(out_np_dtype)
@@ -381,9 +394,9 @@ def linalg__index(op, context, env):
 
 @register("linalg.yield")
 def linalg__yield(op, context, env):
-    from ..ops.control_ops import _YieldResult
+    from ..ops.control_ops import ControlOps
     values = [context.get_value(n) for n in op.operands]
-    return _YieldResult(values)
+    return ControlOps.yield_op(values)
 
 
 @register("linalg.transpose")

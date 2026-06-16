@@ -156,10 +156,13 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 
 MLIRTypeAdapter.install(
     "func.return",
+    "linalg.add",
     "linalg.fill",
     "linalg.matmul",
+    "linalg.batch_matmul",
     "linalg.yield",
     "scf.yield",
+    "scf.if",
     # float binary
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf",
     # float unary
@@ -183,6 +186,8 @@ MLIRTypeAdapter.install(
     "arith.extf", "arith.truncf",
     "arith.extsi", "arith.extui", "arith.trunci",
     "arith.index_cast",
+    "arith.index_castui",
+    "arith.ceildivui",
     "arith.maxnumf",
     "arith.maximumf",
     "arith.minimumf",
@@ -239,12 +244,20 @@ def _adapt_construct_access_tile(mlir_op, attributes, result_type, operands):
     canonical = str(AffineMapAttr(mlir_op.attributes["base_map"]).value)
     attributes["base_map"] = parse_affine_map(f"affine_map<{canonical}>")
 
-    # access_tile_set → coordinate_set; normalize full sets to None
-    if "access_tile_set" in mlir_op.attributes:
-        # str(IntegerSetAttr) → "affine_set<(d0) : ...>"
-        cs = parse_affine_set(str(mlir_op.attributes["access_tile_set"]))
-        if not cs.is_full(shape):
-            attributes["coordinate_set"] = cs
+    # access_tile_set → coordinate_set.  Required attribute per ODS
+    # (Builtin_IntegerSetAttr:$access_tile_set, no OptionalAttr); absence
+    # is invalid IR.  ``parse_affine_set`` lowers axis-aligned sets to
+    # ``BoxSet`` automatically, so the full-rectangle case naturally
+    # comes out as ``BoxSet([0, shape))`` and routes through the
+    # BoxSet fast path in the dialect handler — no normalisation needed.
+    if "access_tile_set" not in mlir_op.attributes:
+        raise ValueError(
+            "construct_access_tile: access_tile_set is required (per ODS)"
+        )
+    # str(IntegerSetAttr) → "affine_set<(d0) : ...>"
+    attributes["coordinate_set"] = parse_affine_set(
+        str(mlir_op.attributes["access_tile_set"])
+    )
 
     # access_tile_order → coordinate_order; normalize identity maps to None
     if "access_tile_order" in mlir_op.attributes:
@@ -450,6 +463,33 @@ def _adapt_tensor_collapse_shape(mlir_op, attributes, result_type, operands):
     attributes["dtype"] = info["dtype"]
 
 
+@MLIRTypeAdapter.install("tensor.reshape")
+def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
+    """Synthesize target_shape/dtype from the result type annotation.
+
+    The shape operand (operands[1]) is left in place so the IR remains
+    well-formed; only the result type is consulted, since it always pins
+    the target shape statically.
+    """
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.reshape: cannot parse result type {result_type!r}")
+    attributes["target_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+
+
+@MLIRTypeAdapter.install("tensor.from_elements")
+def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
+    """Synthesize shape/dtype from result type — operands carry the values."""
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.from_elements: cannot parse result type {result_type!r}")
+    attributes["shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+
+
 @MLIRTypeAdapter.install("tensor.splat")
 def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
@@ -463,19 +503,41 @@ def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
 
 @MLIRTypeAdapter.install("arith.constant")
 def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
-    """Extract value: unwrap splat tensors, convert int/float attrs."""
+    """Extract value: unwrap splat tensors, iterate dense lists, convert int/float attrs.
+
+    Three cases for the ``value`` attribute:
+
+    - splat ``DenseElementsAttr`` (e.g. ``dense<0.0> : tensor<4xf16>``):
+      unwrap to the single splat value via ``get_splat_value()``.
+    - non-splat ``DenseElementsAttr`` (e.g. ``dense<[16, 32]> : tensor<2xindex>``):
+      iterate the elements; record ``dense_list = True`` so the executor
+      builds the array element-by-element rather than splatting one value.
+    - scalar ``IntegerAttr`` / ``FloatAttr`` (e.g. ``42 : index``): use directly.
+    """
     val_attr = mlir_op.attributes["value"]
-    if isinstance(val_attr, DenseElementsAttr) and val_attr.is_splat:
-        val_attr = val_attr.get_splat_value()
-    if not isinstance(val_attr, (IntegerAttr, FloatAttr)):
+    is_list = False
+    if isinstance(val_attr, DenseElementsAttr):
+        if val_attr.is_splat:
+            attributes["value"] = val_attr.get_splat_value().value
+        else:
+            # Iterating DenseElementsAttr yields Python scalars (int/float)
+            # directly, not wrapped IntegerAttr/FloatAttr.
+            attributes["value"] = [
+                e.value if hasattr(e, "value") else e for e in val_attr
+            ]
+            is_list = True
+    elif isinstance(val_attr, (IntegerAttr, FloatAttr)):
+        attributes["value"] = val_attr.value
+    else:
         raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
-    attributes["value"] = val_attr.value
     if result_type and "tensor<" in result_type:
         from ..parser_utils import parse_tensor_type
         info = parse_tensor_type(result_type)
         attributes["shape"] = info["shape"]
         attributes["dtype"] = info["dtype"]
         attributes["is_tensor"] = True
+        if is_list:
+            attributes["dense_list"] = True
 
 
 @MLIRTypeAdapter.install("linalg.broadcast")

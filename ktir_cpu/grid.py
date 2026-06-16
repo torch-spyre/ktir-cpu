@@ -101,11 +101,13 @@ class CoreContext:
         # ring_backend → transfer_backend nomenclature site by site.
         self._send_fn: Optional[Callable[[int, "Tile"], None]] = None
         self._transfer_fn: Optional[Callable[[int], LXScratchpad]] = None
+        self._num_cores: Optional[int] = None
 
     def attach_scheduler(
         self,
         send_fn: Callable[[int, "Tile"], None],
         transfer_fn: Callable[[int], LXScratchpad],
+        num_cores: int,
     ) -> None:
         """Wire scheduler-managed cross-core access for the duration of a run.
 
@@ -114,16 +116,37 @@ class CoreContext:
         the scheduler's message queue; ``transfer_fn(src_core)`` returns
         the LXScratchpad for a remote core (only invoked for genuinely
         remote cores — local fast path stays in ``get_lx``).
+        ``num_cores`` is the workgroup size; backends read it via
+        :attr:`num_cores` to size their protocols (e.g. ``RingReduceBackend``
+        runs ``num_cores - 1`` rounds).
 
         The binding is valid until ``detach_scheduler`` is called.
         """
         self._send_fn = send_fn
         self._transfer_fn = transfer_fn
+        self._num_cores = num_cores
 
     def detach_scheduler(self) -> None:
         """Clear the scheduler bindings installed by :meth:`attach_scheduler`."""
         self._send_fn = None
         self._transfer_fn = None
+        self._num_cores = None
+
+    @property
+    def num_cores(self) -> int:
+        """Workgroup size, available while a scheduler is attached.
+
+        Distinct from ``HardwareConfig.num_cores`` — that one models
+        the chip's per-core HBM bandwidth divisor and stays where it
+        is.  This is the live workgroup size the IR's ``grid``
+        attribute names.
+        """
+        if self._num_cores is None:
+            raise RuntimeError(
+                f"CoreContext(core_id={self.core_id}).num_cores accessed "
+                f"without an attached scheduler"
+            )
+        return self._num_cores
 
     def get_lx(self, core_id: Optional[int] = None) -> LXScratchpad:
         """Return the LXScratchpad for *core_id*.
@@ -528,7 +551,11 @@ class GridExecutor:
                         "transfer_fn invoked but no transfer_backend was "
                         "passed to execute_with_communication."
                     )
-            core.attach_scheduler(send_fn=send_fn, transfer_fn=transfer_fn)
+            core.attach_scheduler(
+                send_fn=send_fn,
+                transfer_fn=transfer_fn,
+                num_cores=self.num_cores,
+            )
             stacks[core.core_id] = CoreExecutionStack(core, operations, input_ptrs, execute_op)
             _advance(core.core_id)
 
