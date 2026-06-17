@@ -175,6 +175,7 @@ def hbm_read(hbm: "HBMSimulator", byte_addr: int, n_elements: int, dtype: str) -
 
 def hbm_write(hbm: "HBMSimulator", byte_addr: int, data: np.ndarray) -> None:
     """Write data to HBM at byte_addr (byte-addressed)."""
+    assert data.ndim == 1, f"hbm_write expects a 1D array, got shape {data.shape}"
     stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
     hbm.write(stick, data, intra_byte=intra)
 
