@@ -26,7 +26,7 @@ module {
 
       %input_row = ktdp.load %input_acc : !ktdp.access_tile<1x64xindex> -> tensor<1x64xf16>
 
-      %neg_inf = arith.constant 0xFF80 : f16
+      %neg_inf = arith.constant 0xFC00 : f16
       %max_init = tensor.splat %neg_inf : tensor<1xf16>
       %reduce_max = linalg.reduce { arith.maximumf }
         ins(%input_row : tensor<1x64xf16>)

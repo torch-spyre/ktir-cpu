@@ -29,7 +29,7 @@ module {
       } : memref<2x262144xf16> -> !ktdp.access_tile<1x262144xindex>
       %row_13 = ktdp.load %input_acc_1 : !ktdp.access_tile<1x262144xindex> -> tensor<1x262144xf16>
       
-      %neg_inf = arith.constant 0xFF80 : f16
+      %neg_inf = arith.constant 0xFC00 : f16
       %max_init = tensor.splat %neg_inf : tensor<1xf16>
       %row_max = linalg.reduce { arith.maxnumf }
           ins(%row_13 : tensor<1x262144xf16>)
