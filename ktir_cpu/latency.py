@@ -504,14 +504,15 @@ class LatencyReport:
             cores_active: number of cores that consumed any cycle (nonzero
                 total_cycles). A core left idle by an oversized grid produces a
                 counter entry but spends zero cycles, so it is excluded and an
-                under-filled grid does not inflate utilization. A core busy only
-                on communication still counts as active — this matches Nsight's
-                "SM Active" sense (at least one warp resident, even if stalled),
-                not "doing useful compute".
+                under-filled grid does not inflate coverage. A core busy only
+                on communication still counts as active — dispatched is not the
+                same as doing useful compute.
             num_cores: chip-wide hardware core count from ``HardwareConfig``.
-            compute_utilization: ``cores_active / num_cores`` — Nsight
-                Compute "SM Active %" analogue (resource coverage only,
-                does not reflect per-core throughput).
+            grid_coverage: ``cores_active / num_cores`` — fraction of chip
+                cores dispatched any work. Spatial dispatch coverage, not how
+                busy each core is (a core running a single cycle counts fully),
+                so it is NOT Nsight's time-based "SM Active %"; pair with
+                chip_throughput / efficiency to read actual utilization.
             units: per-unit dict, each with:
                 achieved_gflops, ceiling_gflops, ridge_point, efficiency,
                 peak_gflops, chip_peak_gflops, chip_throughput.
@@ -532,7 +533,7 @@ class LatencyReport:
                 core's rate to all cores would overstate utilization.
 
                 Distinct from ``efficiency`` (per-active-core, ceiling-based)
-                and from ``compute_utilization`` (active-core fraction):
+                and from ``grid_coverage`` (dispatched-core fraction):
                 chip_throughput is peak-based and chip-wide. The three
                 coincide only when work is evenly distributed and the kernel
                 is compute-bound at its flat peak.
@@ -553,10 +554,10 @@ class LatencyReport:
         # iterations (0 cycles), and those must not inflate utilization. Use
         # total_cycles (compute+memory+comm) so memory-only kernels with 0 FLOPs
         # (e.g. embedding gather) still count their active cores. A comm-only
-        # core also counts as active here — the Nsight "SM Active" sense.
+        # core also counts as active here (dispatched, not necessarily computing).
         cores_active = sum(1 for c in self.counters.values() if c.total_cycles > 0)
         num_cores = self.config.num_cores
-        compute_utilization = cores_active / num_cores if num_cores > 0 else 0.0
+        grid_coverage = cores_active / num_cores if num_cores > 0 else 0.0
 
         # Per-unit hardware ceilings (hardware constants, not kernel-derived).
         unit_ceilings = {
@@ -623,7 +624,7 @@ class LatencyReport:
             "efficiency": units[dominant]["efficiency"],
             "cores_active": cores_active,
             "num_cores": num_cores,
-            "compute_utilization": compute_utilization,
+            "grid_coverage": grid_coverage,
             "units": units,
         }
 
@@ -633,7 +634,8 @@ class LatencyReport:
             "kernel_cycles": self.kernel_cycles,
             "kernel_time_us": self.kernel_time_us,
             "bottleneck": self.bottleneck,
-            "num_cores": len(self.counters),
+            "grid_cores": len(self.counters),
+            "num_cores": self.config.num_cores,
             "per_core": self.per_core_summary(),
         }
 
@@ -672,8 +674,8 @@ class LatencyReport:
             lines.append(f"  Peak bandwidth       : {rf['peak_bw_gb_s']:.2f} GB/s")
             lines.append(f"  Dominant unit        : {rf['dominant_unit']}")
             lines.append(
-                f"  Cores active         : {rf['cores_active']}/{rf['num_cores']}  "
-                f"(compute_utilization {rf['compute_utilization']:.1%})"
+                f"  Grid coverage        : {rf['cores_active']}/{rf['num_cores']}  "
+                f"(grid_coverage {rf['grid_coverage']:.1%})"
             )
             lines.append(
                 f"  Efficiency           : {rf['efficiency']:.1%}  "

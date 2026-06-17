@@ -283,6 +283,9 @@ class TestVectorAddLatency:
         assert "bottleneck" in d
         assert "per_core" in d
         assert len(d["per_core"]) == num_cores
+        # grid_cores = counter entries (grid product); num_cores = hardware total.
+        assert d["grid_cores"] == num_cores
+        assert d["num_cores"] == report.config.num_cores
 
 
 # ---------------------------------------------------------------------------
@@ -321,13 +324,13 @@ class TestRoofline:
         # Chip-level fields (peak-based, Nsight SOL analogue).
         assert "cores_active" in rf
         assert "num_cores" in rf
-        assert "compute_utilization" in rf
+        assert "grid_coverage" in rf
         assert rf["cores_active"] >= 1
         assert rf["num_cores"] == report.config.num_cores
-        # Note: compute_utilization > 1.0 is possible if the kernel grid
+        # Note: grid_coverage > 1.0 is possible if the kernel grid
         # oversubscribes the modelled core count (e.g. running a 64-core
         # kernel against HardwareConfig(num_cores=32)).
-        assert rf["compute_utilization"] > 0
+        assert rf["grid_coverage"] > 0
         for unit in rf["units"].values():
             assert unit["peak_gflops"] > 0
             assert unit["chip_peak_gflops"] == pytest.approx(
@@ -338,7 +341,7 @@ class TestRoofline:
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_chip_throughput_even_tiling_matches_extrapolation(self, path, func_name, entry):
         """For evenly-tiled work, the chip-wide aggregate equals the
-        critical-core extrapolation ``compute_utilization × (achieved / peak)``.
+        critical-core extrapolation ``grid_coverage × (achieved / peak)``.
 
         chip_throughput is defined as the real per-core FLOP sum over elapsed
         time (see test_chip_throughput_uneven_split_uses_aggregate); when every
@@ -350,7 +353,7 @@ class TestRoofline:
         rf = report.roofline()
 
         for unit_name, unit in rf["units"].items():
-            extrapolation = (rf["compute_utilization"]
+            extrapolation = (rf["grid_coverage"]
                              * unit["achieved_gflops"]
                              / unit["peak_gflops"])
             assert unit["chip_throughput"] == pytest.approx(extrapolation, abs=1e-9), (
@@ -466,7 +469,7 @@ class TestRoofline:
     def test_oversized_grid_does_not_inflate_cores_active(self):
         """An over-large grid leaves some cores with zero loop iterations; those
         idle cores still get a counter entry but must not count toward
-        cores_active / compute_utilization (else utilization is overstated)."""
+        cores_active / grid_coverage (else coverage is overstated)."""
         from ktir_cpu.latency import CoreLatencyCounters
 
         cfg = HardwareConfig(num_cores=32)
@@ -483,7 +486,7 @@ class TestRoofline:
 
         rf = LatencyReport(config=cfg, counters=counters).roofline()
         assert rf["cores_active"] == 4          # not 32 (idle cores excluded)
-        assert rf["compute_utilization"] == pytest.approx(4 / 32)
+        assert rf["grid_coverage"] == pytest.approx(4 / 32)
 
 
 # ---------------------------------------------------------------------------
