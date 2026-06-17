@@ -80,8 +80,8 @@ class CoreContext:
           {"%m_acc": Tile(32x1), "%l_acc": Tile(32x1), ...},  # function
           {"%col": 0, "%tile": Tile(32x256), "%m_new": Tile(32x1)}  # body
         ]
-        # At yield: save %m_new, %l_new. pop_scope() frees body LX.
-        # Re-bind %m_acc = %m_new in parent scope, re-track LX.
+        # At yield: save %m_new, %l_new. pop_scope() decrements body Tile refcounts.
+        # set_value("%m_acc", %m_new) in parent scope: refcount tracks automatically.
     """
 
     def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator):
@@ -90,7 +90,7 @@ class CoreContext:
         self.lx = lx              # Core-local LX scratchpad
         self.hbm = hbm            # Shared HBM
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
-        self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
+        self._tile_refcount: Dict[int, int] = {}  # id(Tile) -> refcount
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
         # Scheduler-managed cross-core access — both functions are set by
         # GridExecutor.execute_with_communication via attach_scheduler() and
@@ -214,16 +214,19 @@ class CoreContext:
     def pop_scope(self):
         """Exit the current region scope.
 
-        Discards all SSA values in the topmost scope, frees their LX
-        via ``untrack_lx``, and rewinds ``lx.next_ptr`` to its
-        pre-push value so the bump-pointer reclaims address space
-        alongside the byte counter.
+        Discards all SSA values in the topmost scope, decrements refcounts
+        for any Tiles, and rewinds ``lx.next_ptr`` to its pre-push value so
+        the bump-pointer reclaims address space alongside the byte counter.
         """
         if len(self._scope_stack) <= 1:
             raise RuntimeError("Cannot pop the function-body scope")
         scope = self._scope_stack.pop()
-        for name in scope:
-            self.untrack_lx(name)
+        for value in scope.values():
+            if isinstance(value, Tile):
+                self._tile_refcount[id(value)] -= 1
+                if self._tile_refcount[id(value)] == 0:
+                    del self._tile_refcount[id(value)]
+                    self.lx.used -= value.size_bytes()
         self.lx.next_ptr = self._lx_next_ptr_stack.pop()
         assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
 
@@ -247,15 +250,35 @@ class CoreContext:
     # ------------------------------------------------------------------
 
     def set_value(self, name: str, value: Any):
-        """Set SSA value in the topmost scope.
+        """Set SSA value in the topmost scope, auto-tracking Tile LX usage.
+
+        - First binding of a Tile id: charges lx.used once.
+        - Subsequent bindings (aliases, iter_arg rebinds): refcount increments, no double-charge.
+        - Overwriting an existing name: decrements refcount of the old Tile.
 
         Multiple SSA names may legally map to the same underlying tensor object
         (e.g. when ``linalg.reduce`` binds its result to both the SSA result name
         and the ``outs`` buffer name).  This is valid because Python assignment
         creates a second reference to the same object — it does not copy the data.
-        If you need to detect aliasing, compare ``id(a) == id(b)`` on the values.
         """
+        old = self._scope_stack[-1].get(name)
+        if isinstance(old, Tile):
+            self._tile_refcount[id(old)] -= 1
+            if self._tile_refcount[id(old)] == 0:
+                del self._tile_refcount[id(old)]
+                self.lx.used -= old.size_bytes()
         self._scope_stack[-1][name] = value
+        if isinstance(value, Tile):
+            if self._tile_refcount.get(id(value), 0) == 0:
+                if self.lx.used + value.size_bytes() > self.lx.capacity:
+                    raise MemoryError(
+                        f"LX scratchpad overflow on core {self.core_id}: "
+                        f"requested {value.size_bytes()} bytes, "
+                        f"available {self.lx.capacity - self.lx.used} bytes "
+                        f"(capacity {self.lx.capacity} bytes)"
+                    )
+                self.lx.used += value.size_bytes()
+            self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
 
     def get_value(self, name: str) -> Any:
         """Get SSA value, searching top-to-bottom.
@@ -281,34 +304,14 @@ class CoreContext:
     def clear_values(self):
         """Clear all scopes and LX (for next round of execution)."""
         self._scope_stack = [{}]
-        self._lx_bytes.clear()
+        self._tile_refcount.clear()
         self._lx_next_ptr_stack.clear()
         self.lx.clear()
 
     # ------------------------------------------------------------------
     # LX tracking — single source of truth for lx.used
+    # Tracking is now automatic via set_value / pop_scope.
     # ------------------------------------------------------------------
-
-    def track_lx(self, name: str, size_bytes: int):
-        """Record that SSA value *name* occupies *size_bytes* in LX.
-
-        Increments ``lx.used``.  Raises ``MemoryError`` if the
-        allocation would exceed the 2 MB LX capacity.
-        """
-        if self.lx.used + size_bytes > self.lx.capacity:
-            raise MemoryError(
-                f"LX scratchpad overflow on core {self.core_id}: "
-                f"requested {size_bytes} bytes, "
-                f"available {self.lx.capacity - self.lx.used} bytes "
-                f"(capacity {self.lx.capacity} bytes)"
-            )
-        self._lx_bytes[name] = size_bytes
-        self.lx.used += size_bytes
-
-    def untrack_lx(self, name: str):
-        """Free LX for SSA value *name*.  Decrements ``lx.used``."""
-        if name in self._lx_bytes:
-            self.lx.used -= self._lx_bytes.pop(name)
 
 
 class CoreExecutionStack:
@@ -358,9 +361,6 @@ class CoreExecutionStack:
                     context.set_value(name, val)
             else:
                 context.set_value(op.result, result)
-                from .ir_types import Tile as _Tile
-                if isinstance(result, _Tile):
-                    context.track_lx(op.result, result.size_bytes())
 
     def resume(self, send_val: Any = None) -> Any:
         """Step the generator.  Returns the final value when done."""

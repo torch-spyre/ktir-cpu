@@ -58,10 +58,12 @@ LX lifetime
 Each SSA ``Tile`` value occupies LX from the point it is created
 (via ``ktdp.load`` or a compute op) until the defining region ends.
 ``CoreContext`` uses a scope stack (``_scope_stack``) that mirrors
-MLIR's region structure.  When a region exits (``pop_scope``), all
-SSA values defined in that scope are discarded and their LX is freed
-via ``untrack_lx``.  Values returned via ``scf.yield`` (iter_args)
-are re-bound in the parent scope and their LX is re-tracked.
+MLIR's region structure.  ``set_value`` auto-tracks a Tile's LX usage
+via a per-object refcount (``_tile_refcount``).  When a region exits
+(``pop_scope``), all SSA values in that scope are discarded and their
+refcounts decremented — LX is freed when refcount hits zero.  Values
+returned via ``scf.yield`` (iter_args) are re-bound in the parent scope
+via ``set_value``, which keeps them live without double-charging.
 
 The 2 MB LX limit is the real constraint: it determines how large a
 tile can be loaded, and how many tiles can coexist in LX at any one

@@ -222,8 +222,6 @@ class KTIRInterpreter:
                 )
             for name, val in zip(names, values):
                 context.set_value(name, val)
-                if isinstance(val, Tile):
-                    context.track_lx(name, val.size_bytes())
 
         # Record latency.
         # Sync handlers: charge now, with the final value.

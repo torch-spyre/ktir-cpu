@@ -254,8 +254,6 @@ def execute_fn() -> Callable[[Operation, Any], Any]:
             return result
         if op.result and result is not None:
             ctx.set_value(op.result, result)
-            if isinstance(result, Tile):
-                ctx.track_lx(op.result, result.size_bytes())
         return result
     return _execute
 

@@ -15,7 +15,7 @@
 """Unit tests for CoreContext scope stack and LX tracking.
 
 Tests that region-scoped SSA values correctly manage LX scratchpad
-memory via push_scope/pop_scope and track_lx/untrack_lx.
+memory via push_scope/pop_scope and set_value auto-tracking.
 """
 
 import numpy as np
@@ -111,25 +111,29 @@ class TestScopeStack:
 # ---------------------------------------------------------------------------
 
 class TestLXTracking:
-    """Test that track_lx / untrack_lx correctly manage lx.used."""
+    """Test that set_value auto-tracking correctly manages lx.used."""
 
-    def test_track_increments_used(self):
+    def test_set_value_tile_increments_used(self):
         ctx = _make_context()
         tile = _make_tile((32, 1024))  # 32*1024*2 = 65536 bytes
-        ctx.track_lx("%tile", tile.size_bytes())
+        ctx.set_value("%tile", tile)
         assert ctx.lx.used == 65536
 
-    def test_untrack_decrements_used(self):
+    def test_overwrite_name_decrements_used(self):
         ctx = _make_context()
         tile = _make_tile((32, 1024))
-        ctx.track_lx("%tile", tile.size_bytes())
-        ctx.untrack_lx("%tile")
+        ctx.set_value("%tile", tile)
+        assert ctx.lx.used == 65536
+        ctx.set_value("%tile", 0)  # overwrite with a non-Tile — refcount drops to 0
         assert ctx.lx.used == 0
 
-    def test_untrack_nonexistent_is_noop(self):
+    def test_alias_does_not_double_count(self):
+        """Two names bound to the same Tile object charge LX only once."""
         ctx = _make_context()
-        ctx.untrack_lx("%does_not_exist")  # should not raise
-        assert ctx.lx.used == 0
+        tile = _make_tile((32, 1024))
+        ctx.set_value("%a", tile)
+        ctx.set_value("%b", tile)  # alias — same id(tile)
+        assert ctx.lx.used == 65536
 
     def test_pop_scope_frees_lx(self):
         """Popping a scope frees LX for all Tiles defined in that scope."""
@@ -137,7 +141,6 @@ class TestLXTracking:
         ctx.push_scope()
         tile = _make_tile((32, 1024))  # 65536 bytes
         ctx.set_value("%tile", tile)
-        ctx.track_lx("%tile", tile.size_bytes())
         assert ctx.lx.used == 65536
 
         ctx.pop_scope()
@@ -148,12 +151,10 @@ class TestLXTracking:
         ctx = _make_context()
         outer_tile = _make_tile((4, 64))  # 512 bytes
         ctx.set_value("%outer", outer_tile)
-        ctx.track_lx("%outer", outer_tile.size_bytes())
 
         ctx.push_scope()
         inner_tile = _make_tile((32, 1024))  # 65536 bytes
         ctx.set_value("%inner", inner_tile)
-        ctx.track_lx("%inner", inner_tile.size_bytes())
         assert ctx.lx.used == 512 + 65536
 
         ctx.pop_scope()
@@ -162,13 +163,16 @@ class TestLXTracking:
     def test_lx_overflow_raises(self):
         """Exceeding LX capacity raises MemoryError."""
         ctx = _make_context(lx_size_mb=1)  # 1 MB = 1048576 bytes
-        # Two 512KB tiles fit
-        ctx.track_lx("%a", 512 * 1024)
-        ctx.track_lx("%b", 512 * 1024)
+        # Two 512 KB tiles just fill capacity
+        tile_a = _make_tile((512, 512))  # 512*512*2 = 524288 bytes = 512 KB
+        tile_b = _make_tile((512, 512))
+        ctx.set_value("%a", tile_a)
+        ctx.set_value("%b", tile_b)
         assert ctx.lx.used == 1048576
         # One more byte should overflow
+        tile_c = _make_tile((1,))  # 2 bytes
         with pytest.raises(MemoryError, match="LX scratchpad overflow"):
-            ctx.track_lx("%c", 1)
+            ctx.set_value("%c", tile_c)
 
     def test_clear_values_resets_everything(self):
         ctx = _make_context()
@@ -176,11 +180,11 @@ class TestLXTracking:
         ctx.push_scope()
         ctx.set_value("%y", 2)
         tile = _make_tile((8, 64))
-        ctx.track_lx("%tile", tile.size_bytes())
+        ctx.set_value("%tile", tile)
 
         ctx.clear_values()
         assert ctx._scope_stack == [{}]
-        assert ctx._lx_bytes == {}
+        assert ctx._tile_refcount == {}
         assert ctx.lx.used == 0
 
 
@@ -222,7 +226,6 @@ class TestForOpLXTracking:
         # but over cap if double-counted.
         tile = _make_tile((768, 1024))
         ctx.set_value("%accum_zero", tile)
-        ctx.track_lx("%accum_zero", tile.size_bytes())
         assert ctx.lx.used == 1_572_864
 
         # for_op binds %accum_itr = %accum_zero (same object).
@@ -260,7 +263,6 @@ class TestForOpLXTracking:
         ctx = _make_context()
         tile = _make_tile((32, 64))
         ctx.set_value("%init", tile)
-        ctx.track_lx("%init", tile.size_bytes())
         used_before = ctx.lx.used
 
         ControlOps.for_op(
@@ -274,7 +276,7 @@ class TestForOpLXTracking:
         )
 
         # After the loop, lx.used must be exactly what it was before.
-        # Any delta means for_op left a dangling _lx_bytes entry.
+        # Any delta means for_op left a dangling refcount entry.
         assert ctx.lx.used == used_before, (
             f"leak: expected {used_before}, got {ctx.lx.used}"
         )
@@ -298,7 +300,6 @@ class TestForOpLXTracking:
         ctx = _make_context()
         tile = _make_tile((4, 4))
         ctx.set_value("%acc", tile)
-        ctx.track_lx("%acc", tile.size_bytes())
 
         seen = []
 
@@ -339,8 +340,8 @@ class TestForOpLXTracking:
         ctx = _make_context()
         tile_a = _make_tile((32, 32))   # 32*32*2 = 2048 bytes
         tile_b = _make_tile((16, 16))   # 16*16*2 = 512 bytes
-        ctx.set_value("%a", tile_a); ctx.track_lx("%a", tile_a.size_bytes())
-        ctx.set_value("%b", tile_b); ctx.track_lx("%b", tile_b.size_bytes())
+        ctx.set_value("%a", tile_a)
+        ctx.set_value("%b", tile_b)
         assert ctx.lx.used == 2048 + 512
 
         ControlOps.for_op(
@@ -375,7 +376,6 @@ class TestForOpLXTracking:
         ctx = _make_context()
         tile = _make_tile((8, 8))
         ctx.set_value("%init", tile)
-        ctx.track_lx("%init", tile.size_bytes())
         used_before = ctx.lx.used
 
         ControlOps.for_op(
@@ -444,7 +444,6 @@ class TestForOpLXTracking:
         ctx = _make_context()
         tile = _make_tile((32, 32))
         ctx.set_value("%init", tile)
-        ctx.track_lx("%init", tile.size_bytes())
         baseline = ctx.lx.used
 
         used_per_iter = []
@@ -469,39 +468,42 @@ class TestForOpLXTracking:
         )
 
     def test_new_tile_yielded_from_body_not_leaked(self):
-        """A genuinely new Tile yielded from the body must not leak LX.
+        """A new Tile yielded from the body is live in the iter_arg after the loop.
 
         When the body produces a new Tile each iteration (e.g. a running
-        reduction), that Tile is tracked inside the body scope by
-        _execute_operation and freed by pop_scope when the iteration ends.
-        for_op re-binds the iter_arg name to the new object but must not
-        re-track it — _execute_operation will track the final value under
-        the outer result name when scf.for returns.
-        lx.used after the loop must equal what it was before the loop.
+        reduction), each new tile is tracked inside the body scope by
+        set_value.  When the body scope pops, the new tile's refcount drops to
+        zero — it is freed.  for_op then re-binds the iter_arg name to the new
+        tile in the parent scope via set_value, which charges it once (refcount
+        0→1).  Only the LAST iteration's tile survives: all previous ones are
+        freed when %itr is overwritten.
 
-        LX state per iteration:
-            body entry:    [%init: N]                  lx.used = N
-            body scope:    [%init: N] | [%new: N]      lx.used = 2N
-            pop_scope:     [%init: N]                  lx.used = N   ← %new freed
-            re-bind %itr:  [%init: N]                  lx.used = N   ← no re-track
+        LX state per iteration (3 total, N = tile_size):
+            iter start:    parent={%init: tile, %itr: prev}          lx.used = N (init) + N (prev)
+            body scope:    parent | body={%new: new_tile}             lx.used = 2N + N = 3N
+            pop_scope:     parent={%init: tile, %itr: prev}          lx.used = 2N  (new_tile freed)
+            re-bind %itr:  parent={%init: tile, %itr: new_tile}      lx.used = N + N = 2N
+                           (prev freed when %itr overwritten, new_tile charged)
+
+        After the loop, lx.used = used_before + tile_size (init + last yielded tile).
+        The interpreter would then bind the scf.for result to the same last tile
+        (refcount 1→2, no new charge) so the total remains 2N.
         """
         from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
 
         ctx = _make_context()
         tile = _make_tile((4, 4))
         ctx.set_value("%init", tile)
-        ctx.track_lx("%init", tile.size_bytes())
-        used_before = ctx.lx.used
+        tile_size = tile.size_bytes()
+        used_before = ctx.lx.used  # = tile_size
 
         def body(c, ops):
-            # Simulate _execute_operation creating a new Tile in the body scope
-            # and tracking it there (as ktdp.load or linalg.matmul would do).
+            # Simulate _execute_operation creating a new Tile in the body scope.
             new_tile = _make_tile((4, 4))
             c.push_scope()
             c.set_value("%new", new_tile)
-            c.track_lx("%new", new_tile.size_bytes())
             result = _YieldResult([new_tile])
-            c.pop_scope()  # frees %new from LX
+            c.pop_scope()  # new_tile refcount drops to 0, freed
             return result
 
         ControlOps.for_op(
@@ -514,8 +516,10 @@ class TestForOpLXTracking:
             iter_init_values=[tile],
         )
 
-        assert ctx.lx.used == used_before, (
-            f"leak from yielded new tile: expected {used_before}, got {ctx.lx.used}"
+        # After the loop: %init tile (N) + last yielded tile held by %itr (N).
+        # Only 2 tiles live — old iters' tiles were freed each time %itr was overwritten.
+        assert ctx.lx.used == used_before + tile_size, (
+            f"expected {used_before + tile_size}, got {ctx.lx.used}"
         )
 
     def test_nested_loops_inner_does_not_leak_into_outer(self):
@@ -538,7 +542,6 @@ class TestForOpLXTracking:
         ctx = _make_context()
         outer_tile = _make_tile((32, 32))
         ctx.set_value("%outer_init", outer_tile)
-        ctx.track_lx("%outer_init", outer_tile.size_bytes())
         used_at_outer_start = ctx.lx.used
 
         outer_used_per_iter = []
@@ -549,7 +552,6 @@ class TestForOpLXTracking:
             # Inner loop with its own iter_arg.
             inner_tile = _make_tile((8, 8))
             c.set_value("%inner_init", inner_tile)
-            c.track_lx("%inner_init", inner_tile.size_bytes())
 
             ControlOps.for_op(
                 context=c,
@@ -561,7 +563,8 @@ class TestForOpLXTracking:
                 iter_init_values=[inner_tile],
             )
 
-            c.untrack_lx("%inner_init")
+            # Release the inner tile by overwriting the name with a non-Tile.
+            c.set_value("%inner_init", None)
             return _YieldResult([c.get_value("%outer_itr")])
 
         ControlOps.for_op(
@@ -590,10 +593,10 @@ class TestIterArgsPersistence:
 
         Each iteration:
           1. push_scope
-          2. create body-local Tile (tracked by _execute_operation)
-          3. create new iter_arg Tile (tracked by _execute_operation)
-          4. pop_scope (frees both body-local and new iter_arg Tile)
-          5. untrack old iter_arg, re-bind + re-track new iter_arg
+          2. create body-local Tile via set_value (auto-tracked)
+          3. create new iter_arg Tile via set_value (auto-tracked)
+          4. pop_scope (frees both body-local and new iter_arg Tile via refcount)
+          5. set_value("%acc", new_acc) — decrements old tile, increments new tile
 
         After each iteration, lx.used == iter_arg size only.
         """
@@ -602,7 +605,6 @@ class TestIterArgsPersistence:
         # Initial iter_arg: tensor<4x1xf16> = 8 bytes
         iter_tile = _make_tile((4, 1))
         ctx.set_value("%acc", iter_tile)
-        ctx.track_lx("%acc", iter_tile.size_bytes())
         assert ctx.lx.used == 8
 
         for i in range(3):
@@ -611,23 +613,19 @@ class TestIterArgsPersistence:
             # Body-local: tensor<4x256xf16> = 2048 bytes
             body_tile = _make_tile((4, 256))
             ctx.set_value("%body_tile", body_tile)
-            ctx.track_lx("%body_tile", body_tile.size_bytes())
 
             # New iter_arg value (created in body, will be yielded)
             new_acc = _make_tile((4, 1))
             ctx.set_value("%new_acc", new_acc)
-            ctx.track_lx("%new_acc", new_acc.size_bytes())
 
             assert ctx.lx.used == 8 + 2048 + 8  # old acc + body + new acc
 
-            # pop_scope frees body-local LX (%body_tile AND %new_acc)
+            # pop_scope frees body-local LX (%body_tile AND %new_acc) via refcount
             ctx.pop_scope()
             assert ctx.lx.used == 8  # only old %acc remains
 
-            # Re-bind iter_arg: untrack old, set + track new
-            ctx.untrack_lx("%acc")
+            # Re-bind iter_arg: set_value decrements old tile, increments new tile
             ctx.set_value("%acc", new_acc)
-            ctx.track_lx("%acc", new_acc.size_bytes())
             assert ctx.lx.used == 8  # back to steady state
 
 
@@ -655,13 +653,12 @@ class TestNextPtrRewind:
             ctx.push_scope()
 
             # Mirrors the interpreter's _execute_operation sequence for a
-            # load op: write into LX, set the SSA value in the scope, track
-            # its bytes. pop_scope then frees it via untrack_lx.
+            # load op: write into LX, set the SSA value in the scope.
+            # set_value auto-tracks; pop_scope auto-frees via refcount.
             tile_data = np.zeros((4, 256), dtype=np.float16)  # 2 KB
             MemoryOps._write_to_lx(ctx, tile_data)
             name = f"%tile_iter{i}"
             ctx.set_value(name, Tile(tile_data, "f16", tile_data.shape))
-            ctx.track_lx(name, tile_data.nbytes)
 
             ctx.pop_scope()
 
@@ -730,12 +727,13 @@ class TestNextPtrRewind:
         """The fix must not hide genuine LX exhaustion within a single scope."""
         ctx = _make_context(lx_size_mb=0.125)  # 128 KB cap
 
-        # Try to track more than capacity in one scope — track_lx should raise.
+        # set_value on a Tile whose size would exceed capacity raises MemoryError.
         with pytest.raises(MemoryError, match="LX scratchpad overflow"):
             for i in range(100):
                 data = np.zeros((1024,), dtype=np.float16)  # 2 KB each
+                tile = Tile(data, "f16", data.shape)
                 MemoryOps._write_to_lx(ctx, data)
-                ctx.track_lx(f"%t{i}", data.nbytes)  # eventually exceeds 128 KB
+                ctx.set_value(f"%t{i}", tile)  # eventually exceeds 128 KB
 
     def test_clear_values_resets_watermark_stack(self):
         """clear_values must also clear the watermark stack."""

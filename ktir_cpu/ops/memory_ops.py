@@ -393,8 +393,8 @@ class MemoryOps:
         """Write data into the core-local LX scratchpad.
 
         Advances ``next_ptr`` so subsequent writes don't collide.
-        LX capacity accounting is handled by ``CoreContext.track_lx()``
-        in ``_execute_operation`` — we only reserve address space here.
+        LX capacity accounting is handled by ``CoreContext.set_value()``
+        auto-tracking in ``_execute_operation`` — we only reserve address space here.
         All loaded Tiles always land in LX regardless of source memory space.
         """
         size = data.nbytes
