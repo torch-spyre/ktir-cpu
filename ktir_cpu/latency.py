@@ -521,28 +521,21 @@ class LatencyReport:
             chip_peak_gflops: ``peak_gflops × num_cores`` — chip-wide flat
                 peak. Distinct from ``ceiling_gflops`` which is the
                 roofline ceiling at this kernel's AI.
-            chip_throughput: ``achieved × cores_active / (peak × num_cores)``
-                — Nsight "Compute (SM) Throughput %" analogue. Folds idle
-                cores into the denominator. Identity::
+            chip_throughput: ``sum(core FLOPs over all cores) / elapsed
+                / (peak × num_cores)`` — Nsight "Compute (SM) Throughput %"
+                analogue. The numerator is the actual total FLOPs summed
+                across every core over the elapsed (wall) time, so idle and
+                lighter cores correctly pull the figure down — the same way
+                Nsight aggregates per-SM counters across all SMs over elapsed
+                cycles. This is exact under any work distribution, including
+                split-K and uneven tiling, where extrapolating the critical
+                core's rate to all cores would overstate utilization.
 
-                    chip_throughput = compute_utilization
-                                      × (achieved_gflops / peak_gflops)
-
-                This uses ``peak_gflops`` (flat peak), not the existing
-                ``efficiency`` field which is normalised by ceiling at AI
-                — the two differ in the memory-bound regime.
-
-                Assumes equal disjoint work across active cores
-                (``critical = max(counters)`` represents the bound for
-                all). Holds for current anchor kernels with divisible
-                tiling; becomes an upper bound under split-K or uneven
-                tiles.
-
-                Also assumes every active core does roofline-relevant work
-                (compute or memory). A communication-only core would be
-                counted in ``cores_active`` yet contributes nothing to either
-                roofline axis, overstating throughput. No current kernel
-                produces such a core; revisit this denominator if one does.
+                Distinct from ``efficiency`` (per-active-core, ceiling-based)
+                and from ``compute_utilization`` (active-core fraction):
+                chip_throughput is peak-based and chip-wide. The three
+                coincide only when work is evenly distributed and the kernel
+                is compute-bound at its flat peak.
         """
         if not self.counters:
             return {}
@@ -592,8 +585,18 @@ class LatencyReport:
             # separately in unit_ceilings; per precision/generation, captured by
             # the config values), never core-to-core.
             chip_peak = peak * num_cores
-            chip_throughput = (achieved * cores_active / chip_peak
-                               if chip_peak > 0 else 0.0)
+            # Chip throughput uses the actual FLOPs summed across every core,
+            # not the critical core's rate extrapolated to all cores. Under
+            # uneven tiling the lighter cores do fewer FLOPs in the same wall
+            # time; extrapolating `achieved * cores_active` would count them as
+            # if they matched the critical core and overstate utilization. The
+            # real per-core sum over the same elapsed time gives the true
+            # chip-wide figure, matching Nsight's SM Throughput (per-SM counters
+            # aggregated across all SMs over elapsed cycles).
+            chip_flops = sum(c.flops_by_category.get(cat, 0.0)
+                             for c in self.counters.values() for cat in cats)
+            chip_achieved = chip_flops / elapsed_s if elapsed_s > 0 else 0.0
+            chip_throughput = chip_achieved / chip_peak if chip_peak > 0 else 0.0
             units[unit_name] = {
                 "achieved_gflops": achieved / 1e9,
                 "ceiling_gflops": ceiling / 1e9,

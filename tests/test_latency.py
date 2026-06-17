@@ -336,23 +336,62 @@ class TestRoofline:
             assert unit["chip_throughput"] >= 0
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
-    def test_chip_throughput_identity(self, path, func_name, entry):
-        """chip_throughput == compute_utilization × (achieved / peak).
+    def test_chip_throughput_even_tiling_matches_extrapolation(self, path, func_name, entry):
+        """For evenly-tiled work, the chip-wide aggregate equals the
+        critical-core extrapolation ``compute_utilization × (achieved / peak)``.
 
-        Independent peak-based identity: avoids ``efficiency`` (which is
-        ceiling-based and diverges from peak in the memory-bound regime).
+        chip_throughput is defined as the real per-core FLOP sum over elapsed
+        time (see test_chip_throughput_uneven_split_uses_aggregate); when every
+        active core does equal work the two coincide. This anchors that
+        equivalence so the uneven-split divergence is meaningful, not an
+        artifact of an unrelated formula change.
         """
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
 
         for unit_name, unit in rf["units"].items():
-            expected = (rf["compute_utilization"]
-                        * unit["achieved_gflops"]
-                        / unit["peak_gflops"])
-            assert unit["chip_throughput"] == pytest.approx(expected, abs=1e-9), (
-                f"chip_throughput identity broken for unit {unit_name!r}: "
-                f"got {unit['chip_throughput']}, expected {expected}"
+            extrapolation = (rf["compute_utilization"]
+                             * unit["achieved_gflops"]
+                             / unit["peak_gflops"])
+            assert unit["chip_throughput"] == pytest.approx(extrapolation, abs=1e-9), (
+                f"even-tiling equivalence broken for unit {unit_name!r}: "
+                f"got {unit['chip_throughput']}, expected {extrapolation}"
             )
+
+    def test_chip_throughput_uneven_split_uses_aggregate(self):
+        """Under uneven tiling chip_throughput must aggregate the real FLOPs of
+        every core, not extrapolate the critical (heaviest) core's rate to all.
+
+        Three cores run for the same wall time but do 300/200/100 matmul FLOPs.
+        The aggregate (600) is the true chip work; extrapolating the critical
+        core (300 × 3 = 900) would overstate utilization by 1.5×.
+        """
+        from ktir_cpu.latency import CoreLatencyCounters
+
+        cfg = HardwareConfig(num_cores=32)
+        counters = {}
+        for cid, flops in enumerate((300.0, 200.0, 100.0)):
+            c = CoreLatencyCounters()
+            c.record("compute_matmul", cycles=100.0, flops=flops)
+            counters[cid] = c
+
+        report = LatencyReport(config=cfg, counters=counters)
+        rf = report.roofline()
+        unit = rf["units"]["systolic"]
+
+        clock = cfg.clock_ghz * 1e9
+        elapsed_s = max(c.total_cycles for c in counters.values()) / clock
+        chip_peak = unit["peak_gflops"] * 1e9 * rf["num_cores"]
+        total_flops = sum(c.flops_by_category.get("compute_matmul", 0.0)
+                          for c in counters.values())  # 600
+
+        expected_aggregate = (total_flops / elapsed_s) / chip_peak
+        assert unit["chip_throughput"] == pytest.approx(expected_aggregate)
+
+        # The critical-core extrapolation would be strictly larger (overstated).
+        extrapolation = (unit["achieved_gflops"] * 1e9 * rf["cores_active"]) / chip_peak
+        assert unit["chip_throughput"] < extrapolation
+        assert extrapolation == pytest.approx(1.5 * unit["chip_throughput"])
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_vector_add_is_memory_bound(self, path, func_name, entry):
