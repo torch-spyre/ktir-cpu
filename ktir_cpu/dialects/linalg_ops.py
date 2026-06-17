@@ -195,24 +195,32 @@ def linalg__reduce(op, context, env):
 
     dim = op.attributes.get("dim")  # axis to reduce; None → collapse all
 
+    outs_var = op.attributes.get("outs_var")
+    outs_tile = context.get_value(outs_var) if outs_var else None
+
     if isinstance(tile, Tile):
         folded = _tree_fold(tile, dim, bb0_names, body_ops, context, env)
         if dim is None:
-            result = folded.reshape(()).astype(tile.data.dtype).item()
+            reduced = folded.reshape(()).astype(tile.data.dtype)
         else:
             reduced = np.squeeze(folded, axis=dim).astype(tile.data.dtype)
-            if reduced.ndim == 0:
-                result = reduced.item()
-            else:
-                result = Tile(reduced, tile.dtype, reduced.shape)
+
+        # Combine with the outs initial accumulator.
+        if isinstance(outs_tile, Tile):
+            reduced_tile = Tile(reduced.copy(), tile.dtype, reduced.shape)
+            combined = _run_combiner(
+                bb0_names, body_ops, reduced_tile, outs_tile, context, env,
+            )
+            reduced = combined.data if isinstance(combined, Tile) else np.asarray(combined)
+
+        if reduced.ndim == 0:
+            result = reduced.item()
+        else:
+            result = Tile(reduced, tile.dtype, reduced.shape)
     else:
         # Already a scalar, nothing to reduce.
         result = tile
 
-    # In MLIR linalg semantics the result is written back into the outs buffer,
-    # so downstream ops may reference it by the outs SSA name rather than the
-    # result name. Bind both so either reference resolves correctly.
-    outs_var = op.attributes.get("outs_var")
     if outs_var and result is not None:
         context.set_value(outs_var, result)
 

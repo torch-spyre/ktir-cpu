@@ -498,14 +498,14 @@ class TestReduceLatency:
 
         # Combiner ops carry the cost. Core 0 processes 2 rows; per row a max
         # (arith.maximumf) and a sum (arith.addf) each fold a 1×64 tile → the
-        # tree fold processes 63 elements per reduce. Summed per op across both
-        # rows: 2 × 63 / simd_elements_per_cycle.
-        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        # tree fold processes N-1 elements, plus one final combine with the outs
+        # accumulator (1 element). Total per reduce: N-1+1 = N elements.
+        per_reduce = 64 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         for combiner in ("arith.maximumf", "arith.addf"):
             total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
             assert total == pytest.approx(2 * per_reduce), (
                 f"{combiner} should total {2 * per_reduce} cyc over 2 rows "
-                f"(tree fold of 1×64 → N-1 elems each); got {total}"
+                f"(tree fold of 1×64 + outs combine each); got {total}"
             )
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
@@ -523,13 +523,13 @@ class TestReduceLatency:
         ), "linalg.reduce must be zero-cost in the explicit-region form too"
 
         # reduce_generic.mlir folds a 1×4 input tile with arith.addf. A pairwise
-        # tree fold of 4 elements processes 2 + 1 = 3 elements total →
-        # 3 / simd_elements_per_cycle cycles, charged to the combiner.
-        expected = 3 / cfg.simd_elements_per_cycle  # N-1 for N=4
+        # tree fold of 4 elements processes N-1=3 elements, plus one final
+        # combine with the outs accumulator (1 element). Total: 4 elements.
+        expected = 4 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         total = sum(e.cycles for e in core0.trace if e.op_type == "arith.addf")
         assert total == pytest.approx(expected), (
             f"combiner arith.addf should total {expected} cyc "
-            f"(tree fold of 1×4 → N-1 elems); got {total}"
+            f"(tree fold of 1×4 + outs combine); got {total}"
         )
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
@@ -551,12 +551,12 @@ class TestReduceLatency:
         core0 = report.counters[0]
 
         assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
-        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        per_reduce = 64 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         for combiner in ("arith.maximumf", "arith.addf"):
             total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
             assert total == pytest.approx(2 * per_reduce), (
                 f"{combiner} should total {2 * per_reduce} cyc (explicit-region "
-                f"softmax, 2 rows of 1×64 tree fold); got {total}"
+                f"softmax, 2 rows of 1×64 tree fold + outs combine); got {total}"
             )
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_multiop"))
@@ -569,12 +569,12 @@ class TestReduceLatency:
         core0 = report.counters[0]
 
         assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
-        # 1×8 tree fold → 7 elements processed; each region op charged 7/simd.
-        expected = 7 / cfg.simd_elements_per_cycle  # N-1 for N=8
+        # 1×8 tree fold → 7 elements processed + 1 outs combine = 8 total.
+        expected = 8 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         for region_op in ("arith.cmpf", "arith.select"):
             total = sum(e.cycles for e in core0.trace if e.op_type == region_op)
             assert total == pytest.approx(expected), (
-                f"{region_op} should total {expected} cyc (1×8 tree fold); "
+                f"{region_op} should total {expected} cyc (1×8 tree fold + outs combine); "
                 f"got {total}"
             )
 
