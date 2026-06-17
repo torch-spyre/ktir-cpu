@@ -43,7 +43,8 @@ Linear affine expressions:
   - Addition (+), subtraction (-), negation (unary -)
   - Multiplication by a constant coefficient (N * dI or dI * N)
 
-Not supported: floordiv, ceildiv, mod.
+Supported division ops: floordiv (floor toward -∞), mod (non-negative remainder).
+Not supported: ceildiv.
 
 Affine set enumeration
 ----------------------
@@ -75,6 +76,8 @@ from .affine import AffineMap, AffineSet, BoxSet
 #   ("sub",   node, node)
 #   ("neg",   node)           — unary negation
 #   ("mul",   int,  node)     — constant-coefficient multiplication
+#   ("floordiv", node, int)   — floor division; RHS must be a positive int constant
+#   ("mod",   node, int)      — non-negative remainder (always ≥ 0); RHS positive int
 #   ("max",   node, node)     — pointwise maximum (constructed by sym_max,
 #                               not the surface parser; used to express
 #                               symbolic ``BoxSet.lo`` after intersect)
@@ -98,6 +101,18 @@ _TOKEN_RE = re.compile(
     r'|(==|>=|<=|->|[+\-*(),:[\]])'  # operator / punctuation; == before >= (group 4)
     r')'
 )
+
+# Reserved keyword tokens — never valid as dim/sym/ref names.
+_AFFINE_KEYWORDS = frozenset({"floordiv", "ceildiv", "mod"})
+
+# Multiplicative operators: token → (ast_tag, int_both_sides).
+# int_both_sides=True  → integer may appear on either side; node is (tag, n, primary)
+# int_both_sides=False → integer must be on the right;      node is (tag, primary, n)
+_MULTIPLICATIVE_OPS = {
+    "*":        ("mul",      True),
+    "floordiv": ("floordiv", False),
+    "mod":      ("mod",      False),
+}
 
 
 def _tokenise(text: str) -> List[str]:
@@ -196,29 +211,43 @@ class _Parser:
             operand = self._atom()
             return ("neg", operand)
 
-        # Integer that may be a coefficient: N * expr
+        # Integer-leading: N * expr  (coefficient on the left, arbitrary atom on right).
+        # This is the only form where * takes a non-integer RHS.
         if tok is not None and re.fullmatch(r'-?\d+', tok):
             num = int(self.consume())
             if self.peek() == "*":
                 self.consume("*")
                 operand = self._atom()
                 return ("mul", num, operand)
-            return ("const", num)
+            primary: _Node = ("const", num)
+        else:
+            primary = self._atom()
 
-        # Atom that may be followed by a coefficient: expr * N
-        node = self._atom()
-        if self.peek() == "*":
-            self.consume("*")
+        # Postfix multiplicative operators: expr * N, expr floordiv N, expr mod N.
+        # All require an integer constant on the right.
+        while self.peek() in _MULTIPLICATIVE_OPS:
+            op = self.consume()
             num_tok = self.peek()
             if num_tok is None or not re.fullmatch(r'-?\d+', num_tok):
-                raise ValueError(f"Expected integer coefficient after '*', got {num_tok!r}")
-            return ("mul", int(self.consume()), node)
-        return node
+                raise ValueError(f"Expected integer constant after {op!r}, got {num_tok!r}")
+            n = int(self.consume())
+            tag, int_both_sides = _MULTIPLICATIVE_OPS[op]
+            if op in ("floordiv", "mod") and n <= 0:
+                raise ValueError(
+                    f"{op!r} requires a positive integer divisor, got {n}"
+                )
+            primary = (tag, n, primary) if int_both_sides else (tag, primary, n)
+        return primary
 
     def _atom(self) -> _Node:
         tok = self.peek()
         if tok is None:
             raise ValueError("Unexpected end of expression")
+
+        if tok in _AFFINE_KEYWORDS:
+            raise ValueError(
+                f"Keyword {tok!r} is not valid as an atom in an affine expression"
+            )
 
         # Parenthesised sub-expression
         if tok == "(":
@@ -449,6 +478,11 @@ def _eval_node(node: _Node, dims: List[int], syms: Optional[List[int]] = None) -
         return -_eval_node(node[1], dims, syms)
     if tag == "mul":
         return node[1] * _eval_node(node[2], dims, syms)
+    if tag == "floordiv":
+        return _eval_node(node[1], dims, syms) // node[2]
+    if tag == "mod":
+        # Non-negative remainder matching MLIR semantics: result is always in [0, N).
+        return _eval_node(node[1], dims, syms) % node[2]
     if tag == "max":
         return max(_eval_node(node[1], dims, syms), _eval_node(node[2], dims, syms))
     if tag == "min":
