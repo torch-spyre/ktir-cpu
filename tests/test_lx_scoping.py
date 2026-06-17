@@ -470,24 +470,24 @@ class TestForOpLXTracking:
     def test_new_tile_yielded_from_body_not_leaked(self):
         """A new Tile yielded from the body is live in the iter_arg after the loop.
 
-        When the body produces a new Tile each iteration (e.g. a running
-        reduction), each new tile is tracked inside the body scope by
-        set_value.  When the body scope pops, the new tile's refcount drops to
-        zero — it is freed.  for_op then re-binds the iter_arg name to the new
-        tile in the parent scope via set_value, which charges it once (refcount
-        0→1).  Only the LAST iteration's tile survives: all previous ones are
-        freed when %itr is overwritten.
+        for_op() owns the loop-body scope (push_scope/pop_scope around each
+        iteration).  The body callback receives the already-pushed scope and
+        should NOT call push_scope/pop_scope itself — that would add an extra
+        level not present in real _execute_operation execution.
 
         LX state per iteration (3 total, N = tile_size):
-            iter start:    parent={%init: tile, %itr: prev}          lx.used = N (init) + N (prev)
-            body scope:    parent | body={%new: new_tile}             lx.used = 2N + N = 3N
-            pop_scope:     parent={%init: tile, %itr: prev}          lx.used = 2N  (new_tile freed)
-            re-bind %itr:  parent={%init: tile, %itr: new_tile}      lx.used = N + N = 2N
-                           (prev freed when %itr overwritten, new_tile charged)
+            iter 0 init:   parent={%init: tile, %itr: tile}   lx.used = N  (same object, rc=2)
+            iter 0 body:   ... | body={%i:0, %new0: new0}     lx.used = 2N
+            pop_scope:     parent={%init: tile, %itr: tile}   lx.used = N  (new0 freed, rc=0)
+            rebind %itr:   parent={%init: tile, %itr: new0}   lx.used = 2N (tile rc 2→1, new0 rc 0→1)
 
-        After the loop, lx.used = used_before + tile_size (init + last yielded tile).
-        The interpreter would then bind the scf.for result to the same last tile
-        (refcount 1→2, no new charge) so the total remains 2N.
+            iter 1 body:   ... | body={%i:1, %new1: new1}     lx.used = 3N (init+new0+new1)
+            pop_scope:     parent={%init: tile, %itr: new0}   lx.used = 2N (new1 freed)
+            rebind %itr:   parent={%init: tile, %itr: new1}   lx.used = 2N (new0 freed, new1 charged)
+
+        After the loop: lx.used = 2N (init + last yielded tile held by %itr).
+        The interpreter then binds the scf.for result to the same last tile
+        (refcount 1→2, no new charge) — total stays 2N.
         """
         from ktir_cpu.ops.control_ops import ControlOps, _YieldResult
 
@@ -498,13 +498,11 @@ class TestForOpLXTracking:
         used_before = ctx.lx.used  # = tile_size
 
         def body(c, ops):
-            # Simulate _execute_operation creating a new Tile in the body scope.
+            # for_op already pushed the body scope before calling this.
+            # Simulate _execute_operation placing a new Tile directly in it.
             new_tile = _make_tile((4, 4))
-            c.push_scope()
             c.set_value("%new", new_tile)
-            result = _YieldResult([new_tile])
-            c.pop_scope()  # new_tile refcount drops to 0, freed
-            return result
+            return _YieldResult([new_tile])
 
         ControlOps.for_op(
             context=ctx,
@@ -516,8 +514,8 @@ class TestForOpLXTracking:
             iter_init_values=[tile],
         )
 
-        # After the loop: %init tile (N) + last yielded tile held by %itr (N).
-        # Only 2 tiles live — old iters' tiles were freed each time %itr was overwritten.
+        # After the loop: %init tile (N) + last yielded tile held by %itr (N) = 2N.
+        # All previous iterations' tiles were freed when %itr was overwritten.
         assert ctx.lx.used == used_before + tile_size, (
             f"expected {used_before + tile_size}, got {ctx.lx.used}"
         )
