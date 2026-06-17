@@ -468,11 +468,12 @@ def parse_linalg_reduce(op_text, parse_ctx):
     if combiner_match:
         reduce_fn = combiner_match.group(1)
 
-    # dimensions = [1] or dimensions = [0, 1]
+    # dimensions = [1] or dimensions = [0, 1] or dimensions = []
     dims = None
-    dims_match = re.search(r'dimensions\s*=\s*\[(\d+(?:\s*,\s*\d+)*)\]', op_text)
+    dims_match = re.search(r'dimensions\s*=\s*\[([^\]]*)\]', op_text)
     if dims_match:
-        dims = [int(d.strip()) for d in dims_match.group(1).split(',')]
+        content = dims_match.group(1).strip()
+        dims = [int(d.strip()) for d in content.split(',') if d.strip()] if content else []
 
     # ins(%x : type) — first operand is the input
     operands = []

@@ -839,7 +839,7 @@ class TestMath:
 
 class TestLinalg:
     def test_reduce_along_dim(self):
-        # reduce a 1×4 tile along dim 1 — result is a (1,) tile summing to 10
+        # reduce a 1x4 tile along dim 1 - result is a (1,) tile summing to 10
         data = np.array([[1, 2, 3, 4]], dtype=np.float16)
         t = Tile(data, "f16", data.shape)
         ctx = _ctx_with(**{"%x": t, "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
@@ -883,8 +883,8 @@ class TestLinalg:
 
     def test_reduce_multiop_combiner(self):
         # MULTI-OP combiner: max expressed as cmpf(ogt) + select. The general
-        # tree fold must run BOTH region ops — there is no single combiner name
-        # to map to a NumPy reduction — and still return the correct max.
+        # tree fold must run BOTH region ops - here is no single combiner name
+        # to map to a NumPy reduction - nd still return the correct max.
         data = np.array([[0.1, 0.9, 0.3, 0.2, 0.5, 0.05, 0.7, 0.05]], dtype=np.float16)
         neg_inf = np.float16("-inf")
         ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
@@ -915,7 +915,7 @@ class TestLinalg:
         assert val == pytest.approx(15.0, abs=1e-2)
 
     def test_reduce_multi_axis_3d_disjoint_2d(self):
-        # dimensions = [0, 2] on a (3, 4, 2) tensor — disjoint axes.
+        # dimensions = [0, 2] on a (3, 4, 2) tensor - disjoint axes.
         # Output shape (4,): for each dim1 slot, sum over dim0 and dim2.
         data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
         expected = data.sum(axis=(0, 2))  # shape (4,)
@@ -926,6 +926,20 @@ class TestLinalg:
                        attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
                                    "outs_var": "%init"})
         assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
+    def test_reduce_multi_axis_3d_0d(self):
+        # dimensions = [] on a (3, 4, 2) tensor - zero reduce dims is a no-op.
+        # Output shape must equal input shape; values unchanged.
+        data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
+        expected = data.copy()  # no reduction - identity
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros_like(data), "f16", data.shape)})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [],
+                                   "outs_var": "%init"})
+        assert result.shape == (3, 4, 2)
         np.testing.assert_allclose(result.data, expected, rtol=1e-2)
 
     @pytest.mark.xfail(reason="tree-fold (pairwise halving) breaks the "
