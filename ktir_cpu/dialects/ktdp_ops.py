@@ -189,15 +189,23 @@ def ktdp__load(op, context, env):
         return MemoryOps.distributed_load(
             context, access_tile.parent_ref, result_shape=result_shape
         )
-    css = access_tile.coordinate_set    # AffineSet | None
+    css = access_tile.coordinate_set    # BoxSet | AffineSet (always present post-parse)
     cso = access_tile.coordinate_order  # AffineMap | None
-    if css is not None:
-        coords = css.enumerate(access_tile.shape)
-        if cso is not None:
-            coords = [cso.eval(pt) for pt in coords]
-        result_shape = op.attributes.get("_result_shape", access_tile.shape)
-        return MemoryOps.load(context, access_tile.parent_ref, coords=coords, result_shape=result_shape)
-    return MemoryOps.load(context, access_tile.parent_ref)
+    # BoxSet fast path: rectangular access with identity coordinate order →
+    # build a sub-TileRef on the box and let MemoryOps.load take its own
+    # contiguous/strided fast path on the sub-ref.  Mirrors the BoxSet branch
+    # in MemoryOps.distributed_load — same _subtile_ref + MemoryOps.load
+    # composition, keeping a single strategy across distributed and single-
+    # allocation paths.  Non-rectangular AffineSet still routes through the
+    # coord-list path below where ``_result_shape`` reshapes the gather.
+    if isinstance(css, BoxSet) and (cso is None or cso.is_identity()):
+        sub_ref = MemoryOps._subtile_ref(access_tile.parent_ref, css)
+        return MemoryOps.load(context, sub_ref)
+    coords = css.enumerate(access_tile.shape)
+    if cso is not None:
+        coords = [cso.eval(pt) for pt in coords]
+    result_shape = op.attributes.get("_result_shape", access_tile.shape)
+    return MemoryOps.load(context, access_tile.parent_ref, coords=coords, result_shape=result_shape)
 
 
 @register("ktdp.store", latency_category=LC.MEMORY)
@@ -219,12 +227,18 @@ def ktdp__store(op, context, env):
     tile_ref = access_tile.parent_ref
     css = access_tile.coordinate_set
     cso = access_tile.coordinate_order
-    if css is not None:
-        coords = css.enumerate(access_tile.shape)
-        if cso is not None:
-            coords = [cso.eval(pt) for pt in coords]
-        return MemoryOps.store(context, value, tile_ref, coords=coords)
-    return MemoryOps.store(context, value, tile_ref)
+    # BoxSet fast path: symmetric to ktdp.load.  Build a sub-TileRef on the
+    # box and store through it.  Avoids the read-modify-write scatter that
+    # the coord-list path needs for general AffineSet stores.  Same shape as
+    # the BoxSet branch in MemoryOps.distributed_store — single strategy
+    # across distributed and single-allocation paths.
+    if isinstance(css, BoxSet) and (cso is None or cso.is_identity()):
+        sub_ref = MemoryOps._subtile_ref(tile_ref, css)
+        return MemoryOps.store(context, value, sub_ref)
+    coords = css.enumerate(access_tile.shape)
+    if cso is not None:
+        coords = [cso.eval(pt) for pt in coords]
+    return MemoryOps.store(context, value, tile_ref, coords=coords)
 
 
 # ---------------------------------------------------------------------------
@@ -520,14 +534,26 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
         base_map_str = f'affine_map<({dims}) -> ({dims})>'
     base_map = parse_affine_map(base_map_str)
 
+    # ``access_tile_set`` is required per ODS
+    # (Builtin_IntegerSetAttr:$access_tile_set, no OptionalAttr); absence
+    # is invalid IR.  ``parse_affine_set`` lowers axis-aligned sets to
+    # ``BoxSet`` automatically, so the full-rectangle case naturally
+    # comes out as ``BoxSet([0, shape))`` and routes through the BoxSet
+    # fast path in the dialect handler — no normalisation needed.
     coord_set_str = attrs.get('access_tile_set')
-    coordinate_set = parse_affine_set(coord_set_str) if isinstance(coord_set_str, str) else None
-    # Normalise to None when the set covers the full rectangular tile in
-    # row-major order — it carries no information beyond "load/store everything".
-    # This lets ktdp.load/store take the contiguous fast path instead of
-    # enumerating all coords on every execution.
-    if coordinate_set is not None and coordinate_set.is_full(access_shape):
-        coordinate_set = None
+    if not isinstance(coord_set_str, str):
+        raise ValueError(
+            "construct_access_tile: access_tile_set is required (per ODS)"
+        )
+    coordinate_set = parse_affine_set(coord_set_str)
+    # ``access_shape`` is structurally ``int`` (parsed from
+    # ``<NxMxindex>``); ``raise`` (not ``assert``) so the guard survives
+    # ``python -O``.
+    if not all(isinstance(s, int) for s in access_shape):
+        raise TypeError(
+            f"construct_access_tile: access_shape must be concrete ints, "
+            f"got {access_shape!r}"
+        )
 
     coord_order_str = attrs.get('access_tile_order')
     coordinate_order = parse_affine_map(coord_order_str) if isinstance(coord_order_str, str) else None
