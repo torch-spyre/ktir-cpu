@@ -396,6 +396,41 @@ class TestRoofline:
         assert unit["chip_throughput"] < extrapolation
         assert extrapolation == pytest.approx(1.5 * unit["chip_throughput"])
 
+    def test_dominant_by_cycles_and_per_unit_ai(self):
+        """Dominant unit is the cycle bottleneck, not the FLOP-heaviest, and each
+        unit gets its own arithmetic intensity (its FLOPs / total bytes).
+
+        Mirrors the paged_attention shape on default HW: the systolic matmul has
+        far more FLOPs (524288) but runs in a single cycle, while the SIMD path
+        has fewer FLOPs (28480) yet spends 496 cycles — it is the real
+        bottleneck. Selecting by FLOPs would wrongly pick systolic; selecting by
+        cycles (reading the per-category cycle tally produced upstream) picks
+        simd. No existing roofline test asserts which unit is dominant, so this
+        pins the cycle-based selection against silent regression.
+        """
+        from ktir_cpu.latency import CoreLatencyCounters
+
+        total_bytes = 71680
+        c = CoreLatencyCounters()
+        c.record("compute_matmul", cycles=1.0, flops=524288.0)
+        c.record("compute_float", cycles=496.0, flops=28480.0, nbytes=total_bytes)
+
+        rf = LatencyReport(config=HardwareConfig(), counters={0: c}).roofline()
+
+        # FLOP-heaviest is systolic; cycle-heaviest (the bottleneck) is simd.
+        assert rf["dominant_unit"] == "simd"
+
+        # Each unit's AI is its own FLOPs over the shared total bytes — distinct,
+        # not one mixed value shared by both.
+        ai_sys = rf["units"]["systolic"]["arithmetic_intensity"]
+        ai_simd = rf["units"]["simd"]["arithmetic_intensity"]
+        assert ai_sys == pytest.approx(524288.0 / total_bytes)
+        assert ai_simd == pytest.approx(28480.0 / total_bytes)
+        assert ai_sys != ai_simd
+
+        # The top-level AI is sourced from the dominant (simd) unit, not a mix.
+        assert rf["arithmetic_intensity"] == pytest.approx(ai_simd)
+
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_vector_add_is_memory_bound(self, path, func_name, entry):
         """vector_add has low arithmetic intensity → memory-bound on roofline."""
