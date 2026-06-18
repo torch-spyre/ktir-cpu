@@ -970,7 +970,7 @@ _COMPOUND_FLOORDIV_MOD_MLIR = """
 module {
   func.func @compound_floordiv_mod() attributes {grid = [1, 1]} {
     %src_addr = arith.constant 0 : index
-    %dst_addr = arith.constant 100 : index
+    %dst_addr = arith.constant 6400 : index
 
     %src = ktdp.construct_memory_view %src_addr, sizes: [128], strides: [1] {
         coordinate_set = #src_set,
