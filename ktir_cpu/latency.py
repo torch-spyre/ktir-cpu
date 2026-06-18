@@ -461,8 +461,8 @@ class LatencyReport:
         """Compute per-unit roofline metrics for the critical-path core.
 
         Two compute units are modelled (systolic for matmul, SIMD for everything
-        else).  The dominant unit — whichever accumulated the most FLOPs — sets
-        the compute ceiling.  The chart shows one roof::
+        else).  The dominant unit — whichever consumed the most compute cycles —
+        sets the headline.  The chart shows one roof::
 
             GFLOP/s
               ^
@@ -485,9 +485,11 @@ class LatencyReport:
         - **simd**: all other compute ops (float, transcendental, int),
           peak = ``simd_elements_per_cycle × clock``
 
-        The **dominant unit** is whichever accumulated the most FLOPs in the
-        kernel trace — it reflects which unit did the real work.  The summary
-        ``efficiency`` is reported for the dominant unit.
+        The **dominant unit** is whichever consumed the most compute cycles in
+        the kernel trace — the real bottleneck.  FLOPs are not comparable across
+        units (matmul ``2*M*N*K`` vs SIMD per-element), so cycles, not FLOPs,
+        identify the busy unit.  The summary ``arithmetic_intensity`` and
+        ``efficiency`` are reported for the dominant unit.
 
         For each unit, ``achieved_gflops`` is ``unit_flops / total_wall_time``
         (not unit_flops / unit_cycles) so the achieved rate reflects true
@@ -497,9 +499,10 @@ class LatencyReport:
            Communication cycles (ring allgather/reduce) are not modelled.
 
         Returns a dict with:
-            arithmetic_intensity: total FLOPs / total bytes (FLOP/B).
+            arithmetic_intensity: the dominant unit's per-unit AI
+                (``dominant_unit FLOPs / total bytes``, FLOP/B).
             peak_bw_gb_s: Per-core HBM bandwidth in GB/s.
-            dominant_unit: ``"systolic"`` or ``"simd"`` (most FLOPs).
+            dominant_unit: ``"systolic"`` or ``"simd"`` (most compute cycles).
             efficiency: achieved / ceiling for the dominant unit (0..1).
             cores_active: number of cores that consumed any cycle (nonzero
                 total_cycles). A core left idle by an oversized grid produces a
@@ -515,6 +518,7 @@ class LatencyReport:
                 chip_throughput / efficiency to read actual utilization.
             units: per-unit dict, each with:
                 achieved_gflops, ceiling_gflops, ridge_point, efficiency,
+                arithmetic_intensity (this unit's own FLOPs / total bytes),
                 peak_gflops, chip_peak_gflops, chip_throughput.
 
         Per-unit chip-level fields (peak-based, Nsight SOL analogue):
@@ -546,9 +550,6 @@ class LatencyReport:
         elapsed_s = critical.total_cycles / clock
         peak_bw = self.config.hbm_bytes_per_cycle_per_core * clock
 
-        ai = (critical.total_flops / critical.total_bytes
-              if critical.total_bytes > 0 else float('inf'))
-
         # Count cores that consumed any cycle, not every grid core that produced
         # a counter entry: an oversized grid leaves some cores with zero loop
         # iterations (0 cycles), and those must not inflate utilization. Use
@@ -577,8 +578,15 @@ class LatencyReport:
             cats = unit_categories[unit_name]
             flops = sum(critical.flops_by_category.get(c, 0.0) for c in cats)
             achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
-            # Roofline ceiling at this kernel's AI for this unit.
-            ceiling = min(peak, peak_bw * ai)
+            # Per-unit arithmetic intensity: this unit's own FLOPs over the
+            # kernel's total bytes (NCU convention — numerator split per
+            # pipeline, denominator the shared byte traffic). Each unit gets its
+            # own ceiling instead of sharing one mixed AI, so the other unit's
+            # FLOPs no longer inflate this unit's ceiling.
+            unit_ai = (flops / critical.total_bytes
+                       if critical.total_bytes > 0 else float('inf'))
+            # Roofline ceiling at this unit's own AI.
+            ceiling = min(peak, peak_bw * unit_ai)
             # Cores are homogeneous: every core shares the same clock and
             # compute rates from HardwareConfig, so the chip peak is
             # peak * num_cores, which equals summing identical per-core peaks.
@@ -603,22 +611,28 @@ class LatencyReport:
                 "ceiling_gflops": ceiling / 1e9,
                 "ridge_point": peak / peak_bw,
                 "efficiency": achieved / ceiling if ceiling > 0 else 0.0,
+                "arithmetic_intensity": unit_ai,
                 "peak_gflops": peak / 1e9,
                 "chip_peak_gflops": chip_peak / 1e9,
                 "chip_throughput": chip_throughput,
             }
 
-        # Dominant unit = most FLOPs. Fall back to "simd" when no compute.
+        # Dominant unit = the unit that consumed the most compute cycles — the
+        # real bottleneck. Per-category cycles are already attributed to each
+        # unit upstream (LatencyTracker._estimate); read that conclusion rather
+        # than re-deriving from FLOPs, which are not comparable across units
+        # (matmul 2*M*N*K vs SIMD per-element). Fall back to "simd" when no
+        # compute ran at all (every category zero → both flops and cycles zero).
         dominant = max(
             unit_ceilings,
-            key=lambda u: sum(critical.flops_by_category.get(c, 0.0)
+            key=lambda u: sum(critical.cycles_by_category.get(c, 0.0)
                               for c in unit_categories[u]),
         )
         if all(units[u]["achieved_gflops"] == 0.0 for u in units):
             dominant = "simd"
 
         return {
-            "arithmetic_intensity": ai,
+            "arithmetic_intensity": units[dominant]["arithmetic_intensity"],
             "peak_bw_gb_s": peak_bw / 1e9,
             "dominant_unit": dominant,
             "efficiency": units[dominant]["efficiency"],
