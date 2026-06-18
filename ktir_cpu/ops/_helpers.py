@@ -44,7 +44,7 @@ def _tile_binop(fn, val1, val2, *, scalar_cast):
 
 
 tile_binop_int = partial(_tile_binop, scalar_cast=int)
-tile_binop_float = partial(_tile_binop, scalar_cast=lambda x: x)
+tile_binop_float = partial(_tile_binop, scalar_cast=float)
 
 
 def tile_unary_float(fn, val):
