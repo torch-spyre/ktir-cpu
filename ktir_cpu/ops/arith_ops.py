@@ -29,9 +29,10 @@ from ._helpers import tile_binop_int
 
 
 def _ceildiv(a, b):
-    # np.ceil(a/b) for arrays; math.ceil for scalars.
-    result = np.ceil(a / b)
-    return result.astype(a.dtype) if isinstance(a, np.ndarray) else math.ceil(result)
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        result = np.ceil(a / b)
+        return result.astype(a.dtype if isinstance(a, np.ndarray) else b.dtype)
+    return math.ceil(a / b)
 
 
 def arith_cast(value, target_np_dtype, expect_floating, op_name):

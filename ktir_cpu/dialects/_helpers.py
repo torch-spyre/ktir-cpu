@@ -74,8 +74,19 @@ def _int_binop(op, context, fn):
 def _unary(op, context, fn, scalar_fn=None):
     """Fetch one operand and apply a unary function.
 
-    *fn* is called for both Tiles and scalars unless *scalar_fn* is given,
-    in which case *scalar_fn* handles the scalar path.
+    *fn* handles both Tile and scalar inputs unless *scalar_fn* is provided,
+    in which case *scalar_fn* is used for the scalar path.
+
+    Cast ops need *scalar_fn* because their Tile *fn* (e.g. ArithOps.extf)
+    handles dtype promotion internally, while for bare scalars a plain type
+    coercion is sufficient and correct. Examples from arith cast ops:
+      arith.extf     → scalar_fn=np.float32
+      arith.extui / arith.trunci / arith.fptosi / arith.fptoui → scalar_fn=int
+      arith.uitofp   → scalar_fn=float
+
+    Contrast with the ops-layer tile helpers (tile_binop_int / tile_unary_int
+    etc.) which do casting unconditionally because they operate at the raw
+    NumPy level and always need to normalise scalars before calling the kernel.
     """
     val = context.get_value(op.operands[0])
     if isinstance(val, Tile):
