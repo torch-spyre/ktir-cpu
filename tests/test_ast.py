@@ -132,6 +132,114 @@ class TestParseExpr:
 
 
 # ===========================================================================
+# floordiv / mod expression parsing and evaluation
+# ===========================================================================
+
+class TestFloorDivMod:
+
+    # --- AST structure ---
+
+    def test_floordiv_dim(self):
+        node = parse_expr("d0 floordiv 4")
+        assert node == ("floordiv", ("dim", 0), 4)
+
+    def test_mod_dim(self):
+        node = parse_expr("d0 mod 8")
+        assert node == ("mod", ("dim", 0), 8)
+
+    def test_floordiv_const_lhs(self):
+        # Integer-leading path — previously broken (early-returned before the loop).
+        node = parse_expr("5 floordiv 3")
+        assert node == ("floordiv", ("const", 5), 3)
+
+    def test_mod_const_lhs(self):
+        node = parse_expr("7 mod 4")
+        assert node == ("mod", ("const", 7), 4)
+
+    def test_floordiv_compound_lhs(self):
+        # Compound expression as LHS — the motivating case from the gather kernel.
+        node = parse_expr("(d0 + d1 * 64) floordiv 64")
+        assert node == (
+            "floordiv",
+            ("add", ("dim", 0), ("mul", 64, ("dim", 1))),
+            64,
+        )
+
+    def test_mod_compound_lhs(self):
+        node = parse_expr("(d0 + 1) mod 8")
+        assert node == ("mod", ("add", ("dim", 0), ("const", 1)), 8)
+
+    def test_floordiv_then_mod_chain(self):
+        # d0 floordiv 4 mod 2  →  (d0 floordiv 4) mod 2  (left-to-right)
+        node = parse_expr("d0 floordiv 4 mod 2")
+        assert node == ("mod", ("floordiv", ("dim", 0), 4), 2)
+
+    # --- Evaluation ---
+
+    def test_floordiv_eval_exact(self):
+        node = parse_expr("d0 floordiv 4")
+        assert eval_expr(node, [8]) == 2
+        assert eval_expr(node, [12]) == 3
+
+    def test_floordiv_eval_floor_semantics(self):
+        # Python // floors toward -∞, matching MLIR affine semantics.
+        node = parse_expr("d0 floordiv 4")
+        assert eval_expr(node, [7]) == 1
+        assert eval_expr(node, [0]) == 0
+
+    def test_mod_eval(self):
+        node = parse_expr("d0 mod 64")
+        assert eval_expr(node, [0]) == 0
+        assert eval_expr(node, [63]) == 63
+        assert eval_expr(node, [64]) == 0
+        assert eval_expr(node, [65]) == 1
+
+    def test_compound_floordiv_eval(self):
+        # (y_offset + d_stick*64 + d_lane) floordiv 64
+        # dims: d0=y_offset, d1=d_stick, d2=d_lane
+        node = parse_expr("(d0 + d1 * 64 + d2) floordiv 64")
+        assert eval_expr(node, [0, 0, 0]) == 0
+        assert eval_expr(node, [0, 1, 0]) == 1
+        assert eval_expr(node, [32, 0, 32]) == 1   # (32+0+32)//64 == 1
+        assert eval_expr(node, [32, 0, 31]) == 0   # (32+0+31)//64 == 0
+
+    def test_compound_mod_eval(self):
+        node = parse_expr("(d0 + d1 * 64 + d2) mod 64")
+        assert eval_expr(node, [0, 0, 0]) == 0
+        assert eval_expr(node, [0, 0, 5]) == 5
+        assert eval_expr(node, [32, 0, 32]) == 0   # (32+0+32) % 64 == 0
+        assert eval_expr(node, [32, 0, 10]) == 42  # (32+0+10) % 64 == 42
+
+    # --- Non-positive divisor guard ---
+
+    def test_floordiv_zero_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 floordiv 0")
+
+    def test_floordiv_negative_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 floordiv -4")
+
+    def test_mod_zero_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 mod 0")
+
+    def test_mod_negative_divisor_raises(self):
+        with pytest.raises(ValueError, match="positive integer divisor"):
+            parse_expr("d0 mod -1")
+
+    # --- Keyword guard in _atom ---
+
+    def test_keyword_as_atom_raises(self):
+        with pytest.raises(ValueError, match="Keyword"):
+            parse_expr("floordiv")
+
+    def test_keyword_mod_as_atom_raises(self):
+        with pytest.raises(ValueError, match="Keyword"):
+            parse_expr("mod")
+
+
+# ===========================================================================
 # parse_affine_map — AST structure
 # ===========================================================================
 

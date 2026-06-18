@@ -43,7 +43,7 @@ module {
     %c0       = arith.constant 0          : index
     %zero_f16 = arith.constant 0.0        : f16
     %scale    = arith.constant 1.25e-01   : f16   // 1/sqrt(64) = 0.125
-    %neg_inf  = arith.constant 0xFF80 : f16   // -infinity (f16)
+    %neg_inf  = arith.constant 0xFC00 : f16   // -infinity (f16)
 
     // -----------------------------------------------------------------------
     // 1. Load Q block: [BLOCK_SIZE_M=32, HEAD_DIM=64]

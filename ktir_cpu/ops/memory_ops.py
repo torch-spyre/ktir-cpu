@@ -411,7 +411,7 @@ class MemoryOps:
         dtype: str,
         coords: Optional[List[Tuple[int, ...]]] = None,
         stick_bytes: Optional[int] = None,
-    ) -> Tuple[List[int], Optional[int]]:
+    ) -> Tuple[np.ndarray, Optional[int]]:
         """Linearize N-d coordinates to flat element offsets and optionally count sticks.
 
         Args:
@@ -423,17 +423,35 @@ class MemoryOps:
             stick_bytes: If set (HBM), count distinct sticks touched. None skips.
 
         Returns:
-            (offsets, unique_sticks) — element offsets and stick count (None for LX).
+            (offsets, unique_sticks) — flat element offsets as an ``int64`` ndarray
+            (callers fancy-index with it), and the distinct-stick count (None for LX).
         """
-        offsets = []
-        sticks = set() if stick_bytes else None
-        bpe = _bytes_per_elem(dtype)
-        for coord in (coords if coords is not None else np.ndindex(*shape)):
-            o = sum(c * s for c, s in zip(coord, strides))
-            offsets.append(o)
-            if sticks is not None:
-                sticks.add((base_ptr + o * bpe) // stick_bytes)
-        return offsets, len(sticks) if sticks is not None else None
+        # Vectorised: linearize every coordinate to a flat element offset
+        # `Σ_d coord_d · stride_d` with numpy instead of a per-element Python loop.
+        # The loop form was O(elements) in pure Python (a `sum()` over the dims per
+        # element, plus a set insert for stick counting) and dominated whole-model
+        # timings — the finely LX-tiled production emit issues many large loads, so
+        # this single function was ~90%+ of a Python pass. numpy makes it O(1) calls.
+        strides_arr = np.asarray(strides, dtype=np.int64)
+        if coords is not None:
+            if len(coords) == 0:
+                return np.empty(0, dtype=np.int64), (0 if stick_bytes else None)
+            offs = np.asarray(coords, dtype=np.int64) @ strides_arr  # (N,)
+        elif not shape:  # 0-d scalar tile: one element at offset 0
+            offs = np.zeros(1, dtype=np.int64)
+        else:
+            # Full-shape enumeration in C (row-major) order — matches np.ndindex(*shape).
+            grids = np.indices(shape, dtype=np.int64)  # (ndim, *shape)
+            offs = np.tensordot(strides_arr, grids, axes=(0, 0)).reshape(-1)
+        if stick_bytes:
+            bpe = _bytes_per_elem(dtype)
+            unique = int(np.unique((base_ptr + offs * bpe) // stick_bytes).size)
+        else:
+            unique = None
+        # Return the ndarray (not a list): the hot load/store paths fancy-index
+        # `flat[offsets]` with it directly, and `offsets.max()` beats Python `max`
+        # over a freshly-listified array.
+        return offs, unique
 
     @staticmethod
     def load(
@@ -509,7 +527,7 @@ class MemoryOps:
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes
         )
-        span = max(offsets) + 1 if offsets else 1
+        span = int(offsets.max()) + 1 if offsets.size else 1
         flat = mgr.read(span, tile_ref.dtype)
 
         gathered = flat[offsets]
@@ -564,7 +582,7 @@ class MemoryOps:
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            mgr.write(tile.data.flatten())
+            mgr.write(tile.data.ravel())  # write reads it (copies into store) — view is fine
             if not stick_bytes:
                 return 0
             n = int(np.prod(tile_ref.shape))
@@ -580,9 +598,9 @@ class MemoryOps:
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes,
         )
-        span = max(offsets) + 1 if offsets else 1
+        span = int(offsets.max()) + 1 if offsets.size else 1
         flat = mgr.read(span, tile_ref.dtype)
-        flat[offsets] = tile.data.flatten()
+        flat[offsets] = tile.data.ravel()  # RHS read-only scatter source — view is fine
         mgr.write(flat)
         return unique_sticks if unique_sticks is not None else 0
 
@@ -834,10 +852,15 @@ class MemoryOps:
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords, stick_bytes=mgr.stick_bytes,
             )
-            span = max(offsets) + 1 if offsets else 1
+            span = int(offsets.max()) + 1 if offsets.size else 1
             flat = mgr.read(span, survivor.dtype)
-            for ac, off in zip(access_coords, offsets):
-                out[ac] = flat[off]
+            # Vectorized scatter: per-dimension index arrays → one fancy-index write.
+            out_idx = tuple(
+                np.fromiter((c[d] for c in access_coords), dtype=np.intp,
+                            count=len(access_coords))
+                for d in range(ndim)
+            )
+            out[out_idx] = flat[offsets]
             if unique_sticks is not None:
                 total_unique_sticks += unique_sticks
 
@@ -901,10 +924,15 @@ class MemoryOps:
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords, stick_bytes=mgr.stick_bytes,
             )
-            span = max(offsets) + 1 if offsets else 1
+            span = int(offsets.max()) + 1 if offsets.size else 1
             flat = mgr.read(span, survivor.dtype)
-            for ac, off in zip(access_coords, offsets):
-                flat[off] = tile.data[ac]
+            # Vectorized gather/scatter: per-dimension index arrays → one fancy-index read+write.
+            src_idx = tuple(
+                np.fromiter((c[d] for c in access_coords), dtype=np.intp,
+                            count=len(access_coords))
+                for d in range(ndim)
+            )
+            flat[offsets] = tile.data[src_idx]
             mgr.write(flat)
             if unique_sticks is not None:
                 total_unique_sticks += unique_sticks
