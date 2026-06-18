@@ -917,11 +917,6 @@ class TestLinalg:
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(15.0, abs=1e-2)
 
-    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
-                              "the tree fold seeds from the input only. Harmless "
-                              "while the frontend inits outs to the identity. "
-                              "Tracked in issue #85.",
-                       strict=True)
     def test_reduce_folds_outs_init(self):
         # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
         # outs init = 100 should be 110, not 10.
