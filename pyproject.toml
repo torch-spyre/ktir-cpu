@@ -54,4 +54,5 @@ markers = [
 dev = [
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
+    "pytest>=9.0.2",
 ]

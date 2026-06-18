@@ -646,6 +646,37 @@ def _adapt_tensor_generate(mlir_op, attributes, result_type, operands):
     attributes["dtype"] = info["dtype"]
 
 
+_DYNAMIC_SIZE = -(1 << 63)  # ShapedType::kDynamic in MLIR
+
+
+@MLIRTypeAdapter.install("tensor.extract_slice")
+def _adapt_tensor_extract_slice(mlir_op, attributes, result_type, operands):
+    """Extract static_offsets/sizes/strides and result shape from the op."""
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
+    attributes["result_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+    attributes["static_offsets"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_offsets"]))
+    attributes["static_sizes"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
+    attributes["static_strides"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+
+
+@MLIRTypeAdapter.install("tensor.insert_slice")
+def _adapt_tensor_insert_slice(mlir_op, attributes, result_type, operands):
+    """Extract static_offsets/sizes/strides and result shape from the op."""
+    from ..parser_utils import parse_tensor_type
+    info = parse_tensor_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
+    attributes["result_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+    attributes["static_offsets"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_offsets"]))
+    attributes["static_sizes"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
+    attributes["static_strides"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------

@@ -852,3 +852,179 @@ def test_non_permutation_vso_raises(mlir_factory, func_name):
 
     with pytest.raises(ValueError, match="must permute its input dimensions"):
         interp.execute_function(func_name)
+
+
+# ---------------------------------------------------------------------------
+# parse_subscript_expr / eval_subscript_expr — unit tests
+# ---------------------------------------------------------------------------
+
+class TestSubscriptExpr:
+    """Unit tests for parse_subscript_expr and eval_subscript_expr.
+
+    These exercise the helpers in isolation, independent of any MLIR module.
+    var_names mirrors the intermediate_variables list; SSA refs are pre-resolved
+    to ("const", v) before eval (as _resolve_node does at construct time).
+    """
+
+    from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+
+    # --- single variable ---
+
+    def test_bare_dim(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        expr = parse_subscript_expr("%d0", ["d0", "d1"])
+        assert expr == ("dim", 0)
+        assert eval_subscript_expr(expr, (3, 7)) == 3
+
+    # --- floordiv ---
+
+    def test_floordiv_single_var(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        expr = parse_subscript_expr("%d0 floordiv 4", ["d0"])
+        assert expr == ("floordiv", ("dim", 0), 4)
+        assert eval_subscript_expr(expr, (8,)) == 2
+        assert eval_subscript_expr(expr, (7,)) == 1
+
+    def test_mod_single_var(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        expr = parse_subscript_expr("%d0 mod 64", ["d0"])
+        assert expr == ("mod", ("dim", 0), 64)
+        assert eval_subscript_expr(expr, (65,)) == 1
+        assert eval_subscript_expr(expr, (64,)) == 0
+
+    # --- compound LHS with SSA ref (pre-resolved to const) ---
+
+    def test_compound_floordiv_with_ssa(self):
+        # (%y_offset + %d_stick * 64 + %d_lane) floordiv 64
+        # y_offset is an outer SSA value; d_stick, d_lane are iteration vars.
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        var_names = ["d_stick", "d_lane"]
+        expr = parse_subscript_expr(
+            "(%y_offset + %d_stick * 64 + %d_lane) floordiv 64",
+            var_names,
+        )
+        # Pre-resolve %y_offset to ("const", 32) as _resolve_node would.
+        def resolve(node):
+            if node[0] == "ssa":
+                return ("const", 32)
+            if node[0] in ("add", "sub"):
+                return (node[0], resolve(node[1]), resolve(node[2]))
+            if node[0] == "mul":
+                return (node[0], node[1], resolve(node[2]))
+            if node[0] == "floordiv":
+                return (node[0], resolve(node[1]), node[2])
+            return node
+        expr = resolve(expr)
+        # (32 + d_stick*64 + d_lane) floordiv 64
+        assert eval_subscript_expr(expr, (0, 0))  == 0   # (32+0+0)//64 == 0
+        assert eval_subscript_expr(expr, (0, 32)) == 1   # (32+0+32)//64 == 1
+        assert eval_subscript_expr(expr, (1, 0))  == 1   # (32+64+0)//64 == 1
+        assert eval_subscript_expr(expr, (1, 32)) == 2   # (32+64+32)//64 == 2
+
+    def test_compound_mod_with_ssa(self):
+        from ktir_cpu.dialects.ktdp_helpers import parse_subscript_expr, eval_subscript_expr
+        var_names = ["d_stick", "d_lane"]
+        expr = parse_subscript_expr(
+            "(%y_offset + %d_stick * 64 + %d_lane) mod 64",
+            var_names,
+        )
+        def resolve(node):
+            if node[0] == "ssa":
+                return ("const", 32)
+            if node[0] in ("add", "sub"):
+                return (node[0], resolve(node[1]), resolve(node[2]))
+            if node[0] == "mul":
+                return (node[0], node[1], resolve(node[2]))
+            if node[0] == "mod":
+                return (node[0], resolve(node[1]), node[2])
+            return node
+        expr = resolve(expr)
+        # (32 + d_stick*64 + d_lane) mod 64
+        assert eval_subscript_expr(expr, (0, 0))  == 32  # (32+0+0) % 64
+        assert eval_subscript_expr(expr, (0, 32)) == 0   # (32+0+32) % 64
+        assert eval_subscript_expr(expr, (1, 0))  == 32  # (32+64+0) % 64
+        assert eval_subscript_expr(expr, (1, 31)) == 63  # (32+64+31) % 64
+
+
+# ---------------------------------------------------------------------------
+# Integration: construct_indirect_access_tile with compound floordiv/mod
+# direct subscripts — exercises the ktdp_ops.py parser path (line 792),
+# which the TestSubscriptExpr unit tests bypass.
+# ---------------------------------------------------------------------------
+
+# Kernel: copy src[i] -> dst[i floordiv 64][i mod 64]
+# src is a flat 128-element view (stick 0); dst is a 2x64 view (stick 100).
+# Sticks are spaced far apart so the two allocations don't collide
+# (STICK_BYTES=128, f16=2 bytes → 64 f16 per stick; 128 f16 spans 2 sticks).
+# intermediate_variables(%page, %lane) iterate over [0,2) x [0,64).
+# src subscript: (%page * 64 + %lane)   — direct, compound mul+add
+# dst dim 0:     (%page * 64 + %lane) floordiv 64  — compound LHS floordiv
+# dst dim 1:     (%page * 64 + %lane) mod 64        — compound LHS mod
+# After the copy dst[p][l] == src[p*64+l] == p*64+l for all p,l.
+_COMPOUND_FLOORDIV_MOD_MLIR = """
+#src_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>
+#dst_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#var_set  = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 63 >= 0)>
+#var_order = affine_map<(d0, d1) -> (d0, d1)>
+
+module {
+  func.func @compound_floordiv_mod() attributes {grid = [1, 1]} {
+    %src_addr = arith.constant 0 : index
+    %dst_addr = arith.constant 100 : index
+
+    %src = ktdp.construct_memory_view %src_addr, sizes: [128], strides: [1] {
+        coordinate_set = #src_set,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<128xf16>
+
+    %dst = ktdp.construct_memory_view %dst_addr, sizes: [2, 64], strides: [64, 1] {
+        coordinate_set = #dst_set,
+        memory_space = #ktdp.spyre_memory_space<HBM>
+    } : memref<2x64xf16>
+
+    %src_tile = ktdp.construct_indirect_access_tile
+        intermediate_variables(%page, %lane)
+        %src[(%page * 64 + %lane)] {
+            variables_space_set = #var_set,
+            variables_space_order = #var_order
+        } : memref<128xf16> -> !ktdp.access_tile<2x64xindex>
+
+    %dst_tile = ktdp.construct_indirect_access_tile
+        intermediate_variables(%page, %lane)
+        %dst[(%page * 64 + %lane) floordiv 64, (%page * 64 + %lane) mod 64] {
+            variables_space_set = #var_set,
+            variables_space_order = #var_order
+        } : memref<2x64xf16> -> !ktdp.access_tile<2x64xindex>
+
+    %data = ktdp.load %src_tile : !ktdp.access_tile<2x64xindex> -> tensor<2x64xf16>
+    ktdp.store %data, %dst_tile : tensor<2x64xf16>, !ktdp.access_tile<2x64xindex>
+
+    return
+  }
+}
+"""
+
+
+def test_compound_floordiv_mod_direct_subscript():
+    """Compound-LHS floordiv/mod in construct_indirect_access_tile direct subscripts.
+
+    Exercises ktdp_ops.py parse path (strip('()') bug site) with a non-trivial
+    expression as the floordiv/mod LHS.  Without the fix, floordiv/mod would be
+    silently dropped and dst would not be written correctly.
+    """
+    interp = KTIRInterpreter()
+    interp.load(_COMPOUND_FLOORDIV_MOD_MLIR)
+
+    _orig = interp._prepare_execution
+    def _prepare(grid_shape):
+        _orig(grid_shape)
+        hbm = interp.memory.hbm
+        hbm.write(0, np.arange(128, dtype=np.float16))    # src: stick 0
+        hbm.write(100, np.zeros(128, dtype=np.float16))  # dst: stick 100
+    interp._prepare_execution = _prepare
+
+    interp.execute_function("compound_floordiv_mod")
+
+    dst = interp.memory.hbm.read(100, 128, "f16").reshape(2, 64)
+    expected = np.arange(128, dtype=np.float16).reshape(2, 64)
+    np.testing.assert_array_equal(dst, expected)

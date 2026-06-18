@@ -918,11 +918,6 @@ class TestLinalg:
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(15.0, abs=1e-2)
 
-    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
-                              "the tree fold seeds from the input only. Harmless "
-                              "while the frontend inits outs to the identity. "
-                              "Tracked in issue #85.",
-                       strict=True)
     def test_reduce_folds_outs_init(self):
         # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
         # outs init = 100 should be 110, not 10.
@@ -1157,6 +1152,160 @@ class TestTensor:
                        attributes={"shape": (1,), "dtype": "index"})
         assert result.shape == (1,)
         assert list(result.data) == [128]
+
+    def test_extract_slice(self):
+        # slice rows 2-3, cols 1-3 (offsets=[2,1], sizes=[2,2], strides=[1,1])
+        data = np.arange(16, dtype=np.float16).reshape(4, 4)
+        t = Tile(data, "f16", (4, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [2, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (2, 2),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (2, 2)
+        assert np.array_equal(result.data, data[2:4, 1:3])
+
+    def test_extract_slice_rank_reduce(self):
+        # size-1 leading dim dropped: result_shape (4,) from a (1,4) sub-slice
+        data = np.arange(8, dtype=np.float16).reshape(2, 4)
+        t = Tile(data, "f16", (2, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1, 0],
+                           "static_sizes": [1, 4],
+                           "static_strides": [1, 1],
+                           "result_shape": (4,),
+                           "dtype": "f16",
+                       })
+        assert result.shape == (4,)
+        assert np.array_equal(result.data, data[1, :])
+
+    def test_insert_slice(self):
+        # insert a 2x2 patch at offset [1, 1] into a 4x4 tensor
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (4, 4),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (4, 4)
+        expected = np.zeros((4, 4), dtype=np.float16)
+        expected[1:3, 1:3] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_insert_slice_no_alias(self):
+        # insert_slice must not mutate the original destination tile
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base_data = np.zeros((4, 4), dtype=np.float16)
+        base = Tile(base_data.copy(), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        _call("tensor.insert_slice", ctx, _make_env(),
+              operands=["%patch", "%base"],
+              attributes={
+                  "static_offsets": [0, 0],
+                  "static_sizes": [2, 2],
+                  "static_strides": [1, 1],
+                  "result_shape": (4, 4),
+                  "dtype": "f16",
+              })
+        assert np.array_equal(base.data, base_data)
+
+    def test_extract_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array).
+
+        Mirrors the Spyre matmul lowering pattern:
+            %sl = tensor.extract_slice %b[0, %off, 0][1, 64, 64][1, 1, 1]
+                    : tensor<1x128x64xf32> to tensor<64x64xf32>
+        where %off = k * 64 is a runtime value.
+        """
+        _KDYNAMIC = -(1 << 63)
+        data = np.arange(128 * 64, dtype=np.float32).reshape(1, 128, 64)
+        t = Tile(data, "f32", (1, 128, 64))
+        ctx = _ctx_with(**{"%t": t, "%off": 64})  # second stick: offset=64
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t", "%off"],
+                       attributes={
+                           "static_offsets": [0, _KDYNAMIC, 0],
+                           "static_sizes":   [1, 64, 64],
+                           "static_strides": [1, 1, 1],
+                           "result_shape": (64, 64),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (64, 64)
+        assert np.array_equal(result.data, data[0, 64:128, :])
+
+    def test_insert_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array)."""
+        _KDYNAMIC = -(1 << 63)
+        patch = Tile(np.ones((64,), dtype=np.float32), "f32", (64,))
+        base_data = np.zeros((128,), dtype=np.float32)
+        base = Tile(base_data.copy(), "f32", (128,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base, "%off": 64})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base", "%off"],
+                       attributes={
+                           "static_offsets": [_KDYNAMIC],
+                           "static_sizes":   [64],
+                           "static_strides": [1],
+                           "result_shape": (128,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (128,)
+        expected = np.zeros((128,), dtype=np.float32)
+        expected[64:] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_extract_slice_stride_gt1(self):
+        # stride=2: select every other element — requires stop = off + sz * st
+        data = np.arange(10, dtype=np.float32)
+        t = Tile(data, "f32", (10,))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (3,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (3,)
+        # off=1, sz=3, st=2 → elements at indices 1, 3, 5
+        assert np.array_equal(result.data, data[1:7:2])
+
+    def test_insert_slice_stride_gt1(self):
+        # stride=2: write to every other element — requires stop = off + sz * st
+        patch = Tile(np.array([10.0, 20.0, 30.0], dtype=np.float32), "f32", (3,))
+        base = Tile(np.zeros((10,), dtype=np.float32), "f32", (10,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (10,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (10,)
+        expected = np.zeros((10,), dtype=np.float32)
+        expected[1:7:2] = [10.0, 20.0, 30.0]
+        assert np.array_equal(result.data, expected)
 
 
 # ---------------------------------------------------------------------------
