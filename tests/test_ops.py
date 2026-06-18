@@ -204,6 +204,40 @@ class TestArithOpsInt:
         assert ArithOps.remui(10, 3) == 1
 
 # ---------------------------------------------------------------------------
+# ArithOps (Shrui)
+# ---------------------------------------------------------------------------
+
+class TestArithOpsShrui:
+    def test_scalar_positive(self):
+        # shrui on positive scalars matches shrsi
+        assert ArithOps.shrui(8, 2) == 2
+
+    def test_scalar_negative_zerofills(self):
+        # shrui must zero-fill the high bits, not sign-extend (unlike shrsi)
+        # -1 as i32 is 0xFFFFFFFF; >> 1 should give 0x7FFFFFFF, not -1
+        result = ArithOps.shrui(-1, 1)
+        assert result == 0x7FFFFFFF
+
+    def test_tile_negative_zerofills(self):
+        # same semantics for a tile: high bit becomes 0, not 1
+        # -1 = 0xFFFFFFFF >> 1 = 0x7FFFFFFF; -2 = 0xFFFFFFFE >> 1 = 0x7FFFFFFF
+        data = np.array([-1, -2], dtype=np.int32)
+        t = Tile(data, "i32", data.shape)
+        result = ArithOps.shrui(t, 1)
+        assert isinstance(result, Tile)
+        assert np.array_equal(result.data, np.array([0x7FFFFFFF, 0x7FFFFFFF], dtype=np.uint32))
+
+    def test_tile_scalar_shift(self):
+        # tile shifted by a scalar amount; use int32 to avoid overflow on assignment
+        # -16777216 = 0xFF000000 as int32; >> 8 = 0x00FF0000
+        data = np.array([-16777216], dtype=np.int32)
+        t = Tile(data, "i32", data.shape)
+        result = ArithOps.shrui(t, 8)
+        assert isinstance(result, Tile)
+        assert result.data[0] == 0x00FF0000
+
+
+# ---------------------------------------------------------------------------
 # ArithOps (Cmpi)
 # ---------------------------------------------------------------------------
 
@@ -253,6 +287,19 @@ class TestArithOpsSelect:
         assert np.array_equal(result.data, np.array([1, 5, 3], dtype=np.float16))
 
 # ---------------------------------------------------------------------------
+# ArithOps (Cmpf)
+# ---------------------------------------------------------------------------
+
+class TestArithOpsCmpf:
+    def test_result_dtype_is_i1(self):
+        # cmpf must return i1 regardless of input dtype — not propagate the float dtype
+        t1 = _tile([1.0, 2.0, 3.0])  # f16
+        t2 = _tile([3.0, 2.0, 1.0])  # f16
+        result = ArithOps.cmpf(t1, t2, "olt")
+        assert result.dtype == "i1"
+        assert result.data.dtype == np.bool_
+
+# ---------------------------------------------------------------------------
 # MathOps
 # ---------------------------------------------------------------------------
 
@@ -266,7 +313,7 @@ class TestMathOps:
     def test_exp_scalar(self):
         # scalar exp preserves type
         val = np.float16(1.0)
-        assert abs(float(MathOps.exp_scalar(val)) - np.e) < 0.01
+        assert abs(float(MathOps.exp(val)) - np.e) < 0.01
 
     def test_sqrt_tile(self):
         # element-wise sqrt on a tile
@@ -277,7 +324,59 @@ class TestMathOps:
     def test_sqrt_scalar(self):
         # scalar sqrt preserves type
         val = np.float16(4.0)
-        assert abs(float(MathOps.sqrt_scalar(val)) - 2.0) < 0.01
+        assert abs(float(MathOps.sqrt(val)) - 2.0) < 0.01
+
+# ---------------------------------------------------------------------------
+# Regression: bug C — tile_unary_float scalar path must return float, not
+# silently truncate via type(val)() when val is an int.
+# ---------------------------------------------------------------------------
+
+class TestTileUnaryFloatScalar:
+    def test_returns_float_not_int(self):
+        # Passing a Python int scalar must not truncate the result
+        result = MathOps.exp(4)
+        assert isinstance(result, float), f"expected float, got {type(result)}"
+        assert abs(result - np.e ** 4) < 0.1, f"value wrong: {result}"
+
+    def test_sqrt_int_scalar_not_truncated(self):
+        result = MathOps.sqrt(2)
+        assert isinstance(result, float)
+        assert abs(result - 2 ** 0.5) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Regression: bug E — minsi/maxsi/minui/maxui scalar path must return
+# Python int, not numpy.int64 (np.minimum/maximum return numpy scalar types).
+# ---------------------------------------------------------------------------
+
+class TestArithOpsMinMaxScalarType:
+    def test_minsi_scalar_returns_int(self):
+        result = ArithOps.minsi(3, 7)
+        assert type(result) is int, f"expected int, got {type(result)}"
+        assert result == 3
+
+    def test_maxsi_scalar_returns_int(self):
+        result = ArithOps.maxsi(3, 7)
+        assert type(result) is int, f"expected int, got {type(result)}"
+        assert result == 7
+
+    def test_minui_scalar_returns_int(self):
+        result = ArithOps.minui(5, 2)
+        assert type(result) is int, f"expected int, got {type(result)}"
+        assert result == 2
+
+    def test_maxui_scalar_returns_int(self):
+        result = ArithOps.maxui(5, 2)
+        assert type(result) is int, f"expected int, got {type(result)}"
+        assert result == 5
+
+    def test_minsi_tile_still_returns_tile(self):
+        t1 = _tile([1, 5, 3], "i32")
+        t2 = _tile([4, 2, 3], "i32")
+        result = ArithOps.minsi(t1, t2)
+        assert isinstance(result, Tile)
+        assert list(result.data) == [1, 2, 3]
+
 
 # ---------------------------------------------------------------------------
 # GridOps
