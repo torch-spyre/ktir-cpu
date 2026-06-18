@@ -1019,3 +1019,154 @@ def test_distributed_store_col_packed_does_not_trample_outside_C_i():
         f"P0 col-packed: {(outside != SENTINEL).sum()} cell(s) outside C_i "
         f"differ from sentinel — strides inheritance is broken."
     )
+
+
+# ---------------------------------------------------------------------------
+# distributed_load / distributed_store SLOW path (non-BoxSet C_i)
+#
+# When a partition's coordinate_set is a plain List[Tuple] (parsed via
+# parse_affine_set_raw, which skips BoxSet lowering), distributed_tile_access
+# stores an enumerated point list on each survivor, forcing distributed_load
+# and distributed_store onto their slow paths.  Those slow paths now use NumPy
+# fancy-indexing (one vectorized gather/scatter per partition) instead of a
+# per-coordinate Python loop.  These tests cross a partition boundary so the
+# fancy-index write lands in different access-local regions for each survivor,
+# and assert the survivors are genuinely on the slow path (coordinate_set is a
+# list, not a BoxSet) so a regression to BoxSet wouldn't silently bypass them.
+# ---------------------------------------------------------------------------
+
+def _build_raw_row_band_partitions(p0_stick, p1_stick, part_shape, ncols, dtype):
+    """Two row-band partitions with raw (non-BoxSet) coordinate sets.
+
+    P0 covers rows ``[0, R)``, P1 rows ``[R, 2R)``; both span all *ncols*
+    columns with row-major strides.  Parsing via ``parse_affine_set_raw``
+    keeps the sets as ``AffineSet`` so the surviving C_i is enumerated to a
+    point list — the slow path.
+    """
+    from ktir_cpu.ir_types import MemRef
+    from ktir_cpu.parser_ast import parse_affine_set_raw
+
+    R = part_shape[0]
+    B0 = parse_affine_set_raw(
+        f"affine_set<(d0, d1) : (d0 >= 0, -d0 + {R - 1} >= 0, "
+        f"d1 >= 0, -d1 + {ncols - 1} >= 0)>"
+    )
+    B1 = parse_affine_set_raw(
+        f"affine_set<(d0, d1) : (d0 - {R} >= 0, -d0 + {2 * R - 1} >= 0, "
+        f"d1 >= 0, -d1 + {ncols - 1} >= 0)>"
+    )
+    P0 = MemRef(base_ptr=p0_stick, shape=part_shape, strides=[ncols, 1],
+                memory_space="HBM", dtype=dtype, coordinate_set=B0)
+    P1 = MemRef(base_ptr=p1_stick, shape=part_shape, strides=[ncols, 1],
+                memory_space="HBM", dtype=dtype, coordinate_set=B1)
+    return P0, P1
+
+
+def test_distributed_load_slow_path_cross_boundary():
+    """distributed_load slow path (list C_i) gathers correctly across partitions."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.dtypes import bytes_per_elem
+    from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import DistributedMemRef
+    from ktir_cpu.memory import HBMSimulator, LXScratchpad
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map
+
+    PART_SHAPE = (8, 16)
+    NCOLS = 16
+    DTYPE = "f16"
+    GLOBAL = (16, 16)
+    bpe = bytes_per_elem(DTYPE)
+    elems_per_part = PART_SHAPE[0] * PART_SHAPE[1]
+
+    full = np.arange(GLOBAL[0] * GLOBAL[1], dtype=np.float16).reshape(GLOBAL)
+
+    hbm = HBMSimulator(size_gb=1)
+    P0_STICK = hbm.allocate(elems_per_part * bpe)
+    P1_STICK = hbm.allocate(elems_per_part * bpe)
+    # Row-major contiguous → flatten writes the block verbatim.
+    hbm.write(P0_STICK, full[0:8, :].copy().flatten())
+    hbm.write(P1_STICK, full[8:16, :].copy().flatten())
+    ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                      lx=LXScratchpad(size_mb=1, core_id=0), hbm=hbm)
+
+    P0, P1 = _build_raw_row_band_partitions(P0_STICK, P1_STICK, PART_SHAPE, NCOLS, DTYPE)
+    dist = DistributedMemRef(partitions=[P0, P1], shape=GLOBAL, dtype=DTYPE)
+
+    # 4×4 access at (6, 4): rows 6,7 in P0 and rows 8,9 in P1 → both survive.
+    access_shape = (4, 4)
+    indices = (6, 4)
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    resolved = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=access_shape, base_map=base_map,
+        indices=list(indices), access_tile_set=None,
+    )
+    assert len(resolved.partitions) == 2, "access must straddle both partitions"
+    for part in resolved.partitions:
+        assert not isinstance(part.coordinate_set, BoxSet), \
+            "slow path requires a non-BoxSet (list) coordinate_set"
+        assert isinstance(part.coordinate_set, list)
+
+    tile = MemoryOps.distributed_load(ctx, resolved, result_shape=access_shape)
+    np.testing.assert_array_equal(tile.data, full[6:10, 4:8])
+
+
+def test_distributed_store_slow_path_cross_boundary():
+    """distributed_store slow path (list C_i) scatters across partitions without trampling."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.dtypes import bytes_per_elem
+    from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import DistributedMemRef, Tile
+    from ktir_cpu.memory import HBMSimulator, LXScratchpad
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map
+
+    PART_SHAPE = (8, 16)
+    NCOLS = 16
+    DTYPE = "f16"
+    GLOBAL = (16, 16)
+    bpe = bytes_per_elem(DTYPE)
+    elems_per_part = PART_SHAPE[0] * PART_SHAPE[1]
+    SENTINEL = np.float16(-7.0)
+
+    hbm = HBMSimulator(size_gb=1)
+    P0_STICK = hbm.allocate(elems_per_part * bpe)
+    P1_STICK = hbm.allocate(elems_per_part * bpe)
+    hbm.write(P0_STICK, np.full(elems_per_part, SENTINEL, dtype=np.float16))
+    hbm.write(P1_STICK, np.full(elems_per_part, SENTINEL, dtype=np.float16))
+    ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                      lx=LXScratchpad(size_mb=1, core_id=0), hbm=hbm)
+
+    P0, P1 = _build_raw_row_band_partitions(P0_STICK, P1_STICK, PART_SHAPE, NCOLS, DTYPE)
+    dist = DistributedMemRef(partitions=[P0, P1], shape=GLOBAL, dtype=DTYPE)
+
+    # 4×4 access at (6, 4): rows 6,7 → P0, rows 8,9 → P1.
+    access_shape = (4, 4)
+    indices = (6, 4)
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    resolved = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=access_shape, base_map=base_map,
+        indices=list(indices), access_tile_set=None,
+    )
+    assert len(resolved.partitions) == 2
+    for part in resolved.partitions:
+        assert isinstance(part.coordinate_set, list), "slow path requires list C_i"
+
+    payload = np.arange(1, 17, dtype=np.float16).reshape(4, 4)
+    MemoryOps.distributed_store(ctx, Tile(payload, DTYPE, access_shape), resolved)
+
+    p0_full = hbm.read(P0_STICK, elems_per_part, DTYPE).reshape(PART_SHAPE)
+    p1_full = hbm.read(P1_STICK, elems_per_part, DTYPE).reshape(PART_SHAPE)
+
+    # P0 receives the top two access rows (global rows 6,7 → local 6,7) at cols 4..7.
+    # P1 receives the bottom two access rows (global rows 8,9 → local 0,1) at cols 4..7.
+    np.testing.assert_array_equal(p0_full[6:8, 4:8], payload[0:2, :])
+    np.testing.assert_array_equal(p1_full[0:2, 4:8], payload[2:4, :])
+
+    # Everything outside the two written sub-rectangles stays sentinel.
+    p0_mask = np.zeros(PART_SHAPE, dtype=bool)
+    p0_mask[6:8, 4:8] = True
+    p1_mask = np.zeros(PART_SHAPE, dtype=bool)
+    p1_mask[0:2, 4:8] = True
+    assert np.all(p0_full[~p0_mask] == SENTINEL), "P0 trampled outside C_i (slow path)"
+    assert np.all(p1_full[~p1_mask] == SENTINEL), "P1 trampled outside C_i (slow path)"

@@ -5,7 +5,7 @@
 module {
   func.func @reduce_multiop(%arg0: index) attributes {grid = [1, 1]} {
     %c0 = arith.constant 0 : index
-    %cst = arith.constant 0xFF80 : f16  // -inf (identity for max)
+    %cst = arith.constant 0xFC00 : f16  // -inf (identity for max)
     %view = ktdp.construct_memory_view %arg0, sizes : [1, 8], strides : [8, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 7 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x8xf16>
     %acc = ktdp.construct_access_tile %view[%c0, %c0] {
         access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 7 >= 0)>,

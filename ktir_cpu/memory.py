@@ -85,6 +85,8 @@ between kernels).  This is not modelled here — we simply track the
 live set of SSA tensor values as the LX footprint.
 """
 
+import bisect
+import weakref
 from typing import Dict, Optional, Tuple
 import numpy as np
 
@@ -94,6 +96,31 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 from .dtypes import to_np_dtype, bytes_per_elem
+
+
+class _AllocStore(dict):
+    """A sparse ``{base_ptr: ndarray}`` allocation store.
+
+    A plain ``dict`` subclass with two differences that let it serve as a
+    weak key in :data:`_FIND_ALLOC_CACHE`:
+
+    - it is weak-referenceable (built-in ``dict`` is not), so the cache can
+      hold it weakly and auto-evict its entry when the store is GC'd;
+    - it hashes and compares by identity (built-in ``dict`` is unhashable and
+      compares by contents), which is the semantics a per-store cache wants.
+    """
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+
+# Cache for `_find_allocation`'s O(log n) bisect: maps a memory store to
+# (len, sorted_base_ptrs). Keyed *weakly* by the store itself, so an entry is
+# dropped automatically once its store is garbage-collected — no unbounded
+# growth across repeated benchmark/test runs that each build a fresh store.
+# A len change (allocations only ever get added, or all-cleared) invalidates.
+_FIND_ALLOC_CACHE: "weakref.WeakKeyDictionary[_AllocStore, Tuple[int, list]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _find_allocation(
@@ -113,20 +140,36 @@ def _find_allocation(
     """
     if ptr in memory:
         return (ptr, memory[ptr], 0)
-    for base_ptr, data in memory.items():
-        # Use the allocation's own itemsize to compute its byte span,
-        # not the caller's elem_size (which reflects the access dtype
-        # and may differ from the stored dtype).
+    if not memory:
+        return None
+    # O(log n) containing-interval lookup instead of a linear scan over every
+    # allocation. Allocations are non-overlapping, so the one that can contain
+    # `ptr` is the one with the largest base_ptr <= ptr; bisect finds it. A
+    # per-dict (id -> (len, sorted_base_ptrs)) cache keeps the sorted view; in this
+    # simulator keys are only added (writes) or all-cleared (lx.clear), never
+    # singly removed, so a len change is a sound "rebuild" signal.
+    #
+    # NOTE: the original implementation scanned `memory.items()` linearly, which is
+    # O(allocations) PER access. That is fine for the small per-node working sets of
+    # smollm2 (fits 2 MB LX) but becomes O(n^2) for llama, whose function bodies hold
+    # thousands of live allocations — that artifact, not faithful interpreter compute,
+    # dominated cap-raised llama timings. This lookup removes it.
+    cache = _FIND_ALLOC_CACHE.get(memory) if isinstance(memory, _AllocStore) else None
+    if cache is None or cache[0] != len(memory):
+        keys = sorted(memory.keys())
+        if isinstance(memory, _AllocStore):
+            _FIND_ALLOC_CACHE[memory] = (len(memory), keys)
+    else:
+        keys = cache[1]
+    i = bisect.bisect_right(keys, ptr) - 1
+    if i >= 0:
+        base_ptr = keys[i]
+        data = memory[base_ptr]
+        # Use the allocation's own itemsize to compute its byte span, not the
+        # caller's elem_size (which reflects the access dtype and may differ).
         end_ptr = base_ptr + data.size * data.itemsize
-
-        # NOTE: the ptr in memory check in the first return
-        #       actually handles the ptr == base_ptr case.
-        # - therefore the strict equality base_ptr < ptr
-        #   is meant to emphasize that equality checks will
-        #   not come to this branch of logic.
         if base_ptr < ptr < end_ptr:
-            elem_offset = (ptr - base_ptr) // elem_size
-            return (base_ptr, data, elem_offset)
+            return (base_ptr, data, (ptr - base_ptr) // elem_size)
     return None
 
 
@@ -156,7 +199,11 @@ def _read_flat(
     if alloc is None:
         raise ValueError(f"Read from unmapped address 0x{ptr:x} (n_elements={n_elements})")
     _, data, elem_offset = alloc
-    flat = data.flatten()
+    # ravel (a view when the allocation is contiguous, which it is here) instead of
+    # flatten (always a full copy): we only slice + astype(copy=True) out of `flat`,
+    # never mutate it, so copying the whole allocation per read is pure waste — it
+    # was the dominant cost of a whole-model pass once the offset loop was vectorized.
+    flat = data.ravel()
     end = elem_offset + n_elements
     if end <= flat.size:
         return flat[elem_offset:end].astype(np_dtype, copy=True)
@@ -185,8 +232,8 @@ def _write_flat(memory: Dict[int, np.ndarray], ptr: int, data: np.ndarray):
     alloc = _find_allocation(memory, ptr, bytes_per_elem)
     if alloc is not None:
         base_ptr, existing, elem_offset = alloc
-        flat = existing.flatten().copy()
-        src = data.flatten()
+        flat = existing.flatten()  # flatten already returns a fresh (mutable) copy
+        src = data.ravel()         # read-only — a view is fine
         end_elem = elem_offset + src.size
         if end_elem <= flat.size:
             flat[elem_offset:end_elem] = src
@@ -197,7 +244,7 @@ def _write_flat(memory: Dict[int, np.ndarray], ptr: int, data: np.ndarray):
         flat[elem_offset:] = src[:fit]
         memory[base_ptr] = flat.reshape(existing.shape)
         return
-    memory[ptr] = data.flatten().copy()
+    memory[ptr] = data.flatten()  # flatten already copies; the extra .copy() was redundant
 
 
 class HBMSimulator:
@@ -218,7 +265,7 @@ class HBMSimulator:
     def __init__(self, size_gb: int = 128):
         self.size_gb = size_gb
         self.size_bytes = size_gb * 1024 * 1024 * 1024
-        self.memory: Dict[int, np.ndarray] = {}  # Sparse storage
+        self.memory: Dict[int, np.ndarray] = _AllocStore()  # Sparse storage
         self.next_ptr = 0x10000  # Start allocations at 64KB
 
     def allocate(self, size: int) -> int:
@@ -300,7 +347,7 @@ class LXScratchpad:
         self.capacity = size_mb * 1024 * 1024
         self.used = 0
         self.core_id = core_id
-        self.memory: Dict[int, np.ndarray] = {}
+        self.memory: Dict[int, np.ndarray] = _AllocStore()
         self.next_ptr = 0  # Local address space
 
     def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
@@ -334,6 +381,11 @@ class LXScratchpad:
 
     def clear(self):
         """Clear scratchpad and reset allocation."""
+        # Drop the bisect cache entry too: the store object survives clear()
+        # (same identity), so the WeakKeyDictionary won't auto-evict it. The
+        # len-change check would rebuild lazily anyway, but evict eagerly so a
+        # cleared scratchpad holds no stale sorted-key list.
+        _FIND_ALLOC_CACHE.pop(self.memory, None)
         self.memory.clear()
         self.next_ptr = 0
         self.used = 0
