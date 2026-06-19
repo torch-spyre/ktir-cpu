@@ -402,6 +402,7 @@ class IRFunction:
     arguments: List[Tuple[str, str]]  # [(name, type), ...]
     operations: List[Operation]
     grid: Tuple[int, int, int]  # Grid shape from function attributes
+    use_counts: Dict[str, int] = field(default_factory=dict)  # SSA name -> use count for function body
     return_type: Optional[str] = None
     tensor_sizes: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 

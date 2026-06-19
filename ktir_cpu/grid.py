@@ -92,6 +92,7 @@ class CoreContext:
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._tile_refcount: Dict[int, int] = {}  # id(Tile) -> refcount
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
+        self._use_counts: Dict[str, int] = {}  # SSA name -> use count for current region
         # Scheduler-managed cross-core access — both functions are set by
         # GridExecutor.execute_with_communication via attach_scheduler() and
         # cleared via detach_scheduler() at the end of the run.
@@ -283,6 +284,9 @@ class CoreContext:
     def get_value(self, name: str) -> Any:
         """Get SSA value, searching top-to-bottom.
 
+        On last use (use_count == 1), pops the value from scope and frees LX
+        immediately so the caller can reuse or replace the buffer at no net cost.
+
         Args:
             name: SSA value name (e.g., "%x_tile")
 
@@ -294,7 +298,16 @@ class CoreContext:
         """
         for scope in reversed(self._scope_stack):
             if name in scope:
-                return scope[name]
+                value = scope[name]
+                if (isinstance(value, Tile)
+                        and self._use_counts.get(name, 0) == 1
+                        and scope is self._scope_stack[-1]):
+                    del scope[name]
+                    self._tile_refcount[id(value)] -= 1
+                    if self._tile_refcount[id(value)] == 0:
+                        del self._tile_refcount[id(value)]
+                        self.lx.used -= value.size_bytes()
+                return value
         raise KeyError(f"Value '{name}' not found in core {self.core_id}")
 
     def has_value(self, name: str) -> bool:

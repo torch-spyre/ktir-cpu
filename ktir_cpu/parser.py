@@ -132,12 +132,14 @@ class KTIRParser(KTIRParserBase):
 
             # Parse operations from function body
             operations = self._parse_operations(func_body, parse_ctx)
+            use_counts = self._build_use_counts(operations)
 
             func = IRFunction(
                 name=func_name,
                 arguments=args,
                 operations=operations,
-                grid=grid
+                grid=grid,
+                use_counts=use_counts,
             )
 
             module.add_function(func)
@@ -269,6 +271,18 @@ class KTIRParser(KTIRParserBase):
                 operations.append(op)
 
         return operations
+
+    @staticmethod
+    def _build_use_counts(ops) -> Dict[str, int]:
+        """Count operand uses recursively across all ops and nested regions."""
+        counts: Dict[str, int] = {}
+        for op in ops:
+            for name in op.operands:
+                counts[name] = counts.get(name, 0) + 1
+            for region in op.regions:
+                for name, n in KTIRParser._build_use_counts(region).items():
+                    counts[name] = counts.get(name, 0) + n
+        return counts
 
     @staticmethod
     def _preprocess_text(text: str) -> str:

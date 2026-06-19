@@ -167,6 +167,9 @@ class KTIRInterpreter:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
 
+        for core in self.grid_executor.cores:
+            core._use_counts = func.use_counts
+
         self.grid_executor.execute_with_communication(
             func.operations, input_ptrs, self._execute_op,
             transfer_backend=self.ring_backend,

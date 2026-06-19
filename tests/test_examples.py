@@ -255,30 +255,6 @@ class TestSoftmaxExecution(InterpreterTestMixin):
 
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
-    @pytest.mark.parametrize("path,func_name,entry", get_test_params(
-        "softmax_kernel", filter="ktir/softmax_wide"))
-    def test_softmax_lx_overflow(self, path, func_name, entry):
-        """Softmax with a row too wide for LX should raise MemoryError.
-
-        A naive rowwise softmax loads the full row (1×C) and produces several
-        intermediate Tiles of the same shape (splat, subf, exp, divf).
-        With C=262144 the peak live set is ~3MB, exceeding the 2MB LX.
-        This is exactly the scenario that online_rowchunk solves by
-        chunking the column dimension.
-        """
-        interp = self._make_interp()
-        interp.load(path)
-
-        output_ptr, input_ptr, *_ = interp.arg_names(func_name)
-        sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows_val, n_cols = sizes[input_ptr]["shape"]
-        rng = np.random.default_rng(42)
-        inp = rng.standard_normal((n_rows_val, n_cols)).astype(np.float16)
-        out = np.zeros((n_rows_val, n_cols), dtype=np.float16)
-
-        kwargs = self._build_kwargs(entry, {output_ptr: out, input_ptr: inp})
-        with pytest.raises(MemoryError, match=entry["exception_msg"]):
-            interp.execute_function(func_name, **kwargs)
 
 
 class TestLayerNormExecution(InterpreterTestMixin):
