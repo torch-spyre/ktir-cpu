@@ -9,11 +9,12 @@
 //
 // Grid: [4, 1, 1] — axis 0 distributes work.
 //
-// HBM addressing.  One HBM stick = 128 bytes = 64 f16 elements; each 1×128
-// f16 row spans 2 sticks.  Per-core stride = 2 sticks.
+// HBM addressing.  %in_ptr / %out_ptr are f16 element indices (base_ptr
+// convention: base_ptr * bytes_per_elem gives the byte address).
+// Each 1×128 f16 row = 128 elements.  Per-core stride = 128 elements.
 //
 // Each core c:
-//   1. Constructs a memory view for its row at in_ptr + c*2 sticks.
+//   1. Constructs a memory view for its row at in_ptr + c*128 elements.
 //   2. Loads it into a tensor<1x128xf16> partial.
 //   3. Loops K times, each iteration doing a full ring all-reduce of the
 //      partial, accumulating the result into %acc.
@@ -31,14 +32,14 @@ module {
   func.func @ring_reduce_inner_loop(%in_ptr: index, %out_ptr: index, %n_iters: index)
       attributes {grid = [4]} {
 
-    %c0         = arith.constant 0 : index
-    %c1         = arith.constant 1 : index
-    %row_sticks = arith.constant 2 : index
+    %c0        = arith.constant 0 : index
+    %c1        = arith.constant 1 : index
+    %row_elems = arith.constant 128 : index
 
     %pid = ktdp.get_compute_tile_id : index
 
-    // Stick-index of this core's input row: in_ptr + pid * 2.
-    %offs    = arith.muli %pid, %row_sticks : index
+    // Element-index of this core's input row: in_ptr + pid * 128.
+    %offs    = arith.muli %pid, %row_elems : index
     %row_ptr = arith.addi %in_ptr, %offs : index
 
     // (1) Memory view over this core's 1×128 row
