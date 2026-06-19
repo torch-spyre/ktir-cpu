@@ -21,75 +21,47 @@ from ._helpers import _unary
 from .registry import register
 
 
-@register("math.exp", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__exp(op, context, env):
-    return _unary(op, context, MathOps.exp, MathOps.exp_scalar)
+# ---------------------------------------------------------------------------
+# Unary transcendental ops  (Pattern A.5)
+# ---------------------------------------------------------------------------
+
+_TRANSCENDENTAL_UNARY = {
+    "math.exp":   MathOps.exp,
+    "math.sqrt":  MathOps.sqrt,
+    "math.rsqrt": MathOps.rsqrt,
+    "math.log":   MathOps.log,
+    "math.log2":  MathOps.log2,
+    "math.log1p": MathOps.log1p,
+    "math.tanh":  MathOps.tanh,
+    "math.sin":   MathOps.sin,
+    "math.cos":   MathOps.cos,
+    "math.erf":   MathOps.erf,
+}
+for _name, _fn in _TRANSCENDENTAL_UNARY.items():
+    @register(_name, latency_category=LC.COMPUTE_TRANSCENDENTAL)
+    def _(op, context, env, _fn=_fn):
+        return _unary(op, context, _fn)
 
 
-@register("math.sqrt", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__sqrt(op, context, env):
-    return _unary(op, context, MathOps.sqrt, MathOps.sqrt_scalar)
+# ---------------------------------------------------------------------------
+# Unary float ops  (Pattern A.5)
+# ---------------------------------------------------------------------------
+
+_FLOAT_UNARY = {
+    "math.absf":  MathOps.absf,
+    "math.absi":  MathOps.absi,
+    "math.ceil":  MathOps.ceil,
+    "math.floor": MathOps.floor,
+}
+for _name, _fn in _FLOAT_UNARY.items():
+    @register(_name, latency_category=LC.COMPUTE_FLOAT)
+    def _(op, context, env, _fn=_fn):
+        return _unary(op, context, _fn)
 
 
-@register("math.rsqrt", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__rsqrt(op, context, env):
-    return _unary(op, context, MathOps.rsqrt, MathOps.rsqrt_scalar)
-
-
-@register("math.log", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__log(op, context, env):
-    return _unary(op, context, MathOps.log, MathOps.log_scalar)
-
-
-@register("math.log2", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__log2(op, context, env):
-    return _unary(op, context, MathOps.log2, MathOps.log2_scalar)
-
-
-@register("math.log1p", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__log1p(op, context, env):
-    return _unary(op, context, MathOps.log1p, MathOps.log1p_scalar)
-
-
-@register("math.tanh", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__tanh(op, context, env):
-    return _unary(op, context, MathOps.tanh, MathOps.tanh_scalar)
-
-
-@register("math.sin", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__sin(op, context, env):
-    return _unary(op, context, MathOps.sin, MathOps.sin_scalar)
-
-
-@register("math.cos", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__cos(op, context, env):
-    return _unary(op, context, MathOps.cos, MathOps.cos_scalar)
-
-
-@register("math.absf", latency_category=LC.COMPUTE_FLOAT)
-def math__absf(op, context, env):
-    return _unary(op, context, MathOps.absf, MathOps.absf_scalar)
-
-
-@register("math.absi", latency_category=LC.COMPUTE_FLOAT)
-def math__absi(op, context, env):
-    return _unary(op, context, MathOps.absi, MathOps.absi_scalar)
-
-
-@register("math.ceil", latency_category=LC.COMPUTE_FLOAT)
-def math__ceil(op, context, env):
-    return _unary(op, context, MathOps.ceil, MathOps.ceil_scalar)
-
-
-@register("math.floor", latency_category=LC.COMPUTE_FLOAT)
-def math__floor(op, context, env):
-    return _unary(op, context, MathOps.floor, MathOps.floor_scalar)
-
-
-@register("math.erf", latency_category=LC.COMPUTE_TRANSCENDENTAL)
-def math__erf(op, context, env):
-    return _unary(op, context, MathOps.erf, MathOps.erf_scalar)
-
+# ---------------------------------------------------------------------------
+# Multi-operand ops (bespoke — don't fit _unary)
+# ---------------------------------------------------------------------------
 
 @register("math.powf", latency_category=LC.COMPUTE_TRANSCENDENTAL)
 def math__powf(op, context, env):

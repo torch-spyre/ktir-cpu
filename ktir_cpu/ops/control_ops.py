@@ -64,9 +64,10 @@ class ControlOps:
             return None
 
         # Branch body gets its own scope; body-local LX is freed on pop.
-        # If the branch yields Tile values (via scf.yield), pop_scope frees
-        # their LX.  The caller (dialect handler) will re-track them when it
-        # binds the scf.if result via _execute_operation -> track_lx.
+        # If the branch yields Tile values (via scf.yield), pop_scope
+        # decrements their refcounts (freeing if zero).  The caller
+        # (dialect handler) re-charges them when _execute_operation
+        # calls set_value for the scf.if result.
         context.push_scope()
         result = region_executor(context, region)
         context.pop_scope()
@@ -112,11 +113,10 @@ class ControlOps:
 
         # Bind initial iter_arg values in the *parent* scope.
         # These persist across iterations; body-local values do not.
+        # set_value auto-tracks via refcount — aliases (same id) don't double-charge.
         current_values = list(iter_init_values)
         for name, val in zip(iter_arg_names, current_values):
             context.set_value(name, val)
-            if isinstance(val, Tile):
-                context.track_lx(name, val.size_bytes())
 
         for i in range(int(lower_bound), int(upper_bound), max(int(step), 1)):
             # New scope for this iteration's body-local values.
@@ -150,16 +150,10 @@ class ControlOps:
             #     scf.yield %m_new, %l_new   // Tiles fed back as next %m_acc, %l_acc
             #   }
             #
-            # Here %m_init and %l_init are tensor<32x1xf16> — so the
-            # iter_args %m_acc and %l_acc are Tiles that occupy LX.
-            # When we re-bind them after yield, we must untrack the old
-            # Tile's LX and track the new one.
+            # set_value handles refcount: decrements old tile, increments new tile.
             if yielded_values is not None:
                 for name, val in zip(iter_arg_names, yielded_values):
-                    context.untrack_lx(name)
                     context.set_value(name, val)
-                    if isinstance(val, Tile):
-                        context.track_lx(name, val.size_bytes())
                 current_values = yielded_values
 
         if current_values:

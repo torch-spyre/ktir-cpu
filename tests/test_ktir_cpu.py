@@ -170,12 +170,15 @@ def test_memory_lx():
     assert np.array_equal(data, read_data), "LX read/write mismatch"
     print("  ✓ LX read/write works")
 
-    # Test capacity limit — enforced by CoreContext.track_lx(), not allocate()
+    # Test capacity limit — enforced by CoreContext.set_value() auto-tracking
     from ktir_cpu.grid import CoreContext
     from ktir_cpu.memory import HBMSimulator
+    from ktir_cpu.ir_types import Tile as _Tile
     ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=LXScratchpad(size_mb=2, core_id=0), hbm=HBMSimulator())
     try:
-        ctx.track_lx("%huge", 3 * 1024 * 1024)  # 3MB > 2MB limit
+        import numpy as _np
+        huge = _Tile(_np.zeros((1024, 1536), dtype=_np.float16), "f16", (1024, 1536))  # 3 MB
+        ctx.set_value("%huge", huge)
         assert False, "Should have raised MemoryError"
     except MemoryError:
         print("  ✓ LX capacity limit enforced")

@@ -23,7 +23,7 @@ Public API
 _is_scalar(v)                  — True if v is a numeric scalar (not Tile)
 _float_binop(op, context, fn)  — fetch two operands, dispatch float binop
 _int_binop(op, context, fn)    — fetch two operands, dispatch int binop
-_unary(op, context, tile_fn, scalar_fn) — fetch one operand, dispatch unary
+_unary(op, context, fn, scalar_fn) — fetch one operand, dispatch unary
 unwrap_yield(result)           — unwrap a _YieldResult sentinel; pass through anything else
 """
 
@@ -71,16 +71,32 @@ def _int_binop(op, context, fn):
     return fn(a, b)
 
 
-def _unary(op, context, tile_fn, scalar_fn=None):
+def _unary(op, context, fn, scalar_fn=None):
     """Fetch one operand and apply a unary function.
 
-    *tile_fn* is called when the operand is a Tile.
-    *scalar_fn* is called for scalars; defaults to *tile_fn* if omitted.
+    *fn* is called for both Tiles and scalars unless *scalar_fn* is given,
+    in which case *scalar_fn* handles the scalar path.
+
+    *scalar_fn* is needed for cast ops that must coerce the scalar to a
+    specific Python type before passing to fn — e.g. extf passes
+    scalar_fn=np.float32, extui/trunci/fptosi/fptoui pass int, uitofp passes
+    float.
     """
     val = context.get_value(op.operands[0])
     if isinstance(val, Tile):
-        return tile_fn(val)
-    return (scalar_fn or tile_fn)(val)
+        return fn(val)
+    return (scalar_fn or fn)(val)
+
+
+def _binop_via_op(op, context, fn):
+    """Fetch two operands and call fn(a, b) directly.
+
+    Use when *fn* is an ops-layer callable (e.g. ArithOps.minsi) that
+    already handles Tile/scalar dispatch internally.
+    """
+    a = context.get_value(op.operands[0])
+    b = context.get_value(op.operands[1])
+    return fn(a, b)
 
 
 def unwrap_yield(result):
