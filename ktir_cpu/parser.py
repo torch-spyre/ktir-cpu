@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from .ir_types import Operation, IRFunction, IRModule
 from .dialects import dispatch_parser, make_parse_context, ParseContext
 from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
-from .parser_utils import find_ssa_names
+from .parser_utils import find_ssa_names, parse_multi_result_lhs
 
 
 class KTIRParserBase(ABC):
@@ -354,7 +354,7 @@ class KTIRParser(KTIRParserBase):
             # continuation (e.g. `: input_types\n  -> result_type`).
             if current_op_lines and open_braces == 0 and not stripped.startswith('->'):
                 starts_ssa = re.match(
-                    r'(?:%\w+\s*,\s*)*%\w+\s*=\s', stripped
+                    r'(?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?\s*=\s', stripped
                 )
                 # Two-stage flush decision:
                 #
@@ -590,12 +590,17 @@ class KTIRParser(KTIRParserBase):
             op_type %op1, %op2 : type
             return %result : type
         """
-        # Try to match: %result = op_type rest
-        op_match = re.match(r'(?:(%\w+)\s*=\s*)?([a-z_][a-z0-9_\.]*)\s*(.*)', text, re.DOTALL)
+        # Try to match: %result = op_type rest (including bundled %r:N and comma %a, %b forms)
+        op_match = re.match(r'(?:((?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?)\s*=\s*)?([a-z_][a-z0-9_\.]*)\s*(.*)', text, re.DOTALL)
         if not op_match:
             return None
 
-        result = op_match.group(1)
+        lhs_text = op_match.group(1)
+        if lhs_text:
+            names = parse_multi_result_lhs(lhs_text)
+            result = names if len(names) > 1 else names[0]
+        else:
+            result = None
         op_type = op_match.group(2)
         rest = op_match.group(3).strip()
 

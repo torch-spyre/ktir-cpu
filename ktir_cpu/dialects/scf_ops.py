@@ -19,7 +19,7 @@ import re
 from ..ir_types import Operation
 from ..latency import LatencyCategory as LC
 from ..ops.control_ops import ControlOps
-from ..parser_utils import find_ssa_names
+from ..parser_utils import find_ssa_names, parse_multi_result_lhs
 from .registry import register, register_parser
 
 
@@ -116,14 +116,15 @@ def parse_bb0_block_args(op_text, parse_ctx):
 @register_parser("scf.for ")
 def parse_scf_for(op_text, parse_ctx):
     # Detect optional outer result variable(s): %a, %b, %c = scf.for ...
+    # Also handles bundled form: %acc:2 = scf.for ...
     outer_result = None
-    outer_match = re.match(r'((?:%\w+\s*,\s*)*%\w+)\s*=\s*scf\.for\s+', op_text)
+    outer_match = re.match(r'((?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?)\s*=\s*scf\.for\s+', op_text)
     if outer_match:
-        names = [n.strip() for n in outer_match.group(1).split(',')]
+        names = parse_multi_result_lhs(outer_match.group(1))
         outer_result = names if len(names) > 1 else names[0]
 
     scf_match = re.match(
-        r'(?:(?:%\w+\s*,\s*)*%\w+\s*=\s*)?scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
+        r'(?:(?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?\s*=\s*)?scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
         op_text
     )
     if not scf_match:
