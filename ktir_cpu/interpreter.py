@@ -207,7 +207,7 @@ class KTIRInterpreter:
             resolved_operands = []
             for name in op.operands:
                 try:
-                    resolved_operands.append(context.get_value(name))
+                    resolved_operands.append(context.get_value(name, peek=True))
                 except KeyError:
                     resolved_operands.append(None)
 

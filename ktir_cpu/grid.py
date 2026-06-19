@@ -298,11 +298,15 @@ class CoreContext:
                     )
                 self.lx.used += value.size_bytes()
 
-    def get_value(self, name: str) -> Any:
+    def get_value(self, name: str, *, peek: bool = False) -> Any:
         """Get SSA value, searching top-to-bottom.
 
         On last use (use_count == 1), pops the value from scope and frees LX
         immediately so the caller can reuse or replace the buffer at no net cost.
+
+        Args:
+            peek: If True, suppress consume-on-last-use (used by latency
+                pre-resolution, which reads operand values without consuming them).
 
         Args:
             name: SSA value name (e.g., "%x_tile")
@@ -316,7 +320,8 @@ class CoreContext:
         for scope in reversed(self._scope_stack):
             if name in scope:
                 value = scope[name]
-                if (self.lx_options.consume_last_use
+                if (not peek
+                        and self.lx_options.consume_last_use
                         and isinstance(value, Tile)
                         and self._use_counts.get(name, 0) == 1
                         and scope is self._scope_stack[-1]):
