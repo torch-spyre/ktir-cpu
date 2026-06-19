@@ -1058,6 +1058,7 @@ def _build_raw_row_band_partitions(p0_stick, p1_stick, part_shape, ncols, dtype)
     keeps the sets as ``AffineSet`` so the surviving C_i is enumerated to a
     point list — the slow path.
     """
+    from ktir_cpu.dtypes import stick_to_elem_idx
     from ktir_cpu.ir_types import MemRef
     from ktir_cpu.parser_ast import parse_affine_set_raw
 
@@ -1070,9 +1071,9 @@ def _build_raw_row_band_partitions(p0_stick, p1_stick, part_shape, ncols, dtype)
         f"affine_set<(d0, d1) : (d0 - {R} >= 0, -d0 + {2 * R - 1} >= 0, "
         f"d1 >= 0, -d1 + {ncols - 1} >= 0)>"
     )
-    P0 = MemRef(base_ptr=p0_stick, shape=part_shape, strides=[ncols, 1],
+    P0 = MemRef(base_ptr=stick_to_elem_idx(p0_stick, dtype), shape=part_shape, strides=[ncols, 1],
                 memory_space="HBM", dtype=dtype, coordinate_set=B0)
-    P1 = MemRef(base_ptr=p1_stick, shape=part_shape, strides=[ncols, 1],
+    P1 = MemRef(base_ptr=stick_to_elem_idx(p1_stick, dtype), shape=part_shape, strides=[ncols, 1],
                 memory_space="HBM", dtype=dtype, coordinate_set=B1)
     return P0, P1
 
