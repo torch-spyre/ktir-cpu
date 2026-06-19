@@ -711,12 +711,66 @@ SPEC_PLAIN_LOOP_NO_COMM = {
 }
 
 
+# Nested scf.for: outer loop (n_outer iters) contains inner loop (n_inner iters),
+# inner loop body contains a ring reduce.
+# Total reductions per core = n_outer * n_inner; each yields the same all-reduce
+# sum, so expected = n_outer * n_inner * sum(partials).
+def _nested_reduce_spec(grid, group, init_values, n_outer, n_inner, expected):
+    """Build a spec with outer scf.for → inner scf.for → test.reduce."""
+    inner_body = [
+        _make_reduce_op("%t", group, "%r"),
+        _make_yield_op("%r"),
+    ]
+    inner_for = _make_for_op(
+        "%c0", "%cNi", "%c1", "%j", inner_body,
+        result="%r",
+        iter_args=["%r"],
+        iter_inits=["%r_carry"],
+    )
+    outer_body = [inner_for, _make_yield_op("%r")]
+    outer_for = _make_for_op(
+        "%c0", "%cNo", "%c1", "%i", outer_body,
+        result="%r",
+        iter_args=["%r"],
+        iter_inits=["%r_init"],
+    )
+    return {
+        "grid": grid,
+        "seed": {
+            core_id: {
+                "%t": _tile(v),
+                "%r_init": _tile(0.0),
+                "%r_carry": _tile(0.0),
+                "%c0": 0,
+                "%cNo": n_outer,
+                "%cNi": n_inner,
+                "%c1": 1,
+            }
+            for core_id, v in init_values.items()
+        },
+        "operations": [outer_for],
+        "expect": expected,
+    }
+
+
+SPEC_NESTED_LOOP_REDUCE = _nested_reduce_spec(
+    grid=(2, 1, 1),
+    group=[0, 1],
+    init_values={0: 3.0, 1: 4.0},
+    n_outer=2,
+    n_inner=3,
+    # Each of the 2*3=6 iterations reduces to 3+4=7; final %r = 7.0.
+    expected={0: {"%r": 7.0}, 1: {"%r": 7.0}},
+)
+
+
 @pytest.mark.parametrize(
     "spec",
     [
         pytest.param(SPEC_INNER_REDUCE_SINGLE_ITER, id="inner_reduce_single_iter"),
         pytest.param(SPEC_INNER_REDUCE_MULTI_ITER,  id="inner_reduce_multi_iter"),
         pytest.param(SPEC_PLAIN_LOOP_NO_COMM,       id="plain_loop_no_comm"),
+        pytest.param(SPEC_NESTED_LOOP_REDUCE,       id="nested_loop_reduce"),
     ],
 )
 def test_inner_loop_comm(spec, execute_fn):
