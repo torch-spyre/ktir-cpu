@@ -550,11 +550,24 @@ class KTIRParser(KTIRParserBase):
         # call the parser directly without a module-level alias pre-scan).
         ctx = parse_ctx or make_parse_context({})
 
-        parser_fn = dispatch_parser(op_text)
-        if parser_fn:
-            return parser_fn(op_text, ctx)
+        # Strip op-result-list LHS once, before dialect dispatch.
+        # Grammar: op-result-list ::= op-result (',' op-result)* '='
+        lhs_match = re.match(
+            r'((?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?)\s*=\s*(.*)', op_text, re.DOTALL
+        )
+        if lhs_match:
+            names = parse_multi_result_lhs(lhs_match.group(1))
+            result = names if len(names) > 1 else names[0]
+            body_text = lhs_match.group(2).strip()
+        else:
+            result = None
+            body_text = op_text
 
-        return self._parse_general_operation(op_text)
+        parser_fn = dispatch_parser(body_text)
+        if parser_fn:
+            return parser_fn(body_text, ctx, result=result)
+
+        return self._parse_general_operation(body_text, result=result)
 
     def _parse_index_binary(self, text: str) -> Optional[Operation]:
         """Parse infix index arithmetic: %result = %a OP %b : type
@@ -582,27 +595,20 @@ class KTIRParser(KTIRParserBase):
     # General-purpose operation parser (fallback)
     # ------------------------------------------------------------------
 
-    def _parse_general_operation(self, text: str) -> Optional[Operation]:
+    def _parse_general_operation(self, text: str, result=None) -> Optional[Operation]:
         """Parse a general operation using pattern matching.
 
+        Receives LHS-free body text and the pre-computed result name(s).
         Handles simple operations like:
-            %result = op_type %op1, %op2 : type
             op_type %op1, %op2 : type
             return %result : type
         """
-        # Try to match: %result = op_type rest (including bundled %r:N and comma %a, %b forms)
-        op_match = re.match(r'(?:((?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?)\s*=\s*)?([a-z_][a-z0-9_\.]*)\s*(.*)', text, re.DOTALL)
+        op_match = re.match(r'([a-z_][a-z0-9_\.]*)\s*(.*)', text, re.DOTALL)
         if not op_match:
             return None
 
-        lhs_text = op_match.group(1)
-        if lhs_text:
-            names = parse_multi_result_lhs(lhs_text)
-            result = names if len(names) > 1 else names[0]
-        else:
-            result = None
-        op_type = op_match.group(2)
-        rest = op_match.group(3).strip()
+        op_type = op_match.group(1)
+        rest = op_match.group(2).strip()
 
         # Extract operands: all %name references in the text after op_type,
         # but before any { } attribute blocks.

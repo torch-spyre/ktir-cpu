@@ -461,13 +461,11 @@ def linalg__transpose(op, context, env):
 # element-by-element.  A Python-level fold over every element would be
 # prohibitively slow for the tile sizes seen in practice.
 @register_parser("linalg.reduce")
-def parse_linalg_reduce(op_text, parse_ctx):
+def parse_linalg_reduce(op_text, parse_ctx, result=None):
     """Parse linalg.reduce — shorthand or explicit-region form."""
-    result_match = re.match(r'(%\w+)\s*=\s*linalg\.reduce\s+', op_text)
+    result_match = re.match(r'linalg\.reduce\s+', op_text)
     if not result_match:
         return None
-
-    result_name = result_match.group(1)
 
     # Shorthand combiner: { arith.addf } in the op text (no %SSA inside)
     reduce_fn = None
@@ -501,7 +499,7 @@ def parse_linalg_reduce(op_text, parse_ctx):
         attributes["outs_var"] = outs_var
 
     return Operation(
-        result=result_name,
+        result=result,
         op_type="linalg.reduce",
         operands=operands,
         attributes=attributes,
@@ -510,13 +508,11 @@ def parse_linalg_reduce(op_text, parse_ctx):
 
 
 @register_parser("linalg.fill")
-def parse_linalg_fill(op_text, parse_ctx):
+def parse_linalg_fill(op_text, parse_ctx, result=None):
     """Parse linalg.fill ins(%scalar : f16) outs(%init : tensor<1xf16>) -> tensor<1xf16>"""
-    result_match = re.match(r'(%\w+)\s*=\s*linalg\.fill\s+', op_text)
+    result_match = re.match(r'linalg\.fill\s+', op_text)
     if not result_match:
         return None
-
-    result_name = result_match.group(1)
 
     # Extract ins and outs operands
     ins_match = re.search(r'ins\(([^)]+)\)', op_text)
@@ -529,7 +525,7 @@ def parse_linalg_fill(op_text, parse_ctx):
         operands.extend(find_ssa_names(outs_match.group(1)))
 
     return Operation(
-        result=result_name,
+        result=result,
         op_type="linalg.fill",
         operands=operands,
         attributes={},
@@ -538,12 +534,11 @@ def parse_linalg_fill(op_text, parse_ctx):
 
 
 @register_parser("linalg.transpose")
-def parse_linalg_transpose(op_text, parse_ctx):
+def parse_linalg_transpose(op_text, parse_ctx, result=None):
     """Parse linalg.transpose ins(%x : type) outs(%y : type) permutation = [d0, d1, ...]"""
-    result_match = re.match(r'(%\w+)\s*=\s*linalg\.transpose', op_text)
+    result_match = re.match(r'linalg\.transpose', op_text)
     if not result_match:
         return None
-    result_name = result_match.group(1)
 
     ins_match = re.search(r'ins\s*\(\s*(%\w+)\s*:', op_text)
     outs_match = re.search(r'outs\s*\(\s*(%\w+)\s*:', op_text)
@@ -554,7 +549,7 @@ def parse_linalg_transpose(op_text, parse_ctx):
 
     permutation = [int(d.strip()) for d in perm_match.group(1).split(',')]
     return Operation(
-        result=result_name,
+        result=result,
         op_type="linalg.transpose",
         operands=[ins_match.group(1), outs_match.group(1)],
         attributes={"permutation": permutation},
@@ -563,12 +558,11 @@ def parse_linalg_transpose(op_text, parse_ctx):
 
 
 @register_parser("linalg.generic")
-def parse_linalg_generic(op_text, parse_ctx):
+def parse_linalg_generic(op_text, parse_ctx, result=None):
     """Parse linalg.generic header."""
-    result_match = re.match(r'(%\w+)\s*=\s*linalg\.generic\s+', op_text)
+    result_match = re.match(r'linalg\.generic\s+', op_text)
     if not result_match:
         return None
-    result_name = result_match.group(1)
 
     # indexing_maps = [affine_map<(d0, d1) -> (d0)>, ...]
     maps = []
@@ -591,7 +585,7 @@ def parse_linalg_generic(op_text, parse_ctx):
         outs_operands = find_ssa_names(outs_match.group(1).split(':')[0])
 
     return Operation(
-        result=result_name,
+        result=result,
         op_type="linalg.generic",
         operands=ins_operands + outs_operands,
         attributes={"indexing_maps": maps, "n_ins": len(ins_operands)},
@@ -600,22 +594,22 @@ def parse_linalg_generic(op_text, parse_ctx):
 
 
 @register_parser("linalg.index")
-def parse_linalg_index(op_text, parse_ctx):
+def parse_linalg_index(op_text, parse_ctx, result=None):
     """Parse %row = linalg.index 0 : index"""
-    m = re.match(r'(%\w+)\s*=\s*linalg\.index\s+(\d+)', op_text)
+    m = re.match(r'linalg\.index\s+(\d+)', op_text)
     if not m:
         return None
     return Operation(
-        result=m.group(1),
+        result=result,
         op_type="linalg.index",
         operands=[],
-        attributes={"dim": int(m.group(2))},
+        attributes={"dim": int(m.group(1))},
         result_type="index",
     )
 
 
 @register_parser("linalg.yield")
-def parse_linalg_yield(op_text, parse_ctx):
+def parse_linalg_yield(op_text, parse_ctx, result=None):
     """Parse linalg.yield %val : type"""
     m = re.match(r'linalg\.yield\s+(.*)', op_text)
     if not m:
@@ -631,13 +625,11 @@ def parse_linalg_yield(op_text, parse_ctx):
 
 
 @register_parser("linalg.broadcast")
-def parse_linalg_broadcast(op_text, parse_ctx):
+def parse_linalg_broadcast(op_text, parse_ctx, result=None):
     """Parse linalg.broadcast ins(%x : tensor<1xf16>) outs(%y : tensor<1x1024xf16>) dimensions = [1]"""
-    result_match = re.match(r'(%\w+)\s*=\s*linalg\.broadcast\s+', op_text)
+    result_match = re.match(r'linalg\.broadcast\s+', op_text)
     if not result_match:
         return None
-
-    result_name = result_match.group(1)
 
     ins_match = re.search(r'ins\(([^)]+)\)', op_text)
     outs_match = re.search(r'outs\(([^)]+)\)', op_text)
@@ -654,7 +646,7 @@ def parse_linalg_broadcast(op_text, parse_ctx):
         dims = [int(d.strip()) for d in dims_match.group(1).split(',')]
 
     return Operation(
-        result=result_name,
+        result=result,
         op_type="linalg.broadcast",
         operands=operands,
         attributes={"dimensions": dims},

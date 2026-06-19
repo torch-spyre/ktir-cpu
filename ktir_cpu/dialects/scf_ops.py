@@ -19,7 +19,7 @@ import re
 from ..ir_types import Operation
 from ..latency import LatencyCategory as LC
 from ..ops.control_ops import ControlOps
-from ..parser_utils import find_ssa_names, parse_multi_result_lhs
+from ..parser_utils import find_ssa_names
 from .registry import register, register_parser
 
 
@@ -91,7 +91,7 @@ def region__bb0_args(op, context, env):
 
 
 @register_parser("^bb0")
-def parse_bb0_block_args(op_text, parse_ctx):
+def parse_bb0_block_args(op_text, parse_ctx, result=None):
     """Parse a ^bb0 block-argument label inside any region body.
 
     Syntax:
@@ -114,17 +114,10 @@ def parse_bb0_block_args(op_text, parse_ctx):
 
 
 @register_parser("scf.for ")
-def parse_scf_for(op_text, parse_ctx):
-    # Detect optional outer result variable(s): %a, %b, %c = scf.for ...
-    # Also handles bundled form: %acc:2 = scf.for ...
-    outer_result = None
-    outer_match = re.match(r'((?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?)\s*=\s*scf\.for\s+', op_text)
-    if outer_match:
-        names = parse_multi_result_lhs(outer_match.group(1))
-        outer_result = names if len(names) > 1 else names[0]
-
+def parse_scf_for(op_text, parse_ctx, result=None):
+    # op_text is LHS-free: "scf.for %i = %c0 to %n step %c1 ..."
     scf_match = re.match(
-        r'(?:(?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?\s*=\s*)?scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
+        r'scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
         op_text
     )
     if not scf_match:
@@ -147,9 +140,7 @@ def parse_scf_for(op_text, parse_ctx):
     if iter_args:
         attributes["iter_args"] = iter_args
 
-    # Use the outer result variable if present (e.g. %c = scf.for %off_k = ...);
-    # otherwise fall back to the iter_var for loops without a result.
-    result_name = outer_result if outer_result else iter_var
+    result_name = result if result is not None else iter_var
 
     return Operation(
         result=result_name,
@@ -160,8 +151,8 @@ def parse_scf_for(op_text, parse_ctx):
     )
 
 
-@register_parser("scf.yield", "= scf.yield")
-def parse_scf_yield(op_text, parse_ctx):
+@register_parser("scf.yield")
+def parse_scf_yield(op_text, parse_ctx, result=None):
     rest = op_text
     yield_match = re.match(r'scf\.yield\s*(.*)', op_text)
     if yield_match:
