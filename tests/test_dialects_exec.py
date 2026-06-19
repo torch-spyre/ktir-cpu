@@ -55,6 +55,20 @@ def _make_ctx(grid_pos=(0, 0, 0), core_id=0):
     )
 
 
+def _drive(gen):
+    """Exhaust a scf handler generator synchronously (no scheduler needed).
+    scf__for / scf__if are generator functions; tests that call them directly
+    use this to get the return value without a real scheduler."""
+    import inspect
+    if not inspect.isgenerator(gen):
+        return gen
+    try:
+        while True:
+            next(gen)
+    except StopIteration as e:
+        return e.value
+
+
 def _make_env(grid_shape=(1, 1, 1)):
     memory = SpyreMemoryHierarchy(num_cores=1)
     grid = GridExecutor(grid_shape=grid_shape, memory=memory)
@@ -1454,8 +1468,10 @@ class TestScfFunc:
                        result=None, result_type=None,
                        regions=[[lambda c: ran.append("then")], []])
         env = _make_env()
-        env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
-        dispatch("scf.if")(op, ctx, env)
+        _exec = lambda ctx, ops: [f(ctx) for f in ops]
+        env.execute_region = _exec
+        env.execute_region_with_comms = _exec
+        _drive(dispatch("scf.if")(op, ctx, env))
         assert ran == ["then"]
 
     def test_if_else_branch(self):
@@ -1466,8 +1482,10 @@ class TestScfFunc:
                        result=None, result_type=None,
                        regions=[[], [lambda c: ran.append("else")]])
         env = _make_env()
-        env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
-        dispatch("scf.if")(op, ctx, env)
+        _exec = lambda ctx, ops: [f(ctx) for f in ops]
+        env.execute_region = _exec
+        env.execute_region_with_comms = _exec
+        _drive(dispatch("scf.if")(op, ctx, env))
         assert ran == ["else"]
 
     def test_if_then_else_yield_result(self):
@@ -1486,8 +1504,13 @@ class TestScfFunc:
                 result = dispatch(o.op_type)(o, ctx, env)
             return result
 
+        def real_execute_region_gen(ctx, ops):
+            return real_execute_region(ctx, ops)
+            yield  # make it a generator function
+
         env.execute_region = real_execute_region
-        result = dispatch("scf.if")(op, ctx, env)
+        env.execute_region_with_comms = real_execute_region_gen
+        result = _drive(dispatch("scf.if")(op, ctx, env))
         assert result == 42, f"expected 42, got {result!r}"
 
 # ---------------------------------------------------------------------------

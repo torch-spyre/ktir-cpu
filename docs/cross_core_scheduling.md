@@ -63,6 +63,46 @@ KTIRInterpreter
 
 ---
 
+## Comm ops inside `scf.for` / `scf.if` bodies
+
+A comm op (`ktdp.inter_tile_reduce`) may appear inside an `scf.for` or
+`scf.if` body, not just at the top level of a function.  For the
+generator to reach the scheduler, every frame between the comm op and
+`CoreExecutionStack._execute_until_block` must propagate it via
+`yield from`.
+
+The propagation chain for an inner-loop reduce is:
+
+```
+RingReduceBackend.run            ← yields RecvRequest
+  ↑ yield from
+ktdp.inter_tile_reduce handler   ← returns generator
+  ↑ isgenerator → yield from
+execute_region_with_comms        ← propagates any generator from ops in a region
+  ↑ yield from
+ControlOps.for_op_with_comms     ← propagates through each loop iteration
+  ↑ yield from
+scf__for handler                 ← returns the propagated generator
+  ↑ isgenerator → yield from
+_execute_until_block             ← sole scheduler driver
+```
+
+**`execute_region`** (sync) is used for compute-only regions —
+`linalg.reduce` combiners, `tensor.generate` bodies, ktdp combiner
+bodies.  These never contain comm ops; making them generators would
+break callers like `_run_combiner` that expect a plain return value.
+
+**`execute_region_with_comms`** (generator) is used exclusively by the
+`scf` dialect handlers (`scf__for`, `scf__if`, `scf__while`).  If no
+comm op fires inside the region, `yield from` on a generator that never
+yields returns immediately — zero extra cost.
+
+Both fields live on `ExecutionEnv`.  The routing is static per op type:
+`scf` handlers always use the comms variant; everything else uses the
+sync variant.
+
+---
+
 ## Generator vs plain function — the rule
 
 A backend method (or any client of the scheduler protocol) is a
