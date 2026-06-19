@@ -610,3 +610,47 @@ class TestRingReduceExecution:
         expected = rows.sum(axis=0)
         np.testing.assert_allclose(result, expected, rtol=1e-2,
                                    err_msg="Core 0 output does not match element-wise sum")
+
+
+class TestRingReduceInnerLoopExecution:
+    """End-to-end execution of ring_reduce_inner_loop.mlir.
+
+    Exercises ktdp.inter_tile_produce + ktdp.inter_tile_reduce placed inside
+    an scf.for body — the structural novelty vs ring_reduce.mlir where the
+    reduce appears at the top level.  The loop runs n_iters times, accumulating
+    each iteration's all-reduce into an iter_arg; only core 0 writes back.
+
+    Expected output: K * sum(all 4 input rows), where K = n_iters.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce_inner_loop"))
+    def test_ring_reduce_inner_loop(self, path, func_name, entry):
+        """output[0..127] == n_iters * sum of all 4 input rows."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        n_cols = entry["n_cols"]
+        in_ptr = entry["execute_kwargs"]["in_ptr"]
+        out_ptr = entry["execute_kwargs"]["out_ptr"]
+        n_iters = entry["execute_kwargs"]["n_iters"]
+
+        rng = np.random.default_rng(7)
+        rows = rng.uniform(0.5, 1.5, size=(num_cores, n_cols)).astype(np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(in_ptr,  rows.flatten())
+            interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **entry["execute_kwargs"])
+
+        result = interp.memory.hbm.read(out_ptr, n_cols, "f16")
+        expected = (rows.sum(axis=0) * n_iters).astype(np.float16)
+        np.testing.assert_allclose(result, expected, rtol=1e-2,
+                                   err_msg="Core 0 output does not match n_iters * sum of input rows")

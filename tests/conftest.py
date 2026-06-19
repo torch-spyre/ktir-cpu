@@ -296,6 +296,20 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "n_cols": 128,
         },
     ],
+    "ring_reduce_inner_loop": [
+        {
+            "path": "ktir/ring_reduce_inner_loop.mlir",
+            # 4-core all-reduce sum inside scf.for; loop runs n_iters times,
+            # accumulating the per-iteration reduce into an iter_arg.
+            # Only core 0 writes the final accumulator back.
+            # grid = [4, 1, 1] → 4 cores; n_cols = 128.
+            # HBM stick layout (1 stick = 128 bytes = 64 f16):
+            #   sticks [0..7]  → 4 input rows × 2 sticks each
+            #   sticks [8..9]  → 1 output row × 2 sticks
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 8, "n_iters": 3},
+            "n_cols": 128,
+        },
+    ],
     "ring_reduce_multi_group": [
         {
             "path": "latency/ring_reduce_multi_group.mlir",
