@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Set, Tuple, Any
 from .ir_types import Tile
-from .memory import LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
+from .memory import LXOptions, LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
 
 if TYPE_CHECKING:
     from .ops.comm_ops import TransferBackend
@@ -84,11 +84,12 @@ class CoreContext:
         # set_value("%m_acc", %m_new) in parent scope: refcount tracks automatically.
     """
 
-    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator):
+    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator, lx_options: LXOptions = None):
         self.core_id = core_id
         self.grid_pos = grid_pos  # (x, y, z) position in grid
         self.lx = lx              # Core-local LX scratchpad
         self.hbm = hbm            # Shared HBM
+        self.lx_options = lx_options if lx_options is not None else LXOptions()
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._tile_refcount: Dict[int, int] = {}  # id(Tile) -> refcount
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
@@ -224,9 +225,12 @@ class CoreContext:
         scope = self._scope_stack.pop()
         for value in scope.values():
             if isinstance(value, Tile):
-                self._tile_refcount[id(value)] -= 1
-                if self._tile_refcount[id(value)] == 0:
-                    del self._tile_refcount[id(value)]
+                if self.lx_options.alias_dedup:
+                    self._tile_refcount[id(value)] -= 1
+                    if self._tile_refcount[id(value)] == 0:
+                        del self._tile_refcount[id(value)]
+                        self.lx.used -= value.size_bytes()
+                else:
                     self.lx.used -= value.size_bytes()
         self.lx.next_ptr = self._lx_next_ptr_stack.pop()
         assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
@@ -264,13 +268,27 @@ class CoreContext:
         """
         old = self._scope_stack[-1].get(name)
         if isinstance(old, Tile):
-            self._tile_refcount[id(old)] -= 1
-            if self._tile_refcount[id(old)] == 0:
-                del self._tile_refcount[id(old)]
+            if self.lx_options.alias_dedup:
+                self._tile_refcount[id(old)] -= 1
+                if self._tile_refcount[id(old)] == 0:
+                    del self._tile_refcount[id(old)]
+                    self.lx.used -= old.size_bytes()
+            else:
                 self.lx.used -= old.size_bytes()
         self._scope_stack[-1][name] = value
         if isinstance(value, Tile):
-            if self._tile_refcount.get(id(value), 0) == 0:
+            if self.lx_options.alias_dedup:
+                if self._tile_refcount.get(id(value), 0) == 0:
+                    if self.lx.used + value.size_bytes() > self.lx.capacity:
+                        raise MemoryError(
+                            f"LX scratchpad overflow on core {self.core_id}: "
+                            f"requested {value.size_bytes()} bytes, "
+                            f"available {self.lx.capacity - self.lx.used} bytes "
+                            f"(capacity {self.lx.capacity} bytes)"
+                        )
+                    self.lx.used += value.size_bytes()
+                self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
+            else:
                 if self.lx.used + value.size_bytes() > self.lx.capacity:
                     raise MemoryError(
                         f"LX scratchpad overflow on core {self.core_id}: "
@@ -279,7 +297,6 @@ class CoreContext:
                         f"(capacity {self.lx.capacity} bytes)"
                     )
                 self.lx.used += value.size_bytes()
-            self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
 
     def get_value(self, name: str) -> Any:
         """Get SSA value, searching top-to-bottom.
@@ -299,13 +316,17 @@ class CoreContext:
         for scope in reversed(self._scope_stack):
             if name in scope:
                 value = scope[name]
-                if (isinstance(value, Tile)
+                if (self.lx_options.consume_last_use
+                        and isinstance(value, Tile)
                         and self._use_counts.get(name, 0) == 1
                         and scope is self._scope_stack[-1]):
                     del scope[name]
-                    self._tile_refcount[id(value)] -= 1
-                    if self._tile_refcount[id(value)] == 0:
-                        del self._tile_refcount[id(value)]
+                    if self.lx_options.alias_dedup:
+                        self._tile_refcount[id(value)] -= 1
+                        if self._tile_refcount[id(value)] == 0:
+                            del self._tile_refcount[id(value)]
+                            self.lx.used -= value.size_bytes()
+                    else:
                         self.lx.used -= value.size_bytes()
                 return value
         raise KeyError(f"Value '{name}' not found in core {self.core_id}")

@@ -243,7 +243,24 @@ class TestScopeStack:
 # ---------------------------------------------------------------------------
 
 class TestLXTracking:
-    """Test that set_value auto-tracking correctly manages lx.used."""
+    """set_value auto-tracking: every Tile binding charges lx.used exactly once.
+
+    Tile size used in alias tests: tensor<32x1024xf16> = 32*1024*2 = 65536 bytes.
+
+    Alias dedup (_LX_DEDUP vs _LX_BASELINE)
+    ----------------------------------------
+    Two SSA names can point to the same Python Tile object (e.g. linalg.reduce
+    binds %result and %outs to the same buffer).  Without dedup, each binding
+    charges separately:
+
+      _LX_BASELINE — no id() tracking:
+        set_value("%a", tile)  →  lx.used = 65536   (charged)
+        set_value("%b", tile)  →  lx.used = 131072  (charged again — wrong)
+
+      _LX_DEDUP — refcount by id():
+        set_value("%a", tile)  →  lx.used = 65536   (first binding, charged)
+        set_value("%b", tile)  →  lx.used = 65536   (same id(), refcount 1→2, no charge)
+    """
 
     def test_set_value_tile_increments_used(self):
         ctx = _make_context()
@@ -776,7 +793,7 @@ class TestNextPtrRewind:
     pop_scope so it stays in lockstep with lx.used.
     """
 
-    def test_issue_26_reproducer_next_ptr_bounded_in_loop(self):
+    def test_next_ptr_returns_to_zero_each_iteration(self):
         """The exact failure mode from issue #26.
 
         Before the fix, next_ptr advanced by 2048 (tile size, stick-aligned)
@@ -890,10 +907,31 @@ class TestNextPtrRewind:
 # ---------------------------------------------------------------------------
 
 class TestConsumeOnLastUse:
-    """Tests for the consume_last_use feature (issue #130).
+    """consume_last_use: free a Tile at its last fetch instead of at scope exit.
 
-    Each test pairs _LX_DEDUP (consume off) and _LX_FULL (consume on)
-    to show the expected lx.used in each configuration.
+    Motivating pattern — a binary op where both inputs are single-use:
+
+        %a = ktdp.load ...          # tensor<16x16xf16> = 512 bytes
+        %b = ktdp.load ...          # tensor<16x16xf16> = 512 bytes
+        %r = arith.addf %a, %b     # handler fetches %a then %b, then registers %r
+
+    Without consume_last_use (_LX_DEDUP):
+        after set_value("%a"):       lx.used = 512
+        after set_value("%b"):       lx.used = 1024
+        get_value("%a") — no free:   lx.used = 1024
+        get_value("%b") — no free:   lx.used = 1024
+        set_value("%r", result):     lx.used = 1536   ← all three live simultaneously
+
+    With consume_last_use (_LX_FULL), use_counts = {%a:1, %b:1}:
+        after set_value("%a"):       lx.used = 512
+        after set_value("%b"):       lx.used = 1024
+        get_value("%a") — freed:     lx.used =  512   ← %a gone before handler returns
+        get_value("%b") — freed:     lx.used =    0   ← %b gone before result lands
+        set_value("%r", result):     lx.used =  512   ← net: replaced two inputs with one output
+
+    Guard: only the topmost scope is eligible for early-free.  An outer-scope
+    name with use_count==1 that is read N times inside a loop is NOT consumed
+    on first fetch — the topmost-scope check (scope is _scope_stack[-1]) blocks it.
     """
 
     def test_single_use_tile_lx_used(self):
@@ -967,13 +1005,38 @@ class TestConsumeOnLastUse:
 
 
 class TestUseCountsParsed:
-    """Verify _build_use_counts identifies the three single-use names from issue #130.
+    """_build_use_counts correctly counts operand occurrences across the whole function.
 
-    Gap 1: %accum_zero — used only as scf.for iter_init → count == 1 → freed at loop entry.
-    Gap 2: %c_init     — used only as linalg.matmul outs → count == 1 → freed before matmul result lands.
-    Gap 3: %accum_itr  — used only as arith.addf operand → count == 1 → freed before %accum_next lands.
+    The use-count map is a flat dict: SSA name → number of times it appears
+    as an operand across all ops and nested regions.  A name with count == 1
+    is eligible for consume-on-last-use; count > 1 must never be consumed early.
 
-    Names used in more than one place must have count > 1 so they are NOT consumed on first fetch.
+    Verified against MATMUL_UC_MLIR (8×8 tiles, one scf.for loop):
+
+        // function body
+        %accum_zero = arith.constant dense<0.0>            ← defined here
+        %c = scf.for ... iter_args(%accum_itr = %accum_zero) {
+            // loop body (nested region)
+            %c_init  = tensor.empty()                      ← defined here
+            %a_dot_b = linalg.matmul ... outs(%c_init)     ← %c_init used here (count=1)
+            %accum_next = arith.addf %accum_itr, %a_dot_b  ← %accum_itr used here (count=1)
+                                                           ← %a_dot_b used here (count=1)
+            scf.yield %accum_next
+        }                                                  ← %accum_zero used as iter_init (count=1)
+
+        // after loop
+        ktdp.store %c, %c_acc                              ← %pid_m used here
+
+        // %pid_m also appears inside the loop as index for %a_acc
+        // → two occurrences across function body + loop region → count >= 2
+
+    Name          Where used                         count   eligible?
+    ----------    --------------------------------   -----   ---------
+    %accum_zero   scf.for iter_init                    1     yes — freed when loop starts
+    %c_init       linalg.matmul outs                   1     yes — freed before %a_dot_b lands
+    %accum_itr    arith.addf operand                   1     yes (count) but blocked by
+                                                             topmost-scope guard at runtime
+    %pid_m        %a_acc index, %c_acc index            2     no  — must not be consumed early
     """
 
     def _get_use_counts(self):
@@ -982,42 +1045,79 @@ class TestUseCountsParsed:
         return module.get_function("matmul_uc_test").use_counts
 
     def test_gap1_accum_zero_single_use(self):
-        """Gap 1: %accum_zero is only the iter_init of scf.for — count must be 1."""
+        """%accum_zero appears once — as the iter_init of scf.for."""
         uc = self._get_use_counts()
         assert uc.get("%accum_zero", 0) == 1
 
     def test_gap2_c_init_single_use(self):
-        """Gap 2: %c_init is only the outs of linalg.matmul — count must be 1."""
+        """%c_init appears once — as the outs buffer of linalg.matmul."""
         uc = self._get_use_counts()
         assert uc.get("%c_init", 0) == 1
 
     def test_gap3_accum_itr_single_use(self):
-        """Gap 3: %accum_itr is only an operand of arith.addf — count must be 1."""
+        """%accum_itr appears once — as the left operand of arith.addf."""
         uc = self._get_use_counts()
         assert uc.get("%accum_itr", 0) == 1
 
     def test_multi_use_names_not_single(self):
-        """Names used more than once must have count > 1 so they are not consumed early.
-
-        %pid_m is used as the index base for both %a_acc (inside the loop) and
-        %c_acc (after the loop) — two distinct use sites, so count must be >= 2.
-        """
+        """%pid_m appears twice: once as index for %a_acc inside the loop, once for %c_acc after it."""
         uc = self._get_use_counts()
         assert uc.get("%pid_m", 0) >= 2, (
-            f"Expected %pid_m to have >= 2 uses, got {uc.get('%pid_m', 0)}"
+            f"Expected %pid_m count >= 2, got {uc.get('%pid_m', 0)}"
         )
 
 
 class TestLastUseMatmulKernel:
-    """End-to-end LX tests for the matmul kernel (issue #130).
+    """End-to-end LX accounting for MATMUL_LX_MLIR (issue #130).
 
-    MATMUL_LX_MLIR: BM=512, BN=256, BK=64 — accumulator tile = 256 KB.
-    LX cap is tightened to 1 MB for both tests.
+    Kernel: BM=512, BN=256, BK=64, K=256 (4 iterations).
+    LX cap tightened to 1 MB = 1048576 bytes.
 
-    With _LX_BASELINE: %accum_itr + %c_init + %a_dot_b + %accum_next all
-    coexist (4 × 256 KB = 1 MB), plus %a (64 KB) and %b (32 KB) → overflow.
-    With _LX_FULL: single-use tiles are freed before their consumer's result
-    lands → peak stays within 1 MB.
+    Tile sizes (f16 = 2 bytes/elem):
+        %accum_itr / %accum_next  512×256×2 = 262144 bytes  (256 KB)
+        %c_init / %a_dot_b        512×256×2 = 262144 bytes  (256 KB)
+        %a                        512×64×2  =  65536 bytes  ( 64 KB)
+        %b                         64×256×2 =  32768 bytes  ( 32 KB)
+
+    Per-iteration peak, _LX_DEDUP (consume off):
+        parent scope:  %accum_itr                    262144
+        body scope:    %a + %b + %c_init + %a_dot_b   65536+32768+262144+262144
+                       + %accum_next                 +262144
+                                                     -------
+        peak =  262144 + 65536 + 32768 + 262144 + 262144 + 262144 = 1146880 bytes
+        → exceeds 1 MB cap → MemoryError
+
+    Per-iteration peak, _LX_FULL (consume on), use_counts all 1:
+        parent: %accum_itr alive                      lx = 262144
+        body:
+          ktdp.load  → %a registered                  lx = 327680
+          ktdp.load  → %b registered                  lx = 360448
+          tensor.empty → %c_init registered            lx = 622592
+          linalg.matmul fetches %c_init (count=1, topmost) → freed
+                         %c_init consumed              lx = 360448
+                         %a_dot_b registered           lx = 622592
+          arith.addf fetches %a (count=1, topmost)   → freed
+                         %a consumed                   lx = 557056
+                     fetches %b (count=1, topmost)   → freed
+                         %b consumed                   lx = 524288
+                     fetches %accum_itr (count=1, but parent scope — guard blocks)
+                         %accum_itr stays              lx = 524288
+                     fetches %a_dot_b (count=1, topmost) → freed
+                         %a_dot_b consumed             lx = 262144
+                         %accum_next registered        lx = 524288
+        peak = 524288 bytes (512 KB) — within 1 MB cap → no overflow
+
+    Remaining limitation — simultaneous window for %accum_itr:
+        %accum_itr lives in the parent scope, not the body scope.
+        The topmost-scope guard blocks early-free even though use_count == 1,
+        because %accum_itr is fetched on every iteration (the global count
+        of 1 reflects that it appears once as an operand of arith.addf, but
+        that one appearance is executed K/BK times).
+        As a result, %accum_itr and %accum_next are both live simultaneously
+        inside each iteration body — hence peak = 2 × 256 KB = 512 KB
+        rather than the theoretical minimum of 256 KB.
+        The set_value rebind after each iteration frees %accum_itr promptly,
+        but cannot act before %accum_next is charged.
     """
 
     LX_CAP = 1 * 1024 * 1024  # 1 MB

@@ -96,6 +96,47 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 from .dtypes import to_np_dtype, bytes_per_elem
+from dataclasses import dataclass as _dataclass
+
+
+@_dataclass
+class LXOptions:
+    """Feature flags for CoreContext LX tracking.
+
+    Both flags default to True (full tracking enabled).  Pass a custom
+    instance to CoreContext to isolate or disable individual features —
+    useful in tests to measure the effect of each mechanism in isolation.
+
+    alias_dedup
+    -----------
+    Tracks each Tile allocation by id(Tile) via a refcount dict.  Prevents
+    double-charging when multiple SSA names point to the same Python object:
+
+        tile = Tile(...)
+        set_value("%a", tile)  # refcount 0→1, lx.used += N
+        set_value("%b", tile)  # same id(), refcount 1→2, lx.used unchanged
+        pop_scope()            # refcount 2→1 for %b, 1→0 for %a → lx.used -= N
+
+    Without this flag, each set_value charges independently and pop_scope
+    frees independently — aliases inflate lx.used by a factor of N aliases.
+
+    consume_last_use
+    ----------------
+    Frees a Tile at its last fetch (use_count == 1 in the global use-count
+    map) instead of waiting for scope exit.  Requires alias_dedup to be
+    correct (refcount must reach 0 at the right moment).
+
+    Only applies to names in the topmost scope — outer-scope names used
+    inside a loop have use_count == 1 globally but are fetched per iteration;
+    the topmost-scope guard (scope is _scope_stack[-1]) blocks early-free.
+
+    Preset combinations used in tests:
+        _LX_BASELINE = LXOptions(alias_dedup=False, consume_last_use=False)
+        _LX_DEDUP    = LXOptions(alias_dedup=True,  consume_last_use=False)
+        _LX_FULL     = LXOptions(alias_dedup=True,  consume_last_use=True)
+    """
+    alias_dedup: bool = True
+    consume_last_use: bool = True
 
 
 class _AllocStore(dict):

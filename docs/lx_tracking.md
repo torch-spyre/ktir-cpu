@@ -135,3 +135,29 @@ the old and new carry tile must be simultaneously live.
 Eliminating this window would require either explicit last-use annotations in
 the IR or a liveness analysis pass that is currently out of scope.
 
+
+## Feature flags: LXOptions
+
+Both mechanisms above are controlled by `LXOptions`, a dataclass passed to
+`CoreContext` alongside `LXScratchpad`:
+
+```python
+@dataclass
+class LXOptions:
+    alias_dedup: bool = True       # Complication 1: refcount by id(Tile)
+    consume_last_use: bool = True  # Complication 2: free at last fetch
+```
+
+Both default to `True` so production behavior is unchanged. Tests use explicit
+presets to isolate each feature and measure its effect on `lx.used`:
+
+```python
+_LX_BASELINE = LXOptions(alias_dedup=False, consume_last_use=False)
+_LX_DEDUP    = LXOptions(alias_dedup=True,  consume_last_use=False)
+_LX_FULL     = LXOptions(alias_dedup=True,  consume_last_use=True)
+```
+
+`consume_last_use` requires `alias_dedup` to be correct — the refcount must
+reach 0 at the right moment for the free in `get_value` to fire. Running
+`consume_last_use=True` with `alias_dedup=False` is unsupported.
+
