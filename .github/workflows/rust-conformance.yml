@@ -1,0 +1,304 @@
+name: CI - Conformance (Python <-> Rust)
+
+# DIRECT differential conformance gate: the SAME seeded inputs run through BOTH
+# the Python reference (`ktir_cpu.KTIRInterpreter`) AND the Rust port
+# (`ktir_emulator::interpreter::execute_function`), and the outputs are diffed
+# head-to-head (NOT both-vs-a-hardcoded-answer-key). A divergence beyond the f16
+# tolerance band is a real port-faithfulness regression. See
+# rust/crates/ktir-emulator/tests/equiv/diff_py_vs_rust.py for the driver and the program corpus.
+#
+# CHEAP by construction — tiny hand-written KTIR programs, numpy-only Python (no
+# torch, no model weights, no MLIR frontend build), and the Rust side is one
+# example binary running all (program x seed) cases in a single invocation. So
+# this runs on EVERY relevant push, not workflow_dispatch-only.
+
+on:
+  push:
+    paths:
+      - 'ktir_cpu/**'
+      - 'examples/**'
+      - 'rust/**'
+      - 'rust/crates/ktir-emulator/tests/equiv/**'
+      - '.github/workflows/rust-conformance.yml'
+  pull_request:
+    paths:
+      - 'ktir_cpu/**'
+      - 'examples/**'
+      - 'rust/**'
+      - 'rust/crates/ktir-emulator/tests/equiv/**'
+      - '.github/workflows/rust-conformance.yml'
+
+# Supersede an in-flight run when a new commit lands on the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Seeded iterations per program (seeds 0..N-1). The Rust side is batched into a
+  # single invocation, so each extra iteration is just one execute_function call.
+  # 8 is the proven default (validated to 50 locally — all PASS bit-exact).
+  FUZZ_ITERS: '8'
+
+jobs:
+  diff:
+    name: Python <-> Rust differential
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Full checkout: the driver needs ktir_cpu/ (reference), examples/ (the
+      # hand-written KTIR programs), rust/ (the CLI), and rust/crates/ktir-emulator/tests/equiv/ (driver).
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Linux's accelerated GEMM path is system OpenBLAS (matmul -> cblas_sgemm),
+      # selected by the `openblas-system` feature — same as ci-rust.yml. Without
+      # it the build still works (portable naive f32 triple-loop fallback), but we
+      # match the Rust CI's accelerated path so the conformance diff exercises the
+      # production GEMM and there is no naive-loop f16-rounding surprise.
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      # Build the differential CLI ONCE up front. It is an `example` (it uses the
+      # serde_json dev-dependency); --release because the Python reference runs
+      # the same matmul/layernorm tensors and we don't want a debug-build Rust
+      # interpreter to dominate. We pin the binary path so the driver skips its
+      # own cargo build (KTIR_DIFF_RUN_BIN) and just invokes the prebuilt binary.
+      - name: Build Rust diff CLI
+        working-directory: rust
+        run: cargo build --release --features openblas-system --example ktir_diff_run -p ktir-emulator
+
+      # The driver imports ktir_cpu (numpy-only regex parser; NO mlir-frontend
+      # build) and numpy. `uv run --with numpy` resolves ktir_cpu from the repo
+      # (PEP 621 project) plus numpy, with no extra system deps.
+      #
+      # Gate the FULL corpus (KTIR_DIFF_PROGRAMS=all): every shared example program
+      # is faithful to the Python reference — 15 are bit-exact (max-abs 0) and 3 are
+      # matched-failure fixtures (both sides raise the same category). Zero gaps.
+      # The driver exits non-zero on ANY divergence (a new gap, or a fixture that
+      # stops failing equivalently), so this is a real per-push conformance gate.
+      # FUZZ_ITERS kept modest here for CI cost; the advertised table is run at 100.
+      - name: Differential conformance (Python KTIRInterpreter <-> Rust execute_function)
+        env:
+          KTIR_DIFF_RUN_BIN: ${{ github.workspace }}/rust/target/release/examples/ktir_diff_run
+          KTIR_DIFF_PROGRAMS: all
+          FUZZ_ITERS: "5"
+        run: uv run --with numpy rust/crates/ktir-emulator/tests/equiv/diff_py_vs_rust.py
+
+  # ---------------------------------------------------------------------------
+  # GPU-PATH differential: the job above is BIT-EXACT (Python-f16 ⟷ Rust-AMX/f32)
+  # because the example programs tile BELOW the NAX size gate, so on every runner
+  # their matmuls run on the CPU BLAS path — the production METAL fast path
+  # (NAX matmul2d on M5 / simdgroup on pre-M5) is never exercised by it.
+  #
+  # This job forces those same tiled example matmuls onto the Metal GEMM
+  # (KTIR_DIFF_GPU=1 -> KTIR_DIFF_ENGINE=gpu + KTIR_FORCE_GPU_GEMM=1) and diffs
+  # Python ⟷ Rust-GPU under a PRINCIPLED bf16/f16 band (it CANNOT be bit-exact:
+  # NAX rounds f16 inputs to bf16). It additionally asserts a per-case GPU-GEMM
+  # proof counter (gpu_gemm_count > 0) so a matmul that secretly fell back to AMX
+  # is a FALSE pass and FAILS — numeric agreement on the AMX path would prove
+  # nothing about the GPU.
+  #
+  # GPU-AVAILABILITY CAVEAT. This runs ONLY on macOS, where Metal + the NAX/
+  # simdgroup backend are auto-on (build.rs emits cfg(metal); objc2 + Accelerate
+  # are unconditional macOS deps — no feature flag). Linux GitHub runners have NO
+  # GPU and no Metal, so there is nothing to differentially check there. The
+  # hosted macOS runner's GPU is whatever generation GitHub provisions and is
+  # often NOT an M5 — so its `force_gpu_gemm` tier may be SIMDGROUP (pre-M5), not
+  # NAX. The gpu_gemm_count>0 assertion still holds (it counts the GPU branch on
+  # EITHER tier), but the advertised NAX(512)/NAX(2) numbers and the headline
+  # max-abs were measured locally on an Apple M5 (the production target). CI here
+  # guards against REGRESSION of the GPU path on whatever Apple GPU the runner
+  # has; the M5 NAX-tier numbers are validated on the dev machine.
+  gpu-diff:
+    name: Python <-> Rust GPU-path differential (Metal)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Metal/NAX/simdgroup are auto-on on macOS (no feature flag). Build the diff
+      # CLI once; the driver invokes the prebuilt binary via KTIR_DIFF_RUN_BIN.
+      - name: Build Rust diff CLI (Metal)
+        working-directory: rust
+        run: cargo build --release --example ktir_diff_run -p ktir-emulator
+
+      # PROOF the gate is LIVE, not vacuous. Inject a +5% perturbation into the
+      # Metal GEMM result (KTIR_DIFF_INJECT_DIVERGENCE) — well outside the
+      # principled bf16/f16 band — and assert the differential FAILS (non-zero
+      # exit). If it PASSED with the GPU output corrupted, the band would be
+      # silently swallowing garbage and the green run below would be worthless.
+      # This is the GPU analogue of the NaN-safe diff hardening in the driver.
+      - name: Negative control — injected divergence MUST fail
+        env:
+          KTIR_DIFF_RUN_BIN: ${{ github.workspace }}/rust/target/release/examples/ktir_diff_run
+          KTIR_DIFF_GPU: "1"
+          KTIR_DIFF_INJECT_DIVERGENCE: "0.05"
+          FUZZ_ITERS: "3"
+        run: |
+          if uv run --with numpy rust/crates/ktir-emulator/tests/equiv/diff_py_vs_rust.py; then
+            echo "::error::GPU differential PASSED with a +5% injected divergence — the band is not catching real GPU-output divergence (gate is vacuous)"
+            exit 1
+          fi
+          echo "::notice::negative control OK — injected GPU divergence correctly FAILED the differential"
+
+      # KERNEL-LEVEL check (retained, NOT removed): force the tiled example matmuls
+      # onto the Metal GEMM through the PER-OP `execute_function` selector and diff
+      # Python ⟷ Rust-GPU under the principled band, asserting gpu_gemm_count > 0 for
+      # every GEMM-bearing program (a secret AMX fallback is a FALSE pass). This is a
+      # narrow check of the per-op `linalg.matmul` GPU dispatch in isolation; the
+      # PRODUCTION resident/segmented path is covered by the `resident-diff` job
+      # below (which drives the SAME Metal `metal_gemm_or_blas` offload but through
+      # the real serving executor over the FULL program suite, not just 3 GEMMs).
+      - name: GPU-path differential (per-op kernel check — force Metal GEMM, banded vs Python)
+        env:
+          KTIR_DIFF_RUN_BIN: ${{ github.workspace }}/rust/target/release/examples/ktir_diff_run
+          KTIR_DIFF_GPU: "1"
+          KTIR_DIFF_PROGRAMS: matmul,sdpa,paged_attention
+          FUZZ_ITERS: "5"
+        run: uv run --with numpy rust/crates/ktir-emulator/tests/equiv/diff_py_vs_rust.py
+
+  # ---------------------------------------------------------------------------
+  # RESIDENT/SEGMENTED METAL differential: the PRODUCTION serving path. Where
+  # `gpu-diff` force-runs the per-op `execute_function` GEMM selector on 3 GEMMs,
+  # this job drives the FULL example suite (all 19 programs) through the resident
+  # executor (`ResidentExecutor::new_native` -> `run`) at each kernel's native
+  # grid — resident HBM + weight cache + per-segment seg-plan + the real Metal
+  # offloads (`metal_gemm_or_blas`, fused map windows). It records, per program,
+  # the per-offload proof (gemm_or_blas_gpu / matmul_loop_gpu / map_region_gpu) and
+  # asserts a Metal-bearing program (matmul/sdpa) actually fired an offload (a 0
+  # total on such a program is a FALSE all-CPU pass and FAILS). Programs that
+  # legitimately stay CPU-only on this path (pure elementwise/reduce) conform
+  # bit-exact; programs not expressible as a marshalled-arg ProgramSpec (non-F16
+  # dtype / HBM-seeded / matched-failure fixtures) are reported NOT-DRIVABLE (still
+  # bit-exact on the DEFAULT CPU `diff` job above) — never faked as a Metal pass.
+  #
+  # Same macOS-only GPU-availability caveat as `gpu-diff`: the hosted runner's GPU
+  # may be pre-M5 (simdgroup tier, not NAX); the offload>0 assertion holds on
+  # either tier, the headline NAX(512)/NAX(2) counts were measured on the dev M5.
+  resident-diff:
+    name: Python <-> Rust RESIDENT/Metal differential (production serving path)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Build Rust diff CLI (Metal)
+        working-directory: rust
+        run: cargo build --release --example ktir_diff_run -p ktir-emulator
+
+      # NEGATIVE CONTROL — prove the resident differential is LIVE, not vacuous.
+      # Inject a +5% perturbation into the Metal `metal_gemm_or_blas` result (the
+      # SAME offload the resident path uses) — well outside the principled bf16/f16
+      # band — and assert the differential FAILS. The matmul/sdpa rows must FAIL
+      # WITH their offload proof still > 0 (a real Metal-path divergence, not a
+      # silent CPU fallback). If it PASSED with the GPU output corrupted, the band
+      # would be swallowing garbage and the green run below would be worthless.
+      - name: Negative control — injected resident Metal divergence MUST fail
+        env:
+          KTIR_DIFF_RUN_BIN: ${{ github.workspace }}/rust/target/release/examples/ktir_diff_run
+          KTIR_DIFF_RESIDENT: "1"
+          KTIR_DIFF_PROGRAMS: matmul,sdpa,vector_add
+          KTIR_DIFF_INJECT_DIVERGENCE: "0.05"
+          FUZZ_ITERS: "3"
+        run: |
+          if uv run --with numpy rust/crates/ktir-emulator/tests/equiv/diff_py_vs_rust.py; then
+            echo "::error::RESIDENT differential PASSED with a +5% injected divergence — the band/offload-proof is not catching real Metal-output divergence (gate is vacuous)"
+            exit 1
+          fi
+          echo "::notice::negative control OK — injected resident Metal divergence correctly FAILED the differential"
+
+      # The real gate: drive the FULL suite through the resident/segmented Metal
+      # executor, banded vs Python, with the per-offload proof asserted (a
+      # Metal-bearing program firing 0 offloads is a FALSE all-CPU pass and FAILS).
+      - name: RESIDENT/Metal differential (full suite through the production serving path)
+        env:
+          KTIR_DIFF_RUN_BIN: ${{ github.workspace }}/rust/target/release/examples/ktir_diff_run
+          KTIR_DIFF_RESIDENT: "1"
+          KTIR_DIFF_PROGRAMS: all
+          FUZZ_ITERS: "5"
+        run: uv run --with numpy rust/crates/ktir-emulator/tests/equiv/diff_py_vs_rust.py
+
+  # ---------------------------------------------------------------------------
+  # GATED CARGO TEST: the SAME Metal differential, but exercised through the
+  # `cargo test` entry point so the conformance is a real gated test runnable on
+  # every relevant change — not just a CI-only Python invocation. The integration
+  # test `metal_conformance` (cfg(metal), macOS-only) bundles all three checks of
+  # the jobs above into ONE assert-driven test: (1) the resident full-suite
+  # positive gate, (2) the per-op GPU gate over the GEMM-bearing programs incl.
+  # paged_attention, and (3) the injected-divergence NEGATIVE CONTROL (it requires
+  # the resident differential to FAIL under a +5% Metal-GEMM perturbation — so a
+  # green test PROVES the band/offload-proof actually catches a Metal-path
+  # divergence). It is `#[ignore]` (needs uv + a Metal GPU) and skips cleanly when
+  # uv is absent; here we install uv and run it explicitly. This guards the
+  # developer-facing `cargo test --test metal_conformance -- --ignored` command.
+  gated-cargo-test:
+    name: Gated cargo test (metal_conformance — positive + negative control)
+    runs-on: macos-26
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.2.0
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # The test builds the ktir_diff_run example itself if absent, then shells the
+      # Python driver via `uv run --with numpy`. Run only this one test, ignored,
+      # with --nocapture so the per-program offload-proof table is visible in the
+      # CI log. Metal/NAX are auto-on on macOS (no feature flag).
+      - name: cargo test metal_conformance (--ignored)
+        working-directory: rust
+        run: cargo test --release -p ktir-emulator --test metal_conformance -- --ignored --nocapture
