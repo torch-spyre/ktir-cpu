@@ -952,6 +952,30 @@ class TestConsumeOnLastUse:
         assert ctx_on.lx.used == 0     # freed at fetch — consume on
         assert not ctx_on.has_value("%a")
 
+    def test_peek_does_not_consume(self):
+        """peek=True reads without consuming; subsequent normal get_value still consumes.
+
+        Sequence:
+            set_value("%a", tile)    lx.used = 512
+            get_value("%a", peek=T)  lx.used = 512  — no consume, tile still in scope
+            get_value("%a")          lx.used = 0    — consume fires here, not earlier
+        """
+        tile = _make_tile((16, 16))  # 512 bytes
+
+        ctx = _make_context(lx_options=_LX_FULL)
+        ctx.set_value("%a", tile)
+        ctx._use_counts = {"%a": 1}
+
+        result = ctx.get_value("%a", peek=True)
+        assert result is tile
+        assert ctx.lx.used == 512        # peek did not free
+        assert ctx.has_value("%a")       # still in scope
+
+        result2 = ctx.get_value("%a")
+        assert result2 is tile
+        assert ctx.lx.used == 0          # consumed on normal fetch
+        assert not ctx.has_value("%a")
+
     def test_multi_use_tile_not_consumed(self):
         """Multi-use tile (count > 1) is never consumed regardless of consume_last_use."""
         tile = _make_tile((32, 64))  # 4096 bytes

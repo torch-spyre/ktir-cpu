@@ -305,11 +305,9 @@ class CoreContext:
         immediately so the caller can reuse or replace the buffer at no net cost.
 
         Args:
+            name: SSA value name (e.g., "%x_tile")
             peek: If True, suppress consume-on-last-use (used by latency
                 pre-resolution, which reads operand values without consuming them).
-
-        Args:
-            name: SSA value name (e.g., "%x_tile")
 
         Returns:
             The value
