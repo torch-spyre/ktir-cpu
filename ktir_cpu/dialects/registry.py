@@ -136,3 +136,7 @@ class ExecutionEnv:
 
     grid_executor: GridExecutor
     execute_region: Callable[[CoreContext, List[Operation]], Any]
+    # Generator variant used by scf handlers (scf.for, scf.if) whose bodies
+    # may contain comm ops.  When None, scf handlers fall back to a thin
+    # generator wrapper around execute_region (no comm ops will be scheduled).
+    execute_region_with_comms: Callable[[CoreContext, List[Operation]], Any] = None

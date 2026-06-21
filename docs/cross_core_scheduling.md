@@ -63,6 +63,78 @@ KTIRInterpreter
 
 ---
 
+## Comm ops inside control-flow region bodies
+
+A comm op (`ktdp.inter_tile_reduce`) may appear inside a control-flow
+region body (e.g. `scf.for`, `scf.if`), not just at the top level of a
+function.  The fix has two parts.
+
+### Part 1 — two-speed region executor on `KTIRInterpreter`
+
+`KTIRInterpreter` exposes two region executors on `ExecutionEnv`:
+
+- **`execute_region`** (sync, original): calls `_execute_op` for each op
+  and returns the last result as a plain value.  Used for
+  *compute-only* regions — `linalg.reduce` combiners, `tensor.generate`
+  bodies, ktdp combiner bodies.  These regions are defined by the spec
+  to never contain comm ops; making them generators would break callers
+  like `_run_combiner` that expect a plain return value immediately.
+
+- **`execute_region_with_comms`** (generator, new): same loop, but if an
+  op returns a generator (a comm op fired), does `yield from` on it —
+  forwarding every `RecvRequest` up the call stack to
+  `CoreExecutionStack._execute_until_block`, the sole scheduler driver.
+  When no comm op fires, `yield from` on a never-yielding generator
+  returns immediately at no extra cost.
+
+### Part 2 — `*_with_comms` handler variants on `ControlOps`
+
+Any op whose body region may contain comm ops must itself be a generator
+so it can propagate `RecvRequest`s.  `ControlOps` provides two variants
+of each control-flow op:
+
+- **Sync** (`for_op`, `if_op`, `while_op`): plain functions.  Used by
+  compute-only callers and any test that passes a sync region executor.
+- **Comms** (`for_op_with_comms`, `if_op_with_comms`, `while_op_with_comms`):
+  generator functions.  Identical logic but use
+  `yield from region_executor(...)` instead of a plain call.
+
+The `scf` dialect handlers (`scf__for`, `scf__if`, `scf__while`) always
+use the comms variants and pass `execute_region_with_comms`.  Any future
+op whose body may contain comm ops follows the same pattern.
+
+**Why only control-flow ops need the comms variant.**  The spec partitions
+region-bearing ops into two categories:
+
+- *Control-flow ops* (`scf.for`, `scf.if`, `scf.while`): their bodies
+  are arbitrary kernel code — the same ops that appear at the function
+  top level, including comm ops.
+- *Compute ops* (`linalg.generic`, `linalg.reduce`, `tensor.generate`,
+  ktdp produce/reduce combiners): their bodies are pure arithmetic
+  callbacks, defined by the spec to operate on local tile data only.
+  A comm op inside a `linalg.reduce` combiner body would be a spec
+  violation, not a supported pattern.
+
+The routing is therefore static per op type and needs no runtime check.
+
+### Propagation chain
+
+```
+RingReduceBackend.run            ← yields RecvRequest
+  ↑ yield from
+ktdp.inter_tile_reduce handler   ← returns generator
+  ↑ isgenerator → yield from
+execute_region_with_comms        ← propagates any generator from ops in a region
+  ↑ yield from
+ControlOps.for_op_with_comms     ← propagates through each iteration / branch
+  ↑ yield from
+scf__for / scf__if handler       ← returns the propagated generator
+  ↑ isgenerator → yield from
+_execute_until_block             ← sole scheduler driver
+```
+
+---
+
 ## Generator vs plain function — the rule
 
 A backend method (or any client of the scheduler protocol) is a

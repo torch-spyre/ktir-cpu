@@ -266,7 +266,22 @@ Bidirectional exchanges (both cores send then recv) are handled correctly
 because `send_to` is fire-and-forget — the sender enqueues and continues
 without blocking, so symmetric patterns never deadlock.
 
-### K3. Multi-cast load modeling
+### K3. Comm ops restricted to top-level function body
+
+**Status**: ✅ Fixed (issue #131).
+
+`ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce` can now appear inside
+`scf.for` / `scf.if` bodies.  The fix propagates the generator protocol through
+`execute_region_with_comms` → `ControlOps.for_op_with_comms` / `if_op_with_comms`
+→ `scf__for` / `scf__if` → `_execute_until_block`.  Compute-only region callers
+(`linalg.reduce` combiners, `tensor.generate`, ktdp combiner bodies) continue
+using the synchronous `execute_region` path unchanged.
+
+End-to-end test: `tests/test_examples.py::TestRingReduceInnerLoopExecution`
+(`examples/ktir/ring_reduce_inner_loop.mlir`).
+Unit tests: `tests/test_grid_scheduler.py::test_inner_loop_comm`.
+
+### K4. Multi-cast load modeling
 
 **Status**: ❌ Not modeled. No existing kernels require it.
 

@@ -28,7 +28,7 @@ def scf__if(op, context, env):
     condition = context.get_value(op.operands[0])
     then_region = op.regions[0] if len(op.regions) > 0 else []
     else_region = op.regions[1] if len(op.regions) > 1 else []
-    return ControlOps.if_op(context, condition, then_region, else_region, env.execute_region)
+    return (yield from ControlOps.if_op_with_comms(context, condition, then_region, else_region, env.execute_region_with_comms))
 
 
 @register("scf.for")
@@ -43,8 +43,8 @@ def scf__for(op, context, env):
     iter_init_operands = op.operands[3:]
     iter_init_values = [context.get_value(n) for n in iter_init_operands]
 
-    result = ControlOps.for_op(
-        context, lb, ub, step, iter_var, body_region, env.execute_region,
+    result = yield from ControlOps.for_op_with_comms(
+        context, lb, ub, step, iter_var, body_region, env.execute_region_with_comms,
         iter_arg_names=iter_arg_names,
         iter_init_values=iter_init_values,
     )

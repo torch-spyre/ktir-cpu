@@ -111,6 +111,7 @@ class KTIRInterpreter:
         self._env = ExecutionEnv(
             grid_executor=self.grid_executor,
             execute_region=self.execute_region,
+            execute_region_with_comms=self.execute_region_with_comms,
         )
         if self._latency_tracker is not None:
             self._latency_tracker.reset()
@@ -226,7 +227,9 @@ class KTIRInterpreter:
         # Only Tile values (tensor data backed by NumPy arrays) occupy LX.
         # Other result types — TileRef (metadata), AccessTile (coordinates),
         # int/index (scalars) — are bookkeeping and use no scratchpad memory.
-        if op.result and result is not None:
+        # Generator results (comm ops, scf.for/if with comm bodies) are stored
+        # after the scheduler drives them to completion — skip here.
+        if op.result and result is not None and not inspect.isgenerator(result):
             names = op.result if isinstance(op.result, list) else [op.result]
             values = result if isinstance(result, tuple) else [result]
             if len(names) != len(values):
@@ -318,10 +321,35 @@ class KTIRInterpreter:
     def execute_region(self, context: CoreContext, operations: List[Operation]) -> Any:
         """Execute a nested region synchronously (scf.for body, scf.if branch, etc.).
 
-        Comm ops cannot appear inside nested regions in the current spec, so
-        this stays sync — no generator machinery needed.
+        Comm ops cannot appear inside compute-only regions (linalg combiners,
+        tensor.generate bodies, ktdp combiner bodies).  For scf regions that
+        may contain comm ops use ``execute_region_with_comms`` instead.
         """
         result = None
         for op in operations:
             result = self._execute_op(op, context)
+        return result
+
+    def execute_region_with_comms(self, context: CoreContext, operations: List[Operation]):
+        """Execute a nested region that may contain comm ops (scf.for / scf.if bodies).
+
+        Generator-aware: if an op returns a generator (comm op), propagates it
+        via ``yield from`` so the scheduler can drive it.  The resolved result
+        overwrites the placeholder generator binding that ``_execute_op`` stored
+        before returning.  When no comm op fires this runs synchronously —
+        ``yield from`` on a generator that never yields returns immediately.
+        """
+        result = None
+        for op in operations:
+            result = self._execute_op(op, context)
+            if inspect.isgenerator(result):
+                result = yield from result
+                # _execute_op stored the raw generator under op.result before
+                # returning it.  Overwrite with the resolved tile now that the
+                # scheduler has driven the generator to completion.
+                if op.result is not None and result is not None:
+                    names = op.result if isinstance(op.result, list) else [op.result]
+                    values = result if isinstance(result, tuple) else [result]
+                    for name, val in zip(names, values):
+                        context.set_value(name, val)
         return result
