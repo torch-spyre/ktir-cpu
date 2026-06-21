@@ -422,7 +422,7 @@ def _adapt_construct_indirect_access_tile(mlir_op, attributes, result_type, oper
 @MLIRTypeAdapter.install("linalg.reduce")
 def _adapt_linalg_reduce(mlir_op, attributes, result_type, operands):
     """Extract scalar dim; synthesize outs_var and reduce_fn; drop outs from operands."""
-    attributes["dim"] = list(DenseI64ArrayAttr(mlir_op.attributes["dimensions"]))[0]
+    attributes["dims"] = list(DenseI64ArrayAttr(mlir_op.attributes["dimensions"]))
     n_ins = len(operands) // 2
     attributes["outs_var"] = operands[n_ins]
     del operands[n_ins:]  # drop outs — executor only uses ins operands

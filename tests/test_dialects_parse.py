@@ -467,9 +467,33 @@ class TestLinalgParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "linalg.reduce")
         self.assert_attribute(op, "reduce_fn", "arith.maxnumf")
-        self.assert_attribute(op, "dim", 1)
+        self.assert_attribute(op, "dims", [1])
         self.assert_num_operands(op, 1)
         self.assert_operand_names(op, "%x")
+
+    def test_reduce_empty_dims(self):
+        # dimensions = [] means zero reduce dimensions (shape-preserving no-op)
+        op = self._parse(
+            "%r = linalg.reduce { arith.addf }"
+            " ins(%x : tensor<4x8xf16>)"
+            " outs(%init : tensor<4x8xf16>)"
+            " dimensions = []",
+            args={"%x": "tensor<4x8xf16>", "%init": "tensor<4x8xf16>"},
+        )
+        self.assert_op_type(op, "linalg.reduce")
+        self.assert_attribute(op, "dims", [])
+
+    def test_reduce_multi_dims(self):
+        # dimensions = [0, 2] - multiple axes
+        op = self._parse(
+            "%r = linalg.reduce { arith.addf }"
+            " ins(%x : tensor<2x3x4xf16>)"
+            " outs(%init : tensor<3xf16>)"
+            " dimensions = [0, 2]",
+            args={"%x": "tensor<2x3x4xf16>", "%init": "tensor<3xf16>"},
+        )
+        self.assert_op_type(op, "linalg.reduce")
+        self.assert_attribute(op, "dims", [0, 2])
 
     def test_fill(self):
         # fill records both ins and outs operands

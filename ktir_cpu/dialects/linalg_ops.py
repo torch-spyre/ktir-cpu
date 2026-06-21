@@ -193,17 +193,36 @@ def linalg__reduce(op, context, env):
             ),
         ]
 
-    dim = op.attributes.get("dim")  # axis to reduce; None → collapse all
+    dims = op.attributes.get("dims")
+    if dims is None and op.attributes.get("dim") is not None:
+        dims = [op.attributes["dim"]]
 
     outs_var = op.attributes.get("outs_var")
     outs_tile = context.get_value(outs_var) if outs_var else None
 
     if isinstance(tile, Tile):
-        folded = _tree_fold(tile, dim, bb0_names, body_ops, context, env)
-        if dim is None:
+        if dims is None:
+            # Collapse all axes: flatten then fold.
+            folded = _tree_fold(tile, None, bb0_names, body_ops, context, env)
+        else:
+            # Fold each axis, fastest-moving (rightmost) first.
+            folded = tile.data
+	    # Tree-folding each axis independently reorders element groupings vs.
+	    # MLIR's left-associative scalar loop — see test_reduce_multi_axis_treefold_bug.
+            for d in sorted(dims, reverse=True):
+                folded = _tree_fold(
+                    Tile(folded, tile.dtype, folded.shape),
+                    d, bb0_names, body_ops, context, env,
+                )
+
+        # Squeeze all reduced axes.
+        if dims is None:
             reduced = folded.reshape(()).astype(tile.data.dtype)
         else:
-            reduced = np.squeeze(folded, axis=dim).astype(tile.data.dtype)
+            reduced = folded
+            for d in sorted(dims, reverse=True):
+                reduced = np.squeeze(reduced, axis=d)
+            reduced = reduced.astype(tile.data.dtype)
 
         # Combine with the outs initial accumulator.
         if isinstance(outs_tile, Tile):
@@ -451,12 +470,12 @@ def parse_linalg_reduce(op_text, parse_ctx):
     if combiner_match:
         reduce_fn = combiner_match.group(1)
 
-    # dimensions = [1]
-    dim = None
-    dims_match = re.search(r'dimensions\s*=\s*\[(\d+(?:\s*,\s*\d+)*)\]', op_text)
+    # dimensions = [1] or dimensions = [0, 1] or dimensions = []
+    dims = None
+    dims_match = re.search(r'dimensions\s*=\s*\[([^\]]*)\]', op_text)
     if dims_match:
-        dims = [int(d.strip()) for d in dims_match.group(1).split(',')]
-        dim = dims[0]
+        content = dims_match.group(1).strip()
+        dims = [int(d.strip()) for d in content.split(',') if d.strip()] if content else []
 
     # ins(%x : type) — first operand is the input
     operands = []
@@ -471,8 +490,8 @@ def parse_linalg_reduce(op_text, parse_ctx):
         outs_var = outs_match.group(1)
 
     attributes = {"reduce_fn": reduce_fn}
-    if dim is not None:
-        attributes["dim"] = dim
+    if dims is not None:
+        attributes["dims"] = dims
     if outs_var is not None:
         attributes["outs_var"] = outs_var
 
