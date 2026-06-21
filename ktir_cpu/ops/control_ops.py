@@ -17,6 +17,14 @@ Control flow compute helpers.
 
 Conditional, loop, and yield primitives used by dialect handlers
 in ``ktir_cpu.dialects``.
+
+Each op has two variants:
+  - Sync (``for_op``, ``if_op``, ``while_op``): plain functions, used by
+    tests and any caller that passes a synchronous region executor.
+  - Comms (``for_op_with_comms``, ``if_op_with_comms``, ``while_op_with_comms``):
+    generator functions, used by ``scf__for`` / ``scf__if`` / ``scf__while``
+    when the body may contain comm ops.  They propagate ``RecvRequest`` yields
+    up to the scheduler via ``yield from execute_region_with_comms(...)``.
 """
 
 from typing import List, Any, Callable
@@ -36,8 +44,52 @@ class _YieldResult:
         self.values = values
 
 
+def _for_op_init(iter_arg_names, iter_init_values, context):
+    """Bind initial iter_arg values in the parent scope; return normalised (names, current_values).
+
+    Binding happens in the *parent* scope so values persist across iterations.
+    set_value auto-tracks via refcount — aliases (same id) don't double-charge.
+    """
+    iter_arg_names = iter_arg_names or []
+    iter_init_values = iter_init_values or []
+    current_values = list(iter_init_values)
+    for name, val in zip(iter_arg_names, current_values):
+        context.set_value(name, val)
+    return iter_arg_names, current_values
+
+
+def _for_op_rebind(result, iter_arg_names, current_values, context):
+    """Re-bind yielded values as iter_args in the current (parent) scope.
+
+    Must be called *after* pop_scope() so the binding lands in the parent scope
+    and persists into the next iteration.
+
+    iter_args are loop-carried state in scf.for.  They can be scalars (e.g. an
+    index accumulator) or Tiles (e.g. running statistics in online softmax)::
+
+        scf.for %col = %c0 to %c_C step %c_Bc
+            iter_args(%m_acc = %m_init, %l_acc = %l_init) {
+          ...
+          scf.yield %m_new, %l_new   // Tiles fed back as next %m_acc, %l_acc
+        }
+
+    set_value handles refcount: decrements old tile, increments new tile.
+    Returns the updated current_values list.
+    """
+    if isinstance(result, _YieldResult) and iter_arg_names:
+        yielded = result.values
+        for name, val in zip(iter_arg_names, yielded):
+            context.set_value(name, val)
+        return yielded
+    return current_values
+
+
 class ControlOps:
     """Conditional, loop, and yield helpers."""
+
+    # ------------------------------------------------------------------
+    # Sync variants — plain functions, no generator machinery.
+    # ------------------------------------------------------------------
 
     @staticmethod
     def if_op(
@@ -106,17 +158,8 @@ class ControlOps:
         Returns:
             Final iter_arg values (list) or None if no iter_args.
         """
-        if not iter_arg_names:
-            iter_arg_names = []
-        if not iter_init_values:
-            iter_init_values = []
-
-        # Bind initial iter_arg values in the *parent* scope.
-        # These persist across iterations; body-local values do not.
-        # set_value auto-tracks via refcount — aliases (same id) don't double-charge.
-        current_values = list(iter_init_values)
-        for name, val in zip(iter_arg_names, current_values):
-            context.set_value(name, val)
+        iter_arg_names, current_values = _for_op_init(
+            iter_arg_names, iter_init_values, context)
 
         for i in range(int(lower_bound), int(upper_bound), max(int(step), 1)):
             # New scope for this iteration's body-local values.
@@ -129,48 +172,14 @@ class ControlOps:
             # Execute body
             result = region_executor(context, body_region)
 
-            # Save yielded values before pop_scope() discards them.
-            yielded_values = None
-            if isinstance(result, _YieldResult) and iter_arg_names:
-                yielded_values = result.values
-
             # Pop body scope — frees LX for all body-local Tiles,
             # including any Tiles that were yielded (they lived in this scope).
+            # Rebind happens after pop so updates land in the parent scope.
             context.pop_scope()
+            current_values = _for_op_rebind(
+                result, iter_arg_names, current_values, context)
 
-            # Re-bind yielded values as iter_args in the parent scope.
-            #
-            # iter_args are loop-carried state in scf.for.  They can be
-            # scalars (e.g. an index accumulator) or Tiles (e.g. running
-            # statistics in online softmax):
-            #
-            #   scf.for %col = %c0 to %c_C step %c_Bc
-            #       iter_args(%m_acc = %m_init, %l_acc = %l_init) {
-            #     ...
-            #     scf.yield %m_new, %l_new   // Tiles fed back as next %m_acc, %l_acc
-            #   }
-            #
-            # set_value handles refcount: decrements old tile, increments new tile.
-            if yielded_values is not None:
-                for name, val in zip(iter_arg_names, yielded_values):
-                    context.set_value(name, val)
-                current_values = yielded_values
-
-        if current_values:
-            return current_values
-        return None
-
-    @staticmethod
-    def yield_op(values: List[Any]) -> _YieldResult:
-        """Wrap *values* so the loop driver can update iter_args.
-
-        Args:
-            values: Values to yield
-
-        Returns:
-            _YieldResult wrapping the values
-        """
-        return _YieldResult(values)
+        return current_values if current_values else None
 
     @staticmethod
     def while_op(
@@ -210,3 +219,146 @@ class ControlOps:
             context.pop_scope()
 
         return None
+
+    # ------------------------------------------------------------------
+    # Comms variants — generator functions.
+    # Identical logic but use ``yield from region_executor(...)`` so that
+    # RecvRequests from comm ops bubble up to the scheduler.
+    # Called exclusively by scf dialect handlers via execute_region_with_comms.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def if_op_with_comms(
+        context: CoreContext,
+        condition: bool,
+        then_region: List[Operation],
+        else_region: List[Operation],
+        region_executor: RegionExecutor,
+    ):
+        """Generator variant of if_op for scf.if bodies that may contain comm ops.
+
+        Identical to if_op but uses ``yield from`` so RecvRequests from nested
+        comm ops bubble up to the scheduler.
+
+        Args:
+            context: Core execution context
+            condition: Boolean condition
+            then_region: Operations to execute if true
+            else_region: Operations to execute if false
+            region_executor: Generator callable (execute_region_with_comms)
+
+        Returns:
+            Result from executed region
+        """
+        region = then_region if condition else else_region
+        if not region:
+            return None
+
+        # Branch body gets its own scope; body-local LX is freed on pop.
+        context.push_scope()
+        result = yield from region_executor(context, region)
+        context.pop_scope()
+        from ..dialects._helpers import unwrap_yield
+        return unwrap_yield(result)
+
+    @staticmethod
+    def for_op_with_comms(
+        context: CoreContext,
+        lower_bound: int,
+        upper_bound: int,
+        step: int,
+        iter_var_name: str,
+        body_region: List[Operation],
+        region_executor: RegionExecutor,
+        iter_arg_names: List[str] = None,
+        iter_init_values: List[Any] = None,
+    ):
+        """Generator variant of for_op for scf.for bodies that may contain comm ops.
+
+        Identical to for_op but uses ``yield from`` so RecvRequests from nested
+        comm ops bubble up to the scheduler.
+
+        Args:
+            context: Core execution context
+            lower_bound: Loop start (inclusive)
+            upper_bound: Loop end (exclusive)
+            step: Loop increment
+            iter_var_name: Name of iteration variable (e.g., "%i")
+            body_region: Loop body operations
+            region_executor: Generator callable (execute_region_with_comms)
+            iter_arg_names: Optional list of iter_arg SSA names
+            iter_init_values: Optional list of initial values for iter_args
+
+        Returns:
+            Final iter_arg values (list) or None if no iter_args.
+        """
+        iter_arg_names, current_values = _for_op_init(
+            iter_arg_names, iter_init_values, context)
+
+        for i in range(int(lower_bound), int(upper_bound), max(int(step), 1)):
+            # New scope for this iteration's body-local values.
+            context.push_scope()
+
+            # Set iteration variable
+            context.set_value(iter_var_name, i)
+
+            # Execute body — yield from propagates any RecvRequests to the scheduler.
+            result = yield from region_executor(context, body_region)
+
+            # Pop body scope, then rebind in parent scope so updates persist.
+            context.pop_scope()
+            current_values = _for_op_rebind(
+                result, iter_arg_names, current_values, context)
+
+        return current_values if current_values else None
+
+    @staticmethod
+    def while_op_with_comms(
+        context: CoreContext,
+        before_region: List[Operation],
+        after_region: List[Operation],
+        region_executor: RegionExecutor,
+    ):
+        """Generator variant of while_op for scf.while bodies that may contain comm ops.
+
+        Identical to while_op but uses ``yield from`` so RecvRequests from nested
+        comm ops bubble up to the scheduler.
+
+        Args:
+            context: Core execution context
+            before_region: Condition check region
+            after_region: Loop body region
+            region_executor: Generator callable (execute_region_with_comms)
+
+        Returns:
+            None
+        """
+        max_iterations = 10000  # Safety limit
+
+        for _ in range(max_iterations):
+            # Execute before region (condition check)
+            context.push_scope()
+            condition = yield from region_executor(context, before_region)
+            context.pop_scope()
+
+            if not condition:
+                break
+
+            # Execute after region (loop body)
+            context.push_scope()
+            yield from region_executor(context, after_region)
+            context.pop_scope()
+
+        return None
+
+    @staticmethod
+    def yield_op(values: List[Any]) -> _YieldResult:
+        """Wrap *values* so the loop driver can update iter_args.
+
+        Args:
+            values: Values to yield
+
+        Returns:
+            _YieldResult wrapping the values
+        """
+        return _YieldResult(values)
