@@ -311,20 +311,41 @@ def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
     if not m:
         raise ValueError(f"ktdp.construct_memory_view: cannot parse dtype from {result_type!r}")
     attributes["dtype"] = m.group(1)
-    # str(memory_space attr) → "#ktdp.spyre_memory_space<HBM>"
-    ms = re.search(r'#ktdp\.spyre_memory_space<(\w+)>',
-                   str(mlir_op.attributes["memory_space"]))
+    # str(memory_space attr) -> "#ktdp.spyre_memory_space<HBM>" or "<LX, core = 0>"
+    ms = re.search(
+        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
+        str(mlir_op.attributes["memory_space"]),
+    )
     if not ms:
         raise ValueError(
             f"ktdp.construct_memory_view: cannot parse memory_space from "
             f"{mlir_op.attributes['memory_space']!r}"
         )
     attributes["memory_space"] = ms.group(1)
+    if ms.group(2) is not None:
+        attributes["lx_core_id"] = int(ms.group(2))
     # str(coordinate_set attr) → "affine_set<(d0) : ...>"
     if "coordinate_set" in mlir_op.attributes:
         attributes["coordinate_set"] = parse_affine_set(
             str(mlir_op.attributes["coordinate_set"])
         )
+
+
+@MLIRTypeAdapter.install("ktdp.construct_distributed_memory_view")
+def _adapt_construct_distributed_memory_view(mlir_op, attributes, result_type, operands):
+    """Extract shape and dtype from the result memref type."""
+    m = re.search(r'memref<([^>]+)>', result_type)
+    if not m:
+        raise ValueError(
+            f"ktdp.construct_distributed_memory_view: cannot parse result type {result_type!r}"
+        )
+    parts = m.group(1).split('x')
+    if len(parts) <= 1:
+        raise ValueError(
+            f"ktdp.construct_distributed_memory_view: memref<{m.group(1)}> has no dimensions"
+        )
+    attributes["dtype"] = parts[-1]
+    attributes["shape"] = tuple(int(p) for p in parts[:-1])
 
 
 @MLIRTypeAdapter.install("ktdp.construct_indirect_access_tile")
