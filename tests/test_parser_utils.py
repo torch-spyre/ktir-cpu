@@ -21,7 +21,7 @@ mis-tokenised these by splitting on the ``x`` inside the dtype.
 
 import pytest
 
-from ktir_cpu.parser_utils import parse_tensor_type
+from ktir_cpu.parser_utils import parse_tensor_type, extract_outs_operands
 
 
 # ---------------------------------------------------------------------------
@@ -163,3 +163,25 @@ def test_parse_tensor_type_nested_bracket_dtype(type_str, expected_shape, expect
     """
     info = parse_tensor_type(type_str)
     assert info == {"shape": expected_shape, "dtype": expected_dtype}
+
+
+# ---------------------------------------------------------------------------
+# extract_outs_operands
+# ---------------------------------------------------------------------------
+
+def test_extract_outs_operands_single():
+    assert extract_outs_operands(
+        "linalg.matmul ins(%a, %b : tensor<4x4xf16>, tensor<4x4xf16>) "
+        "outs(%c : tensor<4x4xf16>) -> tensor<4x4xf16>"
+    ) == ["%c"]
+
+
+def test_extract_outs_operands_multi():
+    assert extract_outs_operands(
+        "linalg.generic ins(%a : tensor<4xf16>) "
+        "outs(%c : tensor<4xf16>, %d : tensor<4xf16>)"
+    ) == ["%c", "%d"]
+
+
+def test_extract_outs_operands_none():
+    assert extract_outs_operands("arith.addf %x, %y : f16") == []

@@ -621,7 +621,8 @@ class KTIRParser(KTIRParserBase):
                 attributes["_result_dtype"] = type_info.get("dtype", "f16")
 
         from .parser_utils import extract_outs_operands
-        outs_ops = extract_outs_operands(rest)
+        from .dialects.registry import is_inplace_outs
+        outs_ops = extract_outs_operands(rest) if is_inplace_outs(op_type) else []
 
         return Operation(
             result=result,

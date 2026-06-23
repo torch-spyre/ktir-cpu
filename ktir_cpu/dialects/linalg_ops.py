@@ -297,7 +297,7 @@ def linalg__broadcast(op, context, env):
     return Tile(result, inp.dtype, out_shape)
 
 
-@register("linalg.matmul", latency_category=LC.COMPUTE_MATMUL)
+@register("linalg.matmul", latency_category=LC.COMPUTE_MATMUL, inplace_outs=True)
 def linalg__matmul(op, context, env):
     """Execute linalg.matmul: result = outs + ins[0] @ ins[1].
 
@@ -328,7 +328,7 @@ def linalg__matmul(op, context, env):
     return result
 
 
-@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL)
+@register("linalg.batch_matmul", latency_category=LC.COMPUTE_MATMUL, inplace_outs=True)
 def linalg__batch_matmul(op, context, env):
     """Execute linalg.batch_matmul: result = outs + ins[0] @ ins[1] (batched).
 

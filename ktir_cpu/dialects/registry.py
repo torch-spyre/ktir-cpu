@@ -41,6 +41,10 @@ _REGISTRY: Dict[str, HandlerFn] = {}
 
 _LATENCY_CATEGORIES: Dict[str, str] = {}
 
+# Ops registered with inplace_outs=True — their outs buffer is an in-place
+# accumulator and the handler must return the same Tile object.
+_INPLACE_OPS_SET: set = set()
+
 
 def get_latency_category(op_name: str) -> str:
     """Return the latency category for *op_name*, defaulting to ``"zero"``.
@@ -84,7 +88,7 @@ def make_parse_context(aliases: Dict[str, str]) -> "ParseContext":
     return ParseContext(aliases=aliases)
 
 
-def register(*op_names: str, latency_category: str = "zero"):
+def register(*op_names: str, latency_category: str = "zero", inplace_outs: bool = False):
     """Decorator that registers a dialect operation handler.
 
     Usage::
@@ -100,14 +104,27 @@ def register(*op_names: str, latency_category: str = "zero"):
         @register()  # infers "arith.addf" from function name "arith__addf"
         def arith__addf(op, context, env):
             ...
+
+    Args:
+        inplace_outs: When True, the op's outs buffer is an in-place accumulator
+            and parsers will populate ``Operation.outs_operands``.  The structural
+            assertion in ``_execute_op`` then verifies the handler returns the
+            same Tile object.
     """
     def decorator(fn: HandlerFn) -> HandlerFn:
         names = op_names or (fn.__name__.replace("__", "."),)
         for name in names:
             _REGISTRY[name] = fn
             _LATENCY_CATEGORIES[name] = latency_category
+            if inplace_outs:
+                _INPLACE_OPS_SET.add(name)
         return fn
     return decorator
+
+
+def is_inplace_outs(op_name: str) -> bool:
+    """Return whether *op_name* was registered with ``inplace_outs=True``."""
+    return op_name in _INPLACE_OPS_SET
 
 
 def dispatch(op_name: str) -> Optional[HandlerFn]:
@@ -116,13 +133,14 @@ def dispatch(op_name: str) -> Optional[HandlerFn]:
 
 
 def temp_registry():
-    """Context manager that restores _REGISTRY and _LATENCY_CATEGORIES on exit."""
+    """Context manager that restores _REGISTRY, _LATENCY_CATEGORIES, and _INPLACE_OPS_SET on exit."""
     from contextlib import contextmanager
 
     @contextmanager
     def _ctx():
         saved_registry = _REGISTRY.copy()
         saved_latency = _LATENCY_CATEGORIES.copy()
+        saved_inplace = _INPLACE_OPS_SET.copy()
         try:
             yield
         finally:
@@ -130,6 +148,8 @@ def temp_registry():
             _REGISTRY.update(saved_registry)
             _LATENCY_CATEGORIES.clear()
             _LATENCY_CATEGORIES.update(saved_latency)
+            _INPLACE_OPS_SET.clear()
+            _INPLACE_OPS_SET.update(saved_inplace)
 
     return _ctx()
 

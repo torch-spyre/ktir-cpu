@@ -36,10 +36,6 @@ from .dtypes import to_ktir_dtype as _ktir_dtype, stick_to_elem_idx as _stick_to
 from .memory import HBMSimulator
 from .ops.memory_ops import hbm_read, hbm_write
 
-# Ops where outs is an in-place accumulator (result includes outs values).
-# The structural assertion only applies to these ops.
-_INPLACE_OPS = frozenset({"linalg.matmul", "linalg.batch_matmul"})
-
 
 class KTIRInterpreter:
     """Main KTIR interpreter.
@@ -230,7 +226,6 @@ class KTIRInterpreter:
         # Structural invariant: accumulating ops must return the same outs object.
         # Only applies to ops where result = f(ins) + outs (in-place accumulation).
         if (op.outs_operands and not op.regions
-                and op.op_type in _INPLACE_OPS
                 and result is not None and not inspect.isgenerator(result)):
             for outs_name in op.outs_operands:
                 try:
