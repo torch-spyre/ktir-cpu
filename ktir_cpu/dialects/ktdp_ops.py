@@ -262,30 +262,14 @@ def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
 
 
 @register_parser("ktdp.get_compute_tile_id")
-def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext, result=None):
-    m = re.match(
-        r"ktdp\.get_compute_tile_id\s*:\s*([^{(]*)\s*$", op_text
-    )
-    if not m:
+def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
+    if not op_text.startswith("ktdp.get_compute_tile_id"):
         return None
-    types_text = m.group(1).strip()
-    if not types_text:
-        raise ValueError("no result types specified")
-    type_list = [t.strip() for t in types_text.split(",")]
-    if any(not t for t in type_list):
-        raise ValueError(f"empty type in list: {types_text!r}")
-    type_count = len(type_list)
-    name_count = len(result) if isinstance(result, list) else 1
-    if name_count != type_count:
-        raise ValueError(
-            f"ktdp.get_compute_tile_id: {name_count} result name(s) but "
-            f"{type_count} result type(s) in: {op_text!r}"
-        )
-    return _make_compute_tile_id_op(result)
+    return _make_compute_tile_id_op(None)
 
 
 @register_parser("ktdp.construct_memory_view")
-def parse_construct_memory_view(op_text, parse_ctx: ParseContext, result=None):
+def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     result_match = re.match(r'ktdp\.construct_memory_view\s+(%\w+)', op_text)
     if not result_match:
         return None
@@ -405,7 +389,7 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext, result=None):
         attributes["coordinate_set"] = coordinate_set
 
     return Operation(
-        result=result,
+        result=None,
         op_type="ktdp.construct_memory_view",
         operands=[ptr_operand] + ssa_size_operands + ssa_stride_operands,
         attributes=attributes,
@@ -414,7 +398,7 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext, result=None):
 
 
 @register_parser("ktdp.construct_distributed_memory_view")
-def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext, result=None):
+def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
     """Parse ``ktdp.construct_distributed_memory_view (%a, %b, ... : types) : memref<...>``.
 
     Variadic memref operands, no required attributes — each input carries
@@ -477,7 +461,7 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext, re
     shape = tuple(int(p) for p in parts[:-1])
 
     return Operation(
-        result=result,
+        result=None,
         op_type="ktdp.construct_distributed_memory_view",
         operands=operands,
         attributes={"shape": shape, "dtype": dtype},
@@ -486,7 +470,7 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext, re
 
 
 @register_parser("ktdp.construct_access_tile")
-def parse_construct_access_tile(op_text, parse_ctx: ParseContext, result=None):
+def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
     result_match = re.match(r'ktdp\.construct_access_tile\s+', op_text)
     if not result_match:
         return None
@@ -562,7 +546,7 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext, result=None):
         attributes["coordinate_order"] = coordinate_order
 
     return Operation(
-        result=result,
+        result=None,
         op_type="ktdp.construct_access_tile",
         operands=operands,
         attributes=attributes,
@@ -726,7 +710,7 @@ def ktdp__construct_indirect_access_tile(op, context, env):
 
 
 @register_parser("ktdp.construct_indirect_access_tile")
-def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext, result=None):
+def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext):
     result_match = re.match(
         r'ktdp\.construct_indirect_access_tile\s+', op_text
     )
@@ -823,7 +807,7 @@ def parse_construct_indirect_access_tile(op_text, parse_ctx: ParseContext, resul
         attributes["variables_space_order"] = variables_space_order
 
     return Operation(
-        result=result,
+        result=None,
         op_type="ktdp.construct_indirect_access_tile",
         operands=operands,
         attributes=attributes,
@@ -983,7 +967,7 @@ def ktdp__inter_tile_produce(op, context, env):
 
 
 @register_parser("ktdp.inter_tile_produce")
-def parse_inter_tile_produce(op_text, parse_ctx: ParseContext, result=None):
+def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
     m = re.match(r'ktdp\.inter_tile_produce\b', op_text)
     if not m:
         return None
@@ -1011,7 +995,7 @@ def parse_inter_tile_produce(op_text, parse_ctx: ParseContext, result=None):
     partial_types = tuple(p.strip() for p in split_top_level(inner))
 
     return Operation(
-        result=result,
+        result=None,
         op_type="ktdp.inter_tile_produce",
         operands=[],
         attributes={
@@ -1058,12 +1042,12 @@ def _parse_yield(op_text, op_name):
 
 
 @register_parser("ktdp.yield_partial")
-def parse_yield_partial(op_text, parse_ctx: ParseContext, result=None):
+def parse_yield_partial(op_text, parse_ctx: ParseContext):
     return _parse_yield(op_text, "ktdp.yield_partial")
 
 
 @register_parser("ktdp.yield_reduced")
-def parse_yield_reduced(op_text, parse_ctx: ParseContext, result=None):
+def parse_yield_reduced(op_text, parse_ctx: ParseContext):
     return _parse_yield(op_text, "ktdp.yield_reduced")
 
 
@@ -1155,7 +1139,7 @@ def ktdp__inter_tile_reduce(op, context, env):
 
 
 @register_parser("ktdp.inter_tile_reduce")
-def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext, result=None):
+def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext):
     m = re.match(
         r'ktdp\.inter_tile_reduce\s*\(\s*(%\w+)\s*\)',
         op_text,
@@ -1210,7 +1194,7 @@ def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext, result=None):
     operands = [fut_operand] + identity_operands
 
     return Operation(
-        result=result,
+        result=None,
         op_type="ktdp.inter_tile_reduce",
         operands=operands,
         attributes=attributes,

@@ -57,8 +57,8 @@ def get_latency_category(op_name: str) -> str:
 # Parser registry
 # ---------------------------------------------------------------------------
 
-# Parser signature: (op_text: str, parse_ctx: ParseContext, result=None) -> Optional[Operation]
-# op_text is LHS-free (body only); result is the pre-computed result name(s).
+# Parser signature: (op_text: str, parse_ctx: ParseContext) -> Optional[Operation]
+# op_text is LHS-free (body only); caller assigns op.result after return.
 ParserFn = Callable[..., Optional[Operation]]
 
 _PARSER_REGISTRY: Dict[str, ParserFn] = {}

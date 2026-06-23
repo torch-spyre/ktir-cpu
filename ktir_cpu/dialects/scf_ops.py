@@ -91,7 +91,7 @@ def region__bb0_args(op, context, env):
 
 
 @register_parser("^bb0")
-def parse_bb0_block_args(op_text, parse_ctx, result=None):
+def parse_bb0_block_args(op_text, parse_ctx):
     """Parse a ^bb0 block-argument label inside any region body.
 
     Syntax:
@@ -114,7 +114,7 @@ def parse_bb0_block_args(op_text, parse_ctx, result=None):
 
 
 @register_parser("scf.for ")
-def parse_scf_for(op_text, parse_ctx, result=None):
+def parse_scf_for(op_text, parse_ctx):
     # op_text is LHS-free: "scf.for %i = %c0 to %n step %c1 ..."
     scf_match = re.match(
         r'scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
@@ -140,10 +140,8 @@ def parse_scf_for(op_text, parse_ctx, result=None):
     if iter_args:
         attributes["iter_args"] = iter_args
 
-    result_name = result if result is not None else iter_var
-
     return Operation(
-        result=result_name,
+        result=iter_var,
         op_type="scf.for",
         operands=[lb, ub, step] + iter_inits,
         attributes=attributes,
@@ -152,7 +150,7 @@ def parse_scf_for(op_text, parse_ctx, result=None):
 
 
 @register_parser("scf.yield")
-def parse_scf_yield(op_text, parse_ctx, result=None):
+def parse_scf_yield(op_text, parse_ctx):
     rest = op_text
     yield_match = re.match(r'scf\.yield\s*(.*)', op_text)
     if yield_match:

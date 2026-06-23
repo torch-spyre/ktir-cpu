@@ -355,7 +355,7 @@ def tensor__generate(op, context, env):
 # ---------------------------------------------------------------------------
 
 @register_parser("tensor.empty")
-def parse_tensor_empty(op_text, parse_ctx, result=None):
+def parse_tensor_empty(op_text, parse_ctx):
     """Parse tensor.empty() : tensor<1x1024xf16>"""
     from ..parser_utils import parse_tensor_type
     result_match = re.match(r'tensor\.empty\s*\(\s*\)\s*:\s*(.+)', op_text)
@@ -368,7 +368,7 @@ def parse_tensor_empty(op_text, parse_ctx, result=None):
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.empty",
         operands=[],
         attributes=attributes,
@@ -377,7 +377,7 @@ def parse_tensor_empty(op_text, parse_ctx, result=None):
 
 
 @register_parser("tensor.splat")
-def parse_tensor_splat(op_text, parse_ctx, result=None):
+def parse_tensor_splat(op_text, parse_ctx):
     from ..parser_utils import parse_tensor_type
     result_match = re.match(r'tensor\.splat\s+(%\w+)\s*(?::\s*(.+))?', op_text)
     if not result_match:
@@ -401,7 +401,7 @@ def parse_tensor_splat(op_text, parse_ctx, result=None):
         attributes["dtype"] = type_info.get("dtype", "f16")
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.splat",
         operands=[scalar_operand],
         attributes=attributes,
@@ -410,7 +410,7 @@ def parse_tensor_splat(op_text, parse_ctx, result=None):
 
 
 @register_parser("tensor.extract ")
-def parse_tensor_extract(op_text, parse_ctx, result=None):
+def parse_tensor_extract(op_text, parse_ctx):
     # %scalar = tensor.extract %tensor[%i0, %i1] : tensor<...>
     result_match = re.match(r'tensor\.extract\s+(%\w+)', op_text)
     if not result_match:
@@ -427,7 +427,7 @@ def parse_tensor_extract(op_text, parse_ctx, result=None):
             indices = find_ssa_names(bracket_content)
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.extract",
         operands=[src_operand] + indices,
         attributes={},
@@ -435,7 +435,7 @@ def parse_tensor_extract(op_text, parse_ctx, result=None):
     )
 
 
-def _parse_reshape_op(op_text, op_name, result=None):
+def _parse_reshape_op(op_text, op_name):
     """Shared parser for tensor.expand_shape and tensor.collapse_shape."""
     result_match = re.match(
         r'tensor\.' + op_name + r'\s+(%\w+)', op_text
@@ -467,7 +467,7 @@ def _parse_reshape_op(op_text, op_name, result=None):
         attributes["dtype"] = target_dtype
 
     return Operation(
-        result=result,
+        result=None,
         op_type=f"tensor.{op_name}",
         operands=[operand],
         attributes=attributes,
@@ -476,7 +476,7 @@ def _parse_reshape_op(op_text, op_name, result=None):
 
 
 @register_parser("tensor.yield")
-def parse_tensor_yield(op_text, parse_ctx, result=None):
+def parse_tensor_yield(op_text, parse_ctx):
     """Parse tensor.yield — terminates a tensor.generate body.
 
     Syntax:
@@ -503,7 +503,7 @@ def parse_tensor_yield(op_text, parse_ctx, result=None):
 
 
 @register_parser("tensor.generate")
-def parse_tensor_generate(op_text, parse_ctx, result=None):
+def parse_tensor_generate(op_text, parse_ctx):
     """Parse tensor.generate.
 
     Full syntax:
@@ -545,7 +545,7 @@ def parse_tensor_generate(op_text, parse_ctx, result=None):
         attributes["dtype"] = type_info.get("dtype", "f16")
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.generate",
         operands=[],
         attributes=attributes,
@@ -554,17 +554,17 @@ def parse_tensor_generate(op_text, parse_ctx, result=None):
 
 
 @register_parser("tensor.expand_shape")
-def parse_tensor_expand_shape(op_text, parse_ctx, result=None):
-    return _parse_reshape_op(op_text, "expand_shape", result=result)
+def parse_tensor_expand_shape(op_text, parse_ctx):
+    return _parse_reshape_op(op_text, "expand_shape")
 
 
 @register_parser("tensor.collapse_shape")
-def parse_tensor_collapse_shape(op_text, parse_ctx, result=None):
-    return _parse_reshape_op(op_text, "collapse_shape", result=result)
+def parse_tensor_collapse_shape(op_text, parse_ctx):
+    return _parse_reshape_op(op_text, "collapse_shape")
 
 
 @register_parser("tensor.reshape")
-def parse_tensor_reshape(op_text, parse_ctx, result=None):
+def parse_tensor_reshape(op_text, parse_ctx):
     """Parse `%out = tensor.reshape %src(%shape) : (...) -> tensor<...>`.
 
     Two SSA operands: source tensor and shape tensor. Target shape is read
@@ -590,7 +590,7 @@ def parse_tensor_reshape(op_text, parse_ctx, result=None):
         )
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.reshape",
         operands=[src, shape_operand],
         attributes={
@@ -602,7 +602,7 @@ def parse_tensor_reshape(op_text, parse_ctx, result=None):
 
 
 @register_parser("tensor.from_elements")
-def parse_tensor_from_elements(op_text, parse_ctx, result=None):
+def parse_tensor_from_elements(op_text, parse_ctx):
     """Parse `%shape = tensor.from_elements %d0, %d1, ... : tensor<NxT>`."""
     from ..parser_utils import parse_tensor_type
     m = re.match(
@@ -621,7 +621,7 @@ def parse_tensor_from_elements(op_text, parse_ctx, result=None):
         )
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.from_elements",
         operands=operands,
         attributes={
@@ -664,7 +664,7 @@ def _parse_index_bracket_groups(op_text):
 
 
 @register_parser("tensor.extract_slice")
-def parse_tensor_extract_slice(op_text, parse_ctx, result=None):
+def parse_tensor_extract_slice(op_text, parse_ctx):
     """Parse `%r = tensor.extract_slice %src[offsets][sizes][strides] : T to T`.
 
     Supports mixed static/dynamic entries: ``%off`` tokens become _KDYNAMIC
@@ -687,7 +687,7 @@ def parse_tensor_extract_slice(op_text, parse_ctx, result=None):
         raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.extract_slice",
         operands=[src_operand] + off_d + sz_d + st_d,
         attributes={
@@ -702,7 +702,7 @@ def parse_tensor_extract_slice(op_text, parse_ctx, result=None):
 
 
 @register_parser("tensor.insert_slice")
-def parse_tensor_insert_slice(op_text, parse_ctx, result=None):
+def parse_tensor_insert_slice(op_text, parse_ctx):
     """Parse `%r = tensor.insert_slice %src into %dst[offsets][sizes][strides] : T into T`.
 
     Supports mixed static/dynamic entries: ``%off`` tokens become _KDYNAMIC
@@ -728,7 +728,7 @@ def parse_tensor_insert_slice(op_text, parse_ctx, result=None):
         raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
 
     return Operation(
-        result=result,
+        result=None,
         op_type="tensor.insert_slice",
         operands=[src_operand, dst_operand] + off_d + sz_d + st_d,
         attributes={

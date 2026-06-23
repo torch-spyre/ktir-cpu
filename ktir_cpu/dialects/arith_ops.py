@@ -313,14 +313,13 @@ def arith__select(op, context, env):
 # ---------------------------------------------------------------------------
 
 @register_parser("arith.constant")
-def parse_arith_constant(op_text, parse_ctx, result=None):
+def parse_arith_constant(op_text, parse_ctx):
     from ..parser_utils import parse_numeric, parse_tensor_type, parse_dense_payload
 
     result_match = re.match(r'arith\.constant\s*(.*)', op_text)
     if not result_match:
         return None
 
-    result_name = result
     rest = result_match.group(1).strip()
 
     result_type = None
@@ -405,7 +404,7 @@ def parse_arith_constant(op_text, parse_ctx, result=None):
             attributes.setdefault("value", 0)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.constant",
         operands=[],
         attributes=attributes,
@@ -424,7 +423,7 @@ _CMP_PREDICATES = {
 
 
 @register_parser("arith.cmpi", "arith.cmpf")
-def parse_arith_cmp(op_text, parse_ctx, result=None):
+def parse_arith_cmp(op_text, parse_ctx):
     m = re.match(r'(arith\.cmp[if])\s+', op_text)
     if not m:
         return None
@@ -440,7 +439,7 @@ def parse_arith_cmp(op_text, parse_ctx, result=None):
     if type_match:
         result_type = type_match.group(1).strip()
     return Operation(
-        result=result,
+        result=None,
         op_type=op_type,
         operands=operands,
         attributes={"predicate": predicate},
@@ -449,7 +448,7 @@ def parse_arith_cmp(op_text, parse_ctx, result=None):
 
 
 @register_parser("arith.sitofp")
-def parse_arith_sitofp(op_text, parse_ctx, result=None):
+def parse_arith_sitofp(op_text, parse_ctx):
     result_match = re.match(r'arith\.sitofp\s+(%\w+)', op_text)
     if not result_match:
         return None
@@ -462,7 +461,7 @@ def parse_arith_sitofp(op_text, parse_ctx, result=None):
         result_type = to_match.group(1)
 
     return Operation(
-        result=result,
+        result=None,
         op_type="arith.sitofp",
         operands=[operand],
         attributes={},
@@ -471,7 +470,7 @@ def parse_arith_sitofp(op_text, parse_ctx, result=None):
 
 
 @register_parser("arith.bitcast")
-def parse_arith_bitcast(op_text, parse_ctx, result=None):
+def parse_arith_bitcast(op_text, parse_ctx):
     result_match = re.match(r'arith\.bitcast\s+(%\w+)', op_text)
     if not result_match:
         return None
@@ -484,7 +483,7 @@ def parse_arith_bitcast(op_text, parse_ctx, result=None):
         dst_type = to_match.group(1)
 
     return Operation(
-        result=result,
+        result=None,
         op_type="arith.bitcast",
         operands=[operand],
         attributes={"dst_type": dst_type},

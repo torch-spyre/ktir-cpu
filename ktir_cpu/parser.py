@@ -565,9 +565,13 @@ class KTIRParser(KTIRParserBase):
 
         parser_fn = dispatch_parser(body_text)
         if parser_fn:
-            return parser_fn(body_text, ctx, result=result)
+            op = parser_fn(body_text, ctx)
+        else:
+            op = self._parse_general_operation(body_text)
 
-        return self._parse_general_operation(body_text, result=result)
+        if op is not None and result is not None:
+            op.result = result
+        return op
 
     def _parse_index_binary(self, text: str) -> Optional[Operation]:
         """Parse infix index arithmetic: %result = %a OP %b : type
@@ -595,11 +599,10 @@ class KTIRParser(KTIRParserBase):
     # General-purpose operation parser (fallback)
     # ------------------------------------------------------------------
 
-    def _parse_general_operation(self, text: str, result=None) -> Optional[Operation]:
+    def _parse_general_operation(self, text: str) -> Optional[Operation]:
         """Parse a general operation using pattern matching.
 
-        Receives LHS-free body text and the pre-computed result name(s).
-        Handles simple operations like:
+        Receives LHS-free body text.  Handles simple operations like:
             op_type %op1, %op2 : type
             return %result : type
         """
@@ -612,7 +615,7 @@ class KTIRParser(KTIRParserBase):
 
         # Extract operands: all %name references in the text after op_type,
         # but before any { } attribute blocks.
-        operands = self._extract_operands(rest, result)
+        operands = self._extract_operands(rest, None)
 
         # Extract attributes from { ... } blocks.
         # Be careful not to confuse attribute blocks with region blocks
@@ -636,7 +639,7 @@ class KTIRParser(KTIRParserBase):
         outs_ops = extract_outs_operands(rest) if is_inplace_outs(op_type) else []
 
         return Operation(
-            result=result,
+            result=None,
             op_type=op_type,
             operands=operands,
             attributes=attributes,
