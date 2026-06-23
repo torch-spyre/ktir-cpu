@@ -116,11 +116,13 @@ class CoreLatencyCounters:
     """Per-core cycle counters."""
     memory_cycles: float = 0.0
     comm_cycles: float = 0.0
-    total_bytes: int = 0
-    # Per-category flops and cycles — keys are LatencyCategory string values.
+    # Per-category flops, cycles, and bytes — keys are LatencyCategory string values.
     # Compute categories: "compute_matmul", "compute_float", "compute_transcendental", "compute_int".
     flops_by_category: Dict[str, float] = field(default_factory=dict)
     cycles_by_category: Dict[str, float] = field(default_factory=dict)
+    # Bytes split by transport: the roofline uses DRAM-only traffic for arithmetic
+    # intensity, while comm/ring bytes stay separately readable (dram_bytes / comm_bytes).
+    bytes_by_category: Dict[str, int] = field(default_factory=dict)
     trace: Optional[List[_TraceEntry]] = None
 
     @property
@@ -135,6 +137,29 @@ class CoreLatencyCounters:
     def total_flops(self) -> float:
         return sum(self.flops_by_category.values())
 
+    @property
+    def total_bytes(self) -> int:
+        """All bytes moved by this core, across every transport (HBM + comm/ring)."""
+        return sum(self.bytes_by_category.values())
+
+    @property
+    def comm_bytes(self) -> int:
+        """Bytes this core moved over the cross-core comm transport (ring)."""
+        return self.bytes_by_category.get("comm", 0)
+
+    @property
+    def dram_bytes(self) -> int:
+        """Bytes crossing the HBM/DRAM boundary — the ``"memory"`` category.
+
+        The traffic the roofline's HBM bandwidth ceiling governs, hence the correct
+        denominator for arithmetic intensity. It sums only the ``"memory"`` category
+        (HBM load/store bytes): a per-transport whitelist, so any other transport —
+        comm/ring, or a future interconnect — contributes only if explicitly
+        categorised ``"memory"``. On-chip LX ops record 0 bytes, so they never
+        enter here.
+        """
+        return self.bytes_by_category.get("memory", 0)
+
     def record(self, category: str, cycles: float, op_type: str = "",
                flops: float = 0.0, nbytes: int = 0):
         if category.startswith("compute_"):
@@ -145,7 +170,10 @@ class CoreLatencyCounters:
         elif category == "comm":
             self.comm_cycles += cycles
 
-        self.total_bytes += nbytes
+        # Bucket bytes by transport so the roofline can isolate HBM/DRAM traffic
+        # (dram_bytes) from comm/ring traffic (comm_bytes); total_bytes sums both.
+        if nbytes:
+            self.bytes_by_category[category] = self.bytes_by_category.get(category, 0) + nbytes
 
         if self.trace is not None:
             self.trace.append(_TraceEntry(op_type=op_type, cycles=cycles, category=category))
@@ -578,13 +606,15 @@ class LatencyReport:
             cats = unit_categories[unit_name]
             flops = sum(critical.flops_by_category.get(c, 0.0) for c in cats)
             achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
-            # Per-unit arithmetic intensity: this unit's own FLOPs over the
-            # kernel's total bytes (NCU convention — numerator split per
-            # pipeline, denominator the shared byte traffic). Each unit gets its
-            # own ceiling instead of sharing one mixed AI, so the other unit's
-            # FLOPs no longer inflate this unit's ceiling.
-            unit_ai = (flops / critical.total_bytes
-                       if critical.total_bytes > 0 else float('inf'))
+            # Per-unit arithmetic intensity: this unit's own FLOPs over the kernel's
+            # DRAM bytes (NCU convention — numerator split per pipeline, denominator
+            # the shared byte traffic). The denominator is dram_bytes: the HBM
+            # bandwidth ceiling governs HBM traffic only, so comm/ring bytes (a
+            # different interconnect) are excluded — otherwise a comm kernel's
+            # byte-rate could exceed HBM peak and put the point above the roof. Each
+            # unit gets its own ceiling, so the other unit's FLOPs don't inflate it.
+            unit_ai = (flops / critical.dram_bytes
+                       if critical.dram_bytes > 0 else float('inf'))
             # Roofline ceiling at this unit's own AI.
             ceiling = min(peak, peak_bw * unit_ai)
             # Cores are homogeneous: every core shares the same clock and

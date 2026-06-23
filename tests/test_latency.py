@@ -424,14 +424,16 @@ class TestRoofline:
         total_bytes = 71680
         c = CoreLatencyCounters()
         c.record("compute_matmul", cycles=1.0, flops=524288.0)
-        c.record("compute_float", cycles=496.0, flops=28480.0, nbytes=total_bytes)
+        c.record("compute_float", cycles=496.0, flops=28480.0)
+        # Bytes are HBM traffic — recorded on a memory op (the shared AI denominator).
+        c.record("memory", cycles=1.0, nbytes=total_bytes)
 
         rf = LatencyReport(config=HardwareConfig(), counters={0: c}).roofline()
 
         # FLOP-heaviest is systolic; cycle-heaviest (the bottleneck) is simd.
         assert rf["dominant_unit"] == "simd"
 
-        # Each unit's AI is its own FLOPs over the shared total bytes — distinct,
+        # Each unit's AI is its own FLOPs over the shared DRAM bytes — distinct,
         # not one mixed value shared by both.
         ai_sys = rf["units"]["systolic"]["arithmetic_intensity"]
         ai_simd = rf["units"]["simd"]["arithmetic_intensity"]
@@ -2138,16 +2140,12 @@ class TestRingReduceLatency:
             # no other op in the trace contributes to the comm bucket.
             assert cc.comm_cycles == pytest.approx(expected_comm_cycles)
 
-            # Cumulative comm bytes for this core (the only comm op is
-            # the reduce, so total_bytes - HBM-side load/store bytes
-            # equals the ring's per-core wire load).  We pin the comm
-            # bytes via the cycle assertion above; this asserts the
-            # aggregate counter agrees: ring bytes contribute exactly
-            # ``per_core_ring_bytes`` to ``total_bytes``.
-            # Note ``total_bytes`` also includes HBM bytes from
-            # ``ktdp.load`` / ``ktdp.store``, so we can't pin it on its
-            # own — we just assert it's at least the ring bytes.
-            assert cc.total_bytes >= per_core_ring_bytes
+            # Per-transport byte split. The ring reduce is this core's only comm
+            # op, so comm_bytes is exactly the per-core wire load (derived above
+            # from the kernel/config, not hardcoded); total_bytes still sums both
+            # transports (HBM + comm).
+            assert cc.comm_bytes == per_core_ring_bytes
+            assert cc.total_bytes == cc.dram_bytes + cc.comm_bytes
 
             # Each core loads its own row from HBM exactly once.
             assert ops.count("ktdp.load") == 1
@@ -2167,6 +2165,12 @@ class TestRingReduceLatency:
         per_core_total = {cid: cc.total_cycles for cid, cc in rep.counters.items()}
         assert rep.kernel_cycles == max(per_core_total.values())
         assert per_core_total[0] >= max(per_core_total[c] for c in (1, 2, 3))
+
+        # Roofline invariant on a comm kernel: arithmetic intensity uses dram_bytes
+        # (HBM only), so ring/comm bytes do not inflate the denominator and push the
+        # attained point above the HBM ceiling. With the old total_bytes denominator
+        # this kernel reported efficiency > 1 (point above the roof).
+        assert 0 < rep.roofline()["efficiency"] <= 1.0
 
 
 # ---------------------------------------------------------------------------
