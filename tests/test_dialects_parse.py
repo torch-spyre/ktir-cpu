@@ -798,6 +798,35 @@ class TestKtdpParsers(ParseTestMixin):
         assert op.result.startswith("%")
         assert len(op.result) > 1
 
+    # Both surface forms (bundled "%pid:2" and comma "%x, %y") flow
+    # through the shared parse_multi_result_lhs helper and raise the same
+    # regex-parser diagnostic. The MLIR frontend (used by future
+    # BindingsParseTestMixin subclasses) raises a different but equally
+    # specific diagnostic. Match each backend's full phrasing rather than
+    # a tiny substring — short patterns like "result type" can match
+    # unrelated future error messages and silently let regressions slip
+    # through.
+    _COUNT_MISMATCH_MSG = (
+        # Regex parser:
+        # "ktdp.get_compute_tile_id: N result name(s) but M result
+        #  type(s) in: ..."
+        r"\d+ result name\(s\) but \d+ result type\(s\)"
+        r"|"
+        # MLIR frontend:
+        # "operation defines N results but was provided M to bind"
+        r"operation defines \d+ results but was provided \d+ to bind"
+    )
+
+    def test_get_compute_tile_id_bundled_count_mismatch_rejected(self):
+        # Bundled form "%pid:2 = ... : index" — 2 results declared, 1 type.
+        with pytest.raises(Exception, match=self._COUNT_MISMATCH_MSG):
+            self._parse("%pid:2 = ktdp.get_compute_tile_id : index")
+
+    def test_get_compute_tile_id_comma_count_mismatch_rejected(self):
+        # Comma form "%x, %y = ... : index" — 2 names, 1 type.
+        with pytest.raises(Exception, match=self._COUNT_MISMATCH_MSG):
+            self._parse("%x, %y = ktdp.get_compute_tile_id : index")
+
     def test_construct_memory_view(self):
         # construct_memory_view records shape, strides, dtype, memory_space, and pointer operand
         op = self._parse(

@@ -251,12 +251,15 @@ def ktdp__store(op, context, env):
 # Comma form keeps result names verbatim ("%x", "%y").
 # Bundled form synthesizes "%g#0", "%g#1" so downstream operand lookup
 # finds distinct keys.
-def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
+def _make_compute_tile_id_op(result: str | list[str], expected_result_count=None) -> Operation:
+    attrs = {}
+    if expected_result_count is not None:
+        attrs["_result_count"] = expected_result_count
     return Operation(
         result=result,
         op_type="ktdp.get_compute_tile_id",
         operands=[],
-        attributes={},
+        attributes=attrs,
         result_type="index",
     )
 
@@ -265,7 +268,11 @@ def _make_compute_tile_id_op(result: str | list[str]) -> Operation:
 def parse_get_compute_tile_id(op_text, parse_ctx: ParseContext):
     if not op_text.startswith("ktdp.get_compute_tile_id"):
         return None
-    return _make_compute_tile_id_op(None)
+    types_text = re.search(r':\s*(.+)$', op_text)
+    if not types_text:
+        raise ValueError("ktdp.get_compute_tile_id: no result types specified")
+    type_list = [t.strip() for t in types_text.group(1).split(",") if t.strip()]
+    return _make_compute_tile_id_op(None, expected_result_count=len(type_list))
 
 
 @register_parser("ktdp.construct_memory_view")

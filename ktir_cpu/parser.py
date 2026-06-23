@@ -571,6 +571,14 @@ class KTIRParser(KTIRParserBase):
 
         if op is not None and result is not None:
             op.result = result
+            expected = op.attributes.pop("_result_count", None)
+            if expected is not None:
+                actual = len(result) if isinstance(result, list) else 1
+                if actual != expected:
+                    raise ValueError(
+                        f"{op.op_type}: {actual} result name(s) but "
+                        f"{expected} result type(s) in: {op_text!r}"
+                    )
         return op
 
     def _parse_index_binary(self, text: str) -> Optional[Operation]:
