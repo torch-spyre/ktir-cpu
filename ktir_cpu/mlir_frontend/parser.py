@@ -456,8 +456,8 @@ def _adapt_linalg_reduce(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.empty")
 def _adapt_tensor_empty(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.empty: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -467,8 +467,8 @@ def _adapt_tensor_empty(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.expand_shape")
 def _adapt_tensor_expand_shape(mlir_op, attributes, result_type, operands):
     """Synthesize target_shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.expand_shape: cannot parse result type {result_type!r}")
     attributes["target_shape"] = info["shape"]
@@ -478,8 +478,8 @@ def _adapt_tensor_expand_shape(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.collapse_shape")
 def _adapt_tensor_collapse_shape(mlir_op, attributes, result_type, operands):
     """Synthesize target_shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.collapse_shape: cannot parse result type {result_type!r}")
     attributes["target_shape"] = info["shape"]
@@ -494,8 +494,8 @@ def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
     well-formed; only the result type is consulted, since it always pins
     the target shape statically.
     """
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.reshape: cannot parse result type {result_type!r}")
     attributes["target_shape"] = info["shape"]
@@ -505,8 +505,8 @@ def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.from_elements")
 def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type — operands carry the values."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.from_elements: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -516,8 +516,8 @@ def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.splat")
 def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.splat: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -554,8 +554,8 @@ def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
     else:
         raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
     if result_type and "tensor<" in result_type:
-        from ..parser_utils import parse_tensor_type
-        info = parse_tensor_type(result_type)
+        from ..parser_utils import parse_tensor_or_memref_type
+        info = parse_tensor_or_memref_type(result_type)
         attributes["shape"] = info["shape"]
         attributes["dtype"] = info["dtype"]
         attributes["is_tensor"] = True
@@ -661,8 +661,8 @@ def _adapt_arith_cmpf(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.generate")
 def _adapt_tensor_generate(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.generate: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -675,8 +675,8 @@ _DYNAMIC_SIZE = -(1 << 63)  # ShapedType::kDynamic in MLIR
 @MLIRTypeAdapter.install("tensor.extract_slice")
 def _adapt_tensor_extract_slice(mlir_op, attributes, result_type, operands):
     """Extract static_offsets/sizes/strides and result shape from the op."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
     attributes["result_shape"] = info["shape"]
@@ -689,8 +689,8 @@ def _adapt_tensor_extract_slice(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.insert_slice")
 def _adapt_tensor_insert_slice(mlir_op, attributes, result_type, operands):
     """Extract static_offsets/sizes/strides and result shape from the op."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
     attributes["result_shape"] = info["shape"]
