@@ -205,7 +205,7 @@ def arith__cmpf(op, context, env):
 # Constants & casts
 # ---------------------------------------------------------------------------
 
-@register("arith.constant")
+@register("arith.constant", no_lx_charge=True)
 def arith__constant(op, context, env):
     value = op.attributes.get("value", 0)
     if op.attributes.get("is_tensor"):

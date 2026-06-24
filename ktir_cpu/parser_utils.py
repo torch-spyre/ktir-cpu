@@ -44,6 +44,31 @@ def extract_outs_operands(op_text: str) -> list[str]:
     return names
 
 
+def build_use_counts(ops) -> Dict[str, int]:
+    """Count operand uses recursively across all ops and nested regions.
+
+    Shared by both parsers (regex ``KTIRParser`` and ``MLIRFrontendParser``)
+    so they produce identical ``use_counts``. Operates on duck-typed
+    ``Operation`` objects (``.result``, ``.operands``, ``.regions``) — no
+    import of ir_types needed.
+
+    This is a purely *textual* operand count — a name used once syntactically
+    has count 1 even if that use sits inside a loop body and runs many times.
+    ``consume_last_use`` (the only consumer) compensates with its
+    topmost-scope guard, which blocks early-free of outer-scope names fetched
+    per iteration. Loop-carried-state safety (constant accumulator inits) is
+    handled separately by the ``no_lx_charge`` literal model, not by counting.
+    """
+    counts: Dict[str, int] = {}
+    for op in ops:
+        for name in op.operands:
+            counts[name] = counts.get(name, 0) + 1
+        for region in op.regions:
+            for name, n in build_use_counts(region).items():
+                counts[name] = counts.get(name, 0) + n
+    return counts
+
+
 def parse_multi_result_lhs(lhs_text: str) -> list[str]:
     """Parse the LHS of a multi-result MLIR assignment.
 

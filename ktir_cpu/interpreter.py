@@ -251,8 +251,10 @@ class KTIRInterpreter:
                 raise RuntimeError(
                     f"{op.op_type}: expected {len(names)} result(s), got {len(values)}"
                 )
+            from .dialects.registry import is_no_lx_charge
+            charge = not is_no_lx_charge(op.op_type)
             for name, val in zip(names, values):
-                context.set_value(name, val)
+                context.set_value(name, val, charge=charge)
 
         # Record latency.
         # Sync handlers: charge now, with the final value.
@@ -363,8 +365,10 @@ class KTIRInterpreter:
                 # returning it.  Overwrite with the resolved tile now that the
                 # scheduler has driven the generator to completion.
                 if op.result is not None and result is not None:
+                    from .dialects.registry import is_no_lx_charge
+                    charge = not is_no_lx_charge(op.op_type)
                     names = op.result if isinstance(op.result, list) else [op.result]
                     values = result if isinstance(result, tuple) else [result]
                     for name, val in zip(names, values):
-                        context.set_value(name, val)
+                        context.set_value(name, val, charge=charge)
         return result

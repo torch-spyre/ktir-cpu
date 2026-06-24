@@ -274,15 +274,9 @@ class KTIRParser(KTIRParserBase):
 
     @staticmethod
     def _build_use_counts(ops) -> Dict[str, int]:
-        """Count operand uses recursively across all ops and nested regions."""
-        counts: Dict[str, int] = {}
-        for op in ops:
-            for name in op.operands:
-                counts[name] = counts.get(name, 0) + 1
-            for region in op.regions:
-                for name, n in KTIRParser._build_use_counts(region).items():
-                    counts[name] = counts.get(name, 0) + n
-        return counts
+        """Operand use counts; see parser_utils.build_use_counts."""
+        from .parser_utils import build_use_counts
+        return build_use_counts(ops)
 
     @staticmethod
     def _preprocess_text(text: str) -> str:

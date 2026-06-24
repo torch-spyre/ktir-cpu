@@ -45,6 +45,12 @@ _LATENCY_CATEGORIES: Dict[str, str] = {}
 # accumulator and the handler must return the same Tile object.
 _INPLACE_OPS_SET: set = set()
 
+# Ops registered with no_lx_charge=True — their result is a compile-time
+# literal (e.g. arith.constant) that does not occupy the LX scratchpad. LX is
+# charged only when a consuming op materializes the literal into a real working
+# tile (see CoreContext.set_value / scf.for iter_arg binding).
+_NO_LX_CHARGE_OPS_SET: set = set()
+
 
 def get_latency_category(op_name: str) -> str:
     """Return the latency category for *op_name*, defaulting to ``"zero"``.
@@ -88,7 +94,8 @@ def make_parse_context(aliases: Dict[str, str]) -> "ParseContext":
     return ParseContext(aliases=aliases)
 
 
-def register(*op_names: str, latency_category: str = "zero", inplace_outs: bool = False):
+def register(*op_names: str, latency_category: str = "zero", inplace_outs: bool = False,
+             no_lx_charge: bool = False):
     """Decorator that registers a dialect operation handler.
 
     Usage::
@@ -110,6 +117,10 @@ def register(*op_names: str, latency_category: str = "zero", inplace_outs: bool 
             and parsers will populate ``Operation.outs_operands``.  The structural
             assertion in ``_execute_op`` then verifies the handler returns the
             same Tile object.
+        no_lx_charge: When True, the op's result Tile is a compile-time literal
+            that does not occupy LX (e.g. ``arith.constant``).  ``_execute_op``
+            binds it without charging the scratchpad; a consuming op pays for
+            the real buffer when it materializes the literal.
     """
     def decorator(fn: HandlerFn) -> HandlerFn:
         names = op_names or (fn.__name__.replace("__", "."),)
@@ -118,6 +129,8 @@ def register(*op_names: str, latency_category: str = "zero", inplace_outs: bool 
             _LATENCY_CATEGORIES[name] = latency_category
             if inplace_outs:
                 _INPLACE_OPS_SET.add(name)
+            if no_lx_charge:
+                _NO_LX_CHARGE_OPS_SET.add(name)
         return fn
     return decorator
 
@@ -125,6 +138,11 @@ def register(*op_names: str, latency_category: str = "zero", inplace_outs: bool 
 def is_inplace_outs(op_name: str) -> bool:
     """Return whether *op_name* was registered with ``inplace_outs=True``."""
     return op_name in _INPLACE_OPS_SET
+
+
+def is_no_lx_charge(op_name: str) -> bool:
+    """Return whether *op_name* was registered with ``no_lx_charge=True``."""
+    return op_name in _NO_LX_CHARGE_OPS_SET
 
 
 def dispatch(op_name: str) -> Optional[HandlerFn]:

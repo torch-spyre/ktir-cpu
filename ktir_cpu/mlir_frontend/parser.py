@@ -780,9 +780,12 @@ class MLIRFrontendParser(KTIRParserBase):
             dims += [1] * (3 - len(dims))
             grid = tuple(dims)
 
+        operations = self._adapter.adapt_block(block)
+        from ..parser_utils import build_use_counts
         return IRFunction(
             name=sym_name,
             arguments=arguments,
-            operations=self._adapter.adapt_block(block),
+            operations=operations,
             grid=grid,
+            use_counts=build_use_counts(operations),
         )

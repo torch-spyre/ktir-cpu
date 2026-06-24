@@ -16,11 +16,34 @@
 
 import re
 
-from ..ir_types import Operation
+from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.control_ops import ControlOps
 from ..parser_utils import find_ssa_names
 from .registry import register, register_parser
+
+
+def _materialize_iter_inits(context, iter_init_operands):
+    """Resolve scf.for iter_arg init values, copying constant (0-LX) literals.
+
+    The inner-loop accumulator init is, in practice, always a compile-time
+    literal (``tl.zeros`` → ``arith.constant``), which carries no LX. The loop
+    body accumulates into the iter_arg in place (``linalg.matmul`` outs), so the
+    iter_arg must be its own buffer — otherwise the in-place write corrupts the
+    shared literal, which is re-read on every outer iteration of an enclosing
+    loop.
+
+    We always hand the loop a private ``copy()`` of any Tile init. For the
+    constant case this is free of LX concern (the source literal is uncharged;
+    the copy is a genuine working buffer charged at the loop, where the
+    accumulator really lives). For the rare non-constant init it is still
+    correct — a fresh buffer is never wrong, only marginally more LX.
+    """
+    values = []
+    for name in iter_init_operands:
+        val = context.get_value(name, peek=True)
+        values.append(val.copy() if isinstance(val, Tile) else val)
+    return values
 
 
 @register("scf.if")
@@ -40,8 +63,7 @@ def scf__for(op, context, env):
     body_region = op.regions[0] if op.regions else []
 
     iter_arg_names = op.attributes.get("iter_args", [])
-    iter_init_operands = op.operands[3:]
-    iter_init_values = [context.get_value(n) for n in iter_init_operands]
+    iter_init_values = _materialize_iter_inits(context, op.operands[3:])
 
     result = yield from ControlOps.for_op_with_comms(
         context, lb, ub, step, iter_var, body_region, env.execute_region_with_comms,
