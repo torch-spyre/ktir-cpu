@@ -712,7 +712,16 @@ class LatencyReport:
             lines.append("Roofline Analysis (critical-path core)")
             lines.append("-" * 60)
             ai = rf["arithmetic_intensity"]
-            ai_str = f"{ai:.2f} FLOP/B" if ai != float('inf') else "inf (no memory traffic)"
+            # AI == inf means dram_bytes == 0 (no HBM). Split by total_bytes, not by
+            # naming a transport, so a comm-only kernel (or a future non-HBM
+            # interconnect) reads "no HBM traffic" instead of the misleading "no
+            # memory traffic" — it did move bytes, just not over HBM.
+            if ai != float('inf'):
+                ai_str = f"{ai:.2f} FLOP/B"
+            elif critical.total_bytes > 0:
+                ai_str = "inf (no HBM traffic)"
+            else:
+                ai_str = "inf (no memory traffic)"
             dom_unit = rf["units"][rf["dominant_unit"]]
             lines.append(f"  Arithmetic intensity : {ai_str}")
             lines.append(f"  Peak bandwidth       : {rf['peak_bw_gb_s']:.2f} GB/s")
