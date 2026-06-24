@@ -47,21 +47,34 @@ def extract_outs_operands(op_text: str) -> list[str]:
 def parse_multi_result_lhs(lhs_text: str) -> list[str]:
     """Parse the LHS of a multi-result MLIR assignment.
 
+    Implements the MLIR grammar production::
+
+        op-result-list ::= op-result (`,` op-result)* `=`
+        op-result      ::= value-id (`:` integer-literal)?
+
+    Always produces a flat list of individual SSA names that get bound
+    1:1 to the operation's result values.
+
     Accepts:
-      bundled form  ``"%g:2"``    -> ``["%g#0", "%g#1"]``
-      comma form    ``"%x, %y"``  -> ``["%x", "%y"]``
-      single        ``"%x"``      -> ``["%x"]``
+      bundled form  ``"%g:2"``        -> ``["%g#0", "%g#1"]``
+      comma form    ``"%x, %y"``      -> ``["%x", "%y"]``
+      mixed form    ``"%a:2, %b"``    -> ``["%a#0", "%a#1", "%b"]``
+      single        ``"%x"``          -> ``["%x"]``
 
     Raises ``ValueError`` on malformed input.
     """
-    m = re.fullmatch(r'(%\w+):([1-9]\d*)', lhs_text.strip())
-    if m:
-        base, n = m.group(1), int(m.group(2))
-        return [f"{base}#{i}" for i in range(n)]
-    parts = [p.strip() for p in lhs_text.split(",")]
-    if all(re.fullmatch(r'%\w+', p) for p in parts):
-        return parts
-    raise ValueError(f"cannot parse multi-result LHS: {lhs_text!r}")
+    parts = [p.strip() for p in lhs_text.strip().split(",")]
+    names = []
+    for part in parts:
+        m = re.fullmatch(r'(%\w+):([1-9]\d*)', part)
+        if m:
+            base, n = m.group(1), int(m.group(2))
+            names.extend(f"{base}#{i}" for i in range(n))
+        elif re.fullmatch(r'%\w+', part):
+            names.append(part)
+        else:
+            raise ValueError(f"cannot parse multi-result LHS: {lhs_text!r}")
+    return names
 
 
 def parse_tensor_type(type_str: str) -> Optional[Dict]:

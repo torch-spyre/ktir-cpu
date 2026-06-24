@@ -358,18 +358,17 @@ def tensor__generate(op, context, env):
 def parse_tensor_empty(op_text, parse_ctx):
     """Parse tensor.empty() : tensor<1x1024xf16>"""
     from ..parser_utils import parse_tensor_type
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.empty\s*\(\s*\)\s*:\s*(.+)', op_text)
+    result_match = re.match(r'tensor\.empty\s*\(\s*\)\s*:\s*(.+)', op_text)
     if not result_match:
         return None
-    result_name = result_match.group(1)
-    type_str = result_match.group(2).strip()
+    type_str = result_match.group(1).strip()
     type_info = parse_tensor_type(type_str)
     attributes = {}
     if type_info:
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.empty",
         operands=[],
         attributes=attributes,
@@ -380,13 +379,12 @@ def parse_tensor_empty(op_text, parse_ctx):
 @register_parser("tensor.splat")
 def parse_tensor_splat(op_text, parse_ctx):
     from ..parser_utils import parse_tensor_type
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.splat\s+(%\w+)\s*(?::\s*(.+))?', op_text)
+    result_match = re.match(r'tensor\.splat\s+(%\w+)\s*(?::\s*(.+))?', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    scalar_operand = result_match.group(2)
-    type_str = result_match.group(3).strip() if result_match.group(3) else "unknown"
+    scalar_operand = result_match.group(1)
+    type_str = result_match.group(2).strip() if result_match.group(2) else "unknown"
 
     # When the syntax is `src_type -> dst_type`, parse the destination (result) type.
     # e.g. tensor<1x1xf16> -> tensor<1x1024xf16>  — we want the 1x1024 shape.
@@ -403,7 +401,7 @@ def parse_tensor_splat(op_text, parse_ctx):
         attributes["dtype"] = type_info.get("dtype", "f16")
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.splat",
         operands=[scalar_operand],
         attributes=attributes,
@@ -414,12 +412,11 @@ def parse_tensor_splat(op_text, parse_ctx):
 @register_parser("tensor.extract ")
 def parse_tensor_extract(op_text, parse_ctx):
     # %scalar = tensor.extract %tensor[%i0, %i1] : tensor<...>
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.extract\s+(%\w+)', op_text)
+    result_match = re.match(r'tensor\.extract\s+(%\w+)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    src_operand = result_match.group(2)
+    src_operand = result_match.group(1)
 
     # Extract index operands from brackets: [%c0] or [%i, %j] or []
     indices = []
@@ -430,7 +427,7 @@ def parse_tensor_extract(op_text, parse_ctx):
             indices = find_ssa_names(bracket_content)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.extract",
         operands=[src_operand] + indices,
         attributes={},
@@ -441,13 +438,12 @@ def parse_tensor_extract(op_text, parse_ctx):
 def _parse_reshape_op(op_text, op_name):
     """Shared parser for tensor.expand_shape and tensor.collapse_shape."""
     result_match = re.match(
-        r'(%\w+)\s*=\s*tensor\.' + op_name + r'\s+(%\w+)', op_text
+        r'tensor\.' + op_name + r'\s+(%\w+)', op_text
     )
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    operand = result_match.group(2)
+    operand = result_match.group(1)
 
     target_shape = None
     target_dtype = "f16"
@@ -471,7 +467,7 @@ def _parse_reshape_op(op_text, op_name):
         attributes["dtype"] = target_dtype
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type=f"tensor.{op_name}",
         operands=[operand],
         attributes=attributes,
@@ -531,12 +527,11 @@ def parse_tensor_generate(op_text, parse_ctx):
     """
     from ..parser_utils import parse_tensor_type
 
-    # Match: %result = tensor.generate ...
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.generate', op_text)
+    # Match: tensor.generate ...
+    result_match = re.match(r'tensor\.generate', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
     attributes = {}
 
     # Extract shape and dtype from trailing `: tensor<16x16xf16>`
@@ -550,7 +545,7 @@ def parse_tensor_generate(op_text, parse_ctx):
         attributes["dtype"] = type_info.get("dtype", "f16")
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.generate",
         operands=[],
         attributes=attributes,
@@ -578,11 +573,11 @@ def parse_tensor_reshape(op_text, parse_ctx):
     """
     from ..parser_utils import parse_tensor_type
     m = re.match(
-        r'(%\w+)\s*=\s*tensor\.reshape\s+(%\w+)\s*\(\s*(%\w+)\s*\)', op_text
+        r'tensor\.reshape\s+(%\w+)\s*\(\s*(%\w+)\s*\)', op_text
     )
     if not m:
         return None
-    result_name, src, shape_operand = m.group(1), m.group(2), m.group(3)
+    src, shape_operand = m.group(1), m.group(2)
 
     arrow = re.search(r'->\s*(tensor<[^>]+>)', op_text)
     if not arrow:
@@ -595,7 +590,7 @@ def parse_tensor_reshape(op_text, parse_ctx):
         )
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.reshape",
         operands=[src, shape_operand],
         attributes={
@@ -611,13 +606,12 @@ def parse_tensor_from_elements(op_text, parse_ctx):
     """Parse `%shape = tensor.from_elements %d0, %d1, ... : tensor<NxT>`."""
     from ..parser_utils import parse_tensor_type
     m = re.match(
-        r'(%\w+)\s*=\s*tensor\.from_elements\s+(.*?)\s*:\s*(tensor<[^>]+>)', op_text
+        r'tensor\.from_elements\s+(.*?)\s*:\s*(tensor<[^>]+>)', op_text
     )
     if not m:
         return None
-    result_name = m.group(1)
-    operand_text = m.group(2)
-    type_str = m.group(3)
+    operand_text = m.group(1)
+    type_str = m.group(2)
     operands = find_ssa_names(operand_text)
 
     info = parse_tensor_type(type_str)
@@ -627,7 +621,7 @@ def parse_tensor_from_elements(op_text, parse_ctx):
         )
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.from_elements",
         operands=operands,
         attributes={
@@ -677,11 +671,10 @@ def parse_tensor_extract_slice(op_text, parse_ctx):
     in the static array and are appended to operands after the source.
     """
     from ..parser_utils import parse_tensor_type
-    m = re.match(r'(%\w+)\s*=\s*tensor\.extract_slice\s+(%\w+)', op_text)
+    m = re.match(r'tensor\.extract_slice\s+(%\w+)', op_text)
     if not m:
         return None
-    result_name = m.group(1)
-    src_operand = m.group(2)
+    src_operand = m.group(1)
 
     (off_s, off_d), (sz_s, sz_d), (st_s, st_d) = _parse_index_bracket_groups(op_text)
 
@@ -694,7 +687,7 @@ def parse_tensor_extract_slice(op_text, parse_ctx):
         raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.extract_slice",
         operands=[src_operand] + off_d + sz_d + st_d,
         attributes={
@@ -717,13 +710,12 @@ def parse_tensor_insert_slice(op_text, parse_ctx):
     """
     from ..parser_utils import parse_tensor_type
     m = re.match(
-        r'(%\w+)\s*=\s*tensor\.insert_slice\s+(%\w+)\s+into\s+(%\w+)', op_text
+        r'tensor\.insert_slice\s+(%\w+)\s+into\s+(%\w+)', op_text
     )
     if not m:
         return None
-    result_name = m.group(1)
-    src_operand = m.group(2)
-    dst_operand = m.group(3)
+    src_operand = m.group(1)
+    dst_operand = m.group(2)
 
     (off_s, off_d), (sz_s, sz_d), (st_s, st_d) = _parse_index_bracket_groups(op_text)
 
@@ -736,7 +728,7 @@ def parse_tensor_insert_slice(op_text, parse_ctx):
         raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.insert_slice",
         operands=[src_operand, dst_operand] + off_d + sz_d + st_d,
         attributes={

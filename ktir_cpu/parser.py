@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple
 from .ir_types import Operation, IRFunction, IRModule
 from .dialects import dispatch_parser, make_parse_context, ParseContext
 from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
-from .parser_utils import find_ssa_names
+from .parser_utils import find_ssa_names, parse_multi_result_lhs
 
 
 class KTIRParserBase(ABC):
@@ -354,7 +354,7 @@ class KTIRParser(KTIRParserBase):
             # continuation (e.g. `: input_types\n  -> result_type`).
             if current_op_lines and open_braces == 0 and not stripped.startswith('->'):
                 starts_ssa = re.match(
-                    r'(?:%\w+\s*,\s*)*%\w+\s*=\s', stripped
+                    r'(?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?\s*=\s', stripped
                 )
                 # Two-stage flush decision:
                 #
@@ -550,11 +550,36 @@ class KTIRParser(KTIRParserBase):
         # call the parser directly without a module-level alias pre-scan).
         ctx = parse_ctx or make_parse_context({})
 
-        parser_fn = dispatch_parser(op_text)
-        if parser_fn:
-            return parser_fn(op_text, ctx)
+        # Strip op-result-list LHS once, before dialect dispatch.
+        # Grammar: op-result-list ::= op-result (',' op-result)* '='
+        lhs_match = re.match(
+            r'((?:%\w+(?::\d+)?\s*,\s*)*%\w+(?::\d+)?)\s*=\s*(.*)', op_text, re.DOTALL
+        )
+        if lhs_match:
+            names = parse_multi_result_lhs(lhs_match.group(1))
+            result = names if len(names) > 1 else names[0]
+            body_text = lhs_match.group(2).strip()
+        else:
+            result = None
+            body_text = op_text
 
-        return self._parse_general_operation(op_text)
+        parser_fn = dispatch_parser(body_text)
+        if parser_fn:
+            op = parser_fn(body_text, ctx)
+        else:
+            op = self._parse_general_operation(body_text)
+
+        if op is not None and result is not None:
+            op.result = result
+            expected = op.attributes.pop("_result_count", None)
+            if expected is not None:
+                actual = len(result) if isinstance(result, list) else 1
+                if actual != expected:
+                    raise ValueError(
+                        f"{op.op_type}: {actual} result name(s) but "
+                        f"{expected} result type(s) in: {op_text!r}"
+                    )
+        return op
 
     def _parse_index_binary(self, text: str) -> Optional[Operation]:
         """Parse infix index arithmetic: %result = %a OP %b : type
@@ -585,23 +610,20 @@ class KTIRParser(KTIRParserBase):
     def _parse_general_operation(self, text: str) -> Optional[Operation]:
         """Parse a general operation using pattern matching.
 
-        Handles simple operations like:
-            %result = op_type %op1, %op2 : type
+        Receives LHS-free body text.  Handles simple operations like:
             op_type %op1, %op2 : type
             return %result : type
         """
-        # Try to match: %result = op_type rest
-        op_match = re.match(r'(?:(%\w+)\s*=\s*)?([a-z_][a-z0-9_\.]*)\s*(.*)', text, re.DOTALL)
+        op_match = re.match(r'([a-z_][a-z0-9_\.]*)\s*(.*)', text, re.DOTALL)
         if not op_match:
             return None
 
-        result = op_match.group(1)
-        op_type = op_match.group(2)
-        rest = op_match.group(3).strip()
+        op_type = op_match.group(1)
+        rest = op_match.group(2).strip()
 
         # Extract operands: all %name references in the text after op_type,
         # but before any { } attribute blocks.
-        operands = self._extract_operands(rest, result)
+        operands = self._extract_operands(rest)
 
         # Extract attributes from { ... } blocks.
         # Be careful not to confuse attribute blocks with region blocks
@@ -625,7 +647,7 @@ class KTIRParser(KTIRParserBase):
         outs_ops = extract_outs_operands(rest) if is_inplace_outs(op_type) else []
 
         return Operation(
-            result=result,
+            result=None,
             op_type=op_type,
             operands=operands,
             attributes=attributes,
@@ -633,24 +655,14 @@ class KTIRParser(KTIRParserBase):
             outs_operands=outs_ops,
         )
 
-    def _extract_operands(self, text: str, result: Optional[str]) -> List[str]:
+    def _extract_operands(self, text: str) -> List[str]:
         """Extract SSA operands from operation text.
 
-        Finds all %name references, excluding:
-        - The result name itself
-        - References inside { } attribute blocks
+        Finds all %name references, excluding references inside { }
+        attribute blocks.
         """
-        # Remove all { ... } blocks to avoid picking up references inside
-        # attribute blocks.
         cleaned = re.sub(r'\{[^}]*\}', '', text)
-
-        operands = find_ssa_names(cleaned)
-
-        # Remove result name if present
-        if result:
-            operands = [o for o in operands if o != result]
-
-        return operands
+        return find_ssa_names(cleaned)
 
     def _extract_attributes(self, text: str, aliases: Optional[Dict] = None) -> Dict:
         """Extract attributes from the outermost { ... } block in operation text."""

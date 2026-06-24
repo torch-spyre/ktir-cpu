@@ -21,7 +21,7 @@ mis-tokenised these by splitting on the ``x`` inside the dtype.
 
 import pytest
 
-from ktir_cpu.parser_utils import parse_tensor_type, extract_outs_operands
+from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_type, extract_outs_operands
 
 
 # ---------------------------------------------------------------------------
@@ -185,3 +185,37 @@ def test_extract_outs_operands_multi():
 
 def test_extract_outs_operands_none():
     assert extract_outs_operands("arith.addf %x, %y : f16") == []
+
+# ---------------------------------------------------------------------------
+# parse_multi_result_lhs for supporting parsing result LHS containing a mix 
+#                        of bundled and split forms.
+# ---------------------------------------------------------------------------
+
+def test_parse_multi_result_lhs_single():
+    assert parse_multi_result_lhs("%x") == ["%x"]
+
+
+def test_parse_multi_result_lhs_comma():
+    assert parse_multi_result_lhs("%a, %b, %c") == ["%a", "%b", "%c"]
+
+
+def test_parse_multi_result_lhs_bundled():
+    assert parse_multi_result_lhs("%g:3") == ["%g#0", "%g#1", "%g#2"]
+
+
+def test_parse_multi_result_lhs_bundled_one(): assert parse_multi_result_lhs("%r:1") == ["%r#0"]
+
+
+def test_parse_multi_result_lhs_mixed():
+    assert parse_multi_result_lhs("%a:2, %b") == ["%a#0", "%a#1", "%b"]
+
+
+def test_parse_multi_result_lhs_mixed_complex():
+    assert parse_multi_result_lhs("%x:2, %y, %z:3") == [
+        "%x#0", "%x#1", "%y", "%z#0", "%z#1", "%z#2"
+    ]
+
+
+def test_parse_multi_result_lhs_malformed():
+    with pytest.raises(ValueError, match="cannot parse multi-result LHS"):
+        parse_multi_result_lhs("not_valid")
