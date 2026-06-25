@@ -137,15 +137,9 @@ def parse_bb0_block_args(op_text, parse_ctx):
 
 @register_parser("scf.for ")
 def parse_scf_for(op_text, parse_ctx):
-    # Detect optional outer result variable(s): %a, %b, %c = scf.for ...
-    outer_result = None
-    outer_match = re.match(r'((?:%\w+\s*,\s*)*%\w+)\s*=\s*scf\.for\s+', op_text)
-    if outer_match:
-        names = [n.strip() for n in outer_match.group(1).split(',')]
-        outer_result = names if len(names) > 1 else names[0]
-
+    # op_text is LHS-free: "scf.for %i = %c0 to %n step %c1 ..."
     scf_match = re.match(
-        r'(?:(?:%\w+\s*,\s*)*%\w+\s*=\s*)?scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
+        r'scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
         op_text
     )
     if not scf_match:
@@ -168,12 +162,8 @@ def parse_scf_for(op_text, parse_ctx):
     if iter_args:
         attributes["iter_args"] = iter_args
 
-    # Use the outer result variable if present (e.g. %c = scf.for %off_k = ...);
-    # otherwise fall back to the iter_var for loops without a result.
-    result_name = outer_result if outer_result else iter_var
-
     return Operation(
-        result=result_name,
+        result=iter_var,
         op_type="scf.for",
         operands=[lb, ub, step] + iter_inits,
         attributes=attributes,
@@ -181,7 +171,7 @@ def parse_scf_for(op_text, parse_ctx):
     )
 
 
-@register_parser("scf.yield", "= scf.yield")
+@register_parser("scf.yield")
 def parse_scf_yield(op_text, parse_ctx):
     rest = op_text
     yield_match = re.match(r'scf\.yield\s*(.*)', op_text)

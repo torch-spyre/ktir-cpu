@@ -1098,6 +1098,33 @@ class TestScfParsers(ParseTestMixin):
         assert isinstance(op.result, list)
         assert len(op.result) == 2
 
+    def test_for_bundled_result(self):
+        # bundled form %acc:2 = scf.for ... produces a list of 2 names
+        op = self._parse(
+            "%acc:2 = scf.for %i = %c0 to %n step %c1"
+            " iter_args(%a = %init0, %b = %init1) -> (f16, f16) {\n"
+            "      scf.yield %a, %b : f16, f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index",
+                  "%init0": "f16", "%init1": "f16"},
+        )
+        self.assert_op_type(op, "scf.for")
+        assert isinstance(op.result, list)
+        assert len(op.result) == 2
+        assert all(r.startswith("%") for r in op.result)
+        assert len(set(op.result)) == 2
+
+    def test_for_bundled_result_single(self):
+        # %r:1 = scf.for ... collapses to a single str (convention)
+        op = self._parse(
+            "%r:1 = scf.for %i = %c0 to %n step %c1"
+            " iter_args(%acc = %init) -> (f16) {\n"
+            "      scf.yield %acc : f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index", "%init": "f16"},
+        )
+        self.assert_op_type(op, "scf.for")
+        assert isinstance(op.result, str)
+        assert op.result.startswith("%")
+
     def test_yield_single(self):
         # scf.yield with one value records the operand
         for_op = self._parse(
