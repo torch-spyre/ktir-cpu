@@ -92,6 +92,10 @@ class CoreContext:
         self.lx_options = lx_options if lx_options is not None else LXOptions()
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
         self._tile_refcount: Dict[int, int] = {}  # id(Tile) -> refcount
+        # id(Tile) for tiles that do not occupy LX (compile-time literals from
+        # no_lx_charge ops, e.g. arith.constant). Their binds/unbinds skip every
+        # lx.used adjustment so the scratchpad reflects only real working tiles.
+        self._uncharged_tiles: set = set()
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
         self._use_counts: Dict[str, int] = {}  # SSA name -> use count for current region
         # Scheduler-managed cross-core access — both functions are set by
@@ -225,13 +229,7 @@ class CoreContext:
         scope = self._scope_stack.pop()
         for value in scope.values():
             if isinstance(value, Tile):
-                if self.lx_options.alias_dedup:
-                    self._tile_refcount[id(value)] -= 1
-                    if self._tile_refcount[id(value)] == 0:
-                        del self._tile_refcount[id(value)]
-                        self.lx.used -= value.size_bytes()
-                else:
-                    self.lx.used -= value.size_bytes()
+                self._release_tile(value)
         self.lx.next_ptr = self._lx_next_ptr_stack.pop()
         assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
 
@@ -254,7 +252,7 @@ class CoreContext:
     # SSA value access
     # ------------------------------------------------------------------
 
-    def set_value(self, name: str, value: Any):
+    def set_value(self, name: str, value: Any, *, charge: bool = True):
         """Set SSA value in the topmost scope, auto-tracking Tile LX usage.
 
         - First binding of a Tile id: charges lx.used once.
@@ -265,38 +263,61 @@ class CoreContext:
         (e.g. when ``linalg.reduce`` binds its result to both the SSA result name
         and the ``outs`` buffer name).  This is valid because Python assignment
         creates a second reference to the same object — it does not copy the data.
+
+        ``charge=False`` binds a Tile that does not occupy LX — a compile-time
+        literal from a ``no_lx_charge`` op (e.g. ``arith.constant``). Its id is
+        recorded in ``_uncharged_tiles`` so this bind and every later unbind
+        (overwrite, pop_scope, consume) skips the lx.used adjustment. A
+        consuming op pays for the real buffer when it materializes the literal.
         """
         old = self._scope_stack[-1].get(name)
         if isinstance(old, Tile):
-            if self.lx_options.alias_dedup:
-                self._tile_refcount[id(old)] -= 1
-                if self._tile_refcount[id(old)] == 0:
-                    del self._tile_refcount[id(old)]
-                    self.lx.used -= old.size_bytes()
-            else:
-                self.lx.used -= old.size_bytes()
+            self._release_tile(old)
         self._scope_stack[-1][name] = value
         if isinstance(value, Tile):
+            uncharged = (not charge) or id(value) in self._uncharged_tiles
+            if uncharged:
+                self._uncharged_tiles.add(id(value))
+                # Still refcount so the id is released cleanly, but never touch lx.used.
+                if self.lx_options.alias_dedup:
+                    self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
+                return
             if self.lx_options.alias_dedup:
                 if self._tile_refcount.get(id(value), 0) == 0:
-                    if self.lx.used + value.size_bytes() > self.lx.capacity:
-                        raise MemoryError(
-                            f"LX scratchpad overflow on core {self.core_id}: "
-                            f"requested {value.size_bytes()} bytes, "
-                            f"available {self.lx.capacity - self.lx.used} bytes "
-                            f"(capacity {self.lx.capacity} bytes)"
-                        )
-                    self.lx.used += value.size_bytes()
+                    self._charge_lx(value)
                 self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
             else:
-                if self.lx.used + value.size_bytes() > self.lx.capacity:
-                    raise MemoryError(
-                        f"LX scratchpad overflow on core {self.core_id}: "
-                        f"requested {value.size_bytes()} bytes, "
-                        f"available {self.lx.capacity - self.lx.used} bytes "
-                        f"(capacity {self.lx.capacity} bytes)"
-                    )
-                self.lx.used += value.size_bytes()
+                self._charge_lx(value)
+
+    def _charge_lx(self, value: "Tile") -> None:
+        """Add *value*'s footprint to lx.used, raising on overflow."""
+        if self.lx.used + value.size_bytes() > self.lx.capacity:
+            raise MemoryError(
+                f"LX scratchpad overflow on core {self.core_id}: "
+                f"requested {value.size_bytes()} bytes, "
+                f"available {self.lx.capacity - self.lx.used} bytes "
+                f"(capacity {self.lx.capacity} bytes)"
+            )
+        self.lx.used += value.size_bytes()
+
+    def _release_tile(self, tile: "Tile") -> None:
+        """Drop one reference to *tile*, freeing its LX when the last one goes.
+
+        Uncharged tiles (compile-time literals) never touched lx.used, so their
+        release only updates bookkeeping.
+        """
+        uncharged = id(tile) in self._uncharged_tiles
+        if self.lx_options.alias_dedup:
+            self._tile_refcount[id(tile)] -= 1
+            if self._tile_refcount[id(tile)] == 0:
+                del self._tile_refcount[id(tile)]
+                self._uncharged_tiles.discard(id(tile))
+                if not uncharged:
+                    self.lx.used -= tile.size_bytes()
+        else:
+            self._uncharged_tiles.discard(id(tile))
+            if not uncharged:
+                self.lx.used -= tile.size_bytes()
 
     def get_value(self, name: str, *, peek: bool = False) -> Any:
         """Get SSA value, searching top-to-bottom.
@@ -324,13 +345,7 @@ class CoreContext:
                         and self._use_counts.get(name, 0) == 1
                         and scope is self._scope_stack[-1]):
                     del scope[name]
-                    if self.lx_options.alias_dedup:
-                        self._tile_refcount[id(value)] -= 1
-                        if self._tile_refcount[id(value)] == 0:
-                            del self._tile_refcount[id(value)]
-                            self.lx.used -= value.size_bytes()
-                    else:
-                        self.lx.used -= value.size_bytes()
+                    self._release_tile(value)
                 return value
         raise KeyError(f"Value '{name}' not found in core {self.core_id}")
 
@@ -342,6 +357,7 @@ class CoreContext:
         """Clear all scopes and LX (for next round of execution)."""
         self._scope_stack = [{}]
         self._tile_refcount.clear()
+        self._uncharged_tiles.clear()
         self._lx_next_ptr_stack.clear()
         self.lx.clear()
 

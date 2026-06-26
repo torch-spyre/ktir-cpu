@@ -1098,6 +1098,33 @@ class TestScfParsers(ParseTestMixin):
         assert isinstance(op.result, list)
         assert len(op.result) == 2
 
+    def test_for_bundled_result(self):
+        # bundled form %acc:2 = scf.for ... produces a list of 2 names
+        op = self._parse(
+            "%acc:2 = scf.for %i = %c0 to %n step %c1"
+            " iter_args(%a = %init0, %b = %init1) -> (f16, f16) {\n"
+            "      scf.yield %a, %b : f16, f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index",
+                  "%init0": "f16", "%init1": "f16"},
+        )
+        self.assert_op_type(op, "scf.for")
+        assert isinstance(op.result, list)
+        assert len(op.result) == 2
+        assert all(r.startswith("%") for r in op.result)
+        assert len(set(op.result)) == 2
+
+    def test_for_bundled_result_single(self):
+        # %r:1 = scf.for ... collapses to a single str (convention)
+        op = self._parse(
+            "%r:1 = scf.for %i = %c0 to %n step %c1"
+            " iter_args(%acc = %init) -> (f16) {\n"
+            "      scf.yield %acc : f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index", "%init": "f16"},
+        )
+        self.assert_op_type(op, "scf.for")
+        assert isinstance(op.result, str)
+        assert op.result.startswith("%")
+
     def test_yield_single(self):
         # scf.yield with one value records the operand
         for_op = self._parse(
@@ -1296,34 +1323,36 @@ class TestParseAttrList:
         assert len(result) == 1
 
 
-from ktir_cpu.parser_utils import parse_tensor_type
+from ktir_cpu.parser_utils import parse_tensor_or_memref_type
 
 
-class TestParseTensorType:
+class TestParseTensorOrMemrefType:
     def test_basic_float(self):
-        assert parse_tensor_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
+        assert parse_tensor_or_memref_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
 
     def test_basic_int(self):
-        assert parse_tensor_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
+        assert parse_tensor_or_memref_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
 
     def test_multi_dim(self):
-        assert parse_tensor_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
 
     def test_index_dtype(self):
         # Regression: 'index' contains 'x'; old split('x') would corrupt the dtype.
-        assert parse_tensor_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
-        assert parse_tensor_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
+        assert parse_tensor_or_memref_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
+        assert parse_tensor_or_memref_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
 
     def test_dynamic_dims_dropped(self):
-        assert parse_tensor_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
-        assert parse_tensor_type("tensor<?xf16>") is None
+        assert parse_tensor_or_memref_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("tensor<?xf16>") is None
 
     def test_rank0_returns_none(self):
-        assert parse_tensor_type("tensor<f32>") is None
+        assert parse_tensor_or_memref_type("tensor<f32>") is None
 
-    def test_non_tensor_returns_none(self):
-        assert parse_tensor_type("memref<10xf32>") is None
-        assert parse_tensor_type("f32") is None
+    def test_memref_accepted(self):
+        assert parse_tensor_or_memref_type("memref<10xf32>") == {"shape": (10,), "dtype": "f32"}
+
+    def test_non_type_returns_none(self):
+        assert parse_tensor_or_memref_type("f32") is None
 
     @pytest.mark.xfail(strict=True, reason="nested '<>' in dtype unsupported; regex stops at first '>'")
     @pytest.mark.parametrize("type_str,expected", [
@@ -1332,7 +1361,7 @@ class TestParseTensorType:
         ("tensor<4xvector<4xf32>>", {"shape": (4,), "dtype": "vector<4xf32>"}),
     ])
     def test_nested_bracket_dtype_unsupported(self, type_str, expected):
-        assert parse_tensor_type(type_str) == expected
+        assert parse_tensor_or_memref_type(type_str) == expected
 
 
 # ---------------------------------------------------------------------------

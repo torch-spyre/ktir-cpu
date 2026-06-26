@@ -16,11 +16,34 @@
 
 import re
 
-from ..ir_types import Operation
+from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.control_ops import ControlOps
 from ..parser_utils import find_ssa_names
 from .registry import register, register_parser
+
+
+def _materialize_iter_inits(context, iter_init_operands):
+    """Resolve scf.for iter_arg init values, copying constant (0-LX) literals.
+
+    The inner-loop accumulator init is, in practice, always a compile-time
+    literal (``tl.zeros`` → ``arith.constant``), which carries no LX. The loop
+    body accumulates into the iter_arg in place (``linalg.matmul`` outs), so the
+    iter_arg must be its own buffer — otherwise the in-place write corrupts the
+    shared literal, which is re-read on every outer iteration of an enclosing
+    loop.
+
+    We always hand the loop a private ``copy()`` of any Tile init. For the
+    constant case this is free of LX concern (the source literal is uncharged;
+    the copy is a genuine working buffer charged at the loop, where the
+    accumulator really lives). For the rare non-constant init it is still
+    correct — a fresh buffer is never wrong, only marginally more LX.
+    """
+    values = []
+    for name in iter_init_operands:
+        val = context.get_value(name, peek=True)
+        values.append(val.copy() if isinstance(val, Tile) else val)
+    return values
 
 
 @register("scf.if")
@@ -40,8 +63,7 @@ def scf__for(op, context, env):
     body_region = op.regions[0] if op.regions else []
 
     iter_arg_names = op.attributes.get("iter_args", [])
-    iter_init_operands = op.operands[3:]
-    iter_init_values = [context.get_value(n) for n in iter_init_operands]
+    iter_init_values = _materialize_iter_inits(context, op.operands[3:])
 
     result = yield from ControlOps.for_op_with_comms(
         context, lb, ub, step, iter_var, body_region, env.execute_region_with_comms,
@@ -115,15 +137,9 @@ def parse_bb0_block_args(op_text, parse_ctx):
 
 @register_parser("scf.for ")
 def parse_scf_for(op_text, parse_ctx):
-    # Detect optional outer result variable(s): %a, %b, %c = scf.for ...
-    outer_result = None
-    outer_match = re.match(r'((?:%\w+\s*,\s*)*%\w+)\s*=\s*scf\.for\s+', op_text)
-    if outer_match:
-        names = [n.strip() for n in outer_match.group(1).split(',')]
-        outer_result = names if len(names) > 1 else names[0]
-
+    # op_text is LHS-free: "scf.for %i = %c0 to %n step %c1 ..."
     scf_match = re.match(
-        r'(?:(?:%\w+\s*,\s*)*%\w+\s*=\s*)?scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
+        r'scf\.for\s+(%\w+)\s*=\s*(%\w+)\s+to\s+(%\w+)\s+step\s+(%\w+)',
         op_text
     )
     if not scf_match:
@@ -146,12 +162,8 @@ def parse_scf_for(op_text, parse_ctx):
     if iter_args:
         attributes["iter_args"] = iter_args
 
-    # Use the outer result variable if present (e.g. %c = scf.for %off_k = ...);
-    # otherwise fall back to the iter_var for loops without a result.
-    result_name = outer_result if outer_result else iter_var
-
     return Operation(
-        result=result_name,
+        result=iter_var,
         op_type="scf.for",
         operands=[lb, ub, step] + iter_inits,
         attributes=attributes,
@@ -159,7 +171,7 @@ def parse_scf_for(op_text, parse_ctx):
     )
 
 
-@register_parser("scf.yield", "= scf.yield")
+@register_parser("scf.yield")
 def parse_scf_yield(op_text, parse_ctx):
     rest = op_text
     yield_match = re.match(r'scf\.yield\s*(.*)', op_text)

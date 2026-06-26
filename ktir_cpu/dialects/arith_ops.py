@@ -205,7 +205,7 @@ def arith__cmpf(op, context, env):
 # Constants & casts
 # ---------------------------------------------------------------------------
 
-@register("arith.constant")
+@register("arith.constant", no_lx_charge=True)
 def arith__constant(op, context, env):
     value = op.attributes.get("value", 0)
     if op.attributes.get("is_tensor"):
@@ -314,14 +314,13 @@ def arith__select(op, context, env):
 
 @register_parser("arith.constant")
 def parse_arith_constant(op_text, parse_ctx):
-    from ..parser_utils import parse_numeric, parse_tensor_type, parse_dense_payload
+    from ..parser_utils import parse_numeric, parse_tensor_or_memref_type, parse_dense_payload
 
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.constant\s*(.*)', op_text)
+    result_match = re.match(r'arith\.constant\s*(.*)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    rest = result_match.group(2).strip()
+    rest = result_match.group(1).strip()
 
     result_type = None
     attributes = {}
@@ -358,7 +357,7 @@ def parse_arith_constant(op_text, parse_ctx):
         inner = braced_match.group(1).strip()
         result_type = braced_match.group(2).strip()
 
-        _type_info = parse_tensor_type(result_type)
+        _type_info = parse_tensor_or_memref_type(result_type)
         elem_dtype = _type_info.get("dtype") if _type_info else result_type
 
         dense_match = re.match(r'dense<([^>]+)>', inner)
@@ -385,7 +384,7 @@ def parse_arith_constant(op_text, parse_ctx):
         simple_match = re.match(r'(-?(?:0[xX][0-9a-fA-F]+|[\d.eE+\-]+))\s*:\s*(.+)$', rest)
         if dense_match:
             result_type = dense_match.group(2).strip()
-            type_info = parse_tensor_type(result_type)
+            type_info = parse_tensor_or_memref_type(result_type)
             elem_dtype = type_info.get("dtype") if type_info else None
             _set_dense(dense_match.group(1), elem_dtype)
             _set_tensor_attrs(type_info, result_type)
@@ -400,12 +399,12 @@ def parse_arith_constant(op_text, parse_ctx):
             type_only_match = re.match(r':\s*(.+)$', rest)
             if type_only_match:
                 result_type = type_only_match.group(1).strip()
-                type_info = parse_tensor_type(result_type) if result_type and "tensor<" in result_type else None
+                type_info = parse_tensor_or_memref_type(result_type) if result_type and "tensor<" in result_type else None
                 _set_tensor_attrs(type_info, result_type or "")
             attributes.setdefault("value", 0)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.constant",
         operands=[],
         attributes=attributes,
@@ -425,23 +424,22 @@ _CMP_PREDICATES = {
 
 @register_parser("arith.cmpi", "arith.cmpf")
 def parse_arith_cmp(op_text, parse_ctx):
-    m = re.match(r'(%\w+)\s*=\s*(arith\.cmp[if])\s+', op_text)
+    m = re.match(r'(arith\.cmp[if])\s+', op_text)
     if not m:
         return None
-    result_name = m.group(1)
-    op_type = m.group(2)
+    op_type = m.group(1)
     pred_pattern, default_type = _CMP_PREDICATES[op_type]
     pred_match = re.search(rf'{re.escape(op_type)}\s+({pred_pattern})', op_text)
     if not pred_match:
         raise ValueError(f"{op_type}: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
-    operands = [o for o in find_ssa_names(op_text) if o != result_name]
+    operands = find_ssa_names(op_text)
     result_type = default_type
     type_match = re.search(r':\s*(.+)$', op_text)
     if type_match:
         result_type = type_match.group(1).strip()
     return Operation(
-        result=result_name,
+        result=None,
         op_type=op_type,
         operands=operands,
         attributes={"predicate": predicate},
@@ -451,12 +449,11 @@ def parse_arith_cmp(op_text, parse_ctx):
 
 @register_parser("arith.sitofp")
 def parse_arith_sitofp(op_text, parse_ctx):
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.sitofp\s+(%\w+)', op_text)
+    result_match = re.match(r'arith\.sitofp\s+(%\w+)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    operand = result_match.group(2)
+    operand = result_match.group(1)
 
     result_type = "f16"
     to_match = re.search(r'to\s+(f\d+)', op_text)
@@ -464,7 +461,7 @@ def parse_arith_sitofp(op_text, parse_ctx):
         result_type = to_match.group(1)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.sitofp",
         operands=[operand],
         attributes={},
@@ -474,12 +471,11 @@ def parse_arith_sitofp(op_text, parse_ctx):
 
 @register_parser("arith.bitcast")
 def parse_arith_bitcast(op_text, parse_ctx):
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.bitcast\s+(%\w+)', op_text)
+    result_match = re.match(r'arith\.bitcast\s+(%\w+)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    operand = result_match.group(2)
+    operand = result_match.group(1)
 
     dst_type = "f32"
     to_match = re.search(r'\bto\s+(\S+)\s*$', op_text)
@@ -487,7 +483,7 @@ def parse_arith_bitcast(op_text, parse_ctx):
         dst_type = to_match.group(1)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.bitcast",
         operands=[operand],
         attributes={"dst_type": dst_type},

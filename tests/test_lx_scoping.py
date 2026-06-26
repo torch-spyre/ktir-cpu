@@ -1095,7 +1095,6 @@ class TestLastUseMatmulKernel:
     """End-to-end LX accounting for MATMUL_LX_MLIR (issue #130).
 
     Kernel: BM=512, BN=256, BK=64, K=256 (4 iterations).
-    LX cap tightened to 1 MB = 1048576 bytes.
 
     Tile sizes (f16 = 2 bytes/elem):
         %accum_itr / %accum_next  512×256×2 = 262144 bytes  (256 KB)
@@ -1103,59 +1102,71 @@ class TestLastUseMatmulKernel:
         %a                        512×64×2  =  65536 bytes  ( 64 KB)
         %b                         64×256×2 =  32768 bytes  ( 32 KB)
 
-    Per-iteration peak, _LX_DEDUP (consume off):
-        parent scope:  %accum_itr                    262144
-        body scope:    %a + %b + %c_init + %a_dot_b   65536+32768+262144+262144
-                       + %accum_next                 +262144
-                                                     -------
-        peak =  262144 + 65536 + 32768 + 262144 + 262144 + 262144 = 1146880 bytes
-        → exceeds 1 MB cap → MemoryError
+    %accum_zero is an arith.constant (no_lx_charge) — a 0-LX literal. The
+    scf.for binding materializes it into a fresh, charged %accum_itr buffer
+    (256 KB), so the accumulator cost appears at the loop, not the constant.
+    (%a_view/%b_view/%c_view are memory-view descriptors, not LX tiles — 0 LX.)
 
-    Per-iteration peak, _LX_FULL (consume on), use_counts all 1:
-        parent: %accum_itr alive                      lx = 262144
+    Per-iteration trace, _LX_DEDUP (consume off):
+        parent: %accum_itr  (materialized from %accum_zero)   lx = 262144
         body:
-          ktdp.load  → %a registered                  lx = 327680
-          ktdp.load  → %b registered                  lx = 360448
-          tensor.empty → %c_init registered            lx = 622592
-          linalg.matmul fetches %c_init (count=1, topmost) → freed
-                         %c_init consumed              lx = 360448
-                         %a_dot_b registered           lx = 622592
-          arith.addf fetches %a (count=1, topmost)   → freed
-                         %a consumed                   lx = 557056
-                     fetches %b (count=1, topmost)   → freed
-                         %b consumed                   lx = 524288
-                     fetches %accum_itr (count=1, but parent scope — guard blocks)
-                         %accum_itr stays              lx = 524288
-                     fetches %a_dot_b (count=1, topmost) → freed
-                         %a_dot_b consumed             lx = 262144
-                         %accum_next registered        lx = 524288
-        peak = 524288 bytes (512 KB) — within 1 MB cap → no overflow
+          ktdp.load    → %a            +65536                 lx = 327680
+          ktdp.load    → %b            +32768                 lx = 360448
+          tensor.empty → %c_init      +262144                 lx = 622592
+          linalg.matmul→ %a_dot_b     +262144 (reuses %c_init id, outs)  lx = 622592
+          arith.addf   → %accum_next  +262144                 lx = 884736  ← peak
+        pop body scope frees %a, %b, %c_init/%a_dot_b, %accum_next; rebind
+        %accum_itr = %accum_next for the next iteration.
+        peak = 884736 bytes (864 KB)
+
+    Per-iteration trace, _LX_FULL (consume on), use_counts all 1:
+        parent: %accum_itr alive                              lx = 262144
+        body:
+          ktdp.load    → %a            +65536                 lx = 327680
+          ktdp.load    → %b            +32768                 lx = 360448
+          tensor.empty → %c_init      +262144                 lx = 622592  ← peak
+          linalg.matmul fetches %a (last use, topmost) → freed   lx = 557056
+                        fetches %b (last use, topmost) → freed    lx = 524288
+                        fetches %c_init (last use, topmost)→ freed lx = 262144
+                        → %a_dot_b registered (outs id)        lx = 524288
+          arith.addf   fetches %a_dot_b (last use)→ freed      lx = 262144
+                       fetches %accum_itr (parent scope — guard blocks)
+                        → %accum_next registered               lx = 524288
+        peak = 622592 bytes (608 KB)
+
+    consume_last_use lowers the peak (864 KB → 608 KB) by freeing %a / %b /
+    %c_init at their last fetch instead of at scope exit.
 
     Remaining limitation — simultaneous window for %accum_itr:
-        %accum_itr lives in the parent scope, not the body scope.
-        The topmost-scope guard blocks early-free even though use_count == 1,
-        because %accum_itr is fetched on every iteration (the global count
-        of 1 reflects that it appears once as an operand of arith.addf, but
-        that one appearance is executed K/BK times).
-        As a result, %accum_itr and %accum_next are both live simultaneously
-        inside each iteration body — hence peak = 2 × 256 KB = 512 KB
-        rather than the theoretical minimum of 256 KB.
-        The set_value rebind after each iteration frees %accum_itr promptly,
-        but cannot act before %accum_next is charged.
+        %accum_itr lives in the parent scope, not the body scope, so the
+        topmost-scope guard blocks its early-free; it and %accum_next are both
+        live inside each iteration body (hence the 524288 tail in the consume-on
+        trace). The set_value rebind after each iteration frees the old
+        %accum_itr, but only after %accum_next is charged.
     """
 
-    LX_CAP = 1 * 1024 * 1024  # 1 MB
+    LX_CAP = 1 * 1024 * 1024  # 1 MB — both modes fit under the const=0 model;
+                              # the test asserts the measured peaks, not overflow.
 
     def _run(self, lx_options):
+        """Run the kernel and return the max LX peak observed across cores."""
         from ktir_cpu.interpreter import KTIRInterpreter
 
+        peak = {"v": 0}
+
         class _PatchedInterpreter(KTIRInterpreter):
-            """Applies lx_options and LX cap after each _prepare_execution call."""
+            """Applies lx_options and LX cap, and tracks peak lx.used."""
             def _prepare_execution(self, grid_shape):
                 super()._prepare_execution(grid_shape)
                 for core in self.grid_executor.cores:
                     core.lx.capacity = TestLastUseMatmulKernel.LX_CAP
                     core.lx_options = lx_options
+                    _orig = core._charge_lx
+
+                    def _charge(value, _c=core, _o=_orig):
+                        _o(value)
+                        peak["v"] = max(peak["v"], _c.lx.used)
+                    core._charge_lx = _charge
 
         BM, BN, BK, K = 512, 256, 64, 256
         a = np.random.rand(BM, K).astype(np.float16)
@@ -1163,19 +1174,19 @@ class TestLastUseMatmulKernel:
         c = np.zeros((BM, BN), dtype=np.float16)
         interp = _PatchedInterpreter()
         interp.load(MATMUL_LX_MLIR)
-        return interp.execute_function(
+        interp.execute_function(
             "matmul_lx_test", a_ptr=a, b_ptr=b, c_ptr=c,
             K=K, BM=BM, BN=BN, BK=BK,
         )
+        return peak["v"]
 
-    def test_fits_in_lx_with_consume_on(self):
-        """With consume_last_use on, peak LX stays within 1 MB — no overflow."""
-        self._run(_LX_FULL)  # must not raise
+    def test_consume_on_peak(self):
+        """consume_last_use on: peak LX = 608 KB (within 1 MB), no overflow."""
+        assert self._run(_LX_FULL) == 622592
 
-    def test_overflows_lx_with_consume_off(self):
-        """With consume_last_use off, peak LX exceeds 1 MB — overflow expected."""
-        with pytest.raises(MemoryError, match="LX scratchpad overflow"):
-            self._run(_LX_DEDUP)
+    def test_consume_off_higher_peak(self):
+        """consume_last_use off: peak LX = 864 KB — higher than consume-on, still fits."""
+        assert self._run(_LX_DEDUP) == 884736
 
     def test_addf_loop_body_lx_accounting(self):
         """Unit: fetch two single-use tiles (lx → 0 each step), register result (lx = N)."""
@@ -1469,4 +1480,178 @@ class TestOutsStructuralAssertion:
             interp = KTIRInterpreter()
             interp.load('module { func.func @dummy() attributes {grid = [1]} { return } }')
             interp._execute_op(op, ctx)  # must not raise
+
+
+# Real round-tripped KTIR from the matmul__bmm Triton fixture (dump_round_trip.py).
+# Compiled with: B=4, M=128, K=32, N=64, BLOCK_B=1, BLOCK_M=16, BLOCK_K=16, BLOCK_N=16
+# %cst is defined once outside all loops; outer scf.for loops over m-tiles and
+# n-tiles each run a K-reduction with iter_args(%arg6 = %cst).
+# Without the fix, %cst is mutated after the first K-reduction and subsequent
+# N-tile iterations accumulate on the corrupted value, producing 64/96/128
+# instead of 32 everywhere.
+MULTI_TILE_BMM_MLIR = """
+#map = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 31 >= 0)>
+#set1 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set2 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 127 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+#set3 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 15 >= 0, d2 >= 0, -d2 + 15 >= 0)>
+module {
+  func.func @bmm_matmul_kernel(%arg0: index, %arg1: index, %arg2: index) attributes {grid = [32]} {
+    %cst = arith.constant dense<0.000000e+00> : tensor<1x16x16xf32>
+    %c2_i32 = arith.constant 2 : i32
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c16_i32 = arith.constant 16 : i32
+    %c32_i32 = arith.constant 32 : i32
+    %m_blocks = arith.constant 8 : i32
+    %c4_i32 = arith.constant 4 : i32
+
+    %pid = ktdp.get_compute_tile_id : index
+    %pid_0 = arith.index_cast %pid : index to i32
+    %bm_end = arith.addi %pid_0, %c1_i32 : i32
+    %bm_end_1 = arith.minsi %bm_end, %c32_i32 : i32
+
+    %a_desc = ktdp.construct_memory_view %arg0, sizes: [4, 128, 32], strides: [4096, 32, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4x128x32xf32>
+    %b_desc = ktdp.construct_memory_view %arg1, sizes: [4, 32, 64], strides: [2048, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4x32x64xf32>
+    %c_desc = ktdp.construct_memory_view %arg2, sizes: [4, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4x128x64xf32>
+
+    scf.for %arg3 = %pid_0 to %bm_end_1 step %c1_i32  : i32 {
+      %b = arith.divsi %arg3, %m_blocks : i32
+      %m = arith.remsi %arg3, %m_blocks : i32
+
+      scf.for %arg4 = %c0_i32 to %c4_i32 step %c1_i32  : i32 {
+        %acc = scf.for %arg5 = %c0_i32 to %c2_i32 step %c1_i32 iter_args(%arg6 = %cst) -> (tensor<1x16x16xf32>)  : i32 {
+          %a_tile = arith.muli %m, %c16_i32 : i32
+          %a_tile_2 = arith.muli %arg5, %c16_i32 : i32
+          %a_tile_3 = arith.index_cast %b : i32 to index
+          %a_tile_4 = arith.index_cast %a_tile : i32 to index
+          %a_tile_5 = arith.index_cast %a_tile_2 : i32 to index
+
+          %a_tile_6 = ktdp.construct_access_tile %a_desc[%a_tile_3, %a_tile_4, %a_tile_5] {access_tile_order = #map, access_tile_set = #set3} : memref<4x128x32xf32> -> !ktdp.access_tile<1x16x16xindex>
+          %a_tile_7 = ktdp.load %a_tile_6 : <1x16x16xindex> -> tensor<1x16x16xf32>
+          %b_tile = arith.muli %arg4, %c16_i32 : i32
+          %b_tile_8 = arith.index_cast %b_tile : i32 to index
+
+          %b_tile_9 = ktdp.construct_access_tile %b_desc[%a_tile_3, %a_tile_5, %b_tile_8] {access_tile_order = #map, access_tile_set = #set3} : memref<4x32x64xf32> -> !ktdp.access_tile<1x16x16xindex>
+          %b_tile_10 = ktdp.load %b_tile_9 : <1x16x16xindex> -> tensor<1x16x16xf32>
+          %acc_11 = linalg.batch_matmul ins(%a_tile_7, %b_tile_10 : tensor<1x16x16xf32>, tensor<1x16x16xf32>) outs(%arg6 : tensor<1x16x16xf32>) -> tensor<1x16x16xf32>
+          scf.yield %acc_11 : tensor<1x16x16xf32>
+        }
+        %0 = arith.muli %m, %c16_i32 : i32
+        %1 = arith.muli %arg4, %c16_i32 : i32
+        %2 = arith.index_cast %b : i32 to index
+        %3 = arith.index_cast %0 : i32 to index
+        %4 = arith.index_cast %1 : i32 to index
+
+        %5 = ktdp.construct_access_tile %c_desc[%2, %3, %4] {access_tile_order = #map, access_tile_set = #set3} : memref<4x128x64xf32> -> !ktdp.access_tile<1x16x16xindex>
+        ktdp.store %acc, %5 : tensor<1x16x16xf32>, <1x16x16xindex>
+      }
+    }
+    return
+  }
+}
+"""
+
+
+class TestConstantIterArgMutation:
+    """Regression: batch_matmul must not mutate %cst shared across outer loop iterations.
+
+    The real generated bmm KTIR defines %cst once outside all loops and uses it
+    as the iter_arg init for every K-reduction loop.  Without the fix, %cst is
+    mutated after the first N-tile iteration and subsequent iterations accumulate
+    on the corrupted value, producing 64/96/128 instead of 32 everywhere.
+
+    Fix: %cst is an arith.constant (no_lx_charge) — a 0-LX literal. The scf.for
+    iter_arg binding materializes it into a fresh, charged accumulator buffer
+    per loop entry, so the in-place matmul accumulation never touches the shared
+    literal and each outer iteration restarts from a clean zero.
+    """
+
+    def test_multi_tile_bmm_correctness(self):
+        """Every output tile must equal K=32, not multiples of 32 (cst corrupted)."""
+        from ktir_cpu.interpreter import KTIRInterpreter
+
+        # B=4, M=128, K=32, N=64, ones everywhere.
+        # Each output tile: A_tile(1x16x16) @ B_tile(1x16x16) with K=2 steps of 16
+        # = 16 + 16 = 32.0 everywhere.
+        # If %cst is corrupted, tile (m=0,n=1) starts from 32 and gives 64, etc.
+        B, M, K, N = 4, 128, 32, 64
+        a = np.ones((B, M, K), dtype=np.float32)
+        b = np.ones((B, K, N), dtype=np.float32)
+        c = np.zeros((B, M, N), dtype=np.float32)
+
+        interp = KTIRInterpreter()
+        interp.load(MULTI_TILE_BMM_MLIR)
+        result = interp.execute_function("bmm_matmul_kernel", arg0=a, arg1=b, arg2=c)
+        out = result["arg2"]
+
+        expected = np.full_like(out, 32.0)
+        np.testing.assert_array_equal(out, expected,
+            err_msg=f"unique values {np.unique(out)} — expected all 32.0 (cst corrupted?)")
+
+    def test_iter_arg_init_is_distinct_object_from_constant(self):
+        """Unit: scf.for must hand the loop a *copy* of a constant init.
+
+        Directly exercises _materialize_iter_inits — the aliasing fix. A
+        constant Tile bound with charge=False (an arith.constant literal) must
+        be materialized into a *distinct* Tile object for the iter_arg, so a
+        later in-place mutation of the iter_arg cannot corrupt the literal.
+        """
+        from ktir_cpu.dialects.scf_ops import _materialize_iter_inits
+
+        ctx = _make_context()
+        cst = _make_tile((16, 16), dtype="f32")
+        cst.data[:] = 7.0
+        ctx.set_value("%cst", cst, charge=False)   # 0-LX literal, like arith.constant
+        assert ctx.lx.used == 0
+
+        init_values = _materialize_iter_inits(ctx, ["%cst"])
+        (iter_arg,) = init_values
+
+        # The iter_arg is a different object than the constant ...
+        assert iter_arg is not cst, "iter_arg aliases the constant — in-place mutation will corrupt it"
+        assert id(iter_arg) not in ctx._uncharged_tiles, "the materialized copy must be a real (chargeable) buffer"
+
+        # ... so mutating it in place (as linalg.matmul outs does) leaves %cst clean.
+        iter_arg.data += 1.0
+        assert np.all(cst.data == 7.0), "constant literal was corrupted by iter_arg mutation"
+
+    def test_constant_init_is_uncharged_before_materialize(self):
+        """Sanity: the constant init really is an uncharged literal pre-copy."""
+        from ktir_cpu.dialects.scf_ops import _materialize_iter_inits
+
+        ctx = _make_context()
+        cst = _make_tile((32, 32), dtype="f32")  # 4 KB if it were charged
+        ctx.set_value("%cst", cst, charge=False)
+        assert id(cst) in ctx._uncharged_tiles
+        assert ctx.lx.used == 0
+
+        # Materializing charges the fresh copy (a real working buffer), not the literal.
+        ctx.set_value("%itr", _materialize_iter_inits(ctx, ["%cst"])[0])
+        assert ctx.lx.used == cst.size_bytes()
+
+
+class TestConstantNoLXCharge:
+    """arith.constant tensors are 0-LX literals; consumers pay for real buffers."""
+
+    def test_constant_tensor_costs_zero_lx(self):
+        """Binding an arith.constant tensor result must not charge LX."""
+        from ktir_cpu.interpreter import KTIRInterpreter
+
+        mlir = """
+        module {
+          func.func @k(%arg0: index) attributes {grid = [1]} {
+            %cst = arith.constant dense<0.000000e+00> : tensor<64x64xf32>
+            return
+          }
+        }
+        """
+        interp = KTIRInterpreter()
+        interp.load(mlir)
+        interp.execute_function("k", arg0=np.zeros((1,), dtype=np.float32))
+        # The 64x64xf32 constant (16 KB) must not have occupied LX.
+        for core in interp.grid_executor.cores:
+            assert core.lx.used == 0, (
+                f"constant charged LX: core {core.core_id} lx.used={core.lx.used}"
+            )
 
