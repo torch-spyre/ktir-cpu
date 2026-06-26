@@ -281,6 +281,23 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
         },
     ],
     # ---------------------------------------------------------------------------
+    # LX-fused softmax examples (multi-func via func.call and single-func)
+    # ---------------------------------------------------------------------------
+    "softmax": [
+        {
+            "path": "triton-ktir/softmax_lx_fused.ktir",
+            # Single func.func — 5 stages inlined, 2 HBM passes.
+            # Entry: @softmax(%X: index, %C: index), grid=[32].
+            "execute_kwargs": {},
+        },
+        {
+            "path": "triton-ktir/softmax_lx_fused_calls.ktir",
+            # Multi-func — 5 stage subfunctions called via top-level func.call.
+            # Entry: @softmax(%X: index, %Y: index), grid=[32].
+            "execute_kwargs": {},
+        },
+    ],
+    # ---------------------------------------------------------------------------
     # Cross-core communication examples
     # ---------------------------------------------------------------------------
     "ring_reduce": [

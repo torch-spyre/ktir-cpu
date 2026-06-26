@@ -1152,6 +1152,55 @@ class TestScfParsers(ParseTestMixin):
 
 
 # ---------------------------------------------------------------------------
+# func dialect parsers
+# ---------------------------------------------------------------------------
+
+class TestFuncParsers(ParseTestMixin):
+    """func.call parser: void and value-returning forms, arg binding, multi-call."""
+
+    def test_void_call_no_args(self):
+        # func.call @f() : () -> () — no result, no operands
+        op = self._parse("func.call @callee() : () -> ()", args={})
+        self.assert_op_type(op, "func.call")
+        assert op.result is None
+        assert op.operands == []
+        self.assert_attribute(op, "callee", "callee")
+
+    def test_call_with_args(self):
+        # func.call with two index args records both operands
+        op = self._parse(
+            "func.call @add(%x, %y) : (index, index) -> ()",
+            args={"%x": "index", "%y": "index"},
+        )
+        self.assert_op_type(op, "func.call")
+        self.assert_attribute(op, "callee", "add")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%x", "%y")
+
+    def test_multiple_sequential_calls_parsed_separately(self):
+        # Consecutive void func.call lines each produce a distinct op.
+        ktir = """
+module @m {
+  func.func @a() attributes {grid = [1]} { return }
+  func.func @b() attributes {grid = [1]} { return }
+  func.func @main() attributes {grid = [1]} {
+    func.call @a() : () -> ()
+    func.call @b() : () -> ()
+    return
+  }
+}
+"""
+        from ktir_cpu import KTIRInterpreter
+        interp = KTIRInterpreter()
+        interp.load(ktir)
+        ops = interp.module.get_function("main").operations
+        calls = [o for o in ops if o.op_type == "func.call"]
+        assert len(calls) == 2
+        assert calls[0].attributes["callee"] == "a"
+        assert calls[1].attributes["callee"] == "b"
+
+
+# ---------------------------------------------------------------------------
 # math dialect — all ops parse through the generic fallback parser
 # ---------------------------------------------------------------------------
 

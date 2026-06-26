@@ -226,6 +226,12 @@ MLIRTypeAdapter.install(
 )(_no_attrs)
 
 
+@MLIRTypeAdapter.install("func.call")
+def _adapt_func_call(mlir_op, attributes, result_type, operands):
+    """Extract callee name from FlatSymbolRefAttr (e.g. '@name' → 'name')."""
+    attributes["callee"] = str(mlir_op.attributes["callee"]).lstrip("@")
+
+
 @MLIRTypeAdapter.install("scf.for")
 def _adapt_scf_for(mlir_op, attributes, result_type, operands):
     """Synthesize iter_var / iter_args from block arguments."""

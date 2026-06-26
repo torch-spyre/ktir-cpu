@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SCF / func dialect handlers — if, for, yield, return."""
+"""SCF dialect handlers — scf.if, scf.for, scf.yield."""
 
 import re
 
@@ -87,55 +87,6 @@ def scf__for(op, context, env):
 def scf__yield(op, context, env):
     values = [context.get_value(name) for name in op.operands]
     return ControlOps.yield_op(values)
-
-
-@register("func.return")
-def func__return(op, context, env):
-    if op.operands:
-        return context.get_value(op.operands[0])
-    return None
-
-
-# Also register the bare "return" alias
-@register("return")
-def _return_alias(op, context, env):
-    return func__return(op, context, env)
-
-
-@register("func.call")
-def func__call(op, context, env):
-    """Execute a func.call by inlining the callee in a fresh scope.
-
-    Pushes a new scope for the callee so callee-local SSA values don't
-    collide with caller values.  LX state (lx.memory writes from
-    ktdp.store) survives scope boundaries so data stored to alloc_lx
-    buffers persists across func.call boundaries.
-    """
-    callee_name = op.attributes["callee"]
-    callee = env.module.get_function(callee_name)
-
-    # Resolve caller operands before scope / use_counts swap so peeking uses
-    # the main function's use_counts (no premature consumption of caller vals).
-    arg_values = [context.get_value(operand, peek=True) for operand in op.operands]
-
-    # Push callee scope; swap use_counts so last-use tracking is correct inside.
-    context.push_scope()
-    caller_use_counts = context._use_counts
-    context._use_counts = callee.use_counts
-
-    # Bind callee args (all index scalars — charge=False, no LX to track).
-    for param, val in zip(callee.arg_names, arg_values):
-        context.set_value("%" + param, val, charge=False)
-
-    # Execute callee body; propagate comm yields upward so the scheduler sees them.
-    result = yield from env.execute_region_with_comms(context, callee.operations)
-
-    # Restore: pop scope (frees callee's Tiles, rewinds lx.next_ptr) and
-    # restore caller's use_counts.
-    context.pop_scope()
-    context._use_counts = caller_use_counts
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -224,23 +175,3 @@ def parse_scf_yield(op_text, parse_ctx):
     )
 
 
-@register_parser("func.call")
-def parse_func_call(op_text, parse_ctx):
-    """Parse func.call — both void and single-result forms.
-
-    Syntax (void):   func.call @name(%a, %b) : (index, index) -> ()
-    Syntax (value):  func.call @name(%a) : (index) -> index
-    """
-    m = re.match(r'func\.call\s+@(\w+)\s*\(([^)]*)\)', op_text)
-    if not m:
-        return None
-    callee = m.group(1)
-    args_text = m.group(2).strip()
-    operands = re.findall(r'%\w+', args_text) if args_text else []
-    return Operation(
-        result=None,
-        op_type="func.call",
-        operands=operands,
-        attributes={"callee": callee},
-        result_type=None,
-    )

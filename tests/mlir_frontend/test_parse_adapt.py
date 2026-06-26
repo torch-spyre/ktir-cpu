@@ -13,6 +13,7 @@ import pytest
 
 from test_dialects_parse import (
     TestArithParsers as _TestArithParsers,
+    TestFuncParsers as _TestFuncParsers,
     TestLinalgParsers as _TestLinalgParsers,
     TestTensorParsers as _TestTensorParsers,
     TestKtdpParsers as _TestKtdpParsers,
@@ -59,6 +60,57 @@ module {{
             if op.op_type not in ("func.return", "return"):
                 return op
         raise RuntimeError(f"No target op found in:\n{module_text}")
+
+
+# ---------------------------------------------------------------------------
+# Func
+# ---------------------------------------------------------------------------
+
+class TestFuncAdapt(MLIRFrontendParseTestMixin, _TestFuncParsers):
+    """Func tests via MLIRFrontendParser.
+
+    func.call references a callee that must exist in the module for MLIR
+    verification to pass, so the single-op tests are overridden to embed a
+    callee declaration alongside @_test.  The multi-call test uses
+    KTIRInterpreter directly and is inherited unchanged.
+    """
+
+    def test_void_call_no_args(self):
+        module_text = """\
+module {
+  func.func @callee() attributes {grid = [1]} { return }
+  func.func @_test() attributes {grid = [1]} {
+    func.call @callee() : () -> ()
+    return
+  }
+}
+"""
+        ir_module = MLIRFrontendParser().parse_module(module_text)
+        calls = [o for o in ir_module.get_function("_test").operations
+                 if o.op_type == "func.call"]
+        op = calls[0]
+        self.assert_op_type(op, "func.call")
+        assert op.result is None
+        assert op.operands == []
+        self.assert_attribute(op, "callee", "callee")
+
+    def test_call_with_args(self):
+        module_text = """\
+module {
+  func.func @add(%x: index, %y: index) attributes {grid = [1]} { return }
+  func.func @_test(%x: index, %y: index) attributes {grid = [1]} {
+    func.call @add(%x, %y) : (index, index) -> ()
+    return
+  }
+}
+"""
+        ir_module = MLIRFrontendParser().parse_module(module_text)
+        calls = [o for o in ir_module.get_function("_test").operations
+                 if o.op_type == "func.call"]
+        op = calls[0]
+        self.assert_op_type(op, "func.call")
+        self.assert_attribute(op, "callee", "add")
+        self.assert_num_operands(op, 2)
 
 
 # ---------------------------------------------------------------------------

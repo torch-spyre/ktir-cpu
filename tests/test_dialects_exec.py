@@ -1514,6 +1514,179 @@ class TestScfFunc:
         assert result == 42, f"expected 42, got {result!r}"
 
 # ---------------------------------------------------------------------------
+# func dialect — func.call end-to-end execution
+# ---------------------------------------------------------------------------
+
+def _run_ktir(ktir_text, func_name="main", **kwargs):
+    from ktir_cpu import KTIRInterpreter
+    interp = KTIRInterpreter()
+    interp.load(ktir_text)
+    return interp.execute_function(func_name, **kwargs)
+
+
+class TestFunc:
+    """func.call: callee execution, arg passing, scope isolation, LX persistence."""
+
+    def test_call_passes_args_to_callee(self):
+        # func.call binds caller SSA values to callee arg names
+        ktir = """
+#id1    = affine_map<(d0) -> (d0)>
+#full64 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+module @m {
+  func.func @copy(%src: index, %dst: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %sv = ktdp.construct_memory_view %src, sizes: [64], strides: [1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<64xf32>
+    %st = ktdp.construct_access_tile %sv[%c0]
+            {access_tile_set = #full64,
+             access_tile_order = #id1} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+    %t  = ktdp.load %st : <64xindex> -> tensor<64xf32>
+    %dv = ktdp.construct_memory_view %dst, sizes: [64], strides: [1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<64xf32>
+    %dt = ktdp.construct_access_tile %dv[%c0]
+            {access_tile_set = #full64,
+             access_tile_order = #id1} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+    ktdp.store %t, %dt : tensor<64xf32>, <64xindex>
+    return
+  }
+  func.func @main(%A: index, %B: index) attributes {grid = [1]} {
+    func.call @copy(%A, %B) : (index, index) -> ()
+    return
+  }
+}
+"""
+        rng = np.random.default_rng(1)
+        A = rng.standard_normal(64).astype(np.float32)
+        B = np.zeros(64, dtype=np.float32)
+        result = _run_ktir(ktir, func_name="main", A=A, B=B)
+        np.testing.assert_allclose(result["B"], A, atol=1e-6)
+
+    def test_caller_ssa_survives_call(self):
+        # SSA values bound before func.call remain accessible after it returns
+        ktir = """
+#id1    = affine_map<(d0) -> (d0)>
+#full64 = affine_set<(d0) : (d0 >= 0, -d0 + 63 >= 0)>
+module @m {
+  func.func @noop() attributes {grid = [1]} { return }
+  func.func @main(%X: index, %Y: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %xv = ktdp.construct_memory_view %X, sizes: [64], strides: [1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<64xf32>
+    %xt = ktdp.construct_access_tile %xv[%c0]
+            {access_tile_set = #full64,
+             access_tile_order = #id1} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+    %x  = ktdp.load %xt : <64xindex> -> tensor<64xf32>
+    func.call @noop() : () -> ()
+    %yv = ktdp.construct_memory_view %Y, sizes: [64], strides: [1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<64xf32>
+    %yt = ktdp.construct_access_tile %yv[%c0]
+            {access_tile_set = #full64,
+             access_tile_order = #id1} : memref<64xf32> -> !ktdp.access_tile<64xindex>
+    ktdp.store %x, %yt : tensor<64xf32>, <64xindex>
+    return
+  }
+}
+"""
+        rng = np.random.default_rng(0)
+        X = rng.standard_normal(64).astype(np.float32)
+        Y = np.zeros(64, dtype=np.float32)
+        result = _run_ktir(ktir, func_name="main", X=X, Y=Y)
+        np.testing.assert_allclose(result["Y"], X, atol=1e-6)
+
+    def test_sequential_calls_accumulate(self):
+        # Five func.call @add_one ops each increment the buffer by 1.0
+        ktir = """
+#id1  = affine_map<(d0) -> (d0)>
+#full4 = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>
+module @m {
+  func.func @add_one(%buf: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %bv = ktdp.construct_memory_view %buf, sizes: [4], strides: [1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf32>
+    %bt = ktdp.construct_access_tile %bv[%c0]
+            {access_tile_set = #full4,
+             access_tile_order = #id1} : memref<4xf32> -> !ktdp.access_tile<4xindex>
+    %t  = ktdp.load %bt : <4xindex> -> tensor<4xf32>
+    %c1 = arith.constant 1.0 : f32
+    %e  = tensor.empty() : tensor<4xf32>
+    %o  = linalg.fill ins(%c1 : f32) outs(%e : tensor<4xf32>) -> tensor<4xf32>
+    %r  = arith.addf %t, %o : tensor<4xf32>
+    %bt2 = ktdp.construct_access_tile %bv[%c0]
+             {access_tile_set = #full4,
+              access_tile_order = #id1} : memref<4xf32> -> !ktdp.access_tile<4xindex>
+    ktdp.store %r, %bt2 : tensor<4xf32>, <4xindex>
+    return
+  }
+  func.func @main(%B: index) attributes {grid = [1]} {
+    func.call @add_one(%B) : (index) -> ()
+    func.call @add_one(%B) : (index) -> ()
+    func.call @add_one(%B) : (index) -> ()
+    func.call @add_one(%B) : (index) -> ()
+    func.call @add_one(%B) : (index) -> ()
+    return
+  }
+}
+"""
+        B = np.zeros(4, dtype=np.float32)
+        result = _run_ktir(ktir, func_name="main", B=B)
+        np.testing.assert_allclose(result["B"], np.full(4, 5.0, dtype=np.float32), atol=1e-6)
+
+    def test_lx_state_persists_across_calls(self):
+        # Data written to LX via ktdp.store in one callee is readable in the next
+        ktir = """
+#id3   = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#tile4 = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 0 >= 0,
+                                    d1 >= 0, -d1 + 0 >= 0,
+                                    d2 >= 0, -d2 + 3 >= 0)>
+module @m {
+  func.func @write_lx(%src: index, %lx: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %sv = ktdp.construct_memory_view %src, sizes: [1, 1, 4], strides: [4, 4, 1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x1x4xf32>
+    %st = ktdp.construct_access_tile %sv[%c0, %c0, %c0]
+            {access_tile_set = #tile4,
+             access_tile_order = #id3} : memref<1x1x4xf32> -> !ktdp.access_tile<1x1x4xindex>
+    %t  = ktdp.load %st : <1x1x4xindex> -> tensor<1x1x4xf32>
+    %lv = ktdp.construct_memory_view %lx, sizes: [1, 1, 4], strides: [4, 4, 1]
+            {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x1x4xf32>
+    %lt = ktdp.construct_access_tile %lv[%c0, %c0, %c0]
+            {access_tile_set = #tile4,
+             access_tile_order = #id3} : memref<1x1x4xf32> -> !ktdp.access_tile<1x1x4xindex>
+    ktdp.store %t, %lt : tensor<1x1x4xf32>, <1x1x4xindex>
+    return
+  }
+  func.func @read_lx(%lx: index, %dst: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %lv = ktdp.construct_memory_view %lx, sizes: [1, 1, 4], strides: [4, 4, 1]
+            {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x1x4xf32>
+    %lt = ktdp.construct_access_tile %lv[%c0, %c0, %c0]
+            {access_tile_set = #tile4,
+             access_tile_order = #id3} : memref<1x1x4xf32> -> !ktdp.access_tile<1x1x4xindex>
+    %t  = ktdp.load %lt : <1x1x4xindex> -> tensor<1x1x4xf32>
+    %dv = ktdp.construct_memory_view %dst, sizes: [1, 1, 4], strides: [4, 4, 1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x1x4xf32>
+    %dt = ktdp.construct_access_tile %dv[%c0, %c0, %c0]
+            {access_tile_set = #tile4,
+             access_tile_order = #id3} : memref<1x1x4xf32> -> !ktdp.access_tile<1x1x4xindex>
+    ktdp.store %t, %dt : tensor<1x1x4xf32>, <1x1x4xindex>
+    return
+  }
+  func.func @main(%X: index, %Y: index) attributes {grid = [1]} {
+    %lx_addr = arith.constant 524288 : index
+    func.call @write_lx(%X, %lx_addr) : (index, index) -> ()
+    func.call @read_lx(%lx_addr, %Y)  : (index, index) -> ()
+    return
+  }
+}
+"""
+        rng = np.random.default_rng(7)
+        X = rng.standard_normal((1, 1, 4)).astype(np.float32)
+        Y = np.zeros((1, 1, 4), dtype=np.float32)
+        result = _run_ktir(ktir, func_name="main", X=X, Y=Y)
+        np.testing.assert_allclose(result["Y"], X, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
 # ktdp dialect parsers
 # ---------------------------------------------------------------------------
 
