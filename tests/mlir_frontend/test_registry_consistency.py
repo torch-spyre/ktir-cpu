@@ -67,11 +67,6 @@ FRONTEND_UNSUPPORTED = {
                           "Blocked on ktir-mlir-frontend#23.",
     "ktdp.yield_reduced": "🧪 experimental terminator; no frontend adapter yet. "
                           "Blocked on ktir-mlir-frontend#23.",
-
-    # Real spec op missing only a frontend adapter handler (distinct from the
-    # non-spec ops above).
-    "ktdp.construct_distributed_memory_view": "real ktdp dialect op; no frontend "
-                   "adapter handler yet. Tracked in issue #87.",
 }
 
 

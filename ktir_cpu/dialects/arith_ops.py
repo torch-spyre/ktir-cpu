@@ -314,7 +314,7 @@ def arith__select(op, context, env):
 
 @register_parser("arith.constant")
 def parse_arith_constant(op_text, parse_ctx):
-    from ..parser_utils import parse_numeric, parse_tensor_type, parse_dense_payload
+    from ..parser_utils import parse_numeric, parse_tensor_or_memref_type, parse_dense_payload
 
     result_match = re.match(r'arith\.constant\s*(.*)', op_text)
     if not result_match:
@@ -357,7 +357,7 @@ def parse_arith_constant(op_text, parse_ctx):
         inner = braced_match.group(1).strip()
         result_type = braced_match.group(2).strip()
 
-        _type_info = parse_tensor_type(result_type)
+        _type_info = parse_tensor_or_memref_type(result_type)
         elem_dtype = _type_info.get("dtype") if _type_info else result_type
 
         dense_match = re.match(r'dense<([^>]+)>', inner)
@@ -384,7 +384,7 @@ def parse_arith_constant(op_text, parse_ctx):
         simple_match = re.match(r'(-?(?:0[xX][0-9a-fA-F]+|[\d.eE+\-]+))\s*:\s*(.+)$', rest)
         if dense_match:
             result_type = dense_match.group(2).strip()
-            type_info = parse_tensor_type(result_type)
+            type_info = parse_tensor_or_memref_type(result_type)
             elem_dtype = type_info.get("dtype") if type_info else None
             _set_dense(dense_match.group(1), elem_dtype)
             _set_tensor_attrs(type_info, result_type)
@@ -399,7 +399,7 @@ def parse_arith_constant(op_text, parse_ctx):
             type_only_match = re.match(r':\s*(.+)$', rest)
             if type_only_match:
                 result_type = type_only_match.group(1).strip()
-                type_info = parse_tensor_type(result_type) if result_type and "tensor<" in result_type else None
+                type_info = parse_tensor_or_memref_type(result_type) if result_type and "tensor<" in result_type else None
                 _set_tensor_attrs(type_info, result_type or "")
             attributes.setdefault("value", 0)
 

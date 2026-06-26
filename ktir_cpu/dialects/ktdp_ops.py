@@ -34,7 +34,7 @@ from ..ops.comm_ops import CommPlan, RingReduceBackend
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import enumerate_membership_keys, parse_affine_map, parse_affine_set
-from ..parser_utils import _extract_bracket_content, extract_named_attr, find_ssa_names, parse_attr_block, parse_tensor_type, split_top_level
+from ..parser_utils import _extract_bracket_content, extract_named_attr, find_ssa_names, parse_attr_block, parse_multi_result_lhs, parse_tensor_or_memref_type, split_top_level
 from .registry import ParseContext, register, register_parser
 
 
@@ -338,15 +338,13 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     memref_match = re.search(r'(?:}\s*)?:\s*(?:index\s*->\s*)?memref<([^>]+)>', op_text)
     if not memref_match:
         raise ValueError("construct_memory_view: could not parse dtype from memref<> type")
-    parts = memref_match.group(1).split('x')
-    dtype = parts[-1]
-    if len(parts) <= 1:
+    info = parse_tensor_or_memref_type(memref_match.group(1), keep_dynamic_dims=True)
+    if not info:
         raise ValueError(
             f"construct_memory_view: memref<{memref_match.group(1)}> has no dimensions"
         )
-    # '?' in the memref type means the dimension is dynamic (value only known at
-    # runtime).  We keep it as None until we can substitute the SSA size below.
-    memref_dims = [None if p == "?" else int(p) for p in parts[:-1]]
+    dtype = info["dtype"]
+    memref_dims = list(info["shape"])
     if sizes is not None:
         if len(sizes) != len(memref_dims):
             raise ValueError(
@@ -458,14 +456,14 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
         raise ValueError(
             "construct_distributed_memory_view: could not parse result memref<> type"
         )
-    parts = memref_match.group(1).split('x')
-    if len(parts) <= 1:
+    info = parse_tensor_or_memref_type(memref_match.group(1))
+    if not info:
         raise ValueError(
             f"construct_distributed_memory_view: memref<{memref_match.group(1)}> "
             "has no dimensions"
         )
-    dtype = parts[-1]
-    shape = tuple(int(p) for p in parts[:-1])
+    shape = info["shape"]
+    dtype = info["dtype"]
 
     return Operation(
         result=None,
@@ -1185,7 +1183,7 @@ def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext):
     result_type = arrow_match.group(1).strip() if arrow_match else None
     result_shape = None
     if result_type is not None:
-        parsed = parse_tensor_type(result_type)
+        parsed = parse_tensor_or_memref_type(result_type)
         if parsed is not None:
             result_shape = parsed["shape"]
 

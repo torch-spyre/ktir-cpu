@@ -102,38 +102,66 @@ def parse_multi_result_lhs(lhs_text: str) -> list[str]:
     return names
 
 
-def parse_tensor_type(type_str: str) -> Optional[Dict]:
-    """Parse a tensor type string, returning shape and dtype if it matches.
+def parse_tensor_or_memref_type(type_str: str, *, keep_dynamic_dims=False) -> Optional[Dict]:
+    """Parse a tensor/memref type or bare dims string into shape and dtype.
+
+    Accepts:
+      - ``"tensor<128x32xf16>"``
+      - ``"memref<128x32xf16, #mem_space>"``
+      - ``"128x32xf16"``  (bare inner content)
 
     Args:
-        type_str: Type string (e.g., "tensor<256xf16>")
+        keep_dynamic_dims: If True, dynamic dims (``?``) are kept as None
+            in the shape tuple. If False (default), they are dropped.
 
     Returns:
-        {"shape": tuple, "dtype": str} if tensor type, else None
-
-    Walks the leading dim prefix by matching digit-tokens followed by 'x',
-    taking the remainder as dtype. Handles dtypes containing 'x' (e.g.
-    ``index``). Dynamic dims (``?``) are silently dropped, matching prior
-    behaviour.
+        {"shape": tuple, "dtype": str} or None on failure.
     """
-    m = re.match(r'tensor<([^>]+)>', type_str)
-    if not m:
-        return None
-    inner = m.group(1).strip()
-    # Match all ``NNN x`` dim tokens from the left. The dtype cannot start
-    # with a digit followed by 'x', so the pattern terminates at the right
-    # boundary even when the dtype itself contains 'x' (e.g. ``index``).
-    # Dynamic dims (``?``) are skipped, matching prior behaviour.
+    m = re.match(r'(?:tensor|memref)<([^>]+)>', type_str)
+    inner = m.group(1).strip() if m else type_str.strip()
     prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
     if not prefix:
         return None
-    dims = [int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1))]
+    if keep_dynamic_dims:
+        dims = tuple(
+            None if d == '?' else int(d)
+            for d in re.findall(r'(\d+|[?])\s*x', prefix.group(1))
+        )
+    else:
+        dims = tuple(int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1)))
     if not dims:
         return None
     dtype = inner[prefix.end():].split(',')[0].strip()
     if not dtype:
         return None
-    return {"shape": tuple(dims), "dtype": dtype}
+    return {"shape": dims, "dtype": dtype}
+
+
+def parse_memref_dims(inner: str):
+    """Parse the inner content of memref<...> or similar into (dims, dtype).
+
+    Handles dtypes containing 'x' (e.g. 'index') by matching dim tokens
+    from the left. Dynamic dims ('?') are returned as None.
+
+    Args:
+        inner: The string inside angle brackets, e.g. "128x32xindex"
+
+    Returns:
+        (dims, dtype) where dims is a tuple of int|None and dtype is a string.
+
+    Raises:
+        ValueError: if no dimension tokens are found.
+    """
+    prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
+    if not prefix:
+        raise ValueError(f"no dimensions found in '{inner}'")
+    dims = tuple(
+        None if d == '?' else int(d)
+        for d in re.findall(r'(\d+|[?])\s*x', prefix.group(1))
+    )
+    dtype = inner[prefix.end():].split(',')[0].strip()
+    return dims, dtype
+
 
 def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to a Python int or float.

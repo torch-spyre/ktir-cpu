@@ -21,7 +21,7 @@ mis-tokenised these by splitting on the ``x`` inside the dtype.
 
 import pytest
 
-from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_type, extract_outs_operands
+from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_or_memref_type, extract_outs_operands
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +45,9 @@ from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_type, ext
         ("tensor<1x16x1x128xf16>", (1, 16, 1, 128), "f16"),
     ],
 )
-def test_parse_tensor_type_basic(type_str, expected_shape, expected_dtype):
+def test_parse_tensor_or_memref_type_basic(type_str, expected_shape, expected_dtype):
     """Plain numeric/float dtypes round-trip cleanly across rank 1–4."""
-    info = parse_tensor_type(type_str)
+    info = parse_tensor_or_memref_type(type_str)
     assert info == {"shape": expected_shape, "dtype": expected_dtype}
 
 
@@ -64,7 +64,7 @@ def test_parse_tensor_type_basic(type_str, expected_shape, expected_dtype):
         ("tensor<1x16x1xindex>", (1, 16, 1)),
     ],
 )
-def test_parse_tensor_type_index_dtype(type_str, expected_shape):
+def test_parse_tensor_or_memref_type_index_dtype(type_str, expected_shape):
     """``index`` dtype is preserved despite the ``x`` inside its name.
 
     Pins the regression where ``inner.split('x')`` on ``"2xindex"`` produced
@@ -73,7 +73,7 @@ def test_parse_tensor_type_index_dtype(type_str, expected_shape):
     ``tensor.reshape`` lowerings; mis-parsing it broke any KTIR containing
     ``tl.reshape`` from a 3D descriptor load.
     """
-    info = parse_tensor_type(type_str)
+    info = parse_tensor_or_memref_type(type_str)
     assert info == {"shape": expected_shape, "dtype": "index"}
 
 
@@ -84,18 +84,17 @@ def test_parse_tensor_type_index_dtype(type_str, expected_shape):
 @pytest.mark.parametrize(
     "type_str",
     [
-        "memref<10xf32>",       # Different aggregate type
-        "f32",                  # Bare element type
+        "f32",                  # Bare element type (no dims)
         "not a tensor",         # Random text
         "",                     # Empty
         "tensor<>",             # Malformed: empty body
-        "tensor<f32>",          # Rank-0 tensor — unsupported by the regex parser
-        "tensor<?xf16>",        # All-dynamic dims — no static dims to return
+        "tensor<f32>",          # Rank-0 tensor — no dim tokens
+        "tensor<?xf16>",        # All-dynamic dims — dropped → empty shape
     ],
 )
-def test_parse_tensor_type_rejects_non_tensor(type_str):
-    """Inputs that are not a ranked tensor type return ``None``."""
-    assert parse_tensor_type(type_str) is None
+def test_parse_tensor_or_memref_type_rejects_invalid(type_str):
+    """Inputs with no parseable dim tokens return ``None``."""
+    assert parse_tensor_or_memref_type(type_str) is None
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +105,7 @@ def test_parse_tensor_type_rejects_non_tensor(type_str):
 @pytest.mark.parametrize(
     "type_str, expected_shape, expected_dtype",
     [
-        # Dynamic dims ('?') are silently dropped; only static dims are kept.
+        # Dynamic dims ('?') are dropped by default.
         ("tensor<?x4xf32>", (4,), "f32"),
         ("tensor<2x?x4xindex>", (2, 4), "index"),
         # Encoding attribute (RFC-allowed second positional).
@@ -115,16 +114,35 @@ def test_parse_tensor_type_rejects_non_tensor(type_str):
         # MLIR pretty-printer whitespace tolerance.
         ("tensor< 2 x f32 >", (2,), "f32"),
         ("tensor<1 x 64 x i32>", (1, 64), "i32"),
-        # Trailing context after the closing '>' — ignored, matching the
-        # original ``re.match``-based behaviour. Calls inside the parser
-        # rely on this when they pass un-stripped MLIR fragments.
+        # Trailing context after the closing '>' — ignored.
         ("tensor<4xf32> loc(unknown)", (4,), "f32"),
         ("tensor<4xf32>, %arg0", (4,), "f32"),
+        # memref wrapper
+        ("memref<128x32xf16>", (128, 32), "f16"),
+        ("memref<4x4xi32, #ktdp.spyre_memory_space<LX>>", (4, 4), "i32"),
+        # Bare inner content (no wrapper)
+        ("64x32xindex", (64, 32), "index"),
+        ("256xbf16", (256,), "bf16"),
     ],
 )
-def test_parse_tensor_type_real_mlir_forms(type_str, expected_shape, expected_dtype):
+def test_parse_tensor_or_memref_type_real_mlir_forms(type_str, expected_shape, expected_dtype):
     """Forms that the upstream MLIR pretty-printer can produce."""
-    info = parse_tensor_type(type_str)
+    info = parse_tensor_or_memref_type(type_str)
+    assert info == {"shape": expected_shape, "dtype": expected_dtype}
+
+
+@pytest.mark.parametrize(
+    "type_str, expected_shape, expected_dtype",
+    [
+        ("tensor<?x4xf32>", (None, 4), "f32"),
+        ("tensor<?xf16>", (None,), "f16"),
+        ("memref<?x32xf32>", (None, 32), "f32"),
+        ("128x?xindex", (128, None), "index"),
+    ],
+)
+def test_parse_tensor_or_memref_type_keep_dynamic_dims(type_str, expected_shape, expected_dtype):
+    """With keep_dynamic_dims=True, '?' dims appear as None."""
+    info = parse_tensor_or_memref_type(type_str, keep_dynamic_dims=True)
     assert info == {"shape": expected_shape, "dtype": expected_dtype}
 
 
@@ -152,7 +170,7 @@ def test_parse_tensor_type_real_mlir_forms(type_str, expected_shape, expected_dt
         ("tensor<4xvector<4xf32>>", (4,), "vector<4xf32>"),
     ],
 )
-def test_parse_tensor_type_nested_bracket_dtype(type_str, expected_shape, expected_dtype):
+def test_parse_tensor_or_memref_type_nested_bracket_dtype(type_str, expected_shape, expected_dtype):
     """xfail: dtypes whose own form contains ``<...>`` are not supported.
 
     The regex stops at the first ``>``, so ``complex<f32>`` is parsed
@@ -161,7 +179,7 @@ def test_parse_tensor_type_nested_bracket_dtype(type_str, expected_shape, expect
     bracket) and the trailing ``>`` unconsumed. A depth-counting parser
     is needed to fix this — out of scope for the current change.
     """
-    info = parse_tensor_type(type_str)
+    info = parse_tensor_or_memref_type(type_str)
     assert info == {"shape": expected_shape, "dtype": expected_dtype}
 
 

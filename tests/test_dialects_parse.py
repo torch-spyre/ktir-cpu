@@ -1323,34 +1323,36 @@ class TestParseAttrList:
         assert len(result) == 1
 
 
-from ktir_cpu.parser_utils import parse_tensor_type
+from ktir_cpu.parser_utils import parse_tensor_or_memref_type
 
 
-class TestParseTensorType:
+class TestParseTensorOrMemrefType:
     def test_basic_float(self):
-        assert parse_tensor_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
+        assert parse_tensor_or_memref_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
 
     def test_basic_int(self):
-        assert parse_tensor_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
+        assert parse_tensor_or_memref_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
 
     def test_multi_dim(self):
-        assert parse_tensor_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
 
     def test_index_dtype(self):
         # Regression: 'index' contains 'x'; old split('x') would corrupt the dtype.
-        assert parse_tensor_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
-        assert parse_tensor_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
+        assert parse_tensor_or_memref_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
+        assert parse_tensor_or_memref_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
 
     def test_dynamic_dims_dropped(self):
-        assert parse_tensor_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
-        assert parse_tensor_type("tensor<?xf16>") is None
+        assert parse_tensor_or_memref_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("tensor<?xf16>") is None
 
     def test_rank0_returns_none(self):
-        assert parse_tensor_type("tensor<f32>") is None
+        assert parse_tensor_or_memref_type("tensor<f32>") is None
 
-    def test_non_tensor_returns_none(self):
-        assert parse_tensor_type("memref<10xf32>") is None
-        assert parse_tensor_type("f32") is None
+    def test_memref_accepted(self):
+        assert parse_tensor_or_memref_type("memref<10xf32>") == {"shape": (10,), "dtype": "f32"}
+
+    def test_non_type_returns_none(self):
+        assert parse_tensor_or_memref_type("f32") is None
 
     @pytest.mark.xfail(strict=True, reason="nested '<>' in dtype unsupported; regex stops at first '>'")
     @pytest.mark.parametrize("type_str,expected", [
@@ -1359,7 +1361,7 @@ class TestParseTensorType:
         ("tensor<4xvector<4xf32>>", {"shape": (4,), "dtype": "vector<4xf32>"}),
     ])
     def test_nested_bracket_dtype_unsupported(self, type_str, expected):
-        assert parse_tensor_type(type_str) == expected
+        assert parse_tensor_or_memref_type(type_str) == expected
 
 
 # ---------------------------------------------------------------------------

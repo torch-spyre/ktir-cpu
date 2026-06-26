@@ -25,7 +25,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple
 from .ir_types import Operation, IRFunction, IRModule
 from .dialects import dispatch_parser, make_parse_context, ParseContext
-from .parser_utils import parse_attr_block, parse_tensor_type, parse_numeric
+from .parser_utils import parse_attr_block, parse_tensor_or_memref_type, parse_numeric
 from .parser_utils import find_ssa_names, parse_multi_result_lhs
 
 
@@ -631,7 +631,7 @@ class KTIRParser(KTIRParserBase):
         # For operations that have result type info, extract shape/dtype
         # and put them in attributes for the interpreter.
         if result_type:
-            type_info = parse_tensor_type(result_type)
+            type_info = parse_tensor_or_memref_type(result_type)
             if type_info and "shape" not in attributes:
                 attributes["_result_shape"] = type_info["shape"]
                 attributes["_result_dtype"] = type_info.get("dtype", "f16")

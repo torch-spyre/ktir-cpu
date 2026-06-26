@@ -22,7 +22,7 @@ import numpy as np
 from ..grid import CoreContext
 from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
-from ..parser_utils import find_ssa_names
+from ..parser_utils import find_ssa_names, parse_tensor_or_memref_type
 from .registry import register, register_parser
 
 
@@ -357,12 +357,12 @@ def tensor__generate(op, context, env):
 @register_parser("tensor.empty")
 def parse_tensor_empty(op_text, parse_ctx):
     """Parse tensor.empty() : tensor<1x1024xf16>"""
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     result_match = re.match(r'tensor\.empty\s*\(\s*\)\s*:\s*(.+)', op_text)
     if not result_match:
         return None
     type_str = result_match.group(1).strip()
-    type_info = parse_tensor_type(type_str)
+    type_info = parse_tensor_or_memref_type(type_str)
     attributes = {}
     if type_info:
         attributes["shape"] = type_info["shape"]
@@ -378,7 +378,7 @@ def parse_tensor_empty(op_text, parse_ctx):
 
 @register_parser("tensor.splat")
 def parse_tensor_splat(op_text, parse_ctx):
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     result_match = re.match(r'tensor\.splat\s+(%\w+)\s*(?::\s*(.+))?', op_text)
     if not result_match:
         return None
@@ -395,7 +395,7 @@ def parse_tensor_splat(op_text, parse_ctx):
 
     attributes = {}
 
-    type_info = parse_tensor_type(result_type)
+    type_info = parse_tensor_or_memref_type(result_type)
     if type_info:
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
@@ -449,17 +449,10 @@ def _parse_reshape_op(op_text, op_name):
     target_dtype = "f16"
     into_match = re.search(r'into\s+(?:tile|tensor)<([^>]+)>', op_text)
     if into_match:
-        inner = into_match.group(1)
-        parts = inner.split('x')
-        shape_parts = []
-        for p in parts[:-1]:
-            try:
-                shape_parts.append(int(p))
-            except ValueError:
-                pass
-        if shape_parts:
-            target_shape = tuple(shape_parts)
-            target_dtype = parts[-1]
+        info = parse_tensor_or_memref_type(into_match.group(1))
+        if info:
+            target_shape = tuple(d for d in info["shape"] if d is not None)
+            target_dtype = info["dtype"]
 
     attributes = {}
     if target_shape:
@@ -525,7 +518,7 @@ def parse_tensor_generate(op_text, parse_ctx):
       - result_name: %mask
       - shape/dtype from the trailing `: tensor<16x16xf16>` type annotation
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
 
     # Match: tensor.generate ...
     result_match = re.match(r'tensor\.generate', op_text)
@@ -539,7 +532,7 @@ def parse_tensor_generate(op_text, parse_ctx):
     type_match = re.search(r':\s*(tensor<[^>]+>)\s*$', op_text)
     if not type_match:
         raise ValueError(f"tensor.generate: missing result type in '{op_text}'")
-    type_info = parse_tensor_type(type_match.group(1))
+    type_info = parse_tensor_or_memref_type(type_match.group(1))
     if type_info:
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
@@ -571,7 +564,7 @@ def parse_tensor_reshape(op_text, parse_ctx):
     from the trailing result-type annotation (after `->`), since that is
     always statically pinned, while the shape operand may be runtime.
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     m = re.match(
         r'tensor\.reshape\s+(%\w+)\s*\(\s*(%\w+)\s*\)', op_text
     )
@@ -583,7 +576,7 @@ def parse_tensor_reshape(op_text, parse_ctx):
     if not arrow:
         raise ValueError(f"tensor.reshape: missing result type in '{op_text}'")
     result_type = arrow.group(1)
-    info = parse_tensor_type(result_type)
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(
             f"tensor.reshape: cannot parse result type {result_type!r} in '{op_text}'"
@@ -604,7 +597,7 @@ def parse_tensor_reshape(op_text, parse_ctx):
 @register_parser("tensor.from_elements")
 def parse_tensor_from_elements(op_text, parse_ctx):
     """Parse `%shape = tensor.from_elements %d0, %d1, ... : tensor<NxT>`."""
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     m = re.match(
         r'tensor\.from_elements\s+(.*?)\s*:\s*(tensor<[^>]+>)', op_text
     )
@@ -614,7 +607,7 @@ def parse_tensor_from_elements(op_text, parse_ctx):
     type_str = m.group(2)
     operands = find_ssa_names(operand_text)
 
-    info = parse_tensor_type(type_str)
+    info = parse_tensor_or_memref_type(type_str)
     if info is None:
         raise ValueError(
             f"tensor.from_elements: cannot parse result type {type_str!r} in '{op_text}'"
@@ -670,7 +663,7 @@ def parse_tensor_extract_slice(op_text, parse_ctx):
     Supports mixed static/dynamic entries: ``%off`` tokens become _KDYNAMIC
     in the static array and are appended to operands after the source.
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     m = re.match(r'tensor\.extract_slice\s+(%\w+)', op_text)
     if not m:
         return None
@@ -682,7 +675,7 @@ def parse_tensor_extract_slice(op_text, parse_ctx):
     if not result_type_m:
         raise ValueError(f"tensor.extract_slice: missing result type in {op_text!r}")
     result_type = result_type_m.group(1)
-    info = parse_tensor_type(result_type)
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
 
@@ -708,7 +701,7 @@ def parse_tensor_insert_slice(op_text, parse_ctx):
     Supports mixed static/dynamic entries: ``%off`` tokens become _KDYNAMIC
     in the static array and are appended to operands after source and dest.
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     m = re.match(
         r'tensor\.insert_slice\s+(%\w+)\s+into\s+(%\w+)', op_text
     )
@@ -723,7 +716,7 @@ def parse_tensor_insert_slice(op_text, parse_ctx):
     if not result_type_m:
         raise ValueError(f"tensor.insert_slice: missing result type in {op_text!r}")
     result_type = result_type_m.group(1)
-    info = parse_tensor_type(result_type)
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
 
