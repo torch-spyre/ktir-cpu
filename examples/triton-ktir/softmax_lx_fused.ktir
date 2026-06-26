@@ -1,0 +1,135 @@
+// Single-func, on-chip-fused KTIR — softmax(x) over [512, 1024] (reduce over the 1024 axis).
+//
+// Same 5 stages as softmax_multi.ktir (max, sub, exp, sum, div), but collapsed into ONE func with
+// ONE fixed grid = [32], and with NO intermediate HBM round-trips: the only HBM traffic is the
+// input load and the output store. The function therefore takes only %X (input) and %C (output) —
+// there are no %mx/%sb/%ex/%sm intermediate pointers (contrast softmax_multi.ktir).
+//
+// How the round-trips are removed: instead of letting each stage repartition (the planner's
+// {mb:16,out:2} / {mb:32,out:1} / {mb:1,out:32}), the kernel PINS one partition for the whole
+// kernel — the reduction layout {mb:16, out:2}:
+//     core = out*16 + mb ;  out in [0,2) -> 256 rows ;  mb in [0,16) -> one feature stick (64 wide)
+// so every core holds the SAME tile [256, 64] (its stick of its row-group) across all 5 stages.
+// Consequences:
+//   - max / sum are the only cross-core ops: a local reduce over the 64 width, then an
+//     inter_tile ALL-REDUCE over the 16-stick `mb` cohort (consumer set == producer set, so every
+//     core in the cohort ends with the full row max/sum — no reduce-to-one, no reload).
+//   - sub / exp / div are PURELY LOCAL: each core already holds its x tile and the all-reduced
+//     row max/sum, so they never touch HBM or another core.
+// This is the fusion "case (a)" win (fusing-triton-kernels.md §4.2): consecutive stages share the
+// slicing, so the hand-off stays on-chip in SSA rather than round-tripping HBM.
+//
+// PHYSICAL layout (data_dti.json): logical [512,1024] is stick-on-inner,
+//   sizes [16, 512, 64] = [stick, row, stick_width], strides [64, 1024, 1].
+// The stick index (dim 0) is the `mb` reduction-cohort axis, so the all-reduce runs over dim 0.
+
+#id3 = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+
+// Cross-core cohorts ({mb:16, out:2}): 16 contiguous tiles per group, 2 groups.
+// Tile i is in group g iff 16*g <= i <= 16*g + 15.  (i = core id = out*16 + mb)
+#cohort16 = affine_set<(i)[g] : (i - 16 * g >= 0, -i + 16 * g + 15 >= 0)>
+#groups2  = affine_set<(g) : (g >= 0, -g + 1 >= 0)>
+
+module @softmax_fused {
+  func.func @softmax(%X: index, %C: index)
+      attributes {grid = [32],
+                  // the reduction partition this kernel is pinned to (the other stages fuse onto it)
+                  numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %c16 = arith.constant 16 : index
+    %c64 = arith.constant 64 : index
+    %c256 = arith.constant 256 : index
+    %c0 = arith.constant 0 : index
+    %ninf = arith.constant 0xFC00 : f16            // -inf, max identity
+    %zero = arith.constant 0.000000e+00 : f16       // 0, add identity
+
+    %pid = ktdp.get_compute_tile_id : index
+    %out = arith.divsi %pid, %c16 : index           // 0..1   (row group)
+    %mb  = arith.remsi %pid, %c16 : index           // 0..15  (feature stick / reduction lane)
+    %row0 = arith.muli %out, %c256 : index
+
+    // -------- load this core's tile once: stick %mb, rows [row0, row0+256), full 64 width --------
+    %xv = ktdp.construct_memory_view %X, sizes: [16, 512, 64], strides: [32768, 64, 1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %xt = ktdp.construct_access_tile %xv[%mb, %row0, %c0]
+            {access_tile_set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>,
+             access_tile_order = #id3} : memref<16x512x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %x3 = ktdp.load %xt : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %x  = tensor.extract_slice %x3[0, 0, 0] [1, 256, 64] [1, 1, 1] : tensor<1x256x64xf16> to tensor<256x64xf16>
+
+    // ============ stage 0: max  (cross-core all-reduce over the `mb` cohort) ============
+    %m_init = tensor.empty() : tensor<256xf16>
+    %m_fill = linalg.fill ins(%ninf : f16) outs(%m_init : tensor<256xf16>) -> tensor<256xf16>
+    %lmax = linalg.reduce { arith.maxnumf } ins(%x : tensor<256x64xf16>)
+              outs(%m_fill : tensor<256xf16>) dimensions = [1]              // local max over the 64 width
+    %mid_e = tensor.empty() : tensor<256xf16>
+    %mid = linalg.fill ins(%ninf : f16) outs(%mid_e : tensor<256xf16>) -> tensor<256xf16>
+    %mfut = ktdp.inter_tile_produce
+        producer_tiles_per_group = #cohort16,
+        groups                   = #groups2
+        : tensor<256xf16> -> !ktdp.tile_future<tensor<256xf16>>
+    {
+      ^bb0(%gid: index):
+        ktdp.yield_partial %lmax : tensor<256xf16>
+    }
+    %rowmax = ktdp.inter_tile_reduce(%mfut)
+        consumer_tiles_per_group = #cohort16,
+        groups                   = #groups2,
+        identity(%mid : tensor<256xf16>)
+        : !ktdp.tile_future<tensor<256xf16>> -> tensor<256xf16>
+    {
+      ^bb0(%lhs: tensor<256xf16>, %rhs: tensor<256xf16>):
+        %mx = arith.maxnumf %lhs, %rhs : tensor<256xf16>
+        ktdp.yield_reduced %mx : tensor<256xf16>
+    }
+
+    // ============ stage 1: sub  (purely local — x and rowmax already on this core) ============
+    %sb_e = tensor.empty() : tensor<256x64xf16>
+    %max_b = linalg.broadcast ins(%rowmax : tensor<256xf16>) outs(%sb_e : tensor<256x64xf16>) dimensions = [1]
+    %xs = arith.subf %x, %max_b : tensor<256x64xf16>
+
+    // ============ stage 2: exp  (purely local) ============
+    %xe = math.exp %xs : tensor<256x64xf16>
+
+    // ============ stage 3: sum  (cross-core all-reduce over the `mb` cohort) ============
+    %s_init = tensor.empty() : tensor<256xf16>
+    %s_fill = linalg.fill ins(%zero : f16) outs(%s_init : tensor<256xf16>) -> tensor<256xf16>
+    %lsum = linalg.reduce { arith.addf } ins(%xe : tensor<256x64xf16>)
+              outs(%s_fill : tensor<256xf16>) dimensions = [1]              // local sum over the 64 width
+    %sid_e = tensor.empty() : tensor<256xf16>
+    %sid = linalg.fill ins(%zero : f16) outs(%sid_e : tensor<256xf16>) -> tensor<256xf16>
+    %sfut = ktdp.inter_tile_produce
+        producer_tiles_per_group = #cohort16,
+        groups                   = #groups2
+        : tensor<256xf16> -> !ktdp.tile_future<tensor<256xf16>>
+    {
+      ^bb0(%gid: index):
+        ktdp.yield_partial %lsum : tensor<256xf16>
+    }
+    %rowsum = ktdp.inter_tile_reduce(%sfut)
+        consumer_tiles_per_group = #cohort16,
+        groups                   = #groups2,
+        identity(%sid : tensor<256xf16>)
+        : !ktdp.tile_future<tensor<256xf16>> -> tensor<256xf16>
+    {
+      ^bb0(%lhs: tensor<256xf16>, %rhs: tensor<256xf16>):
+        %s = arith.addf %lhs, %rhs : tensor<256xf16>
+        ktdp.yield_reduced %s : tensor<256xf16>
+    }
+
+    // ============ stage 4: div  (purely local) ============
+    %db_e = tensor.empty() : tensor<256x64xf16>
+    %sum_b = linalg.broadcast ins(%rowsum : tensor<256xf16>) outs(%db_e : tensor<256x64xf16>) dimensions = [1]
+    %y = arith.divf %xe, %sum_b : tensor<256x64xf16>
+
+    // -------- store this core's output tile (the only other HBM access) --------
+    %y3_e = tensor.empty() : tensor<1x256x64xf16>
+    %y3 = tensor.insert_slice %y into %y3_e[0, 0, 0] [1, 256, 64] [1, 1, 1] : tensor<256x64xf16> into tensor<1x256x64xf16>
+    %cv = ktdp.construct_memory_view %C, sizes: [16, 512, 64], strides: [32768, 64, 1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %ct = ktdp.construct_access_tile %cv[%mb, %row0, %c0]
+            {access_tile_set = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>,
+             access_tile_order = #id3} : memref<16x512x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    ktdp.store %y3, %ct : tensor<1x256x64xf16>, <1x256x64xindex>
+    return
+  }
+}
