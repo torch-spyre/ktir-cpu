@@ -107,14 +107,23 @@ class KTIRParser(KTIRParserBase):
 
         # Find each func.func declaration and extract the body using
         # brace counting, which correctly skips the attributes { ... } block.
-        for match in re.finditer(r'func\.func\s+@(\w+)\s*\(([^)]*)\)', mlir_text):
+        # Collect all matches first so we can bound each function's search region.
+        all_func_matches = list(re.finditer(r'func\.func\s+@(\w+)\s*\(([^)]*)\)', mlir_text))
+        for idx, match in enumerate(all_func_matches):
             func_name = match.group(1)
             func_header_end = match.end()
+
+            # Limit search to text before the next func.func declaration so that
+            # _extract_brace_body cannot accidentally pick up a later function's body.
+            if idx + 1 < len(all_func_matches):
+                search_end = all_func_matches[idx + 1].start()
+            else:
+                search_end = len(mlir_text)
 
             # Extract the full header up to the body-opening brace.
             # There may be an attributes { ... } block before the body { ... }.
             # We skip brace-balanced blocks until we find the body.
-            func_body, body_end = self._extract_brace_body(mlir_text, func_header_end)
+            func_body, body_end = self._extract_brace_body(mlir_text[:search_end], func_header_end)
             if func_body is None:
                 continue
 
@@ -435,6 +444,9 @@ class KTIRParser(KTIRParserBase):
         # Match as op names (start of line or after `= `) to avoid false hits
         # on SSA names like `%sum_returned_val`.
         if re.match(r'(?:%\w+\s*=\s*)?(?:return\b|\w+\.yield\b)', text):
+            return True
+        # Void function-call return type: `-> ()`.
+        if re.search(r'->\s*\(\s*\)\s*$', text):
             return True
         # Type annotation: `: <type>` or `-> <type>` at end
         if self._TYPE_TERMINAL_RE.search(text):
