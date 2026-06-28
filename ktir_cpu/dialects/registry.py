@@ -198,3 +198,5 @@ class ExecutionEnv:
     # may contain comm ops.  When None, scf handlers fall back to a thin
     # generator wrapper around execute_region (no comm ops will be scheduled).
     execute_region_with_comms: Callable[[CoreContext, List[Operation]], Any] = None
+    # IRModule — set at runtime so func.call handlers can look up callees.
+    module: Any = None

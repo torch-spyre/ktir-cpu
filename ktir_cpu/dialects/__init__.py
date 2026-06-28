@@ -21,6 +21,7 @@ imports of the individual dialect modules.
 
 from . import (  # noqa: F401 — imported for registration side effects
     arith_ops,
+    func_ops,
     ktdp_ops,
     linalg_ops,
     math_ops,

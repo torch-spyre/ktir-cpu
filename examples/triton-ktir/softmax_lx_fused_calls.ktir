@@ -1,0 +1,314 @@
+// LX-fused softmax using func.call — 5 stages, zero intermediate HBM traffic.
+//
+// Demonstrates multi-func KTIR: the entry point @softmax sequences 5 subfunctions
+// via func.call at the top level.  Each stage runs the full 32-core grid and
+// communicates through per-core LX scratchpad (ktdp.construct_memory_view with
+// memory_space = #ktdp.spyre_memory_space<LX>).
+//
+// Key constraint: func.call ops must appear at the TOP LEVEL of a function body,
+// never inside an scf.for or scf.if region.  The interpreter executes each callee
+// as a complete grid synchronisation point; nesting calls inside loops would
+// interleave the scheduler's comm-delivery queues in undefined ways.
+//
+// HBM traffic: 1 read (X in stage_max) + 1 write (Y in stage_div) = 2 passes.
+//
+// LX layout (per-core, compile-time byte offsets — shapes are static):
+//   x_lx        524288   [1,256,64]×f16 = 32 768 B  (x tile after stage_max)
+//   max_lx      557056   [1,256, 1]×f16 =    512 B  (all-reduced rowmax)
+//   shifted_lx  557568   [1,256,64]×f16 = 32 768 B  (x − rowmax)
+//   exp_lx      590336   [1,256,64]×f16 = 32 768 B  (exp(x − rowmax))
+//   sum_lx      623104   [1,256, 1]×f16 =    512 B  (all-reduced rowsum)
+//   Total per core ≈ 99 KB  (well within 2 MB LX capacity)
+//
+// Base 512 KB = 524288 keeps persistent buffers well above the per-stage
+// temp watermark (~33 KB: only ktdp.load bumps lx.next_ptr; ktdp.store does not).
+//
+// Physical layout: [16, 512, 64] stick-major, strides [32768, 64, 1].
+// Partition: grid=[32], {mb:16, out:2}.  Core i = out*16 + mb; each core owns
+// a [256, 64] slice (256 rows × 64-wide feature stick).
+
+#id3      = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
+#cohort16 = affine_set<(i)[g] : (i - 16 * g >= 0, -i + 16 * g + 15 >= 0)>
+#groups2  = affine_set<(g) : (g >= 0, -g + 1 >= 0)>
+
+// Shared access-tile coordinate sets.
+// Full [1,256,64] tile (x, shifted, exp):
+#full_tile   = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 63 >= 0)>
+// Scalar [1,256,1] tile (rowmax, rowsum):
+#scalar_tile = affine_set<(d0, d1, d2) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 255 >= 0, d2 >= 0, -d2 + 0 >= 0)>
+
+module @softmax_lx_fused_calls {
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // stage_max: load X from HBM, all-reduce rowmax, persist x tile + max in LX
+  // ─────────────────────────────────────────────────────────────────────────
+  func.func @stage_max(%X: index, %x_lx: index, %max_lx: index)
+      attributes {grid = [32], numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %c0   = arith.constant 0 : index
+    %c16  = arith.constant 16 : index
+    %c256 = arith.constant 256 : index
+    %ninf = arith.constant 0xFC00 : f16
+
+    %pid  = ktdp.get_compute_tile_id : index
+    %out  = arith.divsi %pid, %c16 : index
+    %mb   = arith.remsi %pid, %c16 : index
+    %row0 = arith.muli %out, %c256 : index
+
+    // Load this core's [1,256,64] slice from HBM
+    %xv = ktdp.construct_memory_view %X, sizes: [16, 512, 64], strides: [32768, 64, 1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %xt = ktdp.construct_access_tile %xv[%mb, %row0, %c0]
+            {access_tile_set = #full_tile,
+             access_tile_order = #id3} : memref<16x512x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %x3 = ktdp.load %xt : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %x  = tensor.extract_slice %x3[0, 0, 0] [1, 256, 64] [1, 1, 1]
+            : tensor<1x256x64xf16> to tensor<256x64xf16>
+
+    // Local reduce-max over the 64-wide feature stick
+    %m_init = tensor.empty() : tensor<256xf16>
+    %m_fill = linalg.fill ins(%ninf : f16) outs(%m_init : tensor<256xf16>) -> tensor<256xf16>
+    %lmax = linalg.reduce { arith.maxnumf } ins(%x : tensor<256x64xf16>)
+              outs(%m_fill : tensor<256xf16>) dimensions = [1]
+
+    // All-reduce rowmax across the 16-core mb cohort
+    %mid_e = tensor.empty() : tensor<256xf16>
+    %mid   = linalg.fill ins(%ninf : f16) outs(%mid_e : tensor<256xf16>) -> tensor<256xf16>
+    %mfut = ktdp.inter_tile_produce
+        producer_tiles_per_group = #cohort16,
+        groups                   = #groups2
+        : tensor<256xf16> -> !ktdp.tile_future<tensor<256xf16>>
+    {
+      ^bb0(%gid: index):
+        ktdp.yield_partial %lmax : tensor<256xf16>
+    }
+    %rowmax = ktdp.inter_tile_reduce(%mfut)
+        consumer_tiles_per_group = #cohort16,
+        groups                   = #groups2,
+        identity(%mid : tensor<256xf16>)
+        : !ktdp.tile_future<tensor<256xf16>> -> tensor<256xf16>
+    {
+      ^bb0(%lhs: tensor<256xf16>, %rhs: tensor<256xf16>):
+        %mx = arith.maxnumf %lhs, %rhs : tensor<256xf16>
+        ktdp.yield_reduced %mx : tensor<256xf16>
+    }
+
+    // Persist x tile in LX so stage_sub avoids re-reading HBM
+    %xlv = ktdp.construct_memory_view %x_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %xlt = ktdp.construct_access_tile %xlv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    ktdp.store %x3, %xlt : tensor<1x256x64xf16>, <1x256x64xindex>
+
+    // Persist rowmax in LX as [1,256,1]
+    %mlv = ktdp.construct_memory_view %max_lx, sizes: [1, 256, 1], strides: [256, 1, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x1xf16>
+    %mlt = ktdp.construct_access_tile %mlv[%c0, %c0, %c0]
+             {access_tile_set = #scalar_tile,
+              access_tile_order = #id3} : memref<1x256x1xf16> -> !ktdp.access_tile<1x256x1xindex>
+    %max3_e = tensor.empty() : tensor<1x256x1xf16>
+    %max3   = tensor.insert_slice %rowmax into %max3_e[0, 0, 0] [1, 256, 1] [1, 1, 1]
+                : tensor<256xf16> into tensor<1x256x1xf16>
+    ktdp.store %max3, %mlt : tensor<1x256x1xf16>, <1x256x1xindex>
+    return
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // stage_sub: read x and rowmax from LX, compute x - rowmax, store to LX
+  // ─────────────────────────────────────────────────────────────────────────
+  func.func @stage_sub(%x_lx: index, %max_lx: index, %shifted_lx: index)
+      attributes {grid = [32], numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %c0 = arith.constant 0 : index
+
+    %xlv = ktdp.construct_memory_view %x_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %xlt = ktdp.construct_access_tile %xlv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %x3 = ktdp.load %xlt : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %x  = tensor.extract_slice %x3[0, 0, 0] [1, 256, 64] [1, 1, 1]
+            : tensor<1x256x64xf16> to tensor<256x64xf16>
+
+    %mlv = ktdp.construct_memory_view %max_lx, sizes: [1, 256, 1], strides: [256, 1, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x1xf16>
+    %mlt = ktdp.construct_access_tile %mlv[%c0, %c0, %c0]
+             {access_tile_set = #scalar_tile,
+              access_tile_order = #id3} : memref<1x256x1xf16> -> !ktdp.access_tile<1x256x1xindex>
+    %max3   = ktdp.load %mlt : <1x256x1xindex> -> tensor<1x256x1xf16>
+    %rowmax = tensor.extract_slice %max3[0, 0, 0] [1, 256, 1] [1, 1, 1]
+                : tensor<1x256x1xf16> to tensor<256xf16>
+
+    %sb_e  = tensor.empty() : tensor<256x64xf16>
+    %max_b = linalg.broadcast ins(%rowmax : tensor<256xf16>)
+               outs(%sb_e : tensor<256x64xf16>) dimensions = [1]
+    %xs = arith.subf %x, %max_b : tensor<256x64xf16>
+
+    %slv = ktdp.construct_memory_view %shifted_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %slt = ktdp.construct_access_tile %slv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %xs3_e = tensor.empty() : tensor<1x256x64xf16>
+    %xs3   = tensor.insert_slice %xs into %xs3_e[0, 0, 0] [1, 256, 64] [1, 1, 1]
+               : tensor<256x64xf16> into tensor<1x256x64xf16>
+    ktdp.store %xs3, %slt : tensor<1x256x64xf16>, <1x256x64xindex>
+    return
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // stage_exp: read shifted from LX, compute exp, store to LX
+  // ─────────────────────────────────────────────────────────────────────────
+  func.func @stage_exp(%shifted_lx: index, %exp_lx: index)
+      attributes {grid = [32], numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %c0 = arith.constant 0 : index
+
+    %slv = ktdp.construct_memory_view %shifted_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %slt = ktdp.construct_access_tile %slv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %xs3 = ktdp.load %slt : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %xs  = tensor.extract_slice %xs3[0, 0, 0] [1, 256, 64] [1, 1, 1]
+             : tensor<1x256x64xf16> to tensor<256x64xf16>
+
+    %xe = math.exp %xs : tensor<256x64xf16>
+
+    %elv = ktdp.construct_memory_view %exp_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %elt = ktdp.construct_access_tile %elv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %xe3_e = tensor.empty() : tensor<1x256x64xf16>
+    %xe3   = tensor.insert_slice %xe into %xe3_e[0, 0, 0] [1, 256, 64] [1, 1, 1]
+               : tensor<256x64xf16> into tensor<1x256x64xf16>
+    ktdp.store %xe3, %elt : tensor<1x256x64xf16>, <1x256x64xindex>
+    return
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // stage_sum: read exp from LX, all-reduce rowsum, persist sum in LX
+  // ─────────────────────────────────────────────────────────────────────────
+  func.func @stage_sum(%exp_lx: index, %sum_lx: index)
+      attributes {grid = [32], numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %c0   = arith.constant 0 : index
+    %zero = arith.constant 0.000000e+00 : f16
+
+    %elv = ktdp.construct_memory_view %exp_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %elt = ktdp.construct_access_tile %elv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %xe3 = ktdp.load %elt : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %xe  = tensor.extract_slice %xe3[0, 0, 0] [1, 256, 64] [1, 1, 1]
+             : tensor<1x256x64xf16> to tensor<256x64xf16>
+
+    %s_init = tensor.empty() : tensor<256xf16>
+    %s_fill = linalg.fill ins(%zero : f16) outs(%s_init : tensor<256xf16>) -> tensor<256xf16>
+    %lsum = linalg.reduce { arith.addf } ins(%xe : tensor<256x64xf16>)
+              outs(%s_fill : tensor<256xf16>) dimensions = [1]
+
+    // All-reduce sum across the 16-core mb cohort
+    %sid_e = tensor.empty() : tensor<256xf16>
+    %sid   = linalg.fill ins(%zero : f16) outs(%sid_e : tensor<256xf16>) -> tensor<256xf16>
+    %sfut = ktdp.inter_tile_produce
+        producer_tiles_per_group = #cohort16,
+        groups                   = #groups2
+        : tensor<256xf16> -> !ktdp.tile_future<tensor<256xf16>>
+    {
+      ^bb0(%gid: index):
+        ktdp.yield_partial %lsum : tensor<256xf16>
+    }
+    %rowsum = ktdp.inter_tile_reduce(%sfut)
+        consumer_tiles_per_group = #cohort16,
+        groups                   = #groups2,
+        identity(%sid : tensor<256xf16>)
+        : !ktdp.tile_future<tensor<256xf16>> -> tensor<256xf16>
+    {
+      ^bb0(%lhs: tensor<256xf16>, %rhs: tensor<256xf16>):
+        %s = arith.addf %lhs, %rhs : tensor<256xf16>
+        ktdp.yield_reduced %s : tensor<256xf16>
+    }
+
+    %slv = ktdp.construct_memory_view %sum_lx, sizes: [1, 256, 1], strides: [256, 1, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x1xf16>
+    %slt = ktdp.construct_access_tile %slv[%c0, %c0, %c0]
+             {access_tile_set = #scalar_tile,
+              access_tile_order = #id3} : memref<1x256x1xf16> -> !ktdp.access_tile<1x256x1xindex>
+    %sum3_e = tensor.empty() : tensor<1x256x1xf16>
+    %sum3   = tensor.insert_slice %rowsum into %sum3_e[0, 0, 0] [1, 256, 1] [1, 1, 1]
+                : tensor<256xf16> into tensor<1x256x1xf16>
+    ktdp.store %sum3, %slt : tensor<1x256x1xf16>, <1x256x1xindex>
+    return
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // stage_div: read exp and rowsum from LX, compute exp/rowsum, write Y to HBM
+  // ─────────────────────────────────────────────────────────────────────────
+  func.func @stage_div(%exp_lx: index, %sum_lx: index, %Y: index)
+      attributes {grid = [32], numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %c0   = arith.constant 0 : index
+    %c16  = arith.constant 16 : index
+    %c256 = arith.constant 256 : index
+
+    %pid  = ktdp.get_compute_tile_id : index
+    %out  = arith.divsi %pid, %c16 : index
+    %mb   = arith.remsi %pid, %c16 : index
+    %row0 = arith.muli %out, %c256 : index
+
+    %elv = ktdp.construct_memory_view %exp_lx, sizes: [1, 256, 64], strides: [16384, 64, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x64xf16>
+    %elt = ktdp.construct_access_tile %elv[%c0, %c0, %c0]
+             {access_tile_set = #full_tile,
+              access_tile_order = #id3} : memref<1x256x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    %xe3 = ktdp.load %elt : <1x256x64xindex> -> tensor<1x256x64xf16>
+    %xe  = tensor.extract_slice %xe3[0, 0, 0] [1, 256, 64] [1, 1, 1]
+             : tensor<1x256x64xf16> to tensor<256x64xf16>
+
+    %slv = ktdp.construct_memory_view %sum_lx, sizes: [1, 256, 1], strides: [256, 1, 1]
+             {memory_space = #ktdp.spyre_memory_space<LX>} : memref<1x256x1xf16>
+    %slt = ktdp.construct_access_tile %slv[%c0, %c0, %c0]
+             {access_tile_set = #scalar_tile,
+              access_tile_order = #id3} : memref<1x256x1xf16> -> !ktdp.access_tile<1x256x1xindex>
+    %sum3   = ktdp.load %slt : <1x256x1xindex> -> tensor<1x256x1xf16>
+    %rowsum = tensor.extract_slice %sum3[0, 0, 0] [1, 256, 1] [1, 1, 1]
+                : tensor<1x256x1xf16> to tensor<256xf16>
+
+    %db_e  = tensor.empty() : tensor<256x64xf16>
+    %sum_b = linalg.broadcast ins(%rowsum : tensor<256xf16>)
+               outs(%db_e : tensor<256x64xf16>) dimensions = [1]
+    %y = arith.divf %xe, %sum_b : tensor<256x64xf16>
+
+    %y3_e = tensor.empty() : tensor<1x256x64xf16>
+    %y3   = tensor.insert_slice %y into %y3_e[0, 0, 0] [1, 256, 64] [1, 1, 1]
+              : tensor<256x64xf16> into tensor<1x256x64xf16>
+    %cv = ktdp.construct_memory_view %Y, sizes: [16, 512, 64], strides: [32768, 64, 1]
+            {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<16x512x64xf16>
+    %ct = ktdp.construct_access_tile %cv[%mb, %row0, %c0]
+            {access_tile_set = #full_tile,
+             access_tile_order = #id3} : memref<16x512x64xf16> -> !ktdp.access_tile<1x256x64xindex>
+    ktdp.store %y3, %ct : tensor<1x256x64xf16>, <1x256x64xindex>
+    return
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // @softmax: entry point.
+  //
+  // All func.call ops are at the top level — not inside any scf.for/scf.if.
+  // LX base addresses are arith.constant (compile-time; shapes are static).
+  // ─────────────────────────────────────────────────────────────────────────
+  func.func @softmax(%X: index, %Y: index)
+      attributes {grid = [32], numWkSlicesPerDim = {mb = 16, out = 2}} {
+    %x_lx       = arith.constant 524288 : index
+    %max_lx     = arith.constant 557056 : index
+    %shifted_lx = arith.constant 557568 : index
+    %exp_lx     = arith.constant 590336 : index
+    %sum_lx     = arith.constant 623104 : index
+
+    func.call @stage_max(%X, %x_lx, %max_lx)               : (index, index, index) -> ()
+    func.call @stage_sub(%x_lx, %max_lx, %shifted_lx)      : (index, index, index) -> ()
+    func.call @stage_exp(%shifted_lx, %exp_lx)              : (index, index) -> ()
+    func.call @stage_sum(%exp_lx, %sum_lx)                  : (index, index) -> ()
+    func.call @stage_div(%exp_lx, %sum_lx, %Y)              : (index, index, index) -> ()
+    return
+  }
+}

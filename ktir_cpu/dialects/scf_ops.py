@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SCF / func dialect handlers — if, for, yield, return."""
+"""SCF dialect handlers — scf.if, scf.for, scf.yield."""
 
 import re
 
@@ -87,19 +87,6 @@ def scf__for(op, context, env):
 def scf__yield(op, context, env):
     values = [context.get_value(name) for name in op.operands]
     return ControlOps.yield_op(values)
-
-
-@register("func.return")
-def func__return(op, context, env):
-    if op.operands:
-        return context.get_value(op.operands[0])
-    return None
-
-
-# Also register the bare "return" alias
-@register("return")
-def _return_alias(op, context, env):
-    return func__return(op, context, env)
 
 
 # ---------------------------------------------------------------------------
@@ -186,3 +173,5 @@ def parse_scf_yield(op_text, parse_ctx):
         attributes={},
         result_type=None,
     )
+
+

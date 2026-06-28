@@ -112,6 +112,7 @@ class KTIRInterpreter:
             grid_executor=self.grid_executor,
             execute_region=self.execute_region,
             execute_region_with_comms=self.execute_region_with_comms,
+            module=self.module,
         )
         if self._latency_tracker is not None:
             self._latency_tracker.reset()

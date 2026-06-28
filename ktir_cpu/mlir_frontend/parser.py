@@ -149,7 +149,18 @@ class MLIRTypeAdapter:
         )
 
     def adapt_block(self, block) -> List[Operation]:
-        return [self.adapt_op(op) for op in block.operations]
+        ops = []
+        block_args = list(block.arguments)
+        if block_args:
+            ops.append(Operation(
+                result=None,
+                op_type="region.bb0_args",
+                operands=[],
+                attributes={"names": [a.get_name() for a in block_args]},
+                result_type=None,
+            ))
+        ops.extend(self.adapt_op(op) for op in block.operations)
+        return ops
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +174,13 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 MLIRTypeAdapter.install(
     "func.return",
     "linalg.add",
+    "linalg.max",
     "linalg.fill",
     "linalg.yield",
     "scf.yield",
     "scf.if",
+    "ktdp.yield_partial",
+    "ktdp.yield_reduced",
     # float binary
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf",
     # float unary
@@ -224,6 +238,12 @@ MLIRTypeAdapter.install(
     # emitted by the bindings walk but not present in text IR
     "ktdp.region_terminator",
 )(_no_attrs)
+
+
+@MLIRTypeAdapter.install("func.call")
+def _adapt_func_call(mlir_op, attributes, result_type, operands):
+    """Extract callee name from FlatSymbolRefAttr (e.g. '@name' → 'name')."""
+    attributes["callee"] = str(mlir_op.attributes["callee"]).lstrip("@")
 
 
 @MLIRTypeAdapter.install("scf.for")
@@ -667,6 +687,54 @@ def _adapt_tensor_generate(mlir_op, attributes, result_type, operands):
         raise ValueError(f"tensor.generate: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
     attributes["dtype"] = info["dtype"]
+
+
+@MLIRTypeAdapter.install("ktdp.inter_tile_produce")
+def _adapt_inter_tile_produce(mlir_op, attributes, result_type, operands):
+    """Extract producer_tiles_per_group, groups, and partial_tensor_types from result type.
+
+    result_type is "!ktdp.tile_future<T_p_1, ...>" — split the inner content to
+    produce partial_tensor_types, matching what the regex parser produces.
+    """
+    from ..parser_utils import split_top_level
+    attributes["producer_tiles_per_group"] = parse_affine_set(
+        str(mlir_op.attributes["producer_tiles_per_group"])
+    )
+    attributes["groups"] = parse_affine_set(
+        str(mlir_op.attributes["groups"])
+    )
+    # Parse "!ktdp.tile_future<T1, T2, ...>" → ("T1", "T2", ...)
+    m = re.match(r"!ktdp\.tile_future<(.+)>", result_type or "")
+    if not m:
+        raise ValueError(
+            f"ktdp.inter_tile_produce: cannot parse tile_future result type {result_type!r}"
+        )
+    inner = m.group(1).strip()
+    attributes["partial_tensor_types"] = tuple(
+        p.strip() for p in split_top_level(inner)
+    )
+
+
+@MLIRTypeAdapter.install("ktdp.inter_tile_reduce")
+def _adapt_inter_tile_reduce(mlir_op, attributes, result_type, operands):
+    """Extract consumer_tiles_per_group, groups, optional producer_dependency_per_consumer,
+    and _result_shape from the result type, matching the regex parser's output.
+    """
+    from ..parser_utils import parse_tensor_type
+    attributes["consumer_tiles_per_group"] = parse_affine_set(
+        str(mlir_op.attributes["consumer_tiles_per_group"])
+    )
+    attributes["groups"] = parse_affine_set(
+        str(mlir_op.attributes["groups"])
+    )
+    if "producer_dependency_per_consumer" in mlir_op.attributes:
+        attributes["producer_dependency_per_consumer"] = parse_affine_set(
+            str(mlir_op.attributes["producer_dependency_per_consumer"])
+        )
+    if result_type is not None:
+        parsed = parse_tensor_type(result_type)
+        if parsed is not None:
+            attributes["_result_shape"] = parsed["shape"]
 
 
 _DYNAMIC_SIZE = -(1 << 63)  # ShapedType::kDynamic in MLIR
