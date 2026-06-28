@@ -246,20 +246,27 @@ def linalg__reduce(op, context, env):
     return result
 
 
-@register("linalg.add", latency_category=LC.COMPUTE_FLOAT)
-def linalg__add(op, context, env):
-    """Elementwise tensor add — ``%c = linalg.add ins(%a, %b) outs(%init)``.
+_LINALG_BINOP = {
+    "linalg.add": lambda a, b: a + b,
+    "linalg.max": np.maximum,
+}
 
-    Standard MLIR named op: result = a + b (the outs buffer provides the
-    destination shape only; its values are not accumulated into in v1).
+
+@register("linalg.add", "linalg.max", latency_category=LC.COMPUTE_FLOAT)
+def linalg__binop(op, context, env):
+    """Elementwise binary named ops (add, max) — ins(%a, %b) outs(%init).
+
+    The outs buffer provides the destination shape only; its values are
+    not accumulated into the result.
     """
     tile_a = context.get_value(op.operands[0])
     tile_b = context.get_value(op.operands[1])
     if not isinstance(tile_a, Tile) or not isinstance(tile_b, Tile):
         raise TypeError(
-            f"linalg.add: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
+            f"{op.op_type}: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
         )
-    return Tile(tile_a.data + tile_b.data, tile_a.dtype, tile_a.shape)
+    fn = _LINALG_BINOP[op.op_type]
+    return Tile(fn(tile_a.data, tile_b.data), tile_a.dtype, tile_a.shape)
 
 
 @register("linalg.fill")

@@ -174,6 +174,7 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 MLIRTypeAdapter.install(
     "func.return",
     "linalg.add",
+    "linalg.max",
     "linalg.fill",
     "linalg.yield",
     "scf.yield",
