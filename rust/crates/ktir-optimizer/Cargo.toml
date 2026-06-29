@@ -1,0 +1,15 @@
+[package]
+name = "ktir-optimizer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"  # f16 NEON SIMD intrinsics (ktir-core codec) stabilized in 1.94; verified MSRV
+description = "KTIR IR→IR optimization passes (function fusion, trace packing). Depends only on ktir-core."
+license = "Apache-2.0"
+repository = "https://github.com/torch-spyre/ktir-cpu"
+
+[lib]
+name = "ktir_optimizer"
+path = "src/lib.rs"
+
+[dependencies]
+ktir-core = { path = "../ktir-core", version = "0.1.0" }
