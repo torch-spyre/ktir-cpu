@@ -76,12 +76,14 @@ def test_memory_hierarchy():
     assert np.allclose(data, lx_read), "LX read/write mismatch"
     print(f"✓ LX scratchpad: wrote {data.nbytes} bytes, read back OK")
 
-    # Test capacity enforcement via CoreContext.track_lx()
+    # Test capacity enforcement via CoreContext.set_value() auto-tracking
     from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import Tile as _Tile
     ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                       lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
     with pytest.raises(MemoryError):
-        ctx.track_lx("%huge", 3 * 1024 * 1024)  # 3MB > 2MB limit
+        huge = _Tile(np.zeros((1024, 1536), dtype=np.float16), "f16", (1024, 1536))  # 3 MB
+        ctx.set_value("%huge", huge)
     print("✓ LX capacity enforcement: MemoryError raised as expected")
 
     print("✓ Memory hierarchy test passed\n")

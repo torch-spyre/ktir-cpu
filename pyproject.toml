@@ -49,3 +49,10 @@ markers = [
     "spec_gap: RFC conformance gap — feature not yet implemented in the interpreter",
     "regex_only: test validates regex-parser-specific behaviour; skipped under the MLIR frontend adapter",
 ]
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.9",
+    "pytest>=9.0.2",
+]

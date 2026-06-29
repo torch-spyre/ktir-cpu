@@ -108,34 +108,72 @@ class _TraceEntry:
     """Single operation trace entry."""
     op_type: str
     cycles: float
-    category: str  # "compute", "memory", "comm", "zero"
+    category: str
 
 
 @dataclass
 class CoreLatencyCounters:
     """Per-core cycle counters."""
-    compute_cycles: float = 0.0
     memory_cycles: float = 0.0
     comm_cycles: float = 0.0
-    total_flops: float = 0.0
-    total_bytes: int = 0
+    # Per-category flops, cycles, and bytes — keys are LatencyCategory string values.
+    # Compute categories: "compute_matmul", "compute_float", "compute_transcendental", "compute_int".
+    flops_by_category: Dict[str, float] = field(default_factory=dict)
+    cycles_by_category: Dict[str, float] = field(default_factory=dict)
+    # Bytes split by transport: the roofline uses DRAM-only traffic for arithmetic
+    # intensity, while comm/ring bytes stay separately readable (dram_bytes / comm_bytes).
+    bytes_by_category: Dict[str, int] = field(default_factory=dict)
     trace: Optional[List[_TraceEntry]] = None
 
     @property
     def total_cycles(self) -> float:
         return self.compute_cycles + self.memory_cycles + self.comm_cycles
 
+    @property
+    def compute_cycles(self) -> float:
+        return sum(self.cycles_by_category.values())
+
+    @property
+    def total_flops(self) -> float:
+        return sum(self.flops_by_category.values())
+
+    @property
+    def total_bytes(self) -> int:
+        """All bytes moved by this core, across every transport (HBM + comm/ring)."""
+        return sum(self.bytes_by_category.values())
+
+    @property
+    def comm_bytes(self) -> int:
+        """Bytes this core moved over the cross-core comm transport (ring)."""
+        return self.bytes_by_category.get("comm", 0)
+
+    @property
+    def dram_bytes(self) -> int:
+        """Bytes crossing the HBM/DRAM boundary — the ``"memory"`` category.
+
+        The traffic the roofline's HBM bandwidth ceiling governs, hence the correct
+        denominator for arithmetic intensity. It sums only the ``"memory"`` category
+        (HBM load/store bytes): a per-transport whitelist, so any other transport —
+        comm/ring, or a future interconnect — contributes only if explicitly
+        categorised ``"memory"``. On-chip LX ops record 0 bytes, so they never
+        enter here.
+        """
+        return self.bytes_by_category.get("memory", 0)
+
     def record(self, category: str, cycles: float, op_type: str = "",
                flops: float = 0.0, nbytes: int = 0):
-        if category == "compute":
-            self.compute_cycles += cycles
+        if category.startswith("compute_"):
+            self.cycles_by_category[category] = self.cycles_by_category.get(category, 0.0) + cycles
+            self.flops_by_category[category] = self.flops_by_category.get(category, 0.0) + flops
         elif category == "memory":
             self.memory_cycles += cycles
         elif category == "comm":
             self.comm_cycles += cycles
 
-        self.total_flops += flops
-        self.total_bytes += nbytes
+        # Bucket bytes by transport so the roofline can isolate HBM/DRAM traffic
+        # (dram_bytes) from comm/ring traffic (comm_bytes); total_bytes sums both.
+        if nbytes:
+            self.bytes_by_category[category] = self.bytes_by_category.get(category, 0) + nbytes
 
         if self.trace is not None:
             self.trace.append(_TraceEntry(op_type=op_type, cycles=cycles, category=category))
@@ -214,7 +252,7 @@ class LatencyTracker:
             m, n, k = self._matmul_dims(operands)
             flops = 2.0 * m * n * k
             cycles = flops / self.config.systolic_flops_per_cycle
-            return ("compute", cycles, flops, 0)
+            return (str(LC.COMPUTE_MATMUL), cycles, flops, 0)
 
         if category == LC.COMPUTE_TRANSCENDENTAL:
             # Transcendentals (exp, log, …): 1 FLOP per element, same
@@ -223,14 +261,14 @@ class LatencyTracker:
             # increase the FLOP count.
             n_elems = self._num_elements(result, operands)
             cycles = (n_elems / self.config.simd_elements_per_cycle) * self.config.transcendental_penalty
-            return ("compute", cycles, float(n_elems), 0)
+            return (str(LC.COMPUTE_TRANSCENDENTAL), cycles, float(n_elems), 0)
 
         if category == LC.COMPUTE_FLOAT:
             # Elementwise float (addf, mulf, …): 1 FLOP per element,
             # one SIMD-width per cycle.  No memory traffic.
             n_elems = self._num_elements(result, operands)
             cycles = n_elems / self.config.simd_elements_per_cycle
-            return ("compute", cycles, float(n_elems), 0)
+            return (str(LC.COMPUTE_FLOAT), cycles, float(n_elems), 0)
 
         if category == LC.COMPUTE_INT:
             # Integer ops (addi, muli, index casts, …): 1 FLOP per element.
@@ -238,9 +276,9 @@ class LatencyTracker:
             if n_elems <= 1:
                 # Scalar index arithmetic (e.g. address/offset computation) is
                 # resolved at compile time and has no runtime cost.
-                return ("compute", 0.0, 0.0, 0)
+                return (str(LC.COMPUTE_INT), 0.0, 0.0, 0)
             cycles = n_elems / self.config.simd_elements_per_cycle
-            return ("compute", cycles, float(n_elems), 0)
+            return (str(LC.COMPUTE_INT), cycles, float(n_elems), 0)
 
         if category == LC.COMM:
             # Ring/transport bytes for this core's contribution to the
@@ -447,19 +485,19 @@ class LatencyReport:
             })
         return summaries
 
-    def roofline(self) -> Dict[str, float]:
-        """Compute roofline metrics for the critical-path core.
+    def roofline(self) -> Dict[str, Any]:
+        """Compute per-unit roofline metrics for the critical-path core.
 
-        The roofline model shows the maximum achievable performance as a
-        function of a kernel's arithmetic intensity (AI = FLOPs / bytes
-        transferred).  Two hardware limits form a "roof"::
+        Two compute units are modelled (systolic for matmul, SIMD for everything
+        else).  The dominant unit — whichever consumed the most compute cycles —
+        sets the headline.  The chart shows one roof::
 
             GFLOP/s
               ^
-              |         peak_gflops
-              |        .-----------——————————  compute ceiling
+              |         peak (dominant unit)
+              |        .----------------------------  compute ceiling
               |       /
-              |      /    * achieved (kernel)
+              |      /    * kernel dot
               |     /
               |    /
               |   /  BW ceiling = peak_bw × AI
@@ -467,76 +505,171 @@ class LatencyReport:
               | /
               +-----------------------------------> AI (FLOP/B)
                        ^
-                  ridge_point
+                  ridge point
 
-        - **BW ceiling** (the slope): ``peak_bw × AI``.  When a kernel
-          has low AI it cannot feed the compute units fast enough and
-          performance is limited by memory bandwidth.
-        - **Compute ceiling** (the flat top): ``peak_gflops``.  Once AI
-          is high enough the compute units are fully utilized.
-        - **Ridge point**: the AI where the two ceilings meet,
-          ``peak_gflops / peak_bw``.  Left of it the kernel is
-          memory-bound; right of it, compute-bound.
-        - **Efficiency**: ``achieved / ceiling`` — how close the kernel
-          gets to the roofline at its operating point.
 
-        .. note:: The roofline model only covers compute and HBM bandwidth.
+
+        - **systolic**: ``linalg.matmul`` ops, peak = ``systolic_flops_per_cycle × clock``
+        - **simd**: all other compute ops (float, transcendental, int),
+          peak = ``simd_elements_per_cycle × clock``
+
+        The **dominant unit** is whichever consumed the most compute cycles in
+        the kernel trace — the real bottleneck.  FLOPs are not comparable across
+        units (matmul ``2*M*N*K`` vs SIMD per-element), so cycles, not FLOPs,
+        identify the busy unit.  The summary ``arithmetic_intensity`` and
+        ``efficiency`` are reported for the dominant unit.
+
+        For each unit, ``achieved_gflops`` is ``unit_flops / total_wall_time``
+        (not unit_flops / unit_cycles) so the achieved rate reflects true
+        end-to-end throughput including memory stalls.
+
+        .. note:: The roofline covers compute and HBM bandwidth only.
            Communication cycles (ring allgather/reduce) are not modelled.
-           For comm-dominated kernels the ``bottleneck`` property may
-           report ``"comm"`` while the roofline classifies the kernel
-           based on the compute-vs-HBM ratio alone.  For kernels where
-           the bottleneck is ``"compute"`` or ``"memory"``, the roofline
-           bound (AI vs ridge point) will always agree with ``bottleneck``.
 
         Returns a dict with:
-            arithmetic_intensity: FLOPs / byte transferred (FLOP/B).
-            achieved_gflops: Actual throughput of the critical-path core.
-            peak_gflops: Hardware peak compute throughput.
+            arithmetic_intensity: the dominant unit's per-unit AI
+                (``dominant_unit FLOPs / total bytes``, FLOP/B).
             peak_bw_gb_s: Per-core HBM bandwidth in GB/s.
-            ridge_point: AI where BW ceiling meets compute ceiling.
-            ceiling_gflops: Roofline ceiling at this kernel's AI.
-            efficiency: achieved / ceiling (0..1).
+            dominant_unit: ``"systolic"`` or ``"simd"`` (most compute cycles).
+            efficiency: achieved / ceiling for the dominant unit (0..1).
+            cores_active: number of cores that consumed any cycle (nonzero
+                total_cycles). A core left idle by an oversized grid produces a
+                counter entry but spends zero cycles, so it is excluded and an
+                under-filled grid does not inflate coverage. A core busy only
+                on communication still counts as active — dispatched is not the
+                same as doing useful compute.
+            num_cores: chip-wide hardware core count from ``HardwareConfig``.
+            grid_coverage: ``cores_active / num_cores`` — fraction of chip
+                cores dispatched any work. Spatial dispatch coverage, not how
+                busy each core is (a core running a single cycle counts fully),
+                so it is NOT Nsight's time-based "SM Active %"; pair with
+                chip_throughput / efficiency to read actual utilization.
+            units: per-unit dict, each with:
+                achieved_gflops, ceiling_gflops, ridge_point, efficiency,
+                arithmetic_intensity (this unit's own FLOPs / total bytes),
+                peak_gflops, chip_peak_gflops, chip_throughput.
+
+        Per-unit chip-level fields (peak-based, Nsight SOL analogue):
+            peak_gflops: per-core flat hardware peak (independent of AI).
+            chip_peak_gflops: ``peak_gflops × num_cores`` — chip-wide flat
+                peak. Distinct from ``ceiling_gflops`` which is the
+                roofline ceiling at this kernel's AI.
+            chip_throughput: ``sum(core FLOPs over all cores) / elapsed
+                / (peak × num_cores)`` — Nsight "Compute (SM) Throughput %"
+                analogue. The numerator is the actual total FLOPs summed
+                across every core over the elapsed (wall) time, so idle and
+                lighter cores correctly pull the figure down — the same way
+                Nsight aggregates per-SM counters across all SMs over elapsed
+                cycles. This is exact under any work distribution, including
+                split-K and uneven tiling, where extrapolating the critical
+                core's rate to all cores would overstate utilization.
+
+                Distinct from ``efficiency`` (per-active-core, ceiling-based)
+                and from ``grid_coverage`` (dispatched-core fraction):
+                chip_throughput is peak-based and chip-wide. The three
+                coincide only when work is evenly distributed and the kernel
+                is compute-bound at its flat peak.
         """
         if not self.counters:
             return {}
         critical = max(self.counters.values(), key=lambda c: c.total_cycles)
 
-        # Clock in Hz (e.g. 1.0 GHz → 1e9 cycles/s)
         clock = self.config.clock_ghz * 1e9
-
-        # The flat top of the roof: how many FLOPs/s the SIMD pipe can
-        # sustain if it never stalls on memory.
-        peak_flops = self.config.simd_elements_per_cycle * clock
-
-        # The slope of the roof: how many bytes/s HBM can deliver to
-        # this core.  Multiplied by AI this gives the BW ceiling.
+        elapsed_s = critical.total_cycles / clock
         peak_bw = self.config.hbm_bytes_per_cycle_per_core * clock
 
-        # Where the slope meets the flat top (FLOP/B).  Kernels with
-        # AI < ridge_point are memory-bound; AI > ridge_point are
-        # compute-bound.
-        ridge_point = peak_flops / peak_bw
+        # Count cores that consumed any cycle, not every grid core that produced
+        # a counter entry: an oversized grid leaves some cores with zero loop
+        # iterations (0 cycles), and those must not inflate utilization. Use
+        # total_cycles (compute+memory+comm) so memory-only kernels with 0 FLOPs
+        # (e.g. embedding gather) still count their active cores. A comm-only
+        # core also counts as active here (dispatched, not necessarily computing).
+        cores_active = sum(1 for c in self.counters.values() if c.total_cycles > 0)
+        num_cores = self.config.num_cores
+        grid_coverage = cores_active / num_cores if num_cores > 0 else 0.0
 
-        # Achieved throughput: total FLOPs the kernel executed divided
-        # by wall-clock time on this core.
-        elapsed_s = critical.total_cycles / clock
-        achieved_flops = critical.total_flops / elapsed_s if elapsed_s > 0 else 0
+        # Per-unit hardware ceilings (hardware constants, not kernel-derived).
+        unit_ceilings = {
+            "systolic": self.config.systolic_flops_per_cycle * clock,
+            "simd": self.config.simd_elements_per_cycle * clock,
+        }
 
-        # Arithmetic intensity: how many FLOPs per byte of HBM traffic.
-        # Higher AI means more reuse of each byte loaded.
-        ai = critical.total_flops / critical.total_bytes if critical.total_bytes > 0 else float('inf')
+        # Which LatencyCategory strings belong to each unit.
+        _LC = LatencyCategory
+        unit_categories = {
+            "systolic": {str(_LC.COMPUTE_MATMUL)},
+            "simd": {str(_LC.COMPUTE_FLOAT), str(_LC.COMPUTE_TRANSCENDENTAL), str(_LC.COMPUTE_INT)},
+        }
 
-        # The roofline ceiling at this kernel's AI: the lower of the
-        # two ceilings (BW slope vs compute flat top).
-        ceiling = min(peak_flops, peak_bw * ai)
+        units: Dict[str, Any] = {}
+        for unit_name, peak in unit_ceilings.items():
+            cats = unit_categories[unit_name]
+            flops = sum(critical.flops_by_category.get(c, 0.0) for c in cats)
+            achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
+            # Per-unit arithmetic intensity: this unit's own FLOPs over the kernel's
+            # DRAM bytes (NCU convention — numerator split per pipeline, denominator
+            # the shared byte traffic). The denominator is dram_bytes: the HBM
+            # bandwidth ceiling governs HBM traffic only, so comm/ring bytes (a
+            # different interconnect) are excluded — otherwise a comm kernel's
+            # byte-rate could exceed HBM peak and put the point above the roof. Each
+            # unit gets its own ceiling, so the other unit's FLOPs don't inflate it.
+            unit_ai = (flops / critical.dram_bytes
+                       if critical.dram_bytes > 0 else float('inf'))
+            # Roofline ceiling at this unit's own AI.
+            ceiling = min(peak, peak_bw * unit_ai)
+            # Cores are homogeneous: every core shares the same clock and
+            # compute rates from HardwareConfig, so the chip peak is
+            # peak * num_cores, which equals summing identical per-core peaks.
+            # Heterogeneity lives on other axes (per functional unit, captured
+            # separately in unit_ceilings; per precision/generation, captured by
+            # the config values), never core-to-core.
+            chip_peak = peak * num_cores
+            # Chip throughput uses the actual FLOPs summed across every core,
+            # not the critical core's rate extrapolated to all cores. Under
+            # uneven tiling the lighter cores do fewer FLOPs in the same wall
+            # time; extrapolating `achieved * cores_active` would count them as
+            # if they matched the critical core and overstate utilization. The
+            # real per-core sum over the same elapsed time gives the true
+            # chip-wide figure, matching Nsight's SM Throughput (per-SM counters
+            # aggregated across all SMs over elapsed cycles).
+            chip_flops = sum(c.flops_by_category.get(cat, 0.0)
+                             for c in self.counters.values() for cat in cats)
+            chip_achieved = chip_flops / elapsed_s if elapsed_s > 0 else 0.0
+            chip_throughput = chip_achieved / chip_peak if chip_peak > 0 else 0.0
+            units[unit_name] = {
+                "achieved_gflops": achieved / 1e9,
+                "ceiling_gflops": ceiling / 1e9,
+                "ridge_point": peak / peak_bw,
+                "efficiency": achieved / ceiling if ceiling > 0 else 0.0,
+                "arithmetic_intensity": unit_ai,
+                "peak_gflops": peak / 1e9,
+                "chip_peak_gflops": chip_peak / 1e9,
+                "chip_throughput": chip_throughput,
+            }
+
+        # Dominant unit = the unit that consumed the most compute cycles — the
+        # real bottleneck. Per-category cycles are already attributed to each
+        # unit upstream (LatencyTracker._estimate); read that conclusion rather
+        # than re-deriving from FLOPs, which are not comparable across units
+        # (matmul 2*M*N*K vs SIMD per-element). Fall back to "simd" when no
+        # compute ran at all (every category zero → both flops and cycles zero).
+        dominant = max(
+            unit_ceilings,
+            key=lambda u: sum(critical.cycles_by_category.get(c, 0.0)
+                              for c in unit_categories[u]),
+        )
+        if all(units[u]["achieved_gflops"] == 0.0 for u in units):
+            dominant = "simd"
+
         return {
-            "arithmetic_intensity": ai,
-            "achieved_gflops": achieved_flops / 1e9,
-            "peak_gflops": peak_flops / 1e9,
+            "arithmetic_intensity": units[dominant]["arithmetic_intensity"],
             "peak_bw_gb_s": peak_bw / 1e9,
-            "ridge_point": ridge_point,
-            "ceiling_gflops": ceiling / 1e9,
-            "efficiency": achieved_flops / ceiling if ceiling > 0 else 0,
+            "dominant_unit": dominant,
+            "efficiency": units[dominant]["efficiency"],
+            "cores_active": cores_active,
+            "num_cores": num_cores,
+            "grid_coverage": grid_coverage,
+            "units": units,
         }
 
     def summary_dict(self) -> Dict[str, Any]:
@@ -545,7 +678,8 @@ class LatencyReport:
             "kernel_cycles": self.kernel_cycles,
             "kernel_time_us": self.kernel_time_us,
             "bottleneck": self.bottleneck,
-            "num_cores": len(self.counters),
+            "grid_cores": len(self.counters),
+            "num_cores": self.config.num_cores,
             "per_core": self.per_core_summary(),
         }
 
@@ -578,14 +712,50 @@ class LatencyReport:
             lines.append("Roofline Analysis (critical-path core)")
             lines.append("-" * 60)
             ai = rf["arithmetic_intensity"]
-            ai_str = f"{ai:.2f} FLOP/B" if ai != float('inf') else "inf (no memory traffic)"
+            # AI == inf means dram_bytes == 0 (no HBM). Split by total_bytes, not by
+            # naming a transport, so a comm-only kernel (or a future non-HBM
+            # interconnect) reads "no HBM traffic" instead of the misleading "no
+            # memory traffic" — it did move bytes, just not over HBM.
+            if ai != float('inf'):
+                ai_str = f"{ai:.2f} FLOP/B"
+            elif critical.total_bytes > 0:
+                ai_str = "inf (no HBM traffic)"
+            else:
+                ai_str = "inf (no memory traffic)"
+            dom_unit = rf["units"][rf["dominant_unit"]]
             lines.append(f"  Arithmetic intensity : {ai_str}")
-            lines.append(f"  Achieved             : {rf['achieved_gflops']:.2f} GFLOP/s")
-            lines.append(f"  Roofline ceiling     : {rf['ceiling_gflops']:.2f} GFLOP/s")
-            lines.append(f"  Peak compute         : {rf['peak_gflops']:.2f} GFLOP/s")
             lines.append(f"  Peak bandwidth       : {rf['peak_bw_gb_s']:.2f} GB/s")
-            lines.append(f"  Ridge point          : {rf['ridge_point']:.2f} FLOP/B")
-            lines.append(f"  Efficiency           : {rf['efficiency']:.1%}")
+            lines.append(f"  Dominant unit        : {rf['dominant_unit']}")
+            lines.append(
+                f"  Grid coverage        : {rf['cores_active']}/{rf['num_cores']}  "
+                f"(grid_coverage {rf['grid_coverage']:.1%})"
+            )
+            lines.append(
+                f"  Efficiency           : {rf['efficiency']:.1%}  "
+                f"(per-active core, achieved/ceiling)"
+            )
+            lines.append(
+                f"  Chip throughput      : {dom_unit['chip_throughput']:.1%}  "
+                f"(chip-wide, achieved/peak with idle cores)"
+            )
+            lines.append("")
+            lines.append(
+                f"  {'Unit':>10}  {'Achieved':>12}  {'Ceiling':>12}  "
+                f"{'Ridge':>10}  {'Eff':>7}  {'ChipThru':>9}"
+            )
+            lines.append(
+                f"  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*7}  {'-'*9}"
+            )
+            for unit_name, u in rf["units"].items():
+                marker = " *" if unit_name == rf["dominant_unit"] else "  "
+                lines.append(
+                    f"{marker} {unit_name:>10}  "
+                    f"{u['achieved_gflops']:>10.2f} G  "
+                    f"{u['ceiling_gflops']:>10.2f} G  "
+                    f"{u['ridge_point']:>8.1f} F/B  "
+                    f"{u['efficiency']:>6.1%}  "
+                    f"{u['chip_throughput']:>8.2%}"
+                )
             lines.append("=" * 60)
 
         return "\n".join(lines)

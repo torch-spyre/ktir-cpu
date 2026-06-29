@@ -22,6 +22,7 @@ import pytest
 from pathlib import Path
 
 from ktir_cpu import KTIRInterpreter, HardwareConfig, LatencyReport
+from ktir_cpu.dtypes import stick_to_elem_idx
 
 from conftest import EXAMPLES_DIR, get_test_params, parse_example
 
@@ -117,7 +118,7 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     """Run ring_reduce on its 4-core grid and return ``(report, rows, n_cols)``.
 
     Differs from the other ``_run_*`` helpers because ``ring_reduce.mlir``
-    takes raw stick-index pointers (``in_ptr`` / ``out_ptr``) rather than
+    takes f16 element-index pointers (``in_ptr`` / ``out_ptr``) rather than
     ndarray kwargs.  We patch ``_prepare_execution`` to seed the input
     rows after HBM allocation; this mirrors
     ``test_examples.py::TestRingReduceExecution::test_ring_reduce_sum``.
@@ -130,6 +131,11 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
     in_ptr = entry["execute_kwargs"]["in_ptr"]
     out_ptr = entry["execute_kwargs"]["out_ptr"]
 
+    # hbm.write/read take stick indices; convert from element indices.
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    in_stick  = in_ptr  // _elems_per_stick
+    out_stick = out_ptr // _elems_per_stick
+
     rng = np.random.default_rng(42)
     rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
 
@@ -140,8 +146,8 @@ def _run_ring_reduce(path, func_name, entry, cfg, trace=False):
 
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
-        interp.memory.hbm.write(in_ptr,  rows.flatten())
-        interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+        interp.memory.hbm.write(in_stick,  rows.flatten())
+        interp.memory.hbm.write(out_stick, np.zeros(n_cols, dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name, **entry["execute_kwargs"])
@@ -165,6 +171,11 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
     in_ptr = entry["execute_kwargs"]["in_ptr"]
     out_ptr = entry["execute_kwargs"]["out_ptr"]
 
+    # hbm.write/read take stick indices; convert from element indices.
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    in_stick  = in_ptr  // _elems_per_stick
+    out_stick = out_ptr // _elems_per_stick
+
     rng = np.random.default_rng(42)
     rows = rng.uniform(1.0, 2.0, size=(num_cores, n_cols)).astype(np.float16)
 
@@ -175,8 +186,8 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
 
     def _prepare_and_seed(grid_shape):
         _orig(grid_shape)
-        interp.memory.hbm.write(in_ptr,  rows.flatten())
-        interp.memory.hbm.write(out_ptr, np.zeros(n_groups * n_cols, dtype=np.float16))
+        interp.memory.hbm.write(in_stick,  rows.flatten())
+        interp.memory.hbm.write(out_stick, np.zeros(n_groups * n_cols, dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name, **entry["execute_kwargs"])
@@ -186,7 +197,7 @@ def _run_ring_reduce_multi_group(path, func_name, entry, cfg, trace=False):
         n_cols,
         n_groups,
         group_size,
-        interp.memory.hbm.read(out_ptr, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
+        interp.memory.hbm.read(out_stick, n_groups * n_cols, "f16").reshape(n_groups, n_cols),
     )
 
 
@@ -237,7 +248,7 @@ class TestVectorAddLatency:
 
         # Extract addf cycles from trace
         addf_cycles = sum(e.cycles for e in core0.trace
-                          if e.op_type == "arith.addf" and e.category == "compute")
+                          if e.op_type == "arith.addf" and e.category.startswith("compute_"))
         # Per-core tile is 128 elements (BLOCK_SIZE=128), addf costs tile_size / simd
         assert addf_cycles == pytest.approx(128.0 / simd)
 
@@ -283,6 +294,9 @@ class TestVectorAddLatency:
         assert "bottleneck" in d
         assert "per_core" in d
         assert len(d["per_core"]) == num_cores
+        # grid_cores = counter entries (grid product); num_cores = hardware total.
+        assert d["grid_cores"] == num_cores
+        assert d["num_cores"] == report.config.num_cores
 
 
 # ---------------------------------------------------------------------------
@@ -309,25 +323,136 @@ class TestRoofline:
         rf = report.roofline()
 
         assert "arithmetic_intensity" in rf
-        assert "achieved_gflops" in rf
-        assert "peak_gflops" in rf
         assert "peak_bw_gb_s" in rf
-        assert "ridge_point" in rf
-        assert "ceiling_gflops" in rf
+        assert "dominant_unit" in rf
         assert "efficiency" in rf
+        assert "units" in rf
 
         assert 0 < rf["efficiency"] <= 1.0
-        assert rf["achieved_gflops"] <= rf["ceiling_gflops"]
-        assert rf["ceiling_gflops"] <= rf["peak_gflops"]
+        for unit in rf["units"].values():
+            assert unit["achieved_gflops"] <= unit["ceiling_gflops"]
+
+        # Chip-level fields (peak-based, Nsight SOL analogue).
+        assert "cores_active" in rf
+        assert "num_cores" in rf
+        assert "grid_coverage" in rf
+        assert rf["cores_active"] >= 1
+        assert rf["num_cores"] == report.config.num_cores
+        # Note: grid_coverage > 1.0 is possible if the kernel grid
+        # oversubscribes the modelled core count (e.g. running a 64-core
+        # kernel against HardwareConfig(num_cores=32)).
+        assert rf["grid_coverage"] > 0
+        for unit in rf["units"].values():
+            assert unit["peak_gflops"] > 0
+            assert unit["chip_peak_gflops"] == pytest.approx(
+                unit["peak_gflops"] * rf["num_cores"]
+            )
+            assert unit["chip_throughput"] >= 0
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
+    def test_chip_throughput_even_tiling_matches_extrapolation(self, path, func_name, entry):
+        """For evenly-tiled work, the chip-wide aggregate equals the
+        critical-core extrapolation ``grid_coverage × (achieved / peak)``.
+
+        chip_throughput is defined as the real per-core FLOP sum over elapsed
+        time (see test_chip_throughput_uneven_split_uses_aggregate); when every
+        active core does equal work the two coincide. This anchors that
+        equivalence so the uneven-split divergence is meaningful, not an
+        artifact of an unrelated formula change.
+        """
+        report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
+        rf = report.roofline()
+
+        for unit_name, unit in rf["units"].items():
+            extrapolation = (rf["grid_coverage"]
+                             * unit["achieved_gflops"]
+                             / unit["peak_gflops"])
+            assert unit["chip_throughput"] == pytest.approx(extrapolation, abs=1e-9), (
+                f"even-tiling equivalence broken for unit {unit_name!r}: "
+                f"got {unit['chip_throughput']}, expected {extrapolation}"
+            )
+
+    def test_chip_throughput_uneven_split_uses_aggregate(self):
+        """Under uneven tiling chip_throughput must aggregate the real FLOPs of
+        every core, not extrapolate the critical (heaviest) core's rate to all.
+
+        Three cores run for the same wall time but do 300/200/100 matmul FLOPs.
+        The aggregate (600) is the true chip work; extrapolating the critical
+        core (300 × 3 = 900) would overstate utilization by 1.5×.
+        """
+        from ktir_cpu.latency import CoreLatencyCounters
+
+        cfg = HardwareConfig(num_cores=32)
+        counters = {}
+        for cid, flops in enumerate((300.0, 200.0, 100.0)):
+            c = CoreLatencyCounters()
+            c.record("compute_matmul", cycles=100.0, flops=flops)
+            counters[cid] = c
+
+        report = LatencyReport(config=cfg, counters=counters)
+        rf = report.roofline()
+        unit = rf["units"]["systolic"]
+
+        clock = cfg.clock_ghz * 1e9
+        elapsed_s = max(c.total_cycles for c in counters.values()) / clock
+        chip_peak = unit["peak_gflops"] * 1e9 * rf["num_cores"]
+        total_flops = sum(c.flops_by_category.get("compute_matmul", 0.0)
+                          for c in counters.values())  # 600
+
+        expected_aggregate = (total_flops / elapsed_s) / chip_peak
+        assert unit["chip_throughput"] == pytest.approx(expected_aggregate)
+
+        # The critical-core extrapolation would be strictly larger (overstated).
+        extrapolation = (unit["achieved_gflops"] * 1e9 * rf["cores_active"]) / chip_peak
+        assert unit["chip_throughput"] < extrapolation
+        assert extrapolation == pytest.approx(1.5 * unit["chip_throughput"])
+
+    def test_dominant_by_cycles_and_per_unit_ai(self):
+        """Dominant unit is the cycle bottleneck, not the FLOP-heaviest, and each
+        unit gets its own arithmetic intensity (its FLOPs / total bytes).
+
+        Mirrors the paged_attention shape on default HW: the systolic matmul has
+        far more FLOPs (524288) but runs in a single cycle, while the SIMD path
+        has fewer FLOPs (28480) yet spends 496 cycles — it is the real
+        bottleneck. Selecting by FLOPs would wrongly pick systolic; selecting by
+        cycles (reading the per-category cycle tally produced upstream) picks
+        simd. No existing roofline test asserts which unit is dominant, so this
+        pins the cycle-based selection against silent regression.
+        """
+        from ktir_cpu.latency import CoreLatencyCounters
+
+        total_bytes = 71680
+        c = CoreLatencyCounters()
+        c.record("compute_matmul", cycles=1.0, flops=524288.0)
+        c.record("compute_float", cycles=496.0, flops=28480.0)
+        # Bytes are HBM traffic — recorded on a memory op (the shared AI denominator).
+        c.record("memory", cycles=1.0, nbytes=total_bytes)
+
+        rf = LatencyReport(config=HardwareConfig(), counters={0: c}).roofline()
+
+        # FLOP-heaviest is systolic; cycle-heaviest (the bottleneck) is simd.
+        assert rf["dominant_unit"] == "simd"
+
+        # Each unit's AI is its own FLOPs over the shared DRAM bytes — distinct,
+        # not one mixed value shared by both.
+        ai_sys = rf["units"]["systolic"]["arithmetic_intensity"]
+        ai_simd = rf["units"]["simd"]["arithmetic_intensity"]
+        assert ai_sys == pytest.approx(524288.0 / total_bytes)
+        assert ai_simd == pytest.approx(28480.0 / total_bytes)
+        assert ai_sys != ai_simd
+
+        # The top-level AI is sourced from the dominant (simd) unit, not a mix.
+        assert rf["arithmetic_intensity"] == pytest.approx(ai_simd)
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_vector_add_is_memory_bound(self, path, func_name, entry):
         """vector_add has low arithmetic intensity → memory-bound on roofline."""
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
+        dominant = rf["dominant_unit"]
 
-        # AI should be well below the ridge point (memory-bound)
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        # AI should be well below the dominant unit's ridge point (memory-bound)
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
     def test_vector_reduce_is_memory_bound(self, path, func_name, entry):
@@ -335,7 +460,8 @@ class TestRoofline:
         report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
         assert "arithmetic_intensity" in rf
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_roofline_in_report_str(self, path, func_name, entry):
@@ -370,21 +496,45 @@ class TestRoofline:
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_memory_bound_roofline_matches_bottleneck(self, path, func_name, entry):
-        """When bottleneck is memory, roofline AI should be below ridge point."""
+        """When bottleneck is memory, roofline AI should be below the dominant unit's ridge point."""
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         assert report.bottleneck == "memory"
         rf = report.roofline()
-        assert rf["arithmetic_intensity"] < rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("softmax_kernel_small"))
     def test_compute_bound_roofline_matches_bottleneck(self, path, func_name, entry):
-        """When bottleneck is compute, roofline AI should be above ridge point."""
+        """When bottleneck is compute, roofline AI should be above the dominant unit's ridge point."""
         # Single core + high HBM BW → compute-dominated
         cfg = HardwareConfig(num_cores=1, hbm_bandwidth_tb_s=100.0)
         report = _run_softmax(path, func_name, entry, cfg)
         assert report.bottleneck == "compute"
         rf = report.roofline()
-        assert rf["arithmetic_intensity"] > rf["ridge_point"]
+        dominant = rf["dominant_unit"]
+        assert rf["arithmetic_intensity"] > rf["units"][dominant]["ridge_point"]
+
+    def test_oversized_grid_does_not_inflate_cores_active(self):
+        """An over-large grid leaves some cores with zero loop iterations; those
+        idle cores still get a counter entry but must not count toward
+        cores_active / grid_coverage (else coverage is overstated)."""
+        from ktir_cpu.latency import CoreLatencyCounters
+
+        cfg = HardwareConfig(num_cores=32)
+        counters = {}
+        # 4 active cores: real matmul work + HBM traffic.
+        for cid in range(4):
+            c = CoreLatencyCounters()
+            c.record("compute_matmul", cycles=100.0, flops=2048.0)
+            c.record("memory", cycles=50.0, nbytes=1024)
+            counters[cid] = c
+        # 28 idle grid cores: counter entry exists, but zero cycles.
+        for cid in range(4, 32):
+            counters[cid] = CoreLatencyCounters()
+
+        rf = LatencyReport(config=cfg, counters=counters).roofline()
+        assert rf["cores_active"] == 4          # not 32 (idle cores excluded)
+        assert rf["grid_coverage"] == pytest.approx(4 / 32)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +563,7 @@ class TestSoftmaxLatency:
         core0 = report.counters[0]
         compute_by_op = Counter()
         for e in core0.trace:
-            if e.category == "compute":
+            if e.category.startswith("compute_"):
                 compute_by_op[e.op_type] += e.cycles
         top_op = compute_by_op.most_common(1)[0]
         assert top_op[0] == "math.exp"
@@ -496,14 +646,14 @@ class TestReduceLatency:
 
         # Combiner ops carry the cost. Core 0 processes 2 rows; per row a max
         # (arith.maximumf) and a sum (arith.addf) each fold a 1×64 tile → the
-        # tree fold processes 63 elements per reduce. Summed per op across both
-        # rows: 2 × 63 / simd_elements_per_cycle.
-        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        # tree fold processes N-1 elements, plus one final combine with the outs
+        # accumulator (1 element). Total per reduce: N-1+1 = N elements.
+        per_reduce = 64 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         for combiner in ("arith.maximumf", "arith.addf"):
             total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
             assert total == pytest.approx(2 * per_reduce), (
                 f"{combiner} should total {2 * per_reduce} cyc over 2 rows "
-                f"(tree fold of 1×64 → N-1 elems each); got {total}"
+                f"(tree fold of 1×64 + outs combine each); got {total}"
             )
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
@@ -521,13 +671,13 @@ class TestReduceLatency:
         ), "linalg.reduce must be zero-cost in the explicit-region form too"
 
         # reduce_generic.mlir folds a 1×4 input tile with arith.addf. A pairwise
-        # tree fold of 4 elements processes 2 + 1 = 3 elements total →
-        # 3 / simd_elements_per_cycle cycles, charged to the combiner.
-        expected = 3 / cfg.simd_elements_per_cycle  # N-1 for N=4
+        # tree fold of 4 elements processes N-1=3 elements, plus one final
+        # combine with the outs accumulator (1 element). Total: 4 elements.
+        expected = 4 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         total = sum(e.cycles for e in core0.trace if e.op_type == "arith.addf")
         assert total == pytest.approx(expected), (
             f"combiner arith.addf should total {expected} cyc "
-            f"(tree fold of 1×4 → N-1 elems); got {total}"
+            f"(tree fold of 1×4 + outs combine); got {total}"
         )
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
@@ -549,12 +699,12 @@ class TestReduceLatency:
         core0 = report.counters[0]
 
         assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
-        per_reduce = 63 / cfg.simd_elements_per_cycle  # N-1 for N=64
+        per_reduce = 64 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         for combiner in ("arith.maximumf", "arith.addf"):
             total = sum(e.cycles for e in core0.trace if e.op_type == combiner)
             assert total == pytest.approx(2 * per_reduce), (
                 f"{combiner} should total {2 * per_reduce} cyc (explicit-region "
-                f"softmax, 2 rows of 1×64 tree fold); got {total}"
+                f"softmax, 2 rows of 1×64 tree fold + outs combine); got {total}"
             )
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_multiop"))
@@ -567,12 +717,12 @@ class TestReduceLatency:
         core0 = report.counters[0]
 
         assert all(e.cycles == 0.0 for e in core0.trace if e.op_type == "linalg.reduce")
-        # 1×8 tree fold → 7 elements processed; each region op charged 7/simd.
-        expected = 7 / cfg.simd_elements_per_cycle  # N-1 for N=8
+        # 1×8 tree fold → 7 elements processed + 1 outs combine = 8 total.
+        expected = 8 / cfg.simd_elements_per_cycle  # N-1 tree fold + 1 outs combine
         for region_op in ("arith.cmpf", "arith.select"):
             total = sum(e.cycles for e in core0.trace if e.op_type == region_op)
             assert total == pytest.approx(expected), (
-                f"{region_op} should total {expected} cyc (1×8 tree fold); "
+                f"{region_op} should total {expected} cyc (1×8 tree fold + outs combine); "
                 f"got {total}"
             )
 
@@ -758,7 +908,7 @@ class TestLatencyEdgeCases:
 
         # addf on 128 elements with SIMD=1024 → 128/1024 = 0.125 cycles
         addf_cycles = sum(e.cycles for e in core0.trace
-                          if e.op_type == "arith.addf" and e.category == "compute")
+                          if e.op_type == "arith.addf" and e.category.startswith("compute_"))
         assert addf_cycles == pytest.approx(128.0 / 1024)
         assert addf_cycles > 0
         assert not math.isnan(addf_cycles)
@@ -1605,10 +1755,10 @@ class TestIndirectAccessLatency:
         lx = LXScratchpad(core_id=0)
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=HBMSimulator())
 
-        parent_ptr = 0
-        idx_ptr = 64  # past parent's 8 f16 = 16 bytes; safe non-overlap
-        lx.write(parent_ptr, np.zeros(8, dtype=np.float16))  # seed for read-modify-write
-        lx.write(idx_ptr, np.arange(4, dtype=np.int32))
+        parent_ptr = 0   # element index 0 → byte 0 (f16)
+        idx_ptr = 16     # element index 16 → byte 64 (i32, 4 bytes); past parent's 8 f16 = 16 bytes
+        lx.write(parent_ptr * 2, np.zeros(8, dtype=np.float16))   # seed at byte 0
+        lx.write(idx_ptr * 4, np.arange(4, dtype=np.int32))       # seed at byte 64
 
         parent_ref = MemRef(
             base_ptr=parent_ptr, shape=(8,), strides=[1],
@@ -1707,11 +1857,11 @@ class TestIndirectAccessLatency:
         hbm.write(idx1_stick, np.zeros(64, dtype=np.int32))
         hbm.write(idx2_stick, np.zeros(64, dtype=np.int32))
 
-        parent = MemRef(base_ptr=x_stick, shape=(8, 8), strides=[8, 1],
+        parent = MemRef(base_ptr=stick_to_elem_idx(x_stick, "f16"), shape=(8, 8), strides=[8, 1],
                         memory_space="HBM", dtype="f16")
-        idx1 = MemRef(base_ptr=idx1_stick, shape=(8, 8), strides=[8, 1],
+        idx1 = MemRef(base_ptr=stick_to_elem_idx(idx1_stick, "i32"), shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
-        idx2 = MemRef(base_ptr=idx2_stick, shape=(8, 8), strides=[8, 1],
+        idx2 = MemRef(base_ptr=stick_to_elem_idx(idx2_stick, "i32"), shape=(8, 8), strides=[8, 1],
                       memory_space="HBM", dtype="i32")
 
         iat = IndirectAccessTile(
@@ -1990,16 +2140,12 @@ class TestRingReduceLatency:
             # no other op in the trace contributes to the comm bucket.
             assert cc.comm_cycles == pytest.approx(expected_comm_cycles)
 
-            # Cumulative comm bytes for this core (the only comm op is
-            # the reduce, so total_bytes - HBM-side load/store bytes
-            # equals the ring's per-core wire load).  We pin the comm
-            # bytes via the cycle assertion above; this asserts the
-            # aggregate counter agrees: ring bytes contribute exactly
-            # ``per_core_ring_bytes`` to ``total_bytes``.
-            # Note ``total_bytes`` also includes HBM bytes from
-            # ``ktdp.load`` / ``ktdp.store``, so we can't pin it on its
-            # own — we just assert it's at least the ring bytes.
-            assert cc.total_bytes >= per_core_ring_bytes
+            # Per-transport byte split. The ring reduce is this core's only comm
+            # op, so comm_bytes is exactly the per-core wire load (derived above
+            # from the kernel/config, not hardcoded); total_bytes still sums both
+            # transports (HBM + comm).
+            assert cc.comm_bytes == per_core_ring_bytes
+            assert cc.total_bytes == cc.dram_bytes + cc.comm_bytes
 
             # Each core loads its own row from HBM exactly once.
             assert ops.count("ktdp.load") == 1
@@ -2019,6 +2165,12 @@ class TestRingReduceLatency:
         per_core_total = {cid: cc.total_cycles for cid, cc in rep.counters.items()}
         assert rep.kernel_cycles == max(per_core_total.values())
         assert per_core_total[0] >= max(per_core_total[c] for c in (1, 2, 3))
+
+        # Roofline invariant on a comm kernel: arithmetic intensity uses dram_bytes
+        # (HBM only), so ring/comm bytes do not inflate the denominator and push the
+        # attained point above the HBM ceiling. With the old total_bytes denominator
+        # this kernel reported efficiency > 1 (point above the roof).
+        assert 0 < rep.roofline()["efficiency"] <= 1.0
 
 
 # ---------------------------------------------------------------------------

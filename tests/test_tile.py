@@ -28,6 +28,7 @@ from ktir_cpu.affine import AffineMap
 from ktir_cpu.grid import CoreContext
 from ktir_cpu.ir_types import MemRef, TileRef
 from ktir_cpu.memory import HBMSimulator, LXScratchpad
+from ktir_cpu.dtypes import stick_to_elem_idx
 from ktir_cpu.ops.memory_ops import MemoryOps
 from ktir_cpu.parser_ast import parse_affine_map
 
@@ -96,7 +97,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        parent = MemRef(base_ptr=ptr, shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
         identity = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
 
         ref = MemoryOps.tile_access(ctx, parent, indices=[1, 2], access_shape=(2, 2), base_map=identity)
@@ -122,7 +123,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        parent = MemRef(base_ptr=ptr, shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
         swapped = parse_affine_map("affine_map<(d0, d1) -> (d1, d0)>")
 
         ref = MemoryOps.tile_access(ctx, parent, indices=[1, 2], access_shape=(1, 1), base_map=swapped)
@@ -148,7 +149,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        parent = MemRef(base_ptr=ptr, shape=(8, 8), strides=[8, 1], memory_space="HBM", dtype="f16")
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(8, 8), strides=[8, 1], memory_space="HBM", dtype="f16")
         scaled = parse_affine_map("affine_map<(d0, d1) -> (d0 * 2, d1)>")
 
         ref = MemoryOps.tile_access(ctx, parent, indices=[1, 3], access_shape=(1, 1), base_map=scaled)
@@ -165,7 +166,7 @@ class TestTileAccess:
         """
         ctx, hbm = _make_ctx()
         ptr = hbm.allocate(32)
-        parent = MemRef(base_ptr=ptr, shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
         identity = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
 
         ref = MemoryOps.tile_access(ctx, parent, indices=[0, 0], access_shape=(2, 3), base_map=identity)
@@ -196,7 +197,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        parent = MemRef(base_ptr=ptr, shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16")
         identity = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
 
         sub_ref = MemoryOps.tile_access(ctx, parent, indices=[1, 0], access_shape=(2, 2), base_map=identity)
@@ -221,7 +222,7 @@ class TestTileAccess:
         hbm.write(ptr, data)
 
         # 2×2 sub-tile with parent row stride 4 — not contiguous
-        tile_ref = MemRef(base_ptr=ptr, shape=(2, 2), strides=[4, 1], memory_space="HBM", dtype="f16").to_tile_ref()
+        tile_ref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(2, 2), strides=[4, 1], memory_space="HBM", dtype="f16").to_tile_ref()
         assert not MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides)
 
         tile = MemoryOps.load(ctx, tile_ref)
@@ -238,7 +239,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        tile_ref = MemRef(base_ptr=ptr, shape=(2, 2), strides=[4, 1], memory_space="HBM", dtype="f16").to_tile_ref()
+        tile_ref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(2, 2), strides=[4, 1], memory_space="HBM", dtype="f16").to_tile_ref()
         assert not MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides)
 
         patch = np.array([[1, 2], [3, 4]], dtype=np.float16)
@@ -263,7 +264,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        tile_ref = MemRef(base_ptr=ptr, shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16").to_tile_ref()
+        tile_ref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(4, 4), strides=[4, 1], memory_space="HBM", dtype="f16").to_tile_ref()
 
         # Upper-triangular coordinates: d1 >= d0
         # (0,0),(0,1),(0,2),(0,3),(1,1),(1,2),(1,3),(2,2),(2,3),(3,3) — 10 elements
@@ -312,7 +313,7 @@ class TestTileAccess:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        tile_ref = MemRef(base_ptr=ptr, shape=(3, 3), strides=[3, 1], memory_space="HBM", dtype="f16").to_tile_ref()
+        tile_ref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(3, 3), strides=[3, 1], memory_space="HBM", dtype="f16").to_tile_ref()
 
         coords = list(map(tuple, np.ndindex(3, 3)))  # (0,0)..(2,2)
         cso = parse_affine_map("affine_map<(d0, d1) -> (d1, d0)>")
@@ -403,7 +404,7 @@ class TestTileAccessEdgeCases:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        parent = MemRef(base_ptr=ptr, shape=(2, 3, 4), strides=[12, 4, 1],
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(2, 3, 4), strides=[12, 4, 1],
                          memory_space="HBM", dtype="f16")
         identity = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
 
@@ -423,7 +424,7 @@ class TestTileAccessEdgeCases:
         ptr = hbm.allocate(data.nbytes)
         hbm.write(ptr, data)
 
-        parent = MemRef(base_ptr=ptr, shape=(2, 3, 4), strides=[12, 4, 1],
+        parent = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(2, 3, 4), strides=[12, 4, 1],
                          memory_space="HBM", dtype="f16")
         identity = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
 
@@ -462,7 +463,7 @@ class TestTileAccessEdgeCases:
         hbm.write(ptr, data)
 
         # shape (2, 2) with stride [8, 1]: every-other-row gather
-        tile_ref = MemRef(base_ptr=ptr, shape=(2, 2), strides=[8, 1],
+        tile_ref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(2, 2), strides=[8, 1],
                            memory_space="HBM", dtype="f16").to_tile_ref()
         assert not MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides)
 
@@ -481,7 +482,7 @@ class TestTileAccessEdgeCases:
         hbm.write(ptr, data)
 
         # shape (2, 2) with stride [8, 1]: rows 0 and 2 in the parent
-        tile_ref = MemRef(base_ptr=ptr, shape=(2, 2), strides=[8, 1],
+        tile_ref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(2, 2), strides=[8, 1],
                            memory_space="HBM", dtype="f16").to_tile_ref()
         patch = np.array([[10, 20], [30, 40]], dtype=np.float16)
         MemoryOps.store(ctx, Tile(patch, "f16", (2, 2)), tile_ref)

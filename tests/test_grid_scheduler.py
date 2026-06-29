@@ -124,6 +124,8 @@ from typing import Any, Callable, Dict, List, Tuple
 import numpy as np
 import pytest
 
+from ktir_cpu.dialects import dispatch
+from ktir_cpu.dialects.registry import ExecutionEnv
 from ktir_cpu.grid import GridExecutor, RecvRequest
 from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.memory import SpyreMemoryHierarchy
@@ -239,24 +241,61 @@ _STUB_HANDLERS: Dict[str, Callable[[Operation, Any], Any]] = {
 
 @pytest.fixture
 def execute_fn() -> Callable[[Operation, Any], Any]:
-    """Dispatch by op_type to a handler in ``_STUB_HANDLERS``.
+    """Dispatch by op_type to a handler in ``_STUB_HANDLERS``, with scf support.
 
     Mirrors the bind-result/track-LX logic of
     ``KTIRInterpreter.execute_op`` for plain returns; for generator
     returns, hands off to the scheduler (which drives via ``yield from``).
+
+    scf.for / scf.yield / scf.if are routed through the real dialect
+    handlers via a minimal ExecutionEnv whose execute_region_with_comms
+    recurses back into this same _execute — completing the propagation
+    chain without going through KTIRInterpreter.
     """
+    env_holder: List[Any] = [None]
+
+    def execute_region_with_comms(ctx, ops):
+        result = None
+        for op in ops:
+            result = _execute(op, ctx)
+            if inspect.isgenerator(result):
+                result = yield from result
+                if op.result and result is not None:
+                    names = op.result if isinstance(op.result, list) else [op.result]
+                    values = result if isinstance(result, tuple) else [result]
+                    for name, val in zip(names, values):
+                        ctx.set_value(name, val)
+        return result
+
+    memory = SpyreMemoryHierarchy(num_cores=1)
+    dummy_grid = GridExecutor(grid_shape=(1, 1, 1), memory=memory)
+    env_holder[0] = ExecutionEnv(
+        grid_executor=dummy_grid,
+        execute_region=lambda ctx, ops: None,
+        execute_region_with_comms=execute_region_with_comms,
+    )
+
+    # Ops whose bodies may contain comm ops — must route through dialect
+    # handlers with a comm-aware ExecutionEnv so generators propagate.
+    _OPS_CALLING_COMMS = {"scf.for", "scf.yield", "scf.if", "scf.while"}
+
     def _execute(op: Operation, ctx) -> Any:
-        handler = _STUB_HANDLERS.get(op.op_type)
-        if handler is None:
-            raise KeyError(f"No stub handler for op_type {op.op_type!r}")
-        result = handler(op, ctx)
+        if op.op_type in _OPS_CALLING_COMMS:
+            result = dispatch(op.op_type)(op, ctx, env_holder[0])
+        else:
+            handler = _STUB_HANDLERS.get(op.op_type)
+            if handler is None:
+                raise KeyError(f"No stub handler for op_type {op.op_type!r}")
+            result = handler(op, ctx)
         if inspect.isgenerator(result):
             return result
         if op.result and result is not None:
-            ctx.set_value(op.result, result)
-            if isinstance(result, Tile):
-                ctx.track_lx(op.result, result.size_bytes())
+            names = op.result if isinstance(op.result, list) else [op.result]
+            values = result if isinstance(result, tuple) else [result]
+            for name, val in zip(names, values):
+                ctx.set_value(name, val)
         return result
+
     return _execute
 
 
@@ -286,18 +325,25 @@ def build_grid(shape: Tuple[int, int, int]) -> GridExecutor:
 
 
 def initialize_ops(op_descs: List[dict]) -> List[Operation]:
-    """Convert spec op-descriptor dicts to Operation objects."""
-    return [
-        Operation(
-            result=desc.get("result"),
-            op_type=desc["op"],
-            operands=desc.get("args", []),
-            attributes=desc.get("attrs", {}),
-            result_type=desc.get("result_type", "tile"),
-            regions=[],
-        )
-        for desc in op_descs
-    ]
+    """Convert spec op-descriptor dicts to Operation objects.
+
+    Items that are already Operation objects (e.g. pre-built scf.for with
+    inline body regions) are passed through unchanged.
+    """
+    result = []
+    for desc in op_descs:
+        if isinstance(desc, Operation):
+            result.append(desc)
+        else:
+            result.append(Operation(
+                result=desc.get("result"),
+                op_type=desc["op"],
+                operands=desc.get("args", []),
+                attributes=desc.get("attrs", {}),
+                result_type=desc.get("result_type", "tile"),
+                regions=[],
+            ))
+    return result
 
 
 def seed_tiles(grid: GridExecutor, seed: Dict[int, Dict[str, Tile]]) -> None:
@@ -524,3 +570,209 @@ def test_scheduler_detects_deadlock(broken_run, execute_fn, monkeypatch):
     monkeypatch.setattr(RingReduceBackend, "run", broken_run)
     with pytest.raises(RuntimeError, match="Deadlock detected"):
         run_spec(SPEC_RING_REDUCE_4X1X1, execute_fn)
+
+
+# ---------------------------------------------------------------------------
+# Inner-loop comm ops
+# ---------------------------------------------------------------------------
+# These tests exercise comm ops (test.reduce) placed inside an scf.for body,
+# verifying that the generator propagates correctly through the
+# execute_region_with_comms → ControlOps.for_op_with_comms → scf__for chain
+# up to the GridExecutor scheduler.
+#
+# The execute_fn fixture already handles scf.for / scf.yield by routing them
+# through the real dialect handlers with an ExecutionEnv whose
+# execute_region_with_comms recurses back into the same stub, completing the
+# propagation chain without going through KTIRInterpreter.
+#
+# Test matrix:
+#   - single-iter: scf.for runs once, one reduce inside (minimal smoke test)
+#   - multi-iter:  scf.for runs N times, one reduce per iteration (verifies
+#                  the generator is re-entered correctly each iteration)
+#   - plain-loop:  scf.for with no comm op inside (regression — sync path)
+#   - top-level:   test.reduce at top level, no scf.for (regression of
+#                  existing execute_fn path)
+# ---------------------------------------------------------------------------
+
+def _make_for_op(lb: str, ub: str, step: str, iter_var: str,
+                 body: List[Operation],
+                 result: str = None,
+                 iter_args: List[str] = None,
+                 iter_inits: List[str] = None) -> Operation:
+    """Build a synthetic scf.for Operation with an inline body region."""
+    attrs = {"iter_var": iter_var}
+    if iter_args:
+        attrs["iter_args"] = iter_args
+    operands = [lb, ub, step] + (iter_inits or [])
+    return Operation(
+        result=result or iter_var,
+        op_type="scf.for",
+        operands=operands,
+        attributes=attrs,
+        result_type="index",
+        regions=[body],
+    )
+
+
+def _make_reduce_op(arg: str, group: List[int], result: str) -> Operation:
+    return Operation(
+        result=result,
+        op_type="test.reduce",
+        operands=[arg],
+        attributes={"group": group},
+        result_type="tile",
+        regions=[],
+    )
+
+
+def _make_yield_op(*args: str) -> Operation:
+    return Operation(
+        result=None,
+        op_type="scf.yield",
+        operands=list(args),
+        attributes={},
+        result_type=None,
+        regions=[],
+    )
+
+
+# Inner-loop spec helpers — scf.for wrapping a test.reduce.
+# The for loop runs `n_iters` times; each iteration reduces %t across the group.
+# The spec seeds %t on every core and expects %r on every participating core.
+
+def _inner_reduce_spec(grid, group, init_values, n_iters, expected):
+    """Build a spec with scf.for containing a test.reduce.
+
+    Uses iter_args to carry %r out of the loop body so the final reduced
+    tile is visible after the loop.  An identity tile (zeros) is the
+    initial iter_arg value.
+    """
+    body = [
+        _make_reduce_op("%t", group, "%r"),
+        _make_yield_op("%r"),
+    ]
+    for_op = _make_for_op(
+        "%c0", "%cN", "%c1", "%i", body,
+        result="%r",
+        iter_args=["%r"],
+        iter_inits=["%r_init"],
+    )
+    return {
+        "grid": grid,
+        "seed": {
+            core_id: {
+                "%t": _tile(v),
+                "%r_init": _tile(0.0),
+                "%c0": 0,
+                "%cN": n_iters,
+                "%c1": 1,
+            }
+            for core_id, v in init_values.items()
+        },
+        "operations": [for_op],
+        "expect": expected,
+    }
+
+
+SPEC_INNER_REDUCE_SINGLE_ITER = _inner_reduce_spec(
+    grid=(2, 1, 1),
+    group=[0, 1],
+    init_values={0: 5.0, 1: 7.0},
+    n_iters=1,
+    expected={0: {"%r": 12.0}, 1: {"%r": 12.0}},
+)
+
+SPEC_INNER_REDUCE_MULTI_ITER = _inner_reduce_spec(
+    grid=(2, 1, 1),
+    group=[0, 1],
+    init_values={0: 3.0, 1: 4.0},
+    n_iters=3,
+    # Each iteration replaces %r with the all-reduce of %t (3+4=7).
+    # After 3 iters, %r = 7.0 on both cores.
+    expected={0: {"%r": 7.0}, 1: {"%r": 7.0}},
+)
+
+SPEC_PLAIN_LOOP_NO_COMM = {
+    # scf.for with no comm op inside — verifies the sync fallback path
+    # is not broken by the comms machinery.
+    "grid": (2, 1, 1),
+    "seed": {
+        0: {"%t": _tile(1.0), "%c0": 0, "%cN": 3, "%c1": 1},
+        1: {"%t": _tile(2.0), "%c0": 0, "%cN": 3, "%c1": 1},
+    },
+    "operations": [
+        _make_for_op(
+            "%c0", "%cN", "%c1", "%i",
+            body=[_make_yield_op()],   # empty body — no comm, no result
+        ),
+    ],
+    # No reduce → %t unchanged on both cores.
+    "expect": {0: {"%t": 1.0}, 1: {"%t": 2.0}},
+}
+
+
+# Nested scf.for: outer loop (n_outer iters) contains inner loop (n_inner iters),
+# inner loop body contains a ring reduce.
+# Total reductions per core = n_outer * n_inner; each yields the same all-reduce
+# sum, so expected = n_outer * n_inner * sum(partials).
+def _nested_reduce_spec(grid, group, init_values, n_outer, n_inner, expected):
+    """Build a spec with outer scf.for → inner scf.for → test.reduce."""
+    inner_body = [
+        _make_reduce_op("%t", group, "%r"),
+        _make_yield_op("%r"),
+    ]
+    inner_for = _make_for_op(
+        "%c0", "%cNi", "%c1", "%j", inner_body,
+        result="%r",
+        iter_args=["%r"],
+        iter_inits=["%r_carry"],
+    )
+    outer_body = [inner_for, _make_yield_op("%r")]
+    outer_for = _make_for_op(
+        "%c0", "%cNo", "%c1", "%i", outer_body,
+        result="%r",
+        iter_args=["%r"],
+        iter_inits=["%r_init"],
+    )
+    return {
+        "grid": grid,
+        "seed": {
+            core_id: {
+                "%t": _tile(v),
+                "%r_init": _tile(0.0),
+                "%r_carry": _tile(0.0),
+                "%c0": 0,
+                "%cNo": n_outer,
+                "%cNi": n_inner,
+                "%c1": 1,
+            }
+            for core_id, v in init_values.items()
+        },
+        "operations": [outer_for],
+        "expect": expected,
+    }
+
+
+SPEC_NESTED_LOOP_REDUCE = _nested_reduce_spec(
+    grid=(2, 1, 1),
+    group=[0, 1],
+    init_values={0: 3.0, 1: 4.0},
+    n_outer=2,
+    n_inner=3,
+    # Each of the 2*3=6 iterations reduces to 3+4=7; final %r = 7.0.
+    expected={0: {"%r": 7.0}, 1: {"%r": 7.0}},
+)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(SPEC_INNER_REDUCE_SINGLE_ITER, id="inner_reduce_single_iter"),
+        pytest.param(SPEC_INNER_REDUCE_MULTI_ITER,  id="inner_reduce_multi_iter"),
+        pytest.param(SPEC_PLAIN_LOOP_NO_COMM,       id="plain_loop_no_comm"),
+        pytest.param(SPEC_NESTED_LOOP_REDUCE,       id="nested_loop_reduce"),
+    ],
+)
+def test_inner_loop_comm(spec, execute_fn):
+    """Comm ops inside scf.for bodies propagate correctly to the scheduler."""
+    run_spec(spec, execute_fn)

@@ -71,6 +71,8 @@ def _classify_refs(node, var_names: list):
         return (tag, node[1], _classify_refs(node[2], var_names))
     if tag == "neg":
         return (tag, _classify_refs(node[1], var_names))
+    if tag in ("floordiv", "mod"):
+        return (tag, _classify_refs(node[1], var_names), node[2])
     return node  # "const", "dim" — pass through unchanged
 
 
@@ -107,6 +109,8 @@ def _reclassify_dims(node, ssa_operand_names: list):
         return (tag, node[1], _reclassify_dims(node[2], ssa_operand_names))
     if tag == "neg":
         return (tag, _reclassify_dims(node[1], ssa_operand_names))
+    if tag in ("floordiv", "mod"):
+        return (tag, _reclassify_dims(node[1], ssa_operand_names), node[2])
     return node  # "const" — pass through unchanged
 
 
@@ -121,26 +125,11 @@ def parse_subscript_expr(token: str, var_names: list):
       - integer literal                              → ``("const", value)``
       - ``lhs OP rhs``  (OP = +, -, *)              → ``("add/sub/mul", ...)``
 
-    Legacy keyword forms handled via regex fast-path:
-      - ``%name floordiv N``  → ``("floordiv", i, N)``
-      - ``%name mod N``       → ``("mod", i, N)``
-
     ``var_names`` is the list of intermediate variable names (without ``%``).
     """
     from ..parser_ast import _Parser, _tokenise
 
     t = token.strip()
-    bare = t.lstrip("%")
-
-    # Legacy fast-path: keyword forms not in the expression grammar.
-    m = _re.match(r'^(\w+)\s+floordiv\s+(\d+)$', bare)
-    if m:
-        return ("floordiv", var_names.index(m.group(1)), int(m.group(2)))
-    m = _re.match(r'^(\w+)\s+mod\s+(\d+)$', bare)
-    if m:
-        return ("mod", var_names.index(m.group(1)), int(m.group(2)))
-
-    # General case: recursive-descent parse, then classify named refs.
     node = _Parser(_tokenise(t)).parse_expr()
     return _classify_refs(node, var_names)
 
@@ -151,17 +140,11 @@ def eval_subscript_expr(expr: tuple, pt: tuple) -> int:
     *expr* must be a tuple produced by :func:`parse_subscript_expr`.
     *pt* is the variable vector (one int per intermediate variable).
 
-    Delegates to the affine AST evaluator for generic node types
-    (const, dim, add, sub, mul, neg).  Intervenes only for the legacy
-    ("floordiv", i, N) / ("mod", i, N) forms not in the affine grammar.
-    ("ssa", ...) nodes must be pre-resolved to ("const", v) by
-    _resolve_node before eval is called.
+    Fully delegates to the affine AST evaluator, which handles all node
+    types including floordiv and mod.  ("ssa", ...) nodes must be
+    pre-resolved to ("const", v) by _resolve_node before eval is called.
     """
     from ..parser_ast import _eval_node
-    if expr[0] == "floordiv":
-        return pt[expr[1]] // expr[2]
-    if expr[0] == "mod":
-        return pt[expr[1]] % expr[2]
     return _eval_node(expr, list(pt))
 
 

@@ -221,12 +221,9 @@ module {
 
 
 def test_multi_result_single_value_raises_error():
-    """When op.result is a list but handler returns a non-tuple, a TypeError is raised.
+    """When op.result is a list but handler returns a non-tuple, a RuntimeError is raised.
 
-    This documents the current (unguarded) behavior: the interpreter tries to
-    use the list as a dict key in set_value, which is unhashable.  This is a
-    known edge-case that callers must avoid by always returning a tuple from
-    multi-result handlers.
+    The arity guard catches the mismatch before any set_value call.
     """
     from unittest.mock import patch
     from ktir_cpu.dialects import registry
@@ -255,5 +252,43 @@ module {
             result_type=None,
             regions=[],
         )
-        with pytest.raises(TypeError):
+        with pytest.raises(RuntimeError):
             interp._execute_op(op, core)
+
+
+# ---------------------------------------------------------------------------
+# 5. Bundled LHS parsing and execution
+# ---------------------------------------------------------------------------
+
+# Bundled LHS form: %acc:2 defines two results bound as %acc#0, %acc#1.
+# After the loop, %acc#0 and %acc#1 are used on the RHS of arith.addi.
+_BUNDLED_FOR_MLIR = """
+module {
+  func.func @bundled_for() attributes {grid = [1, 1, 1]} {
+    %c0 = arith.constant 0 : index
+    %c3 = arith.constant 3 : index
+    %c1 = arith.constant 1 : index
+    %init_x = arith.constant 0 : index
+    %init_y = arith.constant 10 : index
+
+    // Bundled LHS: %acc:2 defines %acc#0 and %acc#1 simultaneously
+    %acc:2 = scf.for %i = %c0 to %c3 step %c1 iter_args(%x = %init_x, %y = %init_y) -> (index, index) {
+      %x_new = arith.addi %x, %i : index
+      %y_new = arith.addi %y, %i : index
+      scf.yield %x_new, %y_new : index, index
+    }
+
+    // Use-site: %acc#0 and %acc#1 reference the bundled results
+    %sum = arith.addi %acc#0, %acc#1 : index
+    return
+  }
+}
+"""
+
+
+def test_bundled_lhs_for_exec():
+    """Bundled LHS %acc:2 = scf.for parses and executes; %acc#0/%acc#1 resolve."""
+    interp = KTIRInterpreter()
+    interp.load(_BUNDLED_FOR_MLIR)
+    # Should complete without error (KeyError on %acc#0/%acc#1 was the bug)
+    interp.execute_function("bundled_for")

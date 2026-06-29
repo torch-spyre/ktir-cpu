@@ -28,6 +28,7 @@ import pytest
 from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
+from ktir_cpu.dtypes import stick_to_elem_idx
 from ktir_cpu.dialects.registry import dispatch, ExecutionEnv
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,20 @@ def _make_ctx(grid_pos=(0, 0, 0), core_id=0):
         lx=LXScratchpad(size_mb=2, core_id=core_id),
         hbm=HBMSimulator(),
     )
+
+
+def _drive(gen):
+    """Exhaust a scf handler generator synchronously (no scheduler needed).
+    scf__for / scf__if are generator functions; tests that call them directly
+    use this to get the return value without a real scheduler."""
+    import inspect
+    if not inspect.isgenerator(gen):
+        return gen
+    try:
+        while True:
+            next(gen)
+    except StopIteration as e:
+        return e.value
 
 
 def _make_env(grid_shape=(1, 1, 1)):
@@ -838,7 +853,7 @@ class TestMath:
 
 class TestLinalg:
     def test_reduce_along_dim(self):
-        # reduce a 1×4 tile along dim 1 — result is a (1,) tile summing to 10
+        # reduce a 1x4 tile along dim 1 - result is a (1,) tile summing to 10
         data = np.array([[1, 2, 3, 4]], dtype=np.float16)
         t = Tile(data, "f16", data.shape)
         ctx = _ctx_with(**{"%x": t, "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
@@ -882,8 +897,8 @@ class TestLinalg:
 
     def test_reduce_multiop_combiner(self):
         # MULTI-OP combiner: max expressed as cmpf(ogt) + select. The general
-        # tree fold must run BOTH region ops — there is no single combiner name
-        # to map to a NumPy reduction — and still return the correct max.
+        # tree fold must run BOTH region ops - there is no single combiner name
+        # to map to a NumPy reduction - and still return the correct max.
         data = np.array([[0.1, 0.9, 0.3, 0.2, 0.5, 0.05, 0.7, 0.05]], dtype=np.float16)
         neg_inf = np.float16("-inf")
         ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
@@ -901,27 +916,83 @@ class TestLinalg:
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(float(data.max()), abs=1e-2)
 
-    @pytest.mark.xfail(reason="multi-axis reduce not supported: parser keeps only "
-                              "dims[0] and the tree fold indexes a single axis. "
-                              "Tracked in issue #85.",
-                       strict=True)
     def test_reduce_multi_axis(self):
         # dimensions = [0, 1] should reduce BOTH axes (2x3 -> scalar 15).
         data = np.arange(6, dtype=np.float16).reshape(2, 3)  # sum = 15
         ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
-                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+                           "%init": Tile(np.zeros((), dtype=np.float16), "f16", ())})
         result = _call("linalg.reduce", ctx, _make_env(),
                        operands=["%x"],
-                       attributes={"reduce_fn": "arith.addf", "dim": [0, 1],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 1],
                                    "outs_var": "%init"})
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(15.0, abs=1e-2)
 
-    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
-                              "the tree fold seeds from the input only. Harmless "
-                              "while the frontend inits outs to the identity. "
-                              "Tracked in issue #85.",
+    def test_reduce_multi_axis_3d_disjoint_2d(self):
+        # dimensions = [0, 2] on a (3, 4, 2) tensor - disjoint axes.
+        # Output shape (4,): for each dim1 slot, sum over dim0 and dim2.
+        data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
+        expected = data.sum(axis=(0, 2))  # shape (4,)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
+                                   "outs_var": "%init"})
+        assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
+    def test_reduce_multi_axis_3d_0d(self):
+        # dimensions = [] on a (3, 4, 2) tensor - zero reduce dims is a no-op.
+        # Output shape must equal input shape; values unchanged.
+        data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
+        expected = data.copy()  # no reduction - identity
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros_like(data), "f16", data.shape)})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [],
+                                   "outs_var": "%init"})
+        assert result.shape == (3, 4, 2)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
+    @pytest.mark.xfail(reason="tree-fold (pairwise halving) breaks the "
+                              "linalg.reduce associativity-only contract: "
+                              "partial sums across axes reorder elements, "
+                              "producing different f16 rounding than the "
+                              "left-associative sequential reduction MLIR "
+                              "semantics prescribe.",
                        strict=True)
+    # Tree-fold vs. MLIR sequential order for dims=[0, 1] on shape (2, 3):
+    #
+    #   data = [[a, b, c],
+    #            [d, e, f]]
+    #
+    # MLIR (scalar loop, row-major left-associative):
+    #   ((((( a + b ) + c ) + d ) + e ) + f )
+    #
+    # Tree-fold (this impl): fold axis 1 first, then axis 0:
+    #   axis-1: (a+b)+c,  (d+e)+f
+    #   axis-0: ((a+b)+c) + ((d+e)+f)
+    #
+    # These groupings differ, so f16 rounding can diverge.
+    def test_reduce_multi_axis_treefold_bug(self):
+        # (3,4,2) reduce dims=[0,2]. Large cancelling values at [0,:,0] and
+        # [2,:,0] expose the reordering: tree fold pairs partial sums from
+        # dim2 before folding dim0, changing which elements cancel first.
+        data = np.ones((3, 4, 2), dtype=np.float16)
+        data[0, :, 0] = 10000
+        data[2, :, 0] = -10000
+        expected = data.sum(axis=(0, 2))  # numpy left-associative: [1,1,1,1]
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
+                                   "outs_var": "%init"})
+        assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
     def test_reduce_folds_outs_init(self):
         # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
         # outs init = 100 should be 110, not 10.
@@ -963,15 +1034,16 @@ class TestLinalg:
         assert np.allclose(result.data, b.data, rtol=1e-2)
 
     def test_batch_matmul(self):
-        # batched identity: for each batch, I @ B == B
-        eye = np.broadcast_to(np.eye(2, dtype=np.float16), (3, 2, 2)).copy()
-        bdata = np.arange(3 * 2 * 2, dtype=np.float16).reshape(3, 2, 2)
-        a = Tile(eye, "f16", (3, 2, 2))
+        # non-identity A so index transposition bugs would produce wrong values
+        adata = np.array([[[1, 2], [3, 4]], [[2, 0], [1, 3]], [[1, 1], [0, 2]]], dtype=np.float16)
+        bdata = np.array([[[5, 6], [7, 8]], [[1, 2], [3, 4]], [[2, 3], [1, 0]]], dtype=np.float16)
+        expected = np.einsum("bij,bjk->bik", adata, bdata).astype(np.float16)
+        a = Tile(adata, "f16", (3, 2, 2))
         b = Tile(bdata, "f16", (3, 2, 2))
         ctx = _ctx_with(**{"%a": a, "%b": b})
         result = _call("linalg.batch_matmul", ctx, _make_env(), operands=["%a", "%b"])
         assert result.shape == (3, 2, 2)
-        assert np.allclose(result.data, bdata, rtol=1e-2)
+        assert np.allclose(result.data, expected, rtol=1e-2)
 
     def test_generic_reads_outs_arg(self):
         # linalg.generic where the body reads the outs bb0 arg.
@@ -1156,6 +1228,160 @@ class TestTensor:
         assert result.shape == (1,)
         assert list(result.data) == [128]
 
+    def test_extract_slice(self):
+        # slice rows 2-3, cols 1-3 (offsets=[2,1], sizes=[2,2], strides=[1,1])
+        data = np.arange(16, dtype=np.float16).reshape(4, 4)
+        t = Tile(data, "f16", (4, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [2, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (2, 2),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (2, 2)
+        assert np.array_equal(result.data, data[2:4, 1:3])
+
+    def test_extract_slice_rank_reduce(self):
+        # size-1 leading dim dropped: result_shape (4,) from a (1,4) sub-slice
+        data = np.arange(8, dtype=np.float16).reshape(2, 4)
+        t = Tile(data, "f16", (2, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1, 0],
+                           "static_sizes": [1, 4],
+                           "static_strides": [1, 1],
+                           "result_shape": (4,),
+                           "dtype": "f16",
+                       })
+        assert result.shape == (4,)
+        assert np.array_equal(result.data, data[1, :])
+
+    def test_insert_slice(self):
+        # insert a 2x2 patch at offset [1, 1] into a 4x4 tensor
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (4, 4),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (4, 4)
+        expected = np.zeros((4, 4), dtype=np.float16)
+        expected[1:3, 1:3] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_insert_slice_no_alias(self):
+        # insert_slice must not mutate the original destination tile
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base_data = np.zeros((4, 4), dtype=np.float16)
+        base = Tile(base_data.copy(), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        _call("tensor.insert_slice", ctx, _make_env(),
+              operands=["%patch", "%base"],
+              attributes={
+                  "static_offsets": [0, 0],
+                  "static_sizes": [2, 2],
+                  "static_strides": [1, 1],
+                  "result_shape": (4, 4),
+                  "dtype": "f16",
+              })
+        assert np.array_equal(base.data, base_data)
+
+    def test_extract_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array).
+
+        Mirrors the Spyre matmul lowering pattern:
+            %sl = tensor.extract_slice %b[0, %off, 0][1, 64, 64][1, 1, 1]
+                    : tensor<1x128x64xf32> to tensor<64x64xf32>
+        where %off = k * 64 is a runtime value.
+        """
+        _KDYNAMIC = -(1 << 63)
+        data = np.arange(128 * 64, dtype=np.float32).reshape(1, 128, 64)
+        t = Tile(data, "f32", (1, 128, 64))
+        ctx = _ctx_with(**{"%t": t, "%off": 64})  # second stick: offset=64
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t", "%off"],
+                       attributes={
+                           "static_offsets": [0, _KDYNAMIC, 0],
+                           "static_sizes":   [1, 64, 64],
+                           "static_strides": [1, 1, 1],
+                           "result_shape": (64, 64),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (64, 64)
+        assert np.array_equal(result.data, data[0, 64:128, :])
+
+    def test_insert_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array)."""
+        _KDYNAMIC = -(1 << 63)
+        patch = Tile(np.ones((64,), dtype=np.float32), "f32", (64,))
+        base_data = np.zeros((128,), dtype=np.float32)
+        base = Tile(base_data.copy(), "f32", (128,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base, "%off": 64})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base", "%off"],
+                       attributes={
+                           "static_offsets": [_KDYNAMIC],
+                           "static_sizes":   [64],
+                           "static_strides": [1],
+                           "result_shape": (128,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (128,)
+        expected = np.zeros((128,), dtype=np.float32)
+        expected[64:] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_extract_slice_stride_gt1(self):
+        # stride=2: select every other element — requires stop = off + sz * st
+        data = np.arange(10, dtype=np.float32)
+        t = Tile(data, "f32", (10,))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (3,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (3,)
+        # off=1, sz=3, st=2 → elements at indices 1, 3, 5
+        assert np.array_equal(result.data, data[1:7:2])
+
+    def test_insert_slice_stride_gt1(self):
+        # stride=2: write to every other element — requires stop = off + sz * st
+        patch = Tile(np.array([10.0, 20.0, 30.0], dtype=np.float32), "f32", (3,))
+        base = Tile(np.zeros((10,), dtype=np.float32), "f32", (10,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (10,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (10,)
+        expected = np.zeros((10,), dtype=np.float32)
+        expected[1:7:2] = [10.0, 20.0, 30.0]
+        assert np.array_equal(result.data, expected)
+
 
 # ---------------------------------------------------------------------------
 # tensor.generate exec
@@ -1242,8 +1468,10 @@ class TestScfFunc:
                        result=None, result_type=None,
                        regions=[[lambda c: ran.append("then")], []])
         env = _make_env()
-        env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
-        dispatch("scf.if")(op, ctx, env)
+        _exec = lambda ctx, ops: [f(ctx) for f in ops]
+        env.execute_region = _exec
+        env.execute_region_with_comms = _exec
+        _drive(dispatch("scf.if")(op, ctx, env))
         assert ran == ["then"]
 
     def test_if_else_branch(self):
@@ -1254,8 +1482,10 @@ class TestScfFunc:
                        result=None, result_type=None,
                        regions=[[], [lambda c: ran.append("else")]])
         env = _make_env()
-        env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
-        dispatch("scf.if")(op, ctx, env)
+        _exec = lambda ctx, ops: [f(ctx) for f in ops]
+        env.execute_region = _exec
+        env.execute_region_with_comms = _exec
+        _drive(dispatch("scf.if")(op, ctx, env))
         assert ran == ["else"]
 
     def test_if_then_else_yield_result(self):
@@ -1274,8 +1504,13 @@ class TestScfFunc:
                 result = dispatch(o.op_type)(o, ctx, env)
             return result
 
+        def real_execute_region_gen(ctx, ops):
+            return real_execute_region(ctx, ops)
+            yield  # make it a generator function
+
         env.execute_region = real_execute_region
-        result = dispatch("scf.if")(op, ctx, env)
+        env.execute_region_with_comms = real_execute_region_gen
+        result = _drive(dispatch("scf.if")(op, ctx, env))
         assert result == 42, f"expected 42, got {result!r}"
 
 # ---------------------------------------------------------------------------
@@ -1433,6 +1668,7 @@ class TestKtdp:
 
     def test_load_store_roundtrip(self):
         # load reads data from HBM; store writes it back modified
+        from ktir_cpu.affine import BoxSet
         from ktir_cpu.ir_types import AccessTile, MemRef
         from ktir_cpu.parser_ast import parse_affine_map
 
@@ -1444,12 +1680,12 @@ class TestKtdp:
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
         identity_map = parse_affine_map("affine_map<(d0) -> (d0)>")
-        memref = MemRef(base_ptr=ptr, shape=(8,), strides=[1],
+        memref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(8,), strides=[1],
                         memory_space="HBM", dtype="f16")
         tile_ref = memref.to_tile_ref()
         access_tile = AccessTile(parent_ref=tile_ref, shape=(8,),
                                  base_map=identity_map,
-                                 coordinate_set=None,
+                                 coordinate_set=BoxSet(lo=(0,), hi=(8,)),
                                  coordinate_order=None)
         ctx.set_value("%acc", access_tile)
         env = _make_env()

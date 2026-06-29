@@ -22,7 +22,7 @@ import numpy as np
 from ..grid import CoreContext
 from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
-from ..parser_utils import find_ssa_names
+from ..parser_utils import find_ssa_names, parse_tensor_or_memref_type
 from .registry import register, register_parser
 
 
@@ -184,6 +184,112 @@ def tensor__yield(op, context, env):
     return ControlOps.yield_op(values)
 
 
+_KDYNAMIC = -(1 << 63)  # ShapedType::kDynamic sentinel
+
+
+def _resolve_dynamic(static_list, dynamic_operands, context):
+    """Substitute kDynamic sentinels with values from dynamic_operands.
+
+    static_list    — list of ints, some may be _KDYNAMIC
+    dynamic_operands — SSA names for the dynamic positions, in order
+    Returns a list of resolved ints.
+    """
+    dyn_iter = iter(dynamic_operands)
+    result = []
+    for v in static_list:
+        if v == _KDYNAMIC:
+            name = next(dyn_iter)
+            result.append(int(context.get_value(name)))
+        else:
+            result.append(int(v))
+    return result
+
+
+@register("tensor.extract_slice")
+def tensor__extract_slice(op, context, env):
+    """Slice a sub-tensor and reshape to the result type's shape.
+
+    Supports both fully-static and mixed static/dynamic offsets, sizes, and
+    strides.  Dynamic positions carry the sentinel _KDYNAMIC in the static
+    array; their real values are the trailing SSA operands after the source
+    (offsets first, then sizes, then strides).
+    """
+    src = context.get_value(op.operands[0])
+    if not isinstance(src, Tile):
+        raise ValueError(f"tensor.extract_slice: expected Tile source, got {type(src)}")
+
+    static_offsets = op.attributes["static_offsets"]
+    static_sizes = op.attributes["static_sizes"]
+    static_strides = op.attributes["static_strides"]
+    result_shape = tuple(op.attributes["result_shape"])
+    dtype_str = op.attributes["dtype"]
+
+    # Dynamic operands follow the source operand, ordered: offsets, sizes, strides.
+    n_dyn_off = sum(1 for v in static_offsets if v == _KDYNAMIC)
+    n_dyn_sz  = sum(1 for v in static_sizes   if v == _KDYNAMIC)
+    n_dyn_st  = sum(1 for v in static_strides  if v == _KDYNAMIC)
+    dyn_ops = op.operands[1:]
+    dyn_off_ops = dyn_ops[:n_dyn_off]
+    dyn_sz_ops  = dyn_ops[n_dyn_off:n_dyn_off + n_dyn_sz]
+    dyn_st_ops  = dyn_ops[n_dyn_off + n_dyn_sz:n_dyn_off + n_dyn_sz + n_dyn_st]
+
+    offsets = _resolve_dynamic(static_offsets, dyn_off_ops, context)
+    sizes   = _resolve_dynamic(static_sizes,   dyn_sz_ops,  context)
+    strides = _resolve_dynamic(static_strides, dyn_st_ops,  context)
+
+    idx = tuple(
+        slice(off, off + sz * st, st)
+        for off, sz, st in zip(offsets, sizes, strides)
+    )
+    sliced = src.data[idx]
+    reshaped = sliced.reshape(result_shape)
+    return Tile(reshaped, dtype_str, result_shape)
+
+
+@register("tensor.insert_slice")
+def tensor__insert_slice(op, context, env):
+    """Insert a sub-tensor into a destination tensor and return the result.
+
+    Supports both fully-static and mixed static/dynamic offsets, sizes, and
+    strides.  Dynamic positions carry the sentinel _KDYNAMIC in the static
+    array; their real values are the trailing SSA operands after source and
+    dest (offsets first, then sizes, then strides).
+    """
+    src = context.get_value(op.operands[0])
+    dst = context.get_value(op.operands[1])
+
+    if not isinstance(src, Tile):
+        raise ValueError(f"tensor.insert_slice: expected Tile source, got {type(src)}")
+    if not isinstance(dst, Tile):
+        raise ValueError(f"tensor.insert_slice: expected Tile dest, got {type(dst)}")
+
+    static_offsets = op.attributes["static_offsets"]
+    static_sizes = op.attributes["static_sizes"]
+    static_strides = op.attributes["static_strides"]
+    result_shape = tuple(op.attributes["result_shape"])
+    dtype_str = op.attributes["dtype"]
+
+    n_dyn_off = sum(1 for v in static_offsets if v == _KDYNAMIC)
+    n_dyn_sz  = sum(1 for v in static_sizes   if v == _KDYNAMIC)
+    n_dyn_st  = sum(1 for v in static_strides  if v == _KDYNAMIC)
+    dyn_ops = op.operands[2:]
+    dyn_off_ops = dyn_ops[:n_dyn_off]
+    dyn_sz_ops  = dyn_ops[n_dyn_off:n_dyn_off + n_dyn_sz]
+    dyn_st_ops  = dyn_ops[n_dyn_off + n_dyn_sz:n_dyn_off + n_dyn_sz + n_dyn_st]
+
+    offsets = _resolve_dynamic(static_offsets, dyn_off_ops, context)
+    sizes   = _resolve_dynamic(static_sizes,   dyn_sz_ops,  context)
+    strides = _resolve_dynamic(static_strides, dyn_st_ops,  context)
+
+    idx = tuple(
+        slice(off, off + sz * st, st)
+        for off, sz, st in zip(offsets, sizes, strides)
+    )
+    result_data = dst.data.copy()
+    result_data[idx] = src.data.reshape([int(sz) for sz in sizes])
+    return Tile(result_data, dtype_str, result_shape)
+
+
 @register("tensor.generate")
 def tensor__generate(op, context, env):
     """Generate a tensor by evaluating a region body at each index.
@@ -251,19 +357,18 @@ def tensor__generate(op, context, env):
 @register_parser("tensor.empty")
 def parse_tensor_empty(op_text, parse_ctx):
     """Parse tensor.empty() : tensor<1x1024xf16>"""
-    from ..parser_utils import parse_tensor_type
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.empty\s*\(\s*\)\s*:\s*(.+)', op_text)
+    from ..parser_utils import parse_tensor_or_memref_type
+    result_match = re.match(r'tensor\.empty\s*\(\s*\)\s*:\s*(.+)', op_text)
     if not result_match:
         return None
-    result_name = result_match.group(1)
-    type_str = result_match.group(2).strip()
-    type_info = parse_tensor_type(type_str)
+    type_str = result_match.group(1).strip()
+    type_info = parse_tensor_or_memref_type(type_str)
     attributes = {}
     if type_info:
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.empty",
         operands=[],
         attributes=attributes,
@@ -273,14 +378,13 @@ def parse_tensor_empty(op_text, parse_ctx):
 
 @register_parser("tensor.splat")
 def parse_tensor_splat(op_text, parse_ctx):
-    from ..parser_utils import parse_tensor_type
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.splat\s+(%\w+)\s*(?::\s*(.+))?', op_text)
+    from ..parser_utils import parse_tensor_or_memref_type
+    result_match = re.match(r'tensor\.splat\s+(%\w+)\s*(?::\s*(.+))?', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    scalar_operand = result_match.group(2)
-    type_str = result_match.group(3).strip() if result_match.group(3) else "unknown"
+    scalar_operand = result_match.group(1)
+    type_str = result_match.group(2).strip() if result_match.group(2) else "unknown"
 
     # When the syntax is `src_type -> dst_type`, parse the destination (result) type.
     # e.g. tensor<1x1xf16> -> tensor<1x1024xf16>  — we want the 1x1024 shape.
@@ -291,13 +395,13 @@ def parse_tensor_splat(op_text, parse_ctx):
 
     attributes = {}
 
-    type_info = parse_tensor_type(result_type)
+    type_info = parse_tensor_or_memref_type(result_type)
     if type_info:
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.splat",
         operands=[scalar_operand],
         attributes=attributes,
@@ -305,15 +409,14 @@ def parse_tensor_splat(op_text, parse_ctx):
     )
 
 
-@register_parser("tensor.extract")
+@register_parser("tensor.extract ")
 def parse_tensor_extract(op_text, parse_ctx):
     # %scalar = tensor.extract %tensor[%i0, %i1] : tensor<...>
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.extract\s+(%\w+)', op_text)
+    result_match = re.match(r'tensor\.extract\s+(%\w+)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    src_operand = result_match.group(2)
+    src_operand = result_match.group(1)
 
     # Extract index operands from brackets: [%c0] or [%i, %j] or []
     indices = []
@@ -324,7 +427,7 @@ def parse_tensor_extract(op_text, parse_ctx):
             indices = find_ssa_names(bracket_content)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.extract",
         operands=[src_operand] + indices,
         attributes={},
@@ -335,29 +438,21 @@ def parse_tensor_extract(op_text, parse_ctx):
 def _parse_reshape_op(op_text, op_name):
     """Shared parser for tensor.expand_shape and tensor.collapse_shape."""
     result_match = re.match(
-        r'(%\w+)\s*=\s*tensor\.' + op_name + r'\s+(%\w+)', op_text
+        r'tensor\.' + op_name + r'\s+(%\w+)', op_text
     )
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    operand = result_match.group(2)
+    operand = result_match.group(1)
 
     target_shape = None
     target_dtype = "f16"
     into_match = re.search(r'into\s+(?:tile|tensor)<([^>]+)>', op_text)
     if into_match:
-        inner = into_match.group(1)
-        parts = inner.split('x')
-        shape_parts = []
-        for p in parts[:-1]:
-            try:
-                shape_parts.append(int(p))
-            except ValueError:
-                pass
-        if shape_parts:
-            target_shape = tuple(shape_parts)
-            target_dtype = parts[-1]
+        info = parse_tensor_or_memref_type(into_match.group(1))
+        if info:
+            target_shape = tuple(d for d in info["shape"] if d is not None)
+            target_dtype = info["dtype"]
 
     attributes = {}
     if target_shape:
@@ -365,7 +460,7 @@ def _parse_reshape_op(op_text, op_name):
         attributes["dtype"] = target_dtype
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type=f"tensor.{op_name}",
         operands=[operand],
         attributes=attributes,
@@ -423,14 +518,13 @@ def parse_tensor_generate(op_text, parse_ctx):
       - result_name: %mask
       - shape/dtype from the trailing `: tensor<16x16xf16>` type annotation
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
 
-    # Match: %result = tensor.generate ...
-    result_match = re.match(r'(%\w+)\s*=\s*tensor\.generate', op_text)
+    # Match: tensor.generate ...
+    result_match = re.match(r'tensor\.generate', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
     attributes = {}
 
     # Extract shape and dtype from trailing `: tensor<16x16xf16>`
@@ -438,13 +532,13 @@ def parse_tensor_generate(op_text, parse_ctx):
     type_match = re.search(r':\s*(tensor<[^>]+>)\s*$', op_text)
     if not type_match:
         raise ValueError(f"tensor.generate: missing result type in '{op_text}'")
-    type_info = parse_tensor_type(type_match.group(1))
+    type_info = parse_tensor_or_memref_type(type_match.group(1))
     if type_info:
         attributes["shape"] = type_info["shape"]
         attributes["dtype"] = type_info.get("dtype", "f16")
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.generate",
         operands=[],
         attributes=attributes,
@@ -470,26 +564,26 @@ def parse_tensor_reshape(op_text, parse_ctx):
     from the trailing result-type annotation (after `->`), since that is
     always statically pinned, while the shape operand may be runtime.
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     m = re.match(
-        r'(%\w+)\s*=\s*tensor\.reshape\s+(%\w+)\s*\(\s*(%\w+)\s*\)', op_text
+        r'tensor\.reshape\s+(%\w+)\s*\(\s*(%\w+)\s*\)', op_text
     )
     if not m:
         return None
-    result_name, src, shape_operand = m.group(1), m.group(2), m.group(3)
+    src, shape_operand = m.group(1), m.group(2)
 
     arrow = re.search(r'->\s*(tensor<[^>]+>)', op_text)
     if not arrow:
         raise ValueError(f"tensor.reshape: missing result type in '{op_text}'")
     result_type = arrow.group(1)
-    info = parse_tensor_type(result_type)
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(
             f"tensor.reshape: cannot parse result type {result_type!r} in '{op_text}'"
         )
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.reshape",
         operands=[src, shape_operand],
         attributes={
@@ -503,25 +597,24 @@ def parse_tensor_reshape(op_text, parse_ctx):
 @register_parser("tensor.from_elements")
 def parse_tensor_from_elements(op_text, parse_ctx):
     """Parse `%shape = tensor.from_elements %d0, %d1, ... : tensor<NxT>`."""
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     m = re.match(
-        r'(%\w+)\s*=\s*tensor\.from_elements\s+(.*?)\s*:\s*(tensor<[^>]+>)', op_text
+        r'tensor\.from_elements\s+(.*?)\s*:\s*(tensor<[^>]+>)', op_text
     )
     if not m:
         return None
-    result_name = m.group(1)
-    operand_text = m.group(2)
-    type_str = m.group(3)
+    operand_text = m.group(1)
+    type_str = m.group(2)
     operands = find_ssa_names(operand_text)
 
-    info = parse_tensor_type(type_str)
+    info = parse_tensor_or_memref_type(type_str)
     if info is None:
         raise ValueError(
             f"tensor.from_elements: cannot parse result type {type_str!r} in '{op_text}'"
         )
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="tensor.from_elements",
         operands=operands,
         attributes={
@@ -529,4 +622,114 @@ def parse_tensor_from_elements(op_text, parse_ctx):
             "dtype": info["dtype"],
         },
         result_type=type_str,
+    )
+
+
+def _parse_index_list(content):
+    """Parse a bracket group's content into (static_list, dynamic_names).
+
+    Each comma-separated entry is either an integer (static) or an SSA name
+    like ``%off`` (dynamic).  Dynamic entries are stored as _KDYNAMIC in the
+    static list; their SSA names are collected in order into dynamic_names.
+    """
+    static = []
+    dynamic_names = []
+    for token in content.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if token.startswith('%'):
+            static.append(_KDYNAMIC)
+            dynamic_names.append(token)
+        else:
+            static.append(int(token))
+    return static, dynamic_names
+
+
+def _parse_index_bracket_groups(op_text):
+    """Return three (static_list, dynamic_names) tuples for [offsets][sizes][strides]."""
+    groups = []
+    for m in re.finditer(r'\[([^\]]*)\]', op_text):
+        groups.append(_parse_index_list(m.group(1)))
+    if len(groups) < 3:
+        raise ValueError(f"expected [offsets][sizes][strides] in {op_text!r}")
+    return groups[0], groups[1], groups[2]
+
+
+@register_parser("tensor.extract_slice")
+def parse_tensor_extract_slice(op_text, parse_ctx):
+    """Parse `%r = tensor.extract_slice %src[offsets][sizes][strides] : T to T`.
+
+    Supports mixed static/dynamic entries: ``%off`` tokens become _KDYNAMIC
+    in the static array and are appended to operands after the source.
+    """
+    from ..parser_utils import parse_tensor_or_memref_type
+    m = re.match(r'tensor\.extract_slice\s+(%\w+)', op_text)
+    if not m:
+        return None
+    src_operand = m.group(1)
+
+    (off_s, off_d), (sz_s, sz_d), (st_s, st_d) = _parse_index_bracket_groups(op_text)
+
+    result_type_m = re.search(r'\bto\s+(tensor<[^>]+>)\s*$', op_text)
+    if not result_type_m:
+        raise ValueError(f"tensor.extract_slice: missing result type in {op_text!r}")
+    result_type = result_type_m.group(1)
+    info = parse_tensor_or_memref_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
+
+    return Operation(
+        result=None,
+        op_type="tensor.extract_slice",
+        operands=[src_operand] + off_d + sz_d + st_d,
+        attributes={
+            "static_offsets": off_s,
+            "static_sizes": sz_s,
+            "static_strides": st_s,
+            "result_shape": info["shape"],
+            "dtype": info["dtype"],
+        },
+        result_type=result_type,
+    )
+
+
+@register_parser("tensor.insert_slice")
+def parse_tensor_insert_slice(op_text, parse_ctx):
+    """Parse `%r = tensor.insert_slice %src into %dst[offsets][sizes][strides] : T into T`.
+
+    Supports mixed static/dynamic entries: ``%off`` tokens become _KDYNAMIC
+    in the static array and are appended to operands after source and dest.
+    """
+    from ..parser_utils import parse_tensor_or_memref_type
+    m = re.match(
+        r'tensor\.insert_slice\s+(%\w+)\s+into\s+(%\w+)', op_text
+    )
+    if not m:
+        return None
+    src_operand = m.group(1)
+    dst_operand = m.group(2)
+
+    (off_s, off_d), (sz_s, sz_d), (st_s, st_d) = _parse_index_bracket_groups(op_text)
+
+    result_type_m = re.search(r'\binto\s+(tensor<[^>]+>)\s*$', op_text)
+    if not result_type_m:
+        raise ValueError(f"tensor.insert_slice: missing result type in {op_text!r}")
+    result_type = result_type_m.group(1)
+    info = parse_tensor_or_memref_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
+
+    return Operation(
+        result=None,
+        op_type="tensor.insert_slice",
+        operands=[src_operand, dst_operand] + off_d + sz_d + st_d,
+        attributes={
+            "static_offsets": off_s,
+            "static_sizes": sz_s,
+            "static_strides": st_s,
+            "result_shape": info["shape"],
+            "dtype": info["dtype"],
+        },
+        result_type=result_type,
     )

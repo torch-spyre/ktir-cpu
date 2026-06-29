@@ -1,5 +1,14 @@
 # Latency Estimation
 
+> **Notebook maintenance:** `notebooks/latency_demo.ipynb` is the live demo for this doc.
+> Update it (and re-run if keeping executed outputs) when changing:
+> - `HardwareConfig` fields or defaults
+> - `LatencyReport` / `CoreLatencyCounters` API
+> - `roofline()` return shape
+> - any cycle-cost formula in `_estimate()`
+>
+> The notebook covers: matmul, softmax, sdpa, indexed_add — add new example kernels there when they become interesting.
+
 The interpreter can estimate cycle-approximate execution latency on Spyre hardware without access to real hardware. This is **opt-in** — pass a `HardwareConfig` to enable it. When disabled (the default), there is zero overhead and existing behavior is unchanged.
 
 ```python

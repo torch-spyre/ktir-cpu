@@ -24,126 +24,12 @@ from ..parser_utils import find_ssa_names
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
-from ._helpers import _float_binop, _int_binop, _unary
+from ._helpers import _float_binop, _int_binop, _unary, _binop_via_op
 from .registry import register, register_parser
 
 
 def _bool_not(x):
     return ~x if isinstance(x, np.ndarray) else not x
-
-
-
-# ---------------------------------------------------------------------------
-# Float binary ops
-# ---------------------------------------------------------------------------
-
-@register("arith.addf", latency_category=LC.COMPUTE_FLOAT)
-def arith__addf(op, context, env):
-    return _float_binop(op, context, operator.add)
-
-
-@register("arith.subf", latency_category=LC.COMPUTE_FLOAT)
-def arith__subf(op, context, env):
-    return _float_binop(op, context, operator.sub)
-
-
-@register("arith.mulf", latency_category=LC.COMPUTE_FLOAT)
-def arith__mulf(op, context, env):
-    return _float_binop(op, context, operator.mul)
-
-
-@register("arith.divf", latency_category=LC.COMPUTE_FLOAT)
-def arith__divf(op, context, env):
-    return _float_binop(op, context, operator.truediv)
-
-
-@register("arith.remf", latency_category=LC.COMPUTE_FLOAT)
-def arith__remf(op, context, env):
-    return _float_binop(op, context, operator.mod)
-
-
-# ---------------------------------------------------------------------------
-# Float unary ops
-# ---------------------------------------------------------------------------
-
-@register("arith.negf", latency_category=LC.COMPUTE_FLOAT)
-def arith__negf(op, context, env):
-    return _unary(op, context, ArithOps.negf)
-
-
-@register("arith.absf", latency_category=LC.COMPUTE_FLOAT)
-def arith__absf(op, context, env):
-    return _unary(op, context, ArithOps.absf)
-
-
-# ---------------------------------------------------------------------------
-# Float min/max
-# ---------------------------------------------------------------------------
-
-# TODO: consider deprecating arith.maxf / arith.minf aliases — these were
-# renamed to arith.maximumf / arith.minimumf in upstream MLIR.
-@register("arith.maxf", "arith.maximumf", latency_category=LC.COMPUTE_FLOAT)
-def arith__maxf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.maxf(a, b)
-
-
-@register("arith.maxnumf", latency_category=LC.COMPUTE_FLOAT)
-def arith__maxnumf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.maxnumf(a, b)
-
-
-@register("arith.minf", "arith.minimumf", latency_category=LC.COMPUTE_FLOAT)
-def arith__minf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.minf(a, b)
-
-
-@register("arith.minnumf", latency_category=LC.COMPUTE_FLOAT)
-def arith__minnumf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.minnumf(a, b)
-
-
-# ---------------------------------------------------------------------------
-# Float comparison
-# ---------------------------------------------------------------------------
-
-@register("arith.cmpf", latency_category=LC.COMPUTE_FLOAT)
-def arith__cmpf(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    predicate = op.attributes.get("predicate", "oeq")
-    return ArithOps.cmpf(a, b, predicate)
-
-
-# ---------------------------------------------------------------------------
-# Integer binary ops
-# ---------------------------------------------------------------------------
-
-@register("arith.addi", latency_category=LC.COMPUTE_INT)
-def arith__addi(op, context, env):
-    return _int_binop(op, context, operator.add)
-
-
-@register("arith.subi", latency_category=LC.COMPUTE_INT)
-def arith__subi(op, context, env):
-    return _int_binop(op, context, operator.sub)
-
-
-@register("arith.muli", latency_category=LC.COMPUTE_INT)
-def arith__muli(op, context, env):
-    return _int_binop(op, context, operator.mul)
-
-
-@register("arith.divui", latency_category=LC.COMPUTE_INT)
-def arith__divui(op, context, env):
-    return _int_binop(op, context, operator.floordiv)
 
 
 def _truncdiv(a, b):
@@ -156,102 +42,97 @@ def _truncrem(a, b):
     return np.asarray(a) - _truncdiv(a, b) * np.asarray(b)
 
 
-@register("arith.divsi", latency_category=LC.COMPUTE_INT)
-def arith__divsi(op, context, env):
-    return _int_binop(op, context, _truncdiv)
+# ---------------------------------------------------------------------------
+# Float binary ops  (Pattern A.1)
+# ---------------------------------------------------------------------------
 
-
-@register("arith.ceildivsi", latency_category=LC.COMPUTE_INT)
-def arith__ceildivsi(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    return ArithOps.ceildivsi(val1, val2)
-
-
-@register("arith.floordivsi", latency_category=LC.COMPUTE_INT)
-def arith__floordivsi(op, context, env):
-    return _int_binop(op, context, operator.floordiv)
-
-
-@register("arith.remui", latency_category=LC.COMPUTE_INT)
-def arith__remui(op, context, env):
-    return _int_binop(op, context, operator.mod)
-
-
-@register("arith.remsi", latency_category=LC.COMPUTE_INT)
-def arith__remsi(op, context, env):
-    return _int_binop(op, context, _truncrem)
-
-
-@register("arith.minsi", latency_category=LC.COMPUTE_INT)
-def arith__minsi(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.minsi(a, b)
-
-
-@register("arith.maxsi", latency_category=LC.COMPUTE_INT)
-def arith__maxsi(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.maxsi(a, b)
-
-
-@register("arith.minui", latency_category=LC.COMPUTE_INT)
-def arith__minui(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.minui(a, b)
-
-
-@register("arith.maxui", latency_category=LC.COMPUTE_INT)
-def arith__maxui(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.maxui(a, b)
-
-
-@register("arith.ceildivui", latency_category=LC.COMPUTE_INT)
-def arith__ceildivui(op, context, env):
-    a = context.get_value(op.operands[0])
-    b = context.get_value(op.operands[1])
-    return ArithOps.ceildivui(a, b)
+_FLOAT_BINOPS = {
+    "arith.addf": operator.add,
+    "arith.subf": operator.sub,
+    "arith.mulf": operator.mul,
+    "arith.divf": operator.truediv,
+    "arith.remf": operator.mod,
+}
+for _name, _fn in _FLOAT_BINOPS.items():
+    @register(_name, latency_category=LC.COMPUTE_FLOAT)
+    def _(op, context, env, _fn=_fn):
+        return _float_binop(op, context, _fn)
 
 
 # ---------------------------------------------------------------------------
-# Integer bitwise ops
+# Float unary ops  (Pattern A.4 — COMPUTE_FLOAT cluster)
 # ---------------------------------------------------------------------------
 
-@register("arith.andi", latency_category=LC.COMPUTE_INT)
-def arith__andi(op, context, env):
-    return _int_binop(op, context, operator.and_)
+_FLOAT_UNARY_OPS = {
+    "arith.negf": (ArithOps.negf, None),
+    "arith.absf": (ArithOps.absf, None),
+}
+for _name, (_fn, _sfn) in _FLOAT_UNARY_OPS.items():
+    @register(_name, latency_category=LC.COMPUTE_FLOAT)
+    def _(op, context, env, _fn=_fn, _sfn=_sfn):
+        return _unary(op, context, _fn, _sfn)
 
 
-@register("arith.ori", latency_category=LC.COMPUTE_INT)
-def arith__ori(op, context, env):
-    return _int_binop(op, context, operator.or_)
+# ---------------------------------------------------------------------------
+# Float min/max  (Pattern A.3 — via _binop_via_op)
+# ---------------------------------------------------------------------------
+
+# TODO: consider deprecating arith.maxf / arith.minf aliases — these were
+# renamed to arith.maximumf / arith.minimumf in upstream MLIR.
+_FLOAT_MINMAX_OPS = {
+    ("arith.maxf", "arith.maximumf"): ArithOps.maxf,
+    ("arith.maxnumf",):               ArithOps.maxnumf,
+    ("arith.minf", "arith.minimumf"): ArithOps.minf,
+    ("arith.minnumf",):               ArithOps.minnumf,
+}
+for _names, _fn in _FLOAT_MINMAX_OPS.items():
+    @register(*_names, latency_category=LC.COMPUTE_FLOAT)
+    def _(op, context, env, _fn=_fn):
+        return _binop_via_op(op, context, _fn)
 
 
-@register("arith.xori", latency_category=LC.COMPUTE_INT)
-def arith__xori(op, context, env):
-    return _int_binop(op, context, operator.xor)
+# ---------------------------------------------------------------------------
+# Integer binary ops  (Pattern A.2 — _int_binop table)
+# ---------------------------------------------------------------------------
+
+_INT_BINOPS = {
+    "arith.addi":       operator.add,
+    "arith.subi":       operator.sub,
+    "arith.muli":       operator.mul,
+    "arith.divui":      operator.floordiv,
+    "arith.divsi":      _truncdiv,
+    "arith.floordivsi": operator.floordiv,
+    "arith.remui":      operator.mod,
+    "arith.remsi":      _truncrem,
+    "arith.andi":       operator.and_,
+    "arith.ori":        operator.or_,
+    "arith.xori":       operator.xor,
+    "arith.shli":       operator.lshift,
+    "arith.shrsi":      operator.rshift,
+}
+for _name, _fn in _INT_BINOPS.items():
+    @register(_name, latency_category=LC.COMPUTE_INT)
+    def _(op, context, env, _fn=_fn):
+        return _int_binop(op, context, _fn)
 
 
-@register("arith.shli", latency_category=LC.COMPUTE_INT)
-def arith__shli(op, context, env):
-    return _int_binop(op, context, operator.lshift)
+# ---------------------------------------------------------------------------
+# Integer binary ops via ops-layer  (Pattern A.3 — _binop_via_op table)
+# ---------------------------------------------------------------------------
 
-
-@register("arith.shrsi", latency_category=LC.COMPUTE_INT)
-def arith__shrsi(op, context, env):
-    return _int_binop(op, context, operator.rshift)
-
-
-@register("arith.shrui", latency_category=LC.COMPUTE_INT)
-def arith__shrui(op, context, env):
-    val1 = context.get_value(op.operands[0])
-    val2 = context.get_value(op.operands[1])
-    return ArithOps.shrui(val1, val2)
+_INT_BINOPS_VIA_OP = {
+    "arith.minsi":     ArithOps.minsi,
+    "arith.maxsi":     ArithOps.maxsi,
+    "arith.minui":     ArithOps.minui,
+    "arith.maxui":     ArithOps.maxui,
+    "arith.ceildivsi": ArithOps.ceildivsi,
+    "arith.ceildivui": ArithOps.ceildivui,
+    "arith.shrui":     ArithOps.shrui,
+}
+for _name, _fn in _INT_BINOPS_VIA_OP.items():
+    @register(_name, latency_category=LC.COMPUTE_INT)
+    def _(op, context, env, _fn=_fn):
+        return _binop_via_op(op, context, _fn)
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +205,7 @@ def arith__cmpf(op, context, env):
 # Constants & casts
 # ---------------------------------------------------------------------------
 
-@register("arith.constant")
+@register("arith.constant", no_lx_charge=True)
 def arith__constant(op, context, env):
     value = op.attributes.get("value", 0)
     if op.attributes.get("is_tensor"):
@@ -339,14 +220,23 @@ def arith__constant(op, context, env):
     return value
 
 
-@register("arith.extf")
-def arith__extf(op, context, env):
-    return _unary(op, context, ArithOps.extf, np.float32)
+# Cast ops — no latency category  (Pattern A.4 — cast cluster)
+# extsi stays bespoke: uses a lambda that can't be expressed as an ArithOps method.
 
-
-@register("arith.truncf")
-def arith__truncf(op, context, env):
-    return _unary(op, context, ArithOps.truncf)
+_CAST_UNARY_OPS = {
+    "arith.extf":     (ArithOps.extf,     np.float32),
+    "arith.truncf":   (ArithOps.truncf,   None),
+    "arith.extui":    (ArithOps.extui,    int),
+    "arith.trunci":   (ArithOps.trunci,   int),
+    "arith.fptosi":   (ArithOps.fptosi,   int),
+    "arith.fptoui":   (ArithOps.fptoui,   int),
+    "arith.uitofp":   (ArithOps.uitofp,   float),
+    "arith.convertf": (ArithOps.convertf, None),
+}
+for _name, (_fn, _sfn) in _CAST_UNARY_OPS.items():
+    @register(_name)
+    def _(op, context, env, _fn=_fn, _sfn=_sfn):
+        return _unary(op, context, _fn, _sfn)
 
 
 @register("arith.extsi")
@@ -354,35 +244,10 @@ def arith__extsi(op, context, env):
     return _unary(op, context, lambda t: Tile(t.data.astype(np.int64), "i64", t.shape), int)
 
 
-@register("arith.extui")
-def arith__extui(op, context, env):
-    return _unary(op, context, ArithOps.extui, int)
-
-
-@register("arith.trunci")
-def arith__trunci(op, context, env):
-    return _unary(op, context, ArithOps.trunci, int)
-
-
 @register("arith.sitofp")
 def arith__sitofp(op, context, env):
     dtype = op.result_type or "f32"
     return _unary(op, context, lambda v: ArithOps.sitofp(v, dtype))
-
-
-@register("arith.uitofp")
-def arith__uitofp(op, context, env):
-    return _unary(op, context, ArithOps.uitofp, float)
-
-
-@register("arith.fptosi")
-def arith__fptosi(op, context, env):
-    return _unary(op, context, ArithOps.fptosi, int)
-
-
-@register("arith.fptoui")
-def arith__fptoui(op, context, env):
-    return _unary(op, context, ArithOps.fptoui, int)
 
 
 @register("arith.index_cast")
@@ -393,11 +258,6 @@ def arith__index_cast(op, context, env):
 @register("arith.index_castui")
 def arith__index_castui(op, context, env):
     return int(context.get_value(op.operands[0]))
-
-
-@register("arith.convertf")
-def arith__convertf(op, context, env):
-    return _unary(op, context, ArithOps.convertf)
 
 
 @register("arith.bitcast")
@@ -454,14 +314,13 @@ def arith__select(op, context, env):
 
 @register_parser("arith.constant")
 def parse_arith_constant(op_text, parse_ctx):
-    from ..parser_utils import parse_numeric, parse_tensor_type, parse_dense_payload
+    from ..parser_utils import parse_numeric, parse_tensor_or_memref_type, parse_dense_payload
 
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.constant\s*(.*)', op_text)
+    result_match = re.match(r'arith\.constant\s*(.*)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    rest = result_match.group(2).strip()
+    rest = result_match.group(1).strip()
 
     result_type = None
     attributes = {}
@@ -498,7 +357,7 @@ def parse_arith_constant(op_text, parse_ctx):
         inner = braced_match.group(1).strip()
         result_type = braced_match.group(2).strip()
 
-        _type_info = parse_tensor_type(result_type)
+        _type_info = parse_tensor_or_memref_type(result_type)
         elem_dtype = _type_info.get("dtype") if _type_info else result_type
 
         dense_match = re.match(r'dense<([^>]+)>', inner)
@@ -525,7 +384,7 @@ def parse_arith_constant(op_text, parse_ctx):
         simple_match = re.match(r'(-?(?:0[xX][0-9a-fA-F]+|[\d.eE+\-]+))\s*:\s*(.+)$', rest)
         if dense_match:
             result_type = dense_match.group(2).strip()
-            type_info = parse_tensor_type(result_type)
+            type_info = parse_tensor_or_memref_type(result_type)
             elem_dtype = type_info.get("dtype") if type_info else None
             _set_dense(dense_match.group(1), elem_dtype)
             _set_tensor_attrs(type_info, result_type)
@@ -540,12 +399,12 @@ def parse_arith_constant(op_text, parse_ctx):
             type_only_match = re.match(r':\s*(.+)$', rest)
             if type_only_match:
                 result_type = type_only_match.group(1).strip()
-                type_info = parse_tensor_type(result_type) if result_type and "tensor<" in result_type else None
+                type_info = parse_tensor_or_memref_type(result_type) if result_type and "tensor<" in result_type else None
                 _set_tensor_attrs(type_info, result_type or "")
             attributes.setdefault("value", 0)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.constant",
         operands=[],
         attributes=attributes,
@@ -553,75 +412,48 @@ def parse_arith_constant(op_text, parse_ctx):
     )
 
 
-@register_parser("arith.cmpi")
-def parse_arith_cmpi(op_text, parse_ctx):
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.cmpi\s+', op_text)
-    if not result_match:
+# ---------------------------------------------------------------------------
+# Comparison parsers  (Pattern B — single parser for cmpi + cmpf)
+# ---------------------------------------------------------------------------
+
+_CMP_PREDICATES = {
+    "arith.cmpi": (r"eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge", "unknown"),
+    "arith.cmpf": (r"true|false|oeq|ogt|oge|olt|ole|one|ord|ueq|ugt|uge|ult|ule|une|uno", "i1"),
+}
+
+
+@register_parser("arith.cmpi", "arith.cmpf")
+def parse_arith_cmp(op_text, parse_ctx):
+    m = re.match(r'(arith\.cmp[if])\s+', op_text)
+    if not m:
         return None
-
-    result_name = result_match.group(1)
-
-    pred_match = re.search(r'arith\.cmpi\s+(eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge)', op_text)
+    op_type = m.group(1)
+    pred_pattern, default_type = _CMP_PREDICATES[op_type]
+    pred_match = re.search(rf'{re.escape(op_type)}\s+({pred_pattern})', op_text)
     if not pred_match:
-        raise ValueError(f"arith.cmpi: no valid predicate found in: {op_text!r}")
+        raise ValueError(f"{op_type}: no valid predicate found in: {op_text!r}")
     predicate = pred_match.group(1)
-
     operands = find_ssa_names(op_text)
-    operands = [o for o in operands if o != result_name]
-
-    result_type = "unknown"
+    result_type = default_type
     type_match = re.search(r':\s*(.+)$', op_text)
     if type_match:
         result_type = type_match.group(1).strip()
-
     return Operation(
-        result=result_name,
-        op_type="arith.cmpi",
+        result=None,
+        op_type=op_type,
         operands=operands,
         attributes={"predicate": predicate},
-        result_type=result_type
-    )
-
-
-@register_parser("arith.cmpf")
-def parse_arith_cmpf(op_text, parse_ctx):
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.cmpf\s+', op_text)
-    if not result_match:
-        return None
-
-    result_name = result_match.group(1)
-
-    pred_match = re.search(
-        r'arith\.cmpf\s+(true|false|oeq|ogt|oge|olt|ole|one|ord|ueq|ugt|uge|ult|ule|une|uno)', op_text)
-    if not pred_match:
-        raise ValueError(f"arith.cmpf: no valid predicate found in: {op_text!r}")
-    predicate = pred_match.group(1)
-
-    operands = find_ssa_names(op_text)
-    operands = [o for o in operands if o != result_name]
-
-    result_type = "i1"
-    type_match = re.search(r':\s*(.+)$', op_text)
-    if type_match:
-        result_type = type_match.group(1).strip()
-
-    return Operation(
-        result=result_name,
-        op_type="arith.cmpf",
-        operands=operands,
-        attributes={"predicate": predicate},
-        result_type=result_type
+        result_type=result_type,
     )
 
 
 @register_parser("arith.sitofp")
 def parse_arith_sitofp(op_text, parse_ctx):
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.sitofp\s+(%\w+)', op_text)
+    result_match = re.match(r'arith\.sitofp\s+(%\w+)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    operand = result_match.group(2)
+    operand = result_match.group(1)
 
     result_type = "f16"
     to_match = re.search(r'to\s+(f\d+)', op_text)
@@ -629,7 +461,7 @@ def parse_arith_sitofp(op_text, parse_ctx):
         result_type = to_match.group(1)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.sitofp",
         operands=[operand],
         attributes={},
@@ -639,12 +471,11 @@ def parse_arith_sitofp(op_text, parse_ctx):
 
 @register_parser("arith.bitcast")
 def parse_arith_bitcast(op_text, parse_ctx):
-    result_match = re.match(r'(%\w+)\s*=\s*arith\.bitcast\s+(%\w+)', op_text)
+    result_match = re.match(r'arith\.bitcast\s+(%\w+)', op_text)
     if not result_match:
         return None
 
-    result_name = result_match.group(1)
-    operand = result_match.group(2)
+    operand = result_match.group(1)
 
     dst_type = "f32"
     to_match = re.search(r'\bto\s+(\S+)\s*$', op_text)
@@ -652,7 +483,7 @@ def parse_arith_bitcast(op_text, parse_ctx):
         dst_type = to_match.group(1)
 
     return Operation(
-        result=result_name,
+        result=None,
         op_type="arith.bitcast",
         operands=[operand],
         attributes={"dst_type": dst_type},

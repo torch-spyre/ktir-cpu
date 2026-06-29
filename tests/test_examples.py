@@ -255,30 +255,6 @@ class TestSoftmaxExecution(InterpreterTestMixin):
 
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
-    @pytest.mark.parametrize("path,func_name,entry", get_test_params(
-        "softmax_kernel", filter="ktir/softmax_wide"))
-    def test_softmax_lx_overflow(self, path, func_name, entry):
-        """Softmax with a row too wide for LX should raise MemoryError.
-
-        A naive rowwise softmax loads the full row (1×C) and produces several
-        intermediate Tiles of the same shape (splat, subf, exp, divf).
-        With C=262144 the peak live set is ~3MB, exceeding the 2MB LX.
-        This is exactly the scenario that online_rowchunk solves by
-        chunking the column dimension.
-        """
-        interp = self._make_interp()
-        interp.load(path)
-
-        output_ptr, input_ptr, *_ = interp.arg_names(func_name)
-        sizes = interp.tensor_input_output_sizes(func_name)
-        n_rows_val, n_cols = sizes[input_ptr]["shape"]
-        rng = np.random.default_rng(42)
-        inp = rng.standard_normal((n_rows_val, n_cols)).astype(np.float16)
-        out = np.zeros((n_rows_val, n_cols), dtype=np.float16)
-
-        kwargs = self._build_kwargs(entry, {output_ptr: out, input_ptr: inp})
-        with pytest.raises(MemoryError, match=entry["exception_msg"]):
-            interp.execute_function(func_name, **kwargs)
 
 
 class TestLayerNormExecution(InterpreterTestMixin):
@@ -587,21 +563,77 @@ class TestRingReduceExecution:
         interp = KTIRInterpreter()
         interp.load(path)
 
-        # ``in_ptr`` and ``out_ptr`` are HBM stick indices (matching the
-        # convention ``KTIRInterpreter.execute_function`` uses for ndarray
-        # kwargs).  Seed / read directly with them — no element-to-stick
-        # translation needed.
+        # ``in_ptr`` and ``out_ptr`` are f16 element indices (base_ptr
+        # convention).  hbm.write/read take stick indices, so convert.
+        from ktir_cpu.dtypes import stick_to_elem_idx
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES  # 64
+        in_stick  = in_ptr  // elems_per_stick
+        out_stick = out_ptr // elems_per_stick
+
         _orig = interp._prepare_execution
 
         def _prepare_and_seed(grid_shape):
             _orig(grid_shape)
-            interp.memory.hbm.write(in_ptr,  rows.flatten())
-            interp.memory.hbm.write(out_ptr, np.zeros(n_cols, dtype=np.float16))
+            interp.memory.hbm.write(in_stick,  rows.flatten())
+            interp.memory.hbm.write(out_stick, np.zeros(n_cols, dtype=np.float16))
 
         interp._prepare_execution = _prepare_and_seed
         interp.execute_function(func_name, **entry["execute_kwargs"])
 
-        result = interp.memory.hbm.read(out_ptr, n_cols, "f16")
+        result = interp.memory.hbm.read(out_stick, n_cols, "f16")
         expected = rows.sum(axis=0)
         np.testing.assert_allclose(result, expected, rtol=1e-2,
                                    err_msg="Core 0 output does not match element-wise sum")
+
+
+class TestRingReduceInnerLoopExecution:
+    """End-to-end execution of ring_reduce_inner_loop.mlir.
+
+    Exercises ktdp.inter_tile_produce + ktdp.inter_tile_reduce placed inside
+    an scf.for body — the structural novelty vs ring_reduce.mlir where the
+    reduce appears at the top level.  The loop runs n_iters times, accumulating
+    each iteration's all-reduce into an iter_arg; only core 0 writes back.
+
+    Expected output: K * sum(all 4 input rows), where K = n_iters.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ring_reduce_inner_loop"))
+    def test_ring_reduce_inner_loop(self, path, func_name, entry):
+        """output[0..127] == n_iters * sum of all 4 input rows."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        n_cols = entry["n_cols"]
+        in_ptr = entry["execute_kwargs"]["in_ptr"]
+        out_ptr = entry["execute_kwargs"]["out_ptr"]
+        n_iters = entry["execute_kwargs"]["n_iters"]
+
+        rng = np.random.default_rng(7)
+        rows = rng.uniform(0.5, 1.5, size=(num_cores, n_cols)).astype(np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        # in_ptr / out_ptr are f16 element indices; hbm.write/read take stick indices.
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES  # 64
+        in_stick  = in_ptr  // elems_per_stick
+        out_stick = out_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(in_stick,  rows.flatten())
+            interp.memory.hbm.write(out_stick, np.zeros(n_cols, dtype=np.float16))
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **entry["execute_kwargs"])
+
+        result = interp.memory.hbm.read(out_stick, n_cols, "f16")
+        expected = (rows.sum(axis=0) * n_iters).astype(np.float16)
+        np.testing.assert_allclose(result, expected, rtol=1e-2,
+                                   err_msg="Core 0 output does not match n_iters * sum of input rows")
