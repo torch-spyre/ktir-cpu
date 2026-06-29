@@ -15,6 +15,7 @@
 """KTDP dialect handlers — grid, memory view, access tile, load/store."""
 
 import re
+from typing import List, Optional, Sequence, Tuple
 
 from .ktdp_helpers import attach_reshape, parse_subscript_expr
 from ..affine import BoxSet
@@ -102,6 +103,18 @@ def ktdp__construct_distributed_memory_view(op, context, env):
     ``coordinate_set`` (= B_i in global coords).  The op does not allocate
     or move data — partition resolution at access time is performed by
     ``MemoryOps.distributed_tile_access``.
+
+    Dynamic dims (``None`` entries in ``shape``, parsed from ``?`` in the
+    result memref type) are resolved here by taking ``max`` of each
+    partition's upper bound along that axis.  Partition coordinate sets
+    are in global absolute coordinates (see
+    ``MemoryOps.distributed_tile_access`` which intersects them with
+    global ``xA_box`` directly), so ``max(B_i.hi)`` is the global extent.
+    Resolution requires axis-aligned ``BoxSet`` partitions; ``AffineSet``
+    is rejected because ``max(upper_bounds)`` recovers the global extent
+    only for orthogonal-bound boxes, not for general affine constraint
+    sets (where the bounding-box upper bound can over-approximate the
+    actual tensor extent).
     """
     partitions = [context.get_value(name) for name in op.operands]
     for i, p in enumerate(partitions):
@@ -114,11 +127,104 @@ def ktdp__construct_distributed_memory_view(op, context, env):
         raise ValueError(
             "construct_distributed_memory_view: missing required attributes 'shape'/'dtype'"
         )
+    raw_shape = tuple(op.attributes["shape"])
+    shape = _resolve_dynamic_dist_shape(raw_shape, partitions)
     return DistributedMemRef(
         partitions=partitions,
-        shape=tuple(op.attributes["shape"]),
+        shape=shape,
         dtype=op.attributes["dtype"],
     )
+
+
+def _resolve_dynamic_dist_shape(
+    raw_shape: Tuple[Optional[int], ...],
+    partitions: Sequence[MemRef],
+) -> Tuple[int, ...]:
+    """Resolve ``None`` entries in a distributed-view shape via partition union.
+
+    Concrete ``raw_shape`` returns unchanged.  For each ``None`` axis the
+    resolved extent is ``max(hi[axis])`` across all partitions, where
+    ``hi`` is in global coordinates.  This is the smallest shape that
+    satisfies ``BoxSet.enumerate``'s ``shape >= max(hi)`` precondition
+    for every partition; ``max(hi) - min(lo)`` would under-size the
+    memref and break slow-path enumeration on tilings with
+    ``min(lo) > 0``.
+
+    Coverage is not enforced here.  Tilings with ``min(lo) > 0``
+    (non-origin) or interior gaps between partitions produce a memref
+    where uncovered global coordinates surface as ``no partition
+    covers`` at access time via ``MemoryOps.distributed_tile_access``.
+    This function's job is shape resolution; coverage is the
+    access-time contract.
+
+    Requires every partition's ``coordinate_set`` to be a fully-resolved
+    ``BoxSet``; ``construct_memory_view`` specialises symbolic ``BoxSet``
+    partitions against runtime symbols before they reach this point.
+
+    Scope cut — ``AffineSet`` partitions are intentionally rejected on this
+    path only.  ``construct_distributed_memory_view`` itself accepts
+    ``AffineSet`` partitions in the concrete-shape path: they are stored
+    in ``DistributedMemRef`` and dispatched at access time via
+    ``find_partition`` / ``.contains()`` exactly like ``BoxSet``.  The
+    rejection here is an implementation cut, not a correctness one:
+    ``BoxSet`` exposes per-axis ``.hi`` directly, while extracting a
+    per-axis upper bound from a general ``AffineSet`` is bounding-box
+    derivation that this path does not do — tracked under #74.
+    Concrete-shape callers are unaffected.
+    """
+    if not any(s is None for s in raw_shape):
+        return tuple(raw_shape)  # type: ignore[arg-type]
+    if not partitions:
+        raise ValueError(
+            "construct_distributed_memory_view: dynamic-shape result "
+            "requires at least one partition to derive the global extent"
+        )
+    # Single pass: validate each partition and track max(hi) per dynamic axis.
+    ndim = len(raw_shape)
+    max_hi: List[Optional[int]] = [None] * ndim
+    for i, part in enumerate(partitions):
+        cs = part.coordinate_set
+        if not isinstance(cs, BoxSet):
+            raise ValueError(
+                f"construct_distributed_memory_view: dynamic-shape result "
+                f"resolution does not support {type(cs).__name__} "
+                f"partitions (partition {i} on this op).  This is a "
+                f"limitation of the dynamic-shape path only — the "
+                f"concrete-shape path of construct_distributed_memory_view "
+                f"accepts AffineSet partitions normally (they dispatch via "
+                f"find_partition at access time).  Declare the result "
+                f"memref with concrete dims to use this partition."
+            )
+        if not cs.is_concrete:
+            # `ValueError` (not `assert`) so the failure is loud under `python -O`.
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} coordinate_set "
+                f"is not concrete; construct_memory_view should have specialised "
+                f"it against runtime symbols before reaching this handler"
+            )
+        if cs.n_dims != ndim:
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} has rank "
+                f"{cs.n_dims}, expected {ndim} to match result memref rank"
+            )
+        for axis in range(ndim):
+            if raw_shape[axis] is not None:
+                continue
+            hi_a = cs.hi[axis]
+            if max_hi[axis] is None or hi_a > max_hi[axis]:
+                max_hi[axis] = hi_a
+    resolved = list(raw_shape)
+    for axis, dim in enumerate(raw_shape):
+        if dim is not None:
+            continue
+        assert max_hi[axis] is not None  # ≥1 partition × every dynamic axis traversed
+        if max_hi[axis] <= 0:
+            raise ValueError(
+                f"construct_distributed_memory_view: could not resolve "
+                f"dynamic axis {axis}: max(hi)={max_hi[axis]} is non-positive"
+            )
+        resolved[axis] = max_hi[axis]
+    return tuple(resolved)  # type: ignore[return-value]
 
 
 @register("ktdp.construct_access_tile")
@@ -456,7 +562,9 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
         raise ValueError(
             "construct_distributed_memory_view: could not parse result memref<> type"
         )
-    info = parse_tensor_or_memref_type(memref_match.group(1))
+    # Dynamic dims stay None here; ktdp__construct_distributed_memory_view
+    # resolves them from the partition coordinate sets.
+    info = parse_tensor_or_memref_type(memref_match.group(1), keep_dynamic_dims=True)
     if not info:
         raise ValueError(
             f"construct_distributed_memory_view: memref<{memref_match.group(1)}> "
@@ -470,7 +578,9 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
         op_type="ktdp.construct_distributed_memory_view",
         operands=operands,
         attributes={"shape": shape, "dtype": dtype},
-        result_type=f"memref<{'x'.join(str(s) for s in shape)}x{dtype}>"
+        result_type=(
+            f"memref<{'x'.join('?' if s is None else str(s) for s in shape)}x{dtype}>"
+        ),
     )
 
 
