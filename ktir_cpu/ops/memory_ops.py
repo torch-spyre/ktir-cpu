@@ -166,6 +166,14 @@ class _MemAccessor:
     def write(self, data: np.ndarray) -> None:
         self._sim.write(*self._args, data, **self._kwargs)
 
+    def gather(self, offsets: np.ndarray, dtype: str) -> np.ndarray:
+        """Gather elements at *offsets* directly from the stored allocation.
+
+        Avoids the intermediate span copy that :meth:`read` + fancy-index
+        would produce — a single memcpy (the gather result).
+        """
+        return self._sim.gather(*self._args, offsets, dtype, **self._kwargs)
+
 
 def hbm_read(hbm: "HBMSimulator", byte_addr: int, n_elements: int, dtype: str) -> np.ndarray:
     """Read n_elements of dtype from HBM at byte_addr (byte-addressed)."""
@@ -178,6 +186,321 @@ def hbm_write(hbm: "HBMSimulator", byte_addr: int, data: np.ndarray) -> None:
     assert data.ndim == 1, f"hbm_write expects a 1D array, got shape {data.shape}"
     stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
     hbm.write(stick, data, intra_byte=intra)
+
+
+def _expr_dependent_vars(expr: tuple) -> set:
+    """Return the set of iteration-variable indices that *expr* depends on.
+
+    Walks the subscript-expression AST produced by ``parse_subscript_expr``
+    and collects every ``("dim", i)`` reference.  ``("const", ...)`` and
+    ``("ssa", ...)`` nodes contribute nothing — they are loop-invariant.
+    """
+    tag = expr[0]
+    if tag == "dim":
+        return {expr[1]}
+    if tag == "const" or tag == "ssa":
+        return set()
+    if tag in ("add", "sub"):
+        return _expr_dependent_vars(expr[1]) | _expr_dependent_vars(expr[2])
+    if tag == "mul":
+        # ("mul", const_int, sub_expr)
+        return _expr_dependent_vars(expr[2])
+    if tag == "neg":
+        return _expr_dependent_vars(expr[1])
+    if tag in ("floordiv", "mod"):
+        # ("floordiv", sub_expr, const_int)
+        return _expr_dependent_vars(expr[1])
+    return set()
+
+
+def _block_gather_analyze(iat: "IndirectAccessTile"):
+    """Extract block-gather metadata from an IAT.
+
+    Returns (indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los)
+    or None if the IAT doesn't qualify.
+    """
+    indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
+    if len(indirect_subs) != 1:
+        return None
+
+    sub = indirect_subs[0]
+    dep_vars: set = set()
+    for expr in sub["idx_exprs"]:
+        dep_vars |= _expr_dependent_vars(expr)
+
+    vss = iat.variables_space_set
+    if not isinstance(vss, BoxSet):
+        return None
+
+    unique_lookups = 1
+    for d in dep_vars:
+        extent = int(vss.hi[d]) - int(vss.lo[d])
+        if extent <= 0:
+            continue
+        unique_lookups *= extent
+
+    total_points = 1
+    for d in range(vss.n_dims):
+        extent = int(vss.hi[d]) - int(vss.lo[d])
+        if extent > 0:
+            total_points *= extent
+
+    if unique_lookups * 16 > total_points:
+        return None
+
+    dep_var_list = sorted(dep_vars)
+    dep_extents = [int(vss.hi[d]) - int(vss.lo[d]) for d in dep_var_list]
+    dep_los = [int(vss.lo[d]) for d in dep_var_list]
+    return sub, dep_vars, dep_var_list, dep_extents, dep_los
+
+
+def _is_block_gather(iat: "IndirectAccessTile") -> bool:
+    """True when the IAT qualifies for the block-gather fast path."""
+    return _block_gather_analyze(iat) is not None
+
+
+def _block_gather_read_idx(
+    context: CoreContext, iat: "IndirectAccessTile",
+    indirect_sub: dict, dep_vars: set, dep_var_list: list,
+) -> Tuple[np.ndarray, int]:
+    """Read the small index tensor for a block-gather IAT.
+
+    Returns (idx_values_arr, idx_sticks).
+    """
+    vss = iat.variables_space_set
+    iv_idx = indirect_sub["index_view_idx"]
+    iv = iat.index_views[iv_idx]
+    bpe_idx = _bytes_per_elem(iv.dtype)
+    iv_strides = list(iv.strides)
+    iv_base = iv.byte_address
+
+    if dep_vars:
+        import itertools
+        dep_ranges = [range(int(vss.lo[d]), int(vss.hi[d])) for d in dep_var_list]
+        dep_points = list(itertools.product(*dep_ranges))
+    else:
+        dep_points = [()]
+
+    idx_addrs = []
+    for dpt in dep_points:
+        pt = list(vss.lo)
+        for i, d in enumerate(dep_var_list):
+            pt[d] = dpt[i]
+        pt = tuple(pt)
+        offset = sum(
+            eval_subscript_expr(e, pt) * s
+            for e, s in zip(indirect_sub["idx_exprs"], iv_strides)
+        )
+        idx_addrs.append(iv_base + offset * bpe_idx)
+
+    accessor_idx = _MemAccessor(
+        context, iv.memory_space, iv.byte_address, iv.lx_core_id,
+    )
+    if idx_addrs:
+        idx_values_arr, idx_sticks = accessor_idx.read_scattered(idx_addrs, iv.dtype)
+    else:
+        idx_values_arr = np.array([], dtype=np.int32)
+        idx_sticks = 0
+
+    return idx_values_arr, idx_sticks if idx_sticks is not None else 0
+
+
+def _block_gather_offsets(
+    iat: "IndirectAccessTile",
+    idx_values_arr: np.ndarray,
+    dep_vars: set, dep_var_list: list, dep_extents: list, dep_los: list,
+) -> np.ndarray:
+    """Compute flat element offsets for a block-gather IAT via numpy broadcast.
+
+    Returns a 1-D int64 array of element offsets into the parent allocation.
+    """
+    vss = iat.variables_space_set
+    ndim = len(iat.dim_subscripts)
+    tile_ref = iat.parent_ref.to_tile_ref()
+    parent_strides = np.asarray(tile_ref.strides, dtype=np.int64)
+    dim_ranges = [np.arange(int(vss.lo[d]), int(vss.hi[d]), dtype=np.int64)
+                  for d in range(vss.n_dims)]
+
+    # Build the indirect coordinate grid shaped for broadcasting
+    if dep_vars:
+        dep_grids = np.meshgrid(
+            *[np.arange(e, dtype=np.int64) for e in dep_extents],
+            indexing='ij',
+        )
+        dep_strides_arr = np.ones(len(dep_var_list), dtype=np.int64)
+        for i in range(len(dep_var_list) - 2, -1, -1):
+            dep_strides_arr[i] = dep_strides_arr[i + 1] * dep_extents[i + 1]
+        flat_dep_grid = sum(g * s for g, s in zip(dep_grids, dep_strides_arr))
+        idx_lookup_shape = [1] * vss.n_dims
+        for d_pos, d in enumerate(dep_var_list):
+            idx_lookup_shape[d] = dep_extents[d_pos]
+        indirect_coord_grid = idx_values_arr[flat_dep_grid.ravel()].reshape(idx_lookup_shape).astype(np.int64)
+    else:
+        indirect_coord_grid = np.full([1] * vss.n_dims, int(idx_values_arr[0]), dtype=np.int64)
+
+    # Sum per-dim stride contributions via broadcasting
+    iter_shape = tuple(int(vss.hi[d]) - int(vss.lo[d]) for d in range(vss.n_dims))
+    offsets = np.zeros(iter_shape, dtype=np.int64)
+
+    has_direct_expr = False
+    for dim_i, sub_d in enumerate(iat.dim_subscripts):
+        kind = sub_d["kind"]
+        s = parent_strides[dim_i]
+        if kind == "indirect":
+            offsets = offsets + indirect_coord_grid * s
+        elif kind == "direct":
+            var_idx = sub_d["var_index"]
+            coord_1d = dim_ranges[var_idx]
+            shape_for_broadcast = [1] * vss.n_dims
+            shape_for_broadcast[var_idx] = len(coord_1d)
+            offsets = offsets + coord_1d.reshape(shape_for_broadcast) * s
+        elif kind == "direct_expr":
+            has_direct_expr = True
+            break
+
+    if has_direct_expr:
+        return _block_gather_offsets_fallback(
+            iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+            parent_strides, ndim,
+        )
+
+    vso = iat.variables_space_order
+    if vso is not None and not vso.is_identity():
+        return _block_gather_offsets_fallback(
+            iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+            parent_strides, ndim,
+        )
+
+    return offsets.ravel()
+
+
+def _block_gather_offsets_fallback(
+    iat: "IndirectAccessTile",
+    idx_values_arr: np.ndarray,
+    dep_vars: set, dep_var_list: list, dep_extents: list, dep_los: list,
+    parent_strides: np.ndarray, ndim: int,
+) -> np.ndarray:
+    """Per-point fallback for direct_expr dims or non-identity VSO."""
+    vss = iat.variables_space_set
+    n_points = 1
+    for d in range(vss.n_dims):
+        extent = int(vss.hi[d]) - int(vss.lo[d])
+        if extent > 0:
+            n_points *= extent
+
+    points = _enumerate_in_vso_order(iat)
+    points_arr = np.asarray(points, dtype=np.int64)
+
+    if dep_vars:
+        dep_cols = points_arr[:, dep_var_list]
+        dep_cols_shifted = dep_cols - np.array(dep_los, dtype=np.int64)
+        dep_lin_strides = np.ones(len(dep_var_list), dtype=np.int64)
+        for i in range(len(dep_var_list) - 2, -1, -1):
+            dep_lin_strides[i] = dep_lin_strides[i + 1] * dep_extents[i + 1]
+        flat_dep_idx = (dep_cols_shifted * dep_lin_strides).sum(axis=1)
+    else:
+        flat_dep_idx = np.zeros(n_points, dtype=np.int64)
+
+    indirect_coords = idx_values_arr[flat_dep_idx].astype(np.int64)
+    coords_arr = np.empty((n_points, ndim), dtype=np.int64)
+    for dim_i, sub_d in enumerate(iat.dim_subscripts):
+        kind = sub_d["kind"]
+        if kind == "indirect":
+            coords_arr[:, dim_i] = indirect_coords
+        elif kind == "direct":
+            coords_arr[:, dim_i] = points_arr[:, sub_d["var_index"]]
+        elif kind == "direct_expr":
+            coords_arr[:, dim_i] = [
+                eval_subscript_expr(sub_d["subscript"], pt) for pt in points
+            ]
+    return (coords_arr * parent_strides).sum(axis=1)
+
+
+def _block_gather_load(
+    context: CoreContext, iat: "IndirectAccessTile",
+    result_shape: Optional[Tuple[int, ...]] = None,
+) -> Tile:
+    """Fast-path indirect load for block-gather patterns."""
+    info = _block_gather_analyze(iat)
+    indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los = info
+
+    vss = iat.variables_space_set
+    out_shape = result_shape if result_shape is not None else iat.shape
+
+    n_points = 1
+    for d in range(vss.n_dims):
+        extent = int(vss.hi[d]) - int(vss.lo[d])
+        if extent > 0:
+            n_points *= extent
+
+    if n_points == 0:
+        data = np.zeros(out_shape, dtype=_to_np_dtype(iat.parent_ref.dtype))
+        MemoryOps._place_in_lx(context, data)
+        return Tile(data, iat.parent_ref.dtype, out_shape, 0)
+
+    idx_values_arr, idx_sticks = _block_gather_read_idx(
+        context, iat, indirect_sub, dep_vars, dep_var_list,
+    )
+    offsets = _block_gather_offsets(
+        iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+    )
+
+    tile_ref = iat.parent_ref.to_tile_ref()
+    mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
+    stick_bytes = mgr.stick_bytes
+    if stick_bytes:
+        bpe = _bytes_per_elem(tile_ref.dtype)
+        unique_sticks = int(np.unique((tile_ref.base_ptr + offsets * bpe) // stick_bytes).size)
+    else:
+        unique_sticks = None
+
+    gathered = mgr.gather(offsets, tile_ref.dtype)
+    data = gathered.reshape(out_shape)
+    MemoryOps._place_in_lx(context, data)
+    result = Tile(data, tile_ref.dtype, out_shape, unique_sticks)
+    result.index_unique_sticks = idx_sticks
+    return result
+
+
+def _block_gather_store(
+    context: CoreContext, tile: Tile, iat: "IndirectAccessTile",
+) -> int:
+    """Fast-path indirect store for block-gather patterns."""
+    info = _block_gather_analyze(iat)
+    indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los = info
+
+    vss = iat.variables_space_set
+
+    n_points = 1
+    for d in range(vss.n_dims):
+        extent = int(vss.hi[d]) - int(vss.lo[d])
+        if extent > 0:
+            n_points *= extent
+
+    if n_points == 0:
+        return 0
+
+    idx_values_arr, idx_sticks = _block_gather_read_idx(
+        context, iat, indirect_sub, dep_vars, dep_var_list,
+    )
+    offsets = _block_gather_offsets(
+        iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+    )
+
+    tile_ref = iat.parent_ref.to_tile_ref()
+    mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
+    stick_bytes = mgr.stick_bytes
+    if stick_bytes:
+        bpe = _bytes_per_elem(tile_ref.dtype)
+        unique_sticks = int(np.unique((tile_ref.base_ptr + offsets * bpe) // stick_bytes).size)
+    else:
+        unique_sticks = 0
+
+    span = int(offsets.max()) + 1 if offsets.size else 1
+    flat = mgr.read(span, tile_ref.dtype)
+    flat[offsets] = tile.data.ravel()
+    mgr.write(flat)
+    return unique_sticks + idx_sticks
 
 
 def _enumerate_in_vso_order(iat: "IndirectAccessTile") -> List[Tuple[int, ...]]:
@@ -417,6 +740,22 @@ class MemoryOps:
         context.lx.write(lx_ptr, data)
 
     @staticmethod
+    def _place_in_lx(context: "CoreContext", data: np.ndarray):
+        """Place data into LX without copying.
+
+        Same address-space bookkeeping as :meth:`_write_to_lx` but stores
+        the array directly into the LX dict, bypassing ``_write_flat``'s
+        ``_find_allocation`` + ``.flatten()`` copy.  Safe because we always
+        write to a freshly bumped ``next_ptr`` — no existing allocation to
+        patch.  Caller must not mutate *data* afterward.
+        """
+        size = data.nbytes
+        lx_ptr = context.lx.next_ptr
+        context.lx.next_ptr += size
+        context.lx.next_ptr = (context.lx.next_ptr + HBMSimulator.STICK_BYTES - 1) & ~(HBMSimulator.STICK_BYTES - 1)
+        context.lx.memory[lx_ptr] = data.ravel()
+
+    @staticmethod
     def _flat_memory_offsets(
         base_ptr: int,
         shape: Tuple[int, ...],
@@ -535,19 +874,16 @@ class MemoryOps:
                 unique_sticks = None
             return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
 
-        # Strided or coord-set path: linearize coords, single read, numpy fancy-index.
+        # Strided or coord-set path: linearize coords, gather directly from allocation.
         offsets, unique_sticks = MemoryOps._flat_memory_offsets(
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes
         )
-        span = int(offsets.max()) + 1 if offsets.size else 1
-        flat = mgr.read(span, tile_ref.dtype)
-
-        gathered = flat[offsets]
+        gathered = mgr.gather(offsets, tile_ref.dtype)
         out_shape = result_shape if result_shape is not None else tile_ref.shape
         data = gathered.reshape(out_shape)
 
-        MemoryOps._write_to_lx(context, data)
+        MemoryOps._place_in_lx(context, data)
         return Tile(data, tile_ref.dtype, out_shape, unique_sticks)
 
     @staticmethod
@@ -642,6 +978,12 @@ class MemoryOps:
                 f"indirect_load: variables_space_order must permute its input "
                 f"dimensions; got non-permutation map: {vso.source}"
             )
+
+        # Fast path: block-gather patterns (MoE, paged attention) where the
+        # index lookup depends on a small subset of iteration variables.
+        # Bypasses the O(N) Python loops in _resolve_idx_reads / _build_indirect_coords.
+        if _is_block_gather(iat):
+            return _block_gather_load(context, iat, result_shape)
 
         # Resolve every idx-tensor read up front: one accessor per index
         # view, one read_scattered call, sticks deduped inside the accessor.
@@ -874,19 +1216,17 @@ class MemoryOps:
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords, stick_bytes=mgr.stick_bytes,
             )
-            span = int(offsets.max()) + 1 if offsets.size else 1
-            flat = mgr.read(span, survivor.dtype)
-            # Vectorized scatter: per-dimension index arrays → one fancy-index write.
+            gathered = mgr.gather(offsets, survivor.dtype)
             out_idx = tuple(
                 np.fromiter((c[d] for c in access_coords), dtype=np.intp,
                             count=len(access_coords))
                 for d in range(ndim)
             )
-            out[out_idx] = flat[offsets]
+            out[out_idx] = gathered
             if unique_sticks is not None:
                 total_unique_sticks += unique_sticks
 
-        MemoryOps._write_to_lx(context, out)
+        MemoryOps._place_in_lx(context, out)
         return Tile(
             out,
             dist_tile_ref.dtype,
@@ -1002,6 +1342,10 @@ class MemoryOps:
                 f"indirect_store: variables_space_order must permute its input "
                 f"dimensions; got non-permutation map: {vso.source}"
             )
+
+        # Fast path: block-gather patterns (MoE, paged attention).
+        if _is_block_gather(iat):
+            return _block_gather_store(context, tile, iat)
 
         # Resolve idx reads (returns idx_unique_sticks: int, 0 for all-LX
         # views) and delegate the data write to MemoryOps.store (returns

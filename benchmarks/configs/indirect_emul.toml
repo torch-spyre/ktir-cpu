@@ -1,0 +1,35 @@
+name = "indirect-emulation-timing"
+description = "Block-gather fast path vs general inspector for MoE indirect access"
+
+[defaults]
+dtype = "f16"
+n_rounds = 5
+warmup = 2
+
+[modes]
+summary = true
+breakdown = true
+
+[[workloads]]
+label = "xl-262K"
+num_experts = 128
+M = 256
+N = 128
+n_selected = 8
+n_rounds = 3
+
+[[workloads]]
+label = "16MB"
+num_experts = 128
+M = 64
+N = "1K"
+n_selected = 8
+n_rounds = 5
+
+[[workloads]]
+label = "64MB"
+num_experts = 256
+M = 64
+N = "2K"
+n_selected = 8
+n_rounds = 3
