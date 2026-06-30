@@ -205,4 +205,6 @@ def attach_reshape(gen, target_shape):
     closure.
     """
     reduced = yield from gen
+    if reduced is None:
+        return None
     return reshape_tile_to_target(reduced, target_shape)

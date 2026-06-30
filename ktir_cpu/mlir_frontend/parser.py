@@ -134,9 +134,19 @@ class MLIRTypeAdapter:
         handler(mlir_op, attributes, result_type, operands)
 
         from ..dialects.registry import is_inplace_outs
-        from ..parser_utils import extract_outs_operands
-        outs_operands = (extract_outs_operands(mlir_op.get_asm())
+        from ..parser_utils import extract_outs_operands, extract_bb0_arg_names
+        op_asm = mlir_op.get_asm()
+        outs_operands = (extract_outs_operands(op_asm)
                          if is_inplace_outs(mlir_op.name) else [])
+        bb0_names = extract_bb0_arg_names(op_asm)
+        if bb0_names and regions:
+            regions[0].insert(0, Operation(
+                result=None,
+                op_type="region.bb0_args",
+                operands=[],
+                attributes={"names": bb0_names},
+                result_type=None,
+            ))
 
         return Operation(
             result=result,
@@ -149,18 +159,7 @@ class MLIRTypeAdapter:
         )
 
     def adapt_block(self, block) -> List[Operation]:
-        ops = []
-        block_args = list(block.arguments)
-        if block_args:
-            ops.append(Operation(
-                result=None,
-                op_type="region.bb0_args",
-                operands=[],
-                attributes={"names": [a.get_name() for a in block_args]},
-                result_type=None,
-            ))
-        ops.extend(self.adapt_op(op) for op in block.operations)
-        return ops
+        return [self.adapt_op(op) for op in block.operations]
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +173,7 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 MLIRTypeAdapter.install(
     "func.return",
     "linalg.add",
+    "linalg.max",
     "linalg.fill",
     "linalg.yield",
     "scf.yield",
