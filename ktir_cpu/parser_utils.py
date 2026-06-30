@@ -31,6 +31,21 @@ def find_ssa_names(text: str) -> list[str]:
 
 
 _OUTS_RE = re.compile(r'\bouts\s*\(([^)]+)\)')
+_BB0_RE = re.compile(r'\^bb0\s*\(([^)]*)\)')
+
+
+def extract_bb0_arg_names(op_text: str) -> list[str]:
+    """Extract block argument names from a ``^bb0(...)`` label in *op_text*.
+
+    Returns the list of SSA names (e.g. ``['%arg3', '%arg4']``) when the op's
+    ASM contains a region body with explicit block arguments, or an empty list
+    when no ``^bb0(...)`` label is present (e.g. scf.for, which carries its
+    block-arg names as op attributes instead).
+    """
+    m = _BB0_RE.search(op_text)
+    if not m:
+        return []
+    return find_ssa_names(m.group(1))
 
 
 def extract_outs_operands(op_text: str) -> list[str]:
