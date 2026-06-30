@@ -713,7 +713,7 @@ def _adapt_inter_tile_reduce(mlir_op, attributes, result_type, operands):
     """Extract consumer_tiles_per_group, groups, optional producer_dependency_per_consumer,
     and _result_shape from the result type, matching the regex parser's output.
     """
-    from ..parser_utils import parse_tensor_type
+    from ..parser_utils import parse_tensor_or_memref_type
     attributes["consumer_tiles_per_group"] = parse_affine_set(
         str(mlir_op.attributes["consumer_tiles_per_group"])
     )
@@ -725,7 +725,7 @@ def _adapt_inter_tile_reduce(mlir_op, attributes, result_type, operands):
             str(mlir_op.attributes["producer_dependency_per_consumer"])
         )
     if result_type is not None:
-        parsed = parse_tensor_type(result_type)
+        parsed = parse_tensor_or_memref_type(result_type)
         if parsed is not None:
             attributes["_result_shape"] = parsed["shape"]
 
