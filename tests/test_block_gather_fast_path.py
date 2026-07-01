@@ -42,6 +42,7 @@ from ktir_cpu.ops.memory_ops import (
     _build_indirect_coords,
 )
 from ktir_cpu.dtypes import bytes_per_elem
+from ktir_cpu.parser_ast import parse_affine_map
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +549,83 @@ class TestBlockGatherMatchesGeneral:
         coords = _build_indirect_coords(iat, idx_values)
         general_tile = MemoryOps.load(ctx, iat.parent_ref.to_tile_ref(),
                                        coords=coords, result_shape=iat.shape)
+
+        np.testing.assert_array_equal(fast_tile.data, general_tile.data)
+
+
+# ---------------------------------------------------------------------------
+# Non-identity variables_space_order: gate still accepts, fallback is correct
+# ---------------------------------------------------------------------------
+
+class TestBlockGatherPermutedVSO:
+    """_is_block_gather returns True for a permuted variables_space_order,
+    and the load result matches the general inspector-executor path.
+
+    Issue #96 notes that permuted-VSO block-gathers miss the broadcast fast
+    path (they fall through to _block_gather_offsets_fallback via the guard at
+    memory_ops.py:396-402). This class confirms:
+
+      (a) _is_block_gather still returns True — _block_gather_analyze does not
+          gate on VSO, so the dispatch guard in indirect_load routes permuted-
+          VSO IATs into the block-gather branch rather than the general path.
+      (b) _block_gather_load produces bit-exact results vs the general
+          inspector-executor path, confirming the fallback enumerates points in
+          the correct permuted order.
+    """
+
+    def test_permuted_vso_qualifies_and_matches_general(self):
+        """W[E[e], n] with vso=(d1,d0) swaps iteration order; result matches general path."""
+        ctx = _make_context()
+        hbm = ctx.hbm
+        bpe = bytes_per_elem("f16")
+        bpe_idx = bytes_per_elem("i32")
+
+        n_exp, N, n_sel_e = 64, 128, 4  # ratio=128× > 16× ✓
+        data = np.arange(n_exp * N, dtype=np.float16)
+        stick = hbm.allocate(data.nbytes)
+        hbm.write(stick, data)
+        base = (stick * HBMSimulator.STICK_BYTES) // bpe
+
+        e_sel = np.array([5, 17, 42, 63], dtype=np.int32)
+        es = hbm.allocate(e_sel.nbytes)
+        hbm.write(es, e_sel)
+        e_ptr = (es * HBMSimulator.STICK_BYTES) // bpe_idx
+
+        data_memref = MemRef(base_ptr=base, shape=(n_exp, N), strides=[N, 1],
+                             memory_space="HBM", dtype="f16")
+        idx_memref = MemRef(base_ptr=e_ptr, shape=(n_sel_e,), strides=[1],
+                            memory_space="HBM", dtype="i32")
+        dim_subscripts = [
+            {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
+            {"kind": "direct", "var_index": 1},
+        ]
+        vss = BoxSet(lo=(0, 0), hi=(n_sel_e, N))
+        vso = parse_affine_map("affine_map<(d0, d1) -> (d1, d0)>")
+        # double-check we're set up the right way
+        assert not vso.is_identity()
+        assert vso.is_permutation()
+
+        iat = IndirectAccessTile(
+            parent_ref=data_memref, shape=(n_sel_e, N),
+            dim_subscripts=dim_subscripts, index_views=[idx_memref],
+            variables_space_set=vss, variables_space_order=vso,
+        )
+
+        # (a) gate: _block_gather_analyze does not check VSO, so this must be True
+        assert _is_block_gather(iat) is True
+
+        # (b) fast path (routes through _block_gather_offsets_fallback via VSO guard)
+        ctx.lx.memory.clear()
+        ctx.lx.next_ptr = 0
+        fast_tile = _block_gather_load(ctx, iat)
+
+        # general inspector-executor path (also uses _enumerate_in_vso_order)
+        ctx.lx.memory.clear()
+        ctx.lx.next_ptr = 0
+        idx_values, _ = _resolve_idx_reads(ctx, iat)
+        coords = _build_indirect_coords(iat, idx_values)
+        general_tile = MemoryOps.load(ctx, iat.parent_ref.to_tile_ref(),
+                                      coords=coords, result_shape=iat.shape)
 
         np.testing.assert_array_equal(fast_tile.data, general_tile.data)
 
