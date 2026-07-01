@@ -229,6 +229,7 @@ class TestBlockGatherLoad:
 
         expected = x_data.reshape(num_experts, M, N)[selected, :, :]
         np.testing.assert_array_equal(tile.data, expected)
+        assert tile.index_unique_sticks == 1  # 8 i32 elements = 32 bytes < STICK_BYTES
 
     def test_paged_attn_compound_idx(self):
         """cache[BT[0, d0], d1, d2, d3] — compound idx_exprs, 1i + 3d."""
@@ -378,6 +379,7 @@ class TestBlockGatherLoad:
         full = data.reshape(n_exp, n_h, M, N)
         expected = full[np.ix_(e_sel, h_sel, np.arange(M), np.arange(N))]
         np.testing.assert_array_equal(tile.data, expected)
+        assert tile.index_unique_sticks == 2  # e_sel: 3 i32 → 1 stick; h_sel: 2 i32 → 1 stick
 
     def test_direct_expr(self):
         """X[IDX[e], (2*m+1)] — indirect + direct_expr, ratio=60× → qualifies."""
@@ -588,3 +590,64 @@ class TestBlockGatherEdgeCases:
         )
         tile = MemoryOps.indirect_load(ctx, iat)
         assert tile.data.size == 0
+
+
+# ---------------------------------------------------------------------------
+# index_unique_sticks: populated by _block_gather_load
+# ---------------------------------------------------------------------------
+
+class TestBlockGatherIndexUniqueSticks:
+    """_block_gather_load sets Tile.index_unique_sticks with the HBM stick
+    count for index-tensor reads, which the latency estimator uses to account
+    for index-side memory traffic separately from data-side traffic.
+    """
+
+    def test_multi_stick_index_read(self):
+        """33 i32 index elements (132 bytes) cross a stick boundary → index_unique_sticks == 2.
+
+        With STICK_BYTES=128 and bpe_i32=4: addresses e*4 for e in 0..32 span
+        bytes 0..128. Byte 128 lands on the next stick, so the set has 2 entries.
+
+        Note: STICK_BYTES=128 is a fixed hardware constant
+        on HBMSimulator (not exposed in HardwareConfig), and index views are unconstrained in
+        size — there is no spec rule or interpreter limit that caps them at one stick.
+        MoE top-k routing with k > 32 selected experts, for example, produces an i32 index
+        tensor larger than 128 bytes. The block-gather 16× threshold actually favours such
+        large index sets, so this path is exercised by production-scale kernels.
+        """
+        ctx = _make_context()
+        hbm = ctx.hbm
+        bpe_f16 = bytes_per_elem("f16")
+        bpe_i32 = bytes_per_elem("i32")
+
+        # 33 indirect * 32 direct = 1056 total, unique=33, ratio=32× > 16× → qualifies
+        num_experts, M = 256, 32
+        x_data = np.arange(num_experts * M, dtype=np.float16)
+        x_stick = hbm.allocate(x_data.nbytes)
+        hbm.write(x_stick, x_data.ravel())
+        x_base_ptr = (x_stick * HBMSimulator.STICK_BYTES) // bpe_f16
+
+        # 33 * 4 = 132 bytes: elements 0-31 in stick N, element 32 in stick N+1
+        idx_data = np.arange(33, dtype=np.int32)
+        idx_stick = hbm.allocate(idx_data.nbytes)
+        hbm.write(idx_stick, idx_data)
+        idx_base_ptr = (idx_stick * HBMSimulator.STICK_BYTES) // bpe_i32
+
+        x_memref = MemRef(base_ptr=x_base_ptr, shape=(num_experts, M),
+                          strides=[M, 1], memory_space="HBM", dtype="f16")
+        idx_memref = MemRef(base_ptr=idx_base_ptr, shape=(33,), strides=[1],
+                            memory_space="HBM", dtype="i32")
+        dim_subscripts = [
+            {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
+            {"kind": "direct", "var_index": 1},
+        ]
+        vss = BoxSet(lo=(0, 0), hi=(33, M))
+        iat = IndirectAccessTile(
+            parent_ref=x_memref, shape=(33, M),
+            dim_subscripts=dim_subscripts, index_views=[idx_memref],
+            variables_space_set=vss, variables_space_order=None,
+        )
+        assert _is_block_gather(iat)
+        tile = _block_gather_load(ctx, iat)
+
+        assert tile.index_unique_sticks == 2
