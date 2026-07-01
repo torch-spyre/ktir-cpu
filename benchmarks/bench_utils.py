@@ -92,6 +92,34 @@ def make_bench_context(lx_size_mb: int = 512) -> CoreContext:
     return CoreContext(core_id=0, grid_pos=(0, 0, 0), lx=lx, hbm=hbm)
 
 
+def _alloc_tensor(hbm: HBMSimulator, n_elems: int, dtype: str = "f16") -> int:
+    """Allocate random f16 tensor in HBM, return element-addressed base_ptr."""
+    bpe = bytes_per_elem(dtype)
+    data = np.random.randn(n_elems).astype(np.float16)
+    stick = hbm.allocate(data.nbytes)
+    hbm.write(stick, data)
+    return (stick * HBMSimulator.STICK_BYTES) // bpe
+
+
+def _alloc_index(hbm: HBMSimulator, pool: int, n_sel: int) -> int:
+    """Allocate sorted random i32 index selection in HBM, return base_ptr."""
+    bpe = bytes_per_elem("i32")
+    sel = np.sort(np.random.choice(pool, size=n_sel, replace=False)).astype(np.int32)
+    stick = hbm.allocate(sel.nbytes)
+    hbm.write(stick, sel)
+    return (stick * HBMSimulator.STICK_BYTES) // bpe
+
+
+def _strides_from_shape(shape: tuple) -> list:
+    """Row-major strides for a given shape."""
+    strides = []
+    acc = 1
+    for s in reversed(shape):
+        strides.append(acc)
+        acc *= s
+    return list(reversed(strides))
+
+
 def build_moe_iat(
     ctx: CoreContext,
     num_experts: int,
@@ -100,33 +128,11 @@ def build_moe_iat(
     n_selected: int,
     dtype: str = "f16",
 ) -> IndirectAccessTile:
-    """Build an MoE-style IAT: X[IDX[e], M, N] selecting n_selected from num_experts."""
+    """X[IDX[e], M, N] — 1 indirect + 2 direct."""
     hbm = ctx.hbm
-    bpe_data = bytes_per_elem(dtype)
-    bpe_idx = bytes_per_elem("i32")
-
-    x_data = np.random.randn(num_experts * M * N).astype(np.float16)
-    x_stick = hbm.allocate(x_data.nbytes)
-    hbm.write(x_stick, x_data)
-    x_base_ptr = (x_stick * HBMSimulator.STICK_BYTES) // bpe_data
-
-    selected = np.sort(
-        np.random.choice(num_experts, size=n_selected, replace=False)
-    ).astype(np.int32)
-    idx_stick = hbm.allocate(selected.nbytes)
-    hbm.write(idx_stick, selected)
-    idx_base_ptr = (idx_stick * HBMSimulator.STICK_BYTES) // bpe_idx
-
-    x_memref = MemRef(
-        base_ptr=x_base_ptr,
-        shape=(num_experts, M, N),
-        strides=[M * N, N, 1],
-        memory_space="HBM", dtype=dtype,
-    )
-    idx_memref = MemRef(
-        base_ptr=idx_base_ptr, shape=(n_selected,), strides=[1],
-        memory_space="HBM", dtype="i32",
-    )
+    shape = (num_experts, M, N)
+    data_ptr = _alloc_tensor(hbm, num_experts * M * N, dtype)
+    idx_ptr = _alloc_index(hbm, num_experts, n_selected)
 
     dim_subscripts = [
         {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
@@ -135,8 +141,125 @@ def build_moe_iat(
     ]
     vss = BoxSet(lo=(0, 0, 0), hi=(n_selected, M, N))
     return IndirectAccessTile(
-        parent_ref=x_memref, shape=(n_selected, M, N),
-        dim_subscripts=dim_subscripts, index_views=[idx_memref],
+        parent_ref=MemRef(base_ptr=data_ptr, shape=shape,
+                          strides=_strides_from_shape(shape),
+                          memory_space="HBM", dtype=dtype),
+        shape=(n_selected, M, N),
+        dim_subscripts=dim_subscripts,
+        index_views=[MemRef(base_ptr=idx_ptr, shape=(n_selected,), strides=[1],
+                            memory_space="HBM", dtype="i32")],
+        variables_space_set=vss, variables_space_order=None,
+    )
+
+
+def build_sparse_attn_iat(
+    ctx: CoreContext,
+    n_pages: int,
+    n_tokens: int,
+    hidden_dim: int,
+    n_sel_pages: int,
+    n_sel_tokens: int,
+    dtype: str = "f16",
+) -> IndirectAccessTile:
+    """cache[page_idx[b], token_idx[t], d] — 2 indirect + 1 direct."""
+    hbm = ctx.hbm
+    shape = (n_pages, n_tokens, hidden_dim)
+    data_ptr = _alloc_tensor(hbm, n_pages * n_tokens * hidden_dim, dtype)
+    page_ptr = _alloc_index(hbm, n_pages, n_sel_pages)
+    token_ptr = _alloc_index(hbm, n_tokens, n_sel_tokens)
+
+    dim_subscripts = [
+        {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
+        {"kind": "indirect", "index_view_idx": 1, "idx_exprs": [("dim", 1)]},
+        {"kind": "direct", "var_index": 2},
+    ]
+    vss = BoxSet(lo=(0, 0, 0), hi=(n_sel_pages, n_sel_tokens, hidden_dim))
+    return IndirectAccessTile(
+        parent_ref=MemRef(base_ptr=data_ptr, shape=shape,
+                          strides=_strides_from_shape(shape),
+                          memory_space="HBM", dtype=dtype),
+        shape=(n_sel_pages, n_sel_tokens, hidden_dim),
+        dim_subscripts=dim_subscripts,
+        index_views=[
+            MemRef(base_ptr=page_ptr, shape=(n_sel_pages,), strides=[1],
+                   memory_space="HBM", dtype="i32"),
+            MemRef(base_ptr=token_ptr, shape=(n_sel_tokens,), strides=[1],
+                   memory_space="HBM", dtype="i32"),
+        ],
+        variables_space_set=vss, variables_space_order=None,
+    )
+
+
+def build_multi_head_iat(
+    ctx: CoreContext,
+    n_experts: int,
+    n_heads: int,
+    M: int,
+    N: int,
+    n_sel_experts: int,
+    n_sel_heads: int,
+    dtype: str = "f16",
+) -> IndirectAccessTile:
+    """weights[expert_idx[e], head_idx[h], m, n] — 2 indirect + 2 direct."""
+    hbm = ctx.hbm
+    shape = (n_experts, n_heads, M, N)
+    data_ptr = _alloc_tensor(hbm, n_experts * n_heads * M * N, dtype)
+    expert_ptr = _alloc_index(hbm, n_experts, n_sel_experts)
+    head_ptr = _alloc_index(hbm, n_heads, n_sel_heads)
+
+    dim_subscripts = [
+        {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
+        {"kind": "indirect", "index_view_idx": 1, "idx_exprs": [("dim", 1)]},
+        {"kind": "direct", "var_index": 2},
+        {"kind": "direct", "var_index": 3},
+    ]
+    vss = BoxSet(lo=(0, 0, 0, 0), hi=(n_sel_experts, n_sel_heads, M, N))
+    return IndirectAccessTile(
+        parent_ref=MemRef(base_ptr=data_ptr, shape=shape,
+                          strides=_strides_from_shape(shape),
+                          memory_space="HBM", dtype=dtype),
+        shape=(n_sel_experts, n_sel_heads, M, N),
+        dim_subscripts=dim_subscripts,
+        index_views=[
+            MemRef(base_ptr=expert_ptr, shape=(n_sel_experts,), strides=[1],
+                   memory_space="HBM", dtype="i32"),
+            MemRef(base_ptr=head_ptr, shape=(n_sel_heads,), strides=[1],
+                   memory_space="HBM", dtype="i32"),
+        ],
+        variables_space_set=vss, variables_space_order=None,
+    )
+
+
+def build_paged_attn_iat(
+    ctx: CoreContext,
+    n_pages: int,
+    n_heads: int,
+    block_size: int,
+    head_dim: int,
+    n_sel_pages: int,
+    dtype: str = "f16",
+) -> IndirectAccessTile:
+    """cache[page_idx[p], heads, block_size, head_dim] — 1 indirect + 3 direct."""
+    hbm = ctx.hbm
+    shape = (n_pages, n_heads, block_size, head_dim)
+    data_ptr = _alloc_tensor(hbm, n_pages * n_heads * block_size * head_dim, dtype)
+    page_ptr = _alloc_index(hbm, n_pages, n_sel_pages)
+
+    dim_subscripts = [
+        {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
+        {"kind": "direct", "var_index": 1},
+        {"kind": "direct", "var_index": 2},
+        {"kind": "direct", "var_index": 3},
+    ]
+    vss = BoxSet(lo=(0, 0, 0, 0), hi=(n_sel_pages, n_heads, block_size, head_dim))
+    return IndirectAccessTile(
+        parent_ref=MemRef(base_ptr=data_ptr, shape=shape,
+                          strides=_strides_from_shape(shape),
+                          memory_space="HBM", dtype=dtype),
+        shape=(n_sel_pages, n_heads, block_size, head_dim),
+        dim_subscripts=dim_subscripts,
+        index_views=[MemRef(base_ptr=page_ptr, shape=(n_sel_pages,), strides=[1],
+                            memory_space="HBM", dtype="i32")],
         variables_space_set=vss, variables_space_order=None,
     )
 
@@ -307,6 +430,7 @@ class BenchConfig:
     defaults: Dict[str, Any]
     modes: Dict[str, bool]
     workloads: List[Dict[str, Any]]
+    raw: Dict[str, Any] = field(default_factory=dict)
 
 
 def _expand_workload(entry: Dict[str, Any], defaults: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -357,7 +481,7 @@ def _expand_workload(entry: Dict[str, Any], defaults: Dict[str, Any]) -> List[Di
     raise ValueError(f"Unknown mode: {mode!r}. Must be 'product' or 'zip'.")
 
 
-_SKIP_PARSE_KEYS = {"label", "dtype", "mode", "description", "name"}
+_SKIP_PARSE_KEYS = {"label", "dtype", "mode", "description", "name", "pattern"}
 
 
 def _parse_size_fields(d: Dict[str, Any]):
@@ -396,4 +520,5 @@ def load_config(toml_path: str | Path) -> BenchConfig:
         defaults=defaults,
         modes=modes,
         workloads=workloads,
+        raw=raw,
     )

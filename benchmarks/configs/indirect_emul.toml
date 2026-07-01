@@ -1,5 +1,5 @@
 name = "indirect-emulation-timing"
-description = "Block-gather fast path vs general inspector for MoE indirect access"
+description = "Block-gather fast path vs general inspector"
 
 [defaults]
 dtype = "f16"
@@ -10,8 +10,11 @@ warmup = 2
 summary = true
 breakdown = true
 
+# --- MoE FFN (1 indirect + 2 direct) ---
+
 [[workloads]]
-label = "xl-262K"
+label = "moe-262K"
+pattern = "moe_ffn"
 num_experts = 128
 M = 256
 N = 128
@@ -19,17 +22,78 @@ n_selected = 8
 n_rounds = 3
 
 [[workloads]]
-label = "16MB"
-num_experts = 128
-M = 64
-N = "1K"
-n_selected = 8
-n_rounds = 5
-
-[[workloads]]
-label = "64MB"
+label = "moe-1M"
+pattern = "moe_ffn"
 num_experts = 256
 M = 64
 N = "2K"
 n_selected = 8
+n_rounds = 3
+
+# --- Paged attention (1 indirect + 3 direct) ---
+
+[[workloads]]
+label = "paged-attn-256K"
+pattern = "paged_attn"
+n_pages = 128
+n_heads = 8
+block_size = 16
+head_dim = 128
+n_sel_pages = 16
+n_rounds = 5
+
+[[workloads]]
+label = "paged-attn-1M"
+pattern = "paged_attn"
+n_pages = 256
+n_heads = 16
+block_size = 16
+head_dim = 128
+n_sel_pages = 32
+n_rounds = 3
+
+# --- Sparse attention (2 indirect + 1 direct) ---
+
+[[workloads]]
+label = "sparse-attn-32K"
+pattern = "sparse_attn"
+n_pages = 64
+n_tokens = 32
+hidden_dim = "1K"
+n_sel_pages = 8
+n_sel_tokens = 4
+n_rounds = 3
+
+[[workloads]]
+label = "sparse-attn-128K"
+pattern = "sparse_attn"
+n_pages = 128
+n_tokens = 64
+hidden_dim = "2K"
+n_sel_pages = 8
+n_sel_tokens = 8
+n_rounds = 3
+
+# --- Multi-head (2 indirect + 2 direct) ---
+
+[[workloads]]
+label = "multi-head-512K"
+pattern = "multi_head"
+n_experts = 16
+n_heads = 4
+M = 64
+N = "1K"
+n_sel_experts = 4
+n_sel_heads = 2
+n_rounds = 3
+
+[[workloads]]
+label = "multi-head-4M"
+pattern = "multi_head"
+n_experts = 32
+n_heads = 8
+M = 64
+N = "2K"
+n_sel_experts = 8
+n_sel_heads = 4
 n_rounds = 3
