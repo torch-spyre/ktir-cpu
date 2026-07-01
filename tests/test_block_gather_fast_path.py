@@ -165,23 +165,29 @@ class TestBlockGatherGating:
         )
         assert _is_block_gather(iat) is False
 
-    def test_rejected_low_ratio(self):
-        """X[IDX[e], col] with ratio=4× < 16× threshold → rejected."""
-        x_memref = MemRef(base_ptr=0, shape=(16, 4), strides=[4, 1],
+    @pytest.mark.parametrize("unique_rows,direct_cols,expected", [
+        (16,  4, False),   # ratio=4×,  well below threshold
+        ( 2, 15, False),   # ratio=7.5×, just below threshold (2×16=32 > 30)
+        ( 1, 16, True),    # ratio=16×, exactly at threshold (1×16=16 ≤ 16)
+    ])
+    def test_ratio_threshold(self, unique_rows, direct_cols, expected):
+        """X[IDX[e], col] — varies the unique:total ratio around the 16× threshold."""
+        x_memref = MemRef(base_ptr=0, shape=(unique_rows, direct_cols),
+                          strides=[direct_cols, 1],
                           memory_space="HBM", dtype="f16")
-        idx_memref = MemRef(base_ptr=1000, shape=(16,), strides=[1],
+        idx_memref = MemRef(base_ptr=1000, shape=(unique_rows,), strides=[1],
                             memory_space="HBM", dtype="i32")
         dim_subscripts = [
             {"kind": "indirect", "index_view_idx": 0, "idx_exprs": [("dim", 0)]},
             {"kind": "direct", "var_index": 1},
         ]
-        vss = BoxSet(lo=(0, 0), hi=(16, 4))
+        vss = BoxSet(lo=(0, 0), hi=(unique_rows, direct_cols))
         iat = IndirectAccessTile(
-            parent_ref=x_memref, shape=(16, 4),
+            parent_ref=x_memref, shape=(unique_rows, direct_cols),
             dim_subscripts=dim_subscripts, index_views=[idx_memref],
             variables_space_set=vss, variables_space_order=None,
         )
-        assert _is_block_gather(iat) is False
+        assert _is_block_gather(iat) is expected
 
 
 # ---------------------------------------------------------------------------
