@@ -363,6 +363,31 @@ class HBMSimulator:
         )
         _write_flat(self.memory, stick * self.STICK_BYTES + intra_byte, data)
 
+    def gather(self, stick: int, offsets: "np.ndarray", dtype: str, *, intra_byte: int = 0) -> "np.ndarray":
+        """Gather elements at *offsets* directly from the stored allocation.
+
+        Unlike :meth:`read`, this avoids copying a contiguous span first —
+        the fancy-index is applied directly on the allocation's ravel view,
+        producing a single memcpy (the gather result itself).
+
+        Args:
+            stick: HBM stick index (base of the tile).
+            offsets: 1-D int64 ndarray of element offsets relative to *stick*/*intra_byte*.
+            dtype: Element data type.
+            intra_byte: Byte offset within the stick (default 0).
+
+        Returns:
+            1-D NumPy array of gathered elements.
+        """
+        byte_addr = stick * self.STICK_BYTES + intra_byte
+        elem_size = bytes_per_elem(dtype)
+        alloc = _find_allocation(self.memory, byte_addr, elem_size)
+        if alloc is None:
+            raise ValueError(f"Gather from unmapped address 0x{byte_addr:x}")
+        _, data, elem_offset = alloc
+        flat = data.ravel()
+        return flat[elem_offset + offsets]
+
     def read_element(self, addr: int, dtype: str = "f16"):
         """Read a single element by byte address.
 
@@ -419,6 +444,27 @@ class LXScratchpad:
             data: Flat NumPy array to write
         """
         _write_flat(self.memory, ptr, data)
+
+    def gather(self, ptr: int, offsets: "np.ndarray", dtype: str) -> "np.ndarray":
+        """Gather elements at *offsets* directly from the stored allocation.
+
+        Same semantics as :meth:`HBMSimulator.gather` but byte-addressed.
+
+        Args:
+            ptr: Byte address (base of the tile).
+            offsets: 1-D int64 ndarray of element offsets relative to *ptr*.
+            dtype: Element data type.
+
+        Returns:
+            1-D NumPy array of gathered elements.
+        """
+        elem_size = bytes_per_elem(dtype)
+        alloc = _find_allocation(self.memory, ptr, elem_size)
+        if alloc is None:
+            raise ValueError(f"Gather from unmapped LX address 0x{ptr:x}")
+        _, data, elem_offset = alloc
+        flat = data.ravel()
+        return flat[elem_offset + offsets]
 
     def clear(self):
         """Clear scratchpad and reset allocation."""
