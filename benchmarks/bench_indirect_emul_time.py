@@ -1,4 +1,4 @@
-"""Indirect memory access emulation timing — MoE block-gather patterns.
+"""Indirect memory access emulation timing — block-gather patterns.
 
 Subcommands:
   block   — block-gather fast path vs general inspector (summary + breakdown)
@@ -14,12 +14,14 @@ import time
 import numpy as np
 
 from bench_utils import (
-    load_config, make_bench_context, build_moe_iat, reset_lx,
-    flush_cache, format_size, BenchTimer, BenchTable,
+    load_config, make_bench_context,
+    build_moe_iat, build_sparse_attn_iat, build_multi_head_iat, build_paged_attn_iat,
+    reset_lx, flush_cache, format_size, BenchTimer, BenchTable,
 )
 from ktir_cpu.ops.memory_ops import (
     MemoryOps, _MemAccessor,
     _is_block_gather, _block_gather_load,
+    _block_gather_analyze, _block_gather_read_idx, _block_gather_offsets,
     _resolve_idx_reads, _build_indirect_coords,
     _enumerate_in_vso_order,
 )
@@ -28,23 +30,47 @@ from ktir_cpu.dtypes import bytes_per_elem, to_np_dtype
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# IAT builder dispatch
 # ---------------------------------------------------------------------------
 
-def _run_general_path(ctx, iat):
-    reset_lx(ctx)
-    idx_values, _ = _resolve_idx_reads(ctx, iat)
-    coords = _build_indirect_coords(iat, idx_values)
-    MemoryOps.load(ctx, iat.parent_ref.to_tile_ref(), coords=coords, result_shape=iat.shape)
+def _build_iat(ctx, w):
+    """Build an IAT from a workload entry based on its pattern field."""
+    pattern = w["pattern"]
+    if pattern == "moe_ffn":
+        return build_moe_iat(
+            ctx, w["num_experts"], w["M"], w["N"],
+            w["n_selected"], w.get("dtype", "f16"),
+        )
+    if pattern == "paged_attn":
+        return build_paged_attn_iat(
+            ctx, w["n_pages"], w["n_heads"], w["block_size"], w["head_dim"],
+            w["n_sel_pages"], w.get("dtype", "f16"),
+        )
+    if pattern == "sparse_attn":
+        return build_sparse_attn_iat(
+            ctx, w["n_pages"], w["n_tokens"], w["hidden_dim"],
+            w["n_sel_pages"], w["n_sel_tokens"], w.get("dtype", "f16"),
+        )
+    if pattern == "multi_head":
+        return build_multi_head_iat(
+            ctx, w["n_experts"], w["n_heads"], w["M"], w["N"],
+            w["n_sel_experts"], w["n_sel_heads"], w.get("dtype", "f16"),
+        )
+    raise ValueError(f"Unknown pattern: {pattern!r}")
 
 
-def _run_fast_path(ctx, iat):
-    reset_lx(ctx)
-    _block_gather_load(ctx, iat)
+def _count_points(iat):
+    """Total iteration points from the VSS."""
+    n = 1
+    for d in range(iat.variables_space_set.n_dims):
+        extent = int(iat.variables_space_set.hi[d]) - int(iat.variables_space_set.lo[d])
+        if extent > 0:
+            n *= extent
+    return n
 
 
 # ---------------------------------------------------------------------------
-# block subcommand
+# Shared step functions
 # ---------------------------------------------------------------------------
 
 def _old_7_steps(ctx, iat) -> dict:
@@ -83,16 +109,14 @@ def _old_7_steps(ctx, iat) -> dict:
 
 def _new_3_steps(ctx, iat) -> dict:
     """One iteration of new 3-step path, returns per-step ms."""
-    from ktir_cpu.ops.memory_ops import _block_gather_analyze, _block_gather_read_idx, _block_gather_offsets
-
     reset_lx(ctx)
     info = _block_gather_analyze(iat)
-    indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los = info
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
 
     t0 = time.perf_counter()
-    idx_values_arr, _ = _block_gather_read_idx(ctx, iat, indirect_sub, dep_vars, dep_var_list)
+    idx_values_map, _ = _block_gather_read_idx(ctx, iat, indirect_subs, dep_vars, dep_var_list)
     t1 = time.perf_counter()
-    offsets = _block_gather_offsets(iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los)
+    offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los)
     t2 = time.perf_counter()
     tile_ref = iat.parent_ref.to_tile_ref()
     mgr = _MemAccessor(ctx, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
@@ -107,19 +131,22 @@ def _new_3_steps(ctx, iat) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# block subcommand
+# ---------------------------------------------------------------------------
+
 def cmd_block(config):
     """Fast-path vs general-path summary + per-step breakdown."""
     print(f"{config.name}: block-gather fast path")
     print()
 
-    # --- Summary table ---
     table = BenchTable(
-        headers=["Workload", "Shape", "Points", "General (ms)", "Fast (ms)", "Speedup"],
+        headers=["Pattern", "Workload", "Points", "General (ms)", "Fast (ms)", "Speedup"],
     )
 
     for w in config.workloads:
         ctx = make_bench_context()
-        iat = build_moe_iat(ctx, w["num_experts"], w["M"], w["N"], w["n_selected"], w.get("dtype", "f16"))
+        iat = _build_iat(ctx, w)
         assert _is_block_gather(iat), f"Workload {w['label']} does not qualify for fast path"
 
         timer = BenchTimer(
@@ -127,15 +154,22 @@ def cmd_block(config):
             n_rounds=w.get("n_rounds", config.defaults.get("n_rounds", 5)),
             cache_flush=True,
         )
-        general_ms, fast_ms = timer.measure_pair(
-            lambda: _run_general_path(ctx, iat),
-            lambda: _run_fast_path(ctx, iat),
-        )
-        total_pts = w["n_selected"] * w["M"] * w["N"]
+
+        def run_general(ctx=ctx, iat=iat):
+            reset_lx(ctx)
+            idx_values, _ = _resolve_idx_reads(ctx, iat)
+            coords = _build_indirect_coords(iat, idx_values)
+            MemoryOps.load(ctx, iat.parent_ref.to_tile_ref(), coords=coords, result_shape=iat.shape)
+
+        def run_fast(ctx=ctx, iat=iat):
+            reset_lx(ctx)
+            _block_gather_load(ctx, iat)
+
+        general_ms, fast_ms = timer.measure_pair(run_general, run_fast)
+        n_points = _count_points(iat)
         speedup = general_ms / fast_ms if fast_ms > 0 else float("inf")
-        shape_str = f"{w['num_experts']}x{w['M']}x{w['N']}"
         table.add_row([
-            w["label"], shape_str, f"{total_pts:,}",
+            w["pattern"], w["label"], f"{n_points:,}",
             f"{general_ms:.2f}", f"{fast_ms:.2f}", f"{speedup:.1f}x",
         ])
 
@@ -148,7 +182,7 @@ def cmd_block(config):
         print("-" * 60)
 
         ctx = make_bench_context()
-        iat = build_moe_iat(ctx, w["num_experts"], w["M"], w["N"], w["n_selected"], w.get("dtype", "f16"))
+        iat = _build_iat(ctx, w)
         timer = BenchTimer(
             n_warmup=w.get("warmup", config.defaults.get("warmup", 2)),
             n_rounds=w.get("n_rounds", config.defaults.get("n_rounds", 5)),
@@ -191,16 +225,13 @@ def cmd_gather(config):
 
     for w in config.workloads:
         ctx = make_bench_context()
-        iat = build_moe_iat(ctx, w["num_experts"], w["M"], w["N"], w["n_selected"], w.get("dtype", "f16"))
+        iat = _build_iat(ctx, w)
         dtype = w.get("dtype", "f16")
 
-        # Compute offsets once (use fast path to get them)
-        from ktir_cpu.ops.memory_ops import _block_gather_analyze, _block_gather_read_idx, _block_gather_offsets
-
         info = _block_gather_analyze(iat)
-        indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los = info
-        idx_values_arr, _ = _block_gather_read_idx(ctx, iat, indirect_sub, dep_vars, dep_var_list)
-        offsets = _block_gather_offsets(iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los)
+        indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
+        idx_values_map, _ = _block_gather_read_idx(ctx, iat, indirect_subs, dep_vars, dep_var_list)
+        offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los)
 
         tile_ref = iat.parent_ref.to_tile_ref()
         mgr = _MemAccessor(ctx, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
@@ -208,13 +239,13 @@ def cmd_gather(config):
         np_dtype = to_np_dtype(dtype)
         elem_size = bytes_per_elem(dtype)
 
-        def old_gather():
+        def old_gather(ctx=ctx, tile_ref=tile_ref, span=span, np_dtype=np_dtype, elem_size=elem_size, offsets=offsets):
             reset_lx(ctx)
             flat = _read_flat(ctx.hbm.memory, tile_ref.base_ptr, span, np_dtype, elem_size)
             gathered = flat[offsets]
             ctx.lx.memory[ctx.lx.next_ptr] = gathered.flatten()
 
-        def new_gather():
+        def new_gather(ctx=ctx, mgr=mgr, offsets=offsets, dtype=dtype):
             reset_lx(ctx)
             gathered = mgr.gather(offsets, dtype)
             ctx.lx.memory[ctx.lx.next_ptr] = gathered

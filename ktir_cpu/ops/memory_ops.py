@@ -216,17 +216,21 @@ def _expr_dependent_vars(expr: tuple) -> set:
 def _block_gather_analyze(iat: "IndirectAccessTile"):
     """Extract block-gather metadata from an IAT.
 
-    Returns (indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los)
+    Returns (indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los)
     or None if the IAT doesn't qualify.
     """
     indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
-    if len(indirect_subs) != 1:
+    if len(indirect_subs) < 1:
         return None
 
-    sub = indirect_subs[0]
+    direct_subs = [s for s in iat.dim_subscripts if s.get("kind") in ("direct", "direct_expr")]
+    if len(direct_subs) < 1:
+        return None
+
     dep_vars: set = set()
-    for expr in sub["idx_exprs"]:
-        dep_vars |= _expr_dependent_vars(expr)
+    for sub in indirect_subs:
+        for expr in sub["idx_exprs"]:
+            dep_vars |= _expr_dependent_vars(expr)
 
     vss = iat.variables_space_set
     if not isinstance(vss, BoxSet):
@@ -251,7 +255,7 @@ def _block_gather_analyze(iat: "IndirectAccessTile"):
     dep_var_list = sorted(dep_vars)
     dep_extents = [int(vss.hi[d]) - int(vss.lo[d]) for d in dep_var_list]
     dep_los = [int(vss.lo[d]) for d in dep_var_list]
-    return sub, dep_vars, dep_var_list, dep_extents, dep_los
+    return indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los
 
 
 def _is_block_gather(iat: "IndirectAccessTile") -> bool:
@@ -261,53 +265,66 @@ def _is_block_gather(iat: "IndirectAccessTile") -> bool:
 
 def _block_gather_read_idx(
     context: CoreContext, iat: "IndirectAccessTile",
-    indirect_sub: dict, dep_vars: set, dep_var_list: list,
-) -> Tuple[np.ndarray, int]:
-    """Read the small index tensor for a block-gather IAT.
+    indirect_subs: list, dep_vars: set, dep_var_list: list,
+) -> Tuple[dict, int]:
+    """Read index tensors for all indirect dims in a block-gather IAT.
 
-    Returns (idx_values_arr, idx_sticks).
+    Returns (idx_values_map, total_idx_sticks) where idx_values_map maps
+    each indirect sub (by its position in indirect_subs) to a 1-D array.
     """
+    import itertools
     vss = iat.variables_space_set
-    iv_idx = indirect_sub["index_view_idx"]
-    iv = iat.index_views[iv_idx]
-    bpe_idx = _bytes_per_elem(iv.dtype)
-    iv_strides = list(iv.strides)
-    iv_base = iv.byte_address
 
     if dep_vars:
-        import itertools
         dep_ranges = [range(int(vss.lo[d]), int(vss.hi[d])) for d in dep_var_list]
         dep_points = list(itertools.product(*dep_ranges))
     else:
         dep_points = [()]
 
-    idx_addrs = []
-    for dpt in dep_points:
-        pt = list(vss.lo)
-        for i, d in enumerate(dep_var_list):
-            pt[d] = dpt[i]
-        pt = tuple(pt)
-        offset = sum(
-            eval_subscript_expr(e, pt) * s
-            for e, s in zip(indirect_sub["idx_exprs"], iv_strides)
+    idx_values_map = {}
+    total_sticks = 0
+
+    for sub_i, sub in enumerate(indirect_subs):
+        iv_idx = sub["index_view_idx"]
+        iv = iat.index_views[iv_idx]
+        bpe_idx = _bytes_per_elem(iv.dtype)
+        iv_strides = list(iv.strides)
+        iv_base = iv.byte_address
+
+        sub_dep_vars = set()
+        for expr in sub["idx_exprs"]:
+            sub_dep_vars |= _expr_dependent_vars(expr)
+
+        idx_addrs = []
+        for dpt in dep_points:
+            pt = list(vss.lo)
+            for i, d in enumerate(dep_var_list):
+                pt[d] = dpt[i]
+            pt = tuple(pt)
+            offset = sum(
+                eval_subscript_expr(e, pt) * s
+                for e, s in zip(sub["idx_exprs"], iv_strides)
+            )
+            idx_addrs.append(iv_base + offset * bpe_idx)
+
+        accessor_idx = _MemAccessor(
+            context, iv.memory_space, iv.byte_address, iv.lx_core_id,
         )
-        idx_addrs.append(iv_base + offset * bpe_idx)
+        if idx_addrs:
+            arr, sticks = accessor_idx.read_scattered(idx_addrs, iv.dtype)
+            total_sticks += sticks if sticks is not None else 0
+        else:
+            arr = np.array([], dtype=np.int32)
 
-    accessor_idx = _MemAccessor(
-        context, iv.memory_space, iv.byte_address, iv.lx_core_id,
-    )
-    if idx_addrs:
-        idx_values_arr, idx_sticks = accessor_idx.read_scattered(idx_addrs, iv.dtype)
-    else:
-        idx_values_arr = np.array([], dtype=np.int32)
-        idx_sticks = 0
+        idx_values_map[sub_i] = arr
 
-    return idx_values_arr, idx_sticks if idx_sticks is not None else 0
+    return idx_values_map, total_sticks
 
 
 def _block_gather_offsets(
     iat: "IndirectAccessTile",
-    idx_values_arr: np.ndarray,
+    idx_values_map: dict,
+    indirect_subs: list,
     dep_vars: set, dep_var_list: list, dep_extents: list, dep_los: list,
 ) -> np.ndarray:
     """Compute flat element offsets for a block-gather IAT via numpy broadcast.
@@ -321,7 +338,7 @@ def _block_gather_offsets(
     dim_ranges = [np.arange(int(vss.lo[d]), int(vss.hi[d]), dtype=np.int64)
                   for d in range(vss.n_dims)]
 
-    # Build the indirect coordinate grid shaped for broadcasting
+    # Build a flat dep_grid for indexing into idx_values arrays
     if dep_vars:
         dep_grids = np.meshgrid(
             *[np.arange(e, dtype=np.int64) for e in dep_extents],
@@ -331,23 +348,34 @@ def _block_gather_offsets(
         for i in range(len(dep_var_list) - 2, -1, -1):
             dep_strides_arr[i] = dep_strides_arr[i + 1] * dep_extents[i + 1]
         flat_dep_grid = sum(g * s for g, s in zip(dep_grids, dep_strides_arr))
-        idx_lookup_shape = [1] * vss.n_dims
-        for d_pos, d in enumerate(dep_var_list):
-            idx_lookup_shape[d] = dep_extents[d_pos]
-        indirect_coord_grid = idx_values_arr[flat_dep_grid.ravel()].reshape(idx_lookup_shape).astype(np.int64)
     else:
-        indirect_coord_grid = np.full([1] * vss.n_dims, int(idx_values_arr[0]), dtype=np.int64)
+        flat_dep_grid = None
+
+    # Build per-indirect-dim coordinate grids
+    indirect_coord_grids = {}
+    for sub_i in range(len(indirect_subs)):
+        idx_values_arr = idx_values_map[sub_i]
+        if dep_vars and flat_dep_grid is not None:
+            idx_lookup_shape = [1] * vss.n_dims
+            for d_pos, d in enumerate(dep_var_list):
+                idx_lookup_shape[d] = dep_extents[d_pos]
+            grid = idx_values_arr[flat_dep_grid.ravel()].reshape(idx_lookup_shape).astype(np.int64)
+        else:
+            grid = np.full([1] * vss.n_dims, int(idx_values_arr[0]), dtype=np.int64)
+        indirect_coord_grids[sub_i] = grid
 
     # Sum per-dim stride contributions via broadcasting
     iter_shape = tuple(int(vss.hi[d]) - int(vss.lo[d]) for d in range(vss.n_dims))
     offsets = np.zeros(iter_shape, dtype=np.int64)
 
     has_direct_expr = False
+    sub_counter = 0
     for dim_i, sub_d in enumerate(iat.dim_subscripts):
         kind = sub_d["kind"]
         s = parent_strides[dim_i]
         if kind == "indirect":
-            offsets = offsets + indirect_coord_grid * s
+            offsets = offsets + indirect_coord_grids[sub_counter] * s
+            sub_counter += 1
         elif kind == "direct":
             var_idx = sub_d["var_index"]
             coord_1d = dim_ranges[var_idx]
@@ -360,14 +388,16 @@ def _block_gather_offsets(
 
     if has_direct_expr:
         return _block_gather_offsets_fallback(
-            iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+            iat, idx_values_map, indirect_subs,
+            dep_vars, dep_var_list, dep_extents, dep_los,
             parent_strides, ndim,
         )
 
     vso = iat.variables_space_order
     if vso is not None and not vso.is_identity():
         return _block_gather_offsets_fallback(
-            iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+            iat, idx_values_map, indirect_subs,
+            dep_vars, dep_var_list, dep_extents, dep_los,
             parent_strides, ndim,
         )
 
@@ -376,7 +406,8 @@ def _block_gather_offsets(
 
 def _block_gather_offsets_fallback(
     iat: "IndirectAccessTile",
-    idx_values_arr: np.ndarray,
+    idx_values_map: dict,
+    _indirect_subs: list,
     dep_vars: set, dep_var_list: list, dep_extents: list, dep_los: list,
     parent_strides: np.ndarray, ndim: int,
 ) -> np.ndarray:
@@ -401,12 +432,14 @@ def _block_gather_offsets_fallback(
     else:
         flat_dep_idx = np.zeros(n_points, dtype=np.int64)
 
-    indirect_coords = idx_values_arr[flat_dep_idx].astype(np.int64)
     coords_arr = np.empty((n_points, ndim), dtype=np.int64)
+    sub_counter = 0
     for dim_i, sub_d in enumerate(iat.dim_subscripts):
         kind = sub_d["kind"]
         if kind == "indirect":
-            coords_arr[:, dim_i] = indirect_coords
+            idx_values_arr = idx_values_map[sub_counter]
+            coords_arr[:, dim_i] = idx_values_arr[flat_dep_idx].astype(np.int64)
+            sub_counter += 1
         elif kind == "direct":
             coords_arr[:, dim_i] = points_arr[:, sub_d["var_index"]]
         elif kind == "direct_expr":
@@ -422,7 +455,7 @@ def _block_gather_load(
 ) -> Tile:
     """Fast-path indirect load for block-gather patterns."""
     info = _block_gather_analyze(iat)
-    indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los = info
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
 
     vss = iat.variables_space_set
     out_shape = result_shape if result_shape is not None else iat.shape
@@ -438,11 +471,12 @@ def _block_gather_load(
         MemoryOps._place_in_lx(context, data)
         return Tile(data, iat.parent_ref.dtype, out_shape, 0)
 
-    idx_values_arr, idx_sticks = _block_gather_read_idx(
-        context, iat, indirect_sub, dep_vars, dep_var_list,
+    idx_values_map, idx_sticks = _block_gather_read_idx(
+        context, iat, indirect_subs, dep_vars, dep_var_list,
     )
     offsets = _block_gather_offsets(
-        iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+        iat, idx_values_map, indirect_subs,
+        dep_vars, dep_var_list, dep_extents, dep_los,
     )
 
     tile_ref = iat.parent_ref.to_tile_ref()
@@ -467,7 +501,7 @@ def _block_gather_store(
 ) -> int:
     """Fast-path indirect store for block-gather patterns."""
     info = _block_gather_analyze(iat)
-    indirect_sub, dep_vars, dep_var_list, dep_extents, dep_los = info
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
 
     vss = iat.variables_space_set
 
@@ -480,11 +514,12 @@ def _block_gather_store(
     if n_points == 0:
         return 0
 
-    idx_values_arr, idx_sticks = _block_gather_read_idx(
-        context, iat, indirect_sub, dep_vars, dep_var_list,
+    idx_values_map, idx_sticks = _block_gather_read_idx(
+        context, iat, indirect_subs, dep_vars, dep_var_list,
     )
     offsets = _block_gather_offsets(
-        iat, idx_values_arr, dep_vars, dep_var_list, dep_extents, dep_los,
+        iat, idx_values_map, indirect_subs,
+        dep_vars, dep_var_list, dep_extents, dep_los,
     )
 
     tile_ref = iat.parent_ref.to_tile_ref()
