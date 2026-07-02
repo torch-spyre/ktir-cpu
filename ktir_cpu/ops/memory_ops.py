@@ -227,8 +227,10 @@ def _expr_dependent_vars(expr: tuple) -> set:
 def _block_gather_analyze(iat: "IndirectAccessTile"):
     """Extract block-gather metadata from an IAT.
 
-    Returns (indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los)
-    or None if the IAT doesn't qualify.
+    Returns (indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los,
+    use_fallback_offsets) or None if the IAT doesn't qualify.
+    use_fallback_offsets is True when direct_expr dims or non-identity VSO
+    require the per-point fallback offset computation.
     """
     indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
     if len(indirect_subs) < 1:
@@ -263,10 +265,15 @@ def _block_gather_analyze(iat: "IndirectAccessTile"):
     if unique_lookups * 16 > total_points:
         return None
 
+    has_direct_expr = any(s.get("kind") == "direct_expr" for s in iat.dim_subscripts)
+    vso = iat.variables_space_order
+    non_identity_vso = vso is not None and not vso.is_identity()
+    use_fallback_offsets = has_direct_expr or non_identity_vso
+
     dep_var_list = sorted(dep_vars)
     dep_extents = [int(vss.hi[d]) - int(vss.lo[d]) for d in dep_var_list]
     dep_los = [int(vss.lo[d]) for d in dep_var_list]
-    return indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los
+    return indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback_offsets
 
 
 def _is_block_gather(iat: "IndirectAccessTile") -> bool:
@@ -302,10 +309,6 @@ def _block_gather_read_idx(
         iv_strides = list(iv.strides)
         iv_base = iv.byte_address
 
-        sub_dep_vars = set()
-        for expr in sub["idx_exprs"]:
-            sub_dep_vars |= _expr_dependent_vars(expr)
-
         idx_addrs = []
         for dpt in dep_points:
             pt = list(vss.lo)
@@ -337,6 +340,7 @@ def _block_gather_offsets(
     idx_values_map: dict,
     indirect_subs: list,
     dep_vars: set, dep_var_list: list, dep_extents: list, dep_los: list,
+    use_fallback: bool = False,
 ) -> np.ndarray:
     """Compute flat element offsets for a block-gather IAT via numpy broadcast.
 
@@ -346,6 +350,14 @@ def _block_gather_offsets(
     ndim = len(iat.dim_subscripts)
     tile_ref = iat.parent_ref.to_tile_ref()
     parent_strides = np.asarray(tile_ref.strides, dtype=np.int64)
+
+    if use_fallback:
+        return _block_gather_offsets_fallback(
+            iat, idx_values_map, indirect_subs,
+            dep_vars, dep_var_list, dep_extents, dep_los,
+            parent_strides, ndim,
+        )
+
     dim_ranges = [np.arange(int(vss.lo[d]), int(vss.hi[d]), dtype=np.int64)
                   for d in range(vss.n_dims)]
 
@@ -379,7 +391,6 @@ def _block_gather_offsets(
     iter_shape = tuple(int(vss.hi[d]) - int(vss.lo[d]) for d in range(vss.n_dims))
     offsets = np.zeros(iter_shape, dtype=np.int64)
 
-    has_direct_expr = False
     sub_counter = 0
     for dim_i, sub_d in enumerate(iat.dim_subscripts):
         kind = sub_d["kind"]
@@ -393,24 +404,6 @@ def _block_gather_offsets(
             shape_for_broadcast = [1] * vss.n_dims
             shape_for_broadcast[var_idx] = len(coord_1d)
             offsets = offsets + coord_1d.reshape(shape_for_broadcast) * s
-        elif kind == "direct_expr":
-            has_direct_expr = True
-            break
-
-    if has_direct_expr:
-        return _block_gather_offsets_fallback(
-            iat, idx_values_map, indirect_subs,
-            dep_vars, dep_var_list, dep_extents, dep_los,
-            parent_strides, ndim,
-        )
-
-    vso = iat.variables_space_order
-    if vso is not None and not vso.is_identity():
-        return _block_gather_offsets_fallback(
-            iat, idx_values_map, indirect_subs,
-            dep_vars, dep_var_list, dep_extents, dep_los,
-            parent_strides, ndim,
-        )
 
     return offsets.ravel()
 
@@ -466,7 +459,9 @@ def _block_gather_load(
 ) -> Tile:
     """Fast-path indirect load for block-gather patterns."""
     info = _block_gather_analyze(iat)
-    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
+    if info is None:
+        raise ValueError("IAT does not qualify for block-gather fast path")
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
 
     vss = iat.variables_space_set
     out_shape = result_shape if result_shape is not None else iat.shape
@@ -488,6 +483,7 @@ def _block_gather_load(
     offsets = _block_gather_offsets(
         iat, idx_values_map, indirect_subs,
         dep_vars, dep_var_list, dep_extents, dep_los,
+        use_fallback,
     )
 
     tile_ref = iat.parent_ref.to_tile_ref()
@@ -512,7 +508,9 @@ def _block_gather_store(
 ) -> int:
     """Fast-path indirect store for block-gather patterns."""
     info = _block_gather_analyze(iat)
-    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
+    if info is None:
+        raise ValueError("IAT does not qualify for block-gather fast path")
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
 
     vss = iat.variables_space_set
 
@@ -530,7 +528,7 @@ def _block_gather_store(
     )
     offsets = _block_gather_offsets(
         iat, idx_values_map, indirect_subs,
-        dep_vars, dep_var_list, dep_extents, dep_los,
+        dep_vars, dep_var_list, dep_extents, dep_los, use_fallback,
     )
 
     tile_ref = iat.parent_ref.to_tile_ref()

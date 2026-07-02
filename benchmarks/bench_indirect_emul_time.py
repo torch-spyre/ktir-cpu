@@ -18,6 +18,9 @@ from bench_utils import (
     build_moe_iat, build_sparse_attn_iat, build_multi_head_iat, build_paged_attn_iat,
     reset_lx, flush_cache, format_size, BenchTimer, BenchTable,
 )
+# Private imports: benchmark needs sub-step timing, which requires calling
+# internal functions individually.  Coupled to memory_ops internals — update
+# if those functions are renamed or re-signatured.
 from ktir_cpu.ops.memory_ops import (
     MemoryOps, _MemAccessor,
     _is_block_gather, _block_gather_load,
@@ -111,12 +114,12 @@ def _new_3_steps(ctx, iat) -> dict:
     """One iteration of new 3-step path, returns per-step ms."""
     reset_lx(ctx)
     info = _block_gather_analyze(iat)
-    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
 
     t0 = time.perf_counter()
     idx_values_map, _ = _block_gather_read_idx(ctx, iat, indirect_subs, dep_vars, dep_var_list)
     t1 = time.perf_counter()
-    offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los)
+    offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback)
     t2 = time.perf_counter()
     tile_ref = iat.parent_ref.to_tile_ref()
     mgr = _MemAccessor(ctx, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
@@ -229,9 +232,9 @@ def cmd_gather(config):
         dtype = w.get("dtype", "f16")
 
         info = _block_gather_analyze(iat)
-        indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los = info
+        indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
         idx_values_map, _ = _block_gather_read_idx(ctx, iat, indirect_subs, dep_vars, dep_var_list)
-        offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los)
+        offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback)
 
         tile_ref = iat.parent_ref.to_tile_ref()
         mgr = _MemAccessor(ctx, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
