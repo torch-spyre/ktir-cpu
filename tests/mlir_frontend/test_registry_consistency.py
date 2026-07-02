@@ -57,10 +57,6 @@ FRONTEND_UNSUPPORTED = {
     "ktdp.coreid": "non-spec op (not in the ktdp dialect). Reconcile to the "
                    "real core-identity form or remove. See issue #88.",
 
-    # Real spec op missing only a frontend adapter handler (distinct from the
-    # non-spec ops above).
-    "ktdp.construct_distributed_memory_view": "real ktdp dialect op; no frontend "
-                   "adapter handler yet. Tracked in issue #87.",
 }
 
 
