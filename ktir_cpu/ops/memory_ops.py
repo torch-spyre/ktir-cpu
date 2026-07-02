@@ -169,10 +169,21 @@ class _MemAccessor:
     def gather(self, offsets: np.ndarray, dtype: str) -> np.ndarray:
         """Gather elements at *offsets* directly from the stored allocation.
 
-        Avoids the intermediate span copy that :meth:`read` + fancy-index
-        would produce — a single memcpy (the gather result).
+        Args:
+            offsets: 1-D int64 element offsets relative to base
+            dtype: element type (e.g. "f16", "i32")
         """
         return self._sim.gather(*self._args, offsets, dtype, **self._kwargs)
+
+    def scatter(self, offsets: np.ndarray, data: np.ndarray, dtype: str) -> None:
+        """Scatter *data* into elements at *offsets* — inverse of gather.
+
+        Args:
+            offsets: 1-D int64 element offsets relative to base
+            data: values to write (same length as offsets)
+            dtype: element type (e.g. "f16", "i32")
+        """
+        self._sim.scatter(*self._args, offsets, data, dtype, **self._kwargs)
 
 
 def hbm_read(hbm: "HBMSimulator", byte_addr: int, n_elements: int, dtype: str) -> np.ndarray:
@@ -531,10 +542,7 @@ def _block_gather_store(
     else:
         unique_sticks = 0
 
-    span = int(offsets.max()) + 1 if offsets.size else 1
-    flat = mgr.read(span, tile_ref.dtype)
-    flat[offsets] = tile.data.ravel()
-    mgr.write(flat)
+    mgr.scatter(offsets, tile.data.ravel(), tile_ref.dtype)
     return unique_sticks + idx_sticks
 
 
@@ -982,10 +990,7 @@ class MemoryOps:
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes,
         )
-        span = int(offsets.max()) + 1 if offsets.size else 1
-        flat = mgr.read(span, tile_ref.dtype)
-        flat[offsets] = tile.data.ravel()  # RHS read-only scatter source — view is fine
-        mgr.write(flat)
+        mgr.scatter(offsets, tile.data.ravel(), tile_ref.dtype)
         return unique_sticks if unique_sticks is not None else 0
 
     @staticmethod
@@ -1321,16 +1326,12 @@ class MemoryOps:
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords, stick_bytes=mgr.stick_bytes,
             )
-            span = int(offsets.max()) + 1 if offsets.size else 1
-            flat = mgr.read(span, survivor.dtype)
-            # Vectorized gather/scatter: per-dimension index arrays → one fancy-index read+write.
             src_idx = tuple(
                 np.fromiter((c[d] for c in access_coords), dtype=np.intp,
                             count=len(access_coords))
                 for d in range(ndim)
             )
-            flat[offsets] = tile.data[src_idx]
-            mgr.write(flat)
+            mgr.scatter(offsets, tile.data[src_idx], survivor.dtype)
             if unique_sticks is not None:
                 total_unique_sticks += unique_sticks
 

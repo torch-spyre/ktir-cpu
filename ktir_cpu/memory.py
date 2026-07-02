@@ -288,6 +288,41 @@ def _write_flat(memory: Dict[int, np.ndarray], ptr: int, data: np.ndarray):
     memory[ptr] = data.flatten()  # flatten already copies; the extra .copy() was redundant
 
 
+def _gather_from(memory: Dict[int, np.ndarray], byte_addr: int, offsets: "np.ndarray", dtype: str) -> "np.ndarray":
+    """Gather elements at *offsets* from an existing allocation.
+
+    Args:
+        memory: backing store dict {byte_addr: ndarray}
+        byte_addr: absolute byte address of the allocation base
+        offsets: 1-D int64 element offsets relative to base
+        dtype: element type (e.g. "f16", "i32")
+    """
+    elem_size = bytes_per_elem(dtype)
+    alloc = _find_allocation(memory, byte_addr, elem_size)
+    if alloc is None:
+        raise ValueError(f"Gather from unmapped address 0x{byte_addr:x}")
+    _, data, elem_offset = alloc
+    return data.ravel()[elem_offset + offsets]
+
+
+def _scatter_into(memory: Dict[int, np.ndarray], byte_addr: int, offsets: "np.ndarray", data: "np.ndarray", dtype: str) -> None:
+    """Scatter *data* into elements at *offsets* within an existing allocation.
+
+    Args:
+        memory: backing store dict {byte_addr: ndarray}
+        byte_addr: absolute byte address of the allocation base
+        offsets: 1-D int64 element offsets relative to base
+        data: values to write (same length as offsets)
+        dtype: element type (e.g. "f16", "i32")
+    """
+    elem_size = bytes_per_elem(dtype)
+    alloc = _find_allocation(memory, byte_addr, elem_size)
+    if alloc is None:
+        raise ValueError(f"Scatter to unmapped address 0x{byte_addr:x}")
+    _, buf, elem_offset = alloc
+    buf.ravel()[elem_offset + offsets] = data
+
+
 class HBMSimulator:
     """Simulates 128GB HBM using sparse storage.
 
@@ -366,27 +401,25 @@ class HBMSimulator:
     def gather(self, stick: int, offsets: "np.ndarray", dtype: str, *, intra_byte: int = 0) -> "np.ndarray":
         """Gather elements at *offsets* directly from the stored allocation.
 
-        Unlike :meth:`read`, this avoids copying a contiguous span first —
-        the fancy-index is applied directly on the allocation's ravel view,
-        producing a single memcpy (the gather result itself).
+        Args:
+            stick: HBM stick index (base of the tile)
+            offsets: 1-D int64 element offsets relative to base
+            dtype: element type (e.g. "f16", "i32")
+            intra_byte: byte offset within the stick (default 0)
+        """
+        return _gather_from(self.memory, stick * self.STICK_BYTES + intra_byte, offsets, dtype)
+
+    def scatter(self, stick: int, offsets: "np.ndarray", data: "np.ndarray", dtype: str, *, intra_byte: int = 0) -> None:
+        """Scatter *data* into elements at *offsets* — inverse of gather.
 
         Args:
-            stick: HBM stick index (base of the tile).
-            offsets: 1-D int64 ndarray of element offsets relative to *stick*/*intra_byte*.
-            dtype: Element data type.
-            intra_byte: Byte offset within the stick (default 0).
-
-        Returns:
-            1-D NumPy array of gathered elements.
+            stick: HBM stick index (base of the tile)
+            offsets: 1-D int64 element offsets relative to base
+            data: values to write (same length as offsets)
+            dtype: element type (e.g. "f16", "i32")
+            intra_byte: byte offset within the stick (default 0)
         """
-        byte_addr = stick * self.STICK_BYTES + intra_byte
-        elem_size = bytes_per_elem(dtype)
-        alloc = _find_allocation(self.memory, byte_addr, elem_size)
-        if alloc is None:
-            raise ValueError(f"Gather from unmapped address 0x{byte_addr:x}")
-        _, data, elem_offset = alloc
-        flat = data.ravel()
-        return flat[elem_offset + offsets]
+        _scatter_into(self.memory, stick * self.STICK_BYTES + intra_byte, offsets, data, dtype)
 
     def read_element(self, addr: int, dtype: str = "f16"):
         """Read a single element by byte address.
@@ -448,23 +481,23 @@ class LXScratchpad:
     def gather(self, ptr: int, offsets: "np.ndarray", dtype: str) -> "np.ndarray":
         """Gather elements at *offsets* directly from the stored allocation.
 
-        Same semantics as :meth:`HBMSimulator.gather` but byte-addressed.
+        Args:
+            ptr: byte address (base of the tile)
+            offsets: 1-D int64 element offsets relative to base
+            dtype: element type (e.g. "f16", "i32")
+        """
+        return _gather_from(self.memory, ptr, offsets, dtype)
+
+    def scatter(self, ptr: int, offsets: "np.ndarray", data: "np.ndarray", dtype: str) -> None:
+        """Scatter *data* into elements at *offsets* — inverse of gather.
 
         Args:
-            ptr: Byte address (base of the tile).
-            offsets: 1-D int64 ndarray of element offsets relative to *ptr*.
-            dtype: Element data type.
-
-        Returns:
-            1-D NumPy array of gathered elements.
+            ptr: byte address (base of the tile)
+            offsets: 1-D int64 element offsets relative to base
+            data: values to write (same length as offsets)
+            dtype: element type (e.g. "f16", "i32")
         """
-        elem_size = bytes_per_elem(dtype)
-        alloc = _find_allocation(self.memory, ptr, elem_size)
-        if alloc is None:
-            raise ValueError(f"Gather from unmapped LX address 0x{ptr:x}")
-        _, data, elem_offset = alloc
-        flat = data.ravel()
-        return flat[elem_offset + offsets]
+        _scatter_into(self.memory, ptr, offsets, data, dtype)
 
     def clear(self):
         """Clear scratchpad and reset allocation."""

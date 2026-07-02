@@ -496,6 +496,61 @@ class TestBlockGatherStore:
 
 
 # ---------------------------------------------------------------------------
+# Scatter: unit tests for HBMSimulator.scatter / LXScratchpad.scatter
+# ---------------------------------------------------------------------------
+
+class TestScatter:
+    """scatter() writes only the targeted offsets, leaving the rest untouched."""
+
+    def test_hbm_scatter_sparse(self):
+        """Scatter into a few elements of a larger allocation."""
+        hbm = HBMSimulator()
+        data = np.zeros(64, dtype=np.float16)  # allocate data (zeros)
+        stick = hbm.allocate(data.nbytes)
+        hbm.write(stick, data)
+
+        offsets = np.array([5, 17, 42, 63], dtype=np.int64)  # scatter targets
+        values = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float16)
+        hbm.scatter(stick, offsets, values, "f16")
+
+        result = hbm.read(stick, 64, "f16")
+        for o, v in zip(offsets, values):
+            assert result[o] == v
+        untouched = np.delete(np.arange(64), offsets)
+        np.testing.assert_array_equal(result[untouched], 0.0)
+
+    def test_lx_scatter_sparse(self):
+        """Scatter into LX scratchpad allocation."""
+        lx = LXScratchpad(size_mb=1)
+        data = np.zeros(32, dtype=np.float16)
+        lx.write(0, data)
+
+        offsets = np.array([0, 15, 31], dtype=np.int64)
+        values = np.array([10.0, 20.0, 30.0], dtype=np.float16)
+        lx.scatter(0, offsets, values, "f16")
+
+        result = lx.gather(0, np.arange(32, dtype=np.int64), "f16")
+        for o, v in zip(offsets, values):
+            assert result[o] == v
+        untouched = np.delete(np.arange(32), offsets)
+        np.testing.assert_array_equal(result[untouched], 0.0)
+
+    def test_scatter_gather_roundtrip(self):
+        """scatter then gather at same offsets returns the scattered values."""
+        hbm = HBMSimulator()
+        data = np.random.randn(128).astype(np.float16)  # allocate data
+        stick = hbm.allocate(data.nbytes)
+        hbm.write(stick, data)
+
+        offsets = np.array([10, 50, 100, 127], dtype=np.int64)
+        new_vals = np.array([99.0, 88.0, 77.0, 66.0], dtype=np.float16)
+        hbm.scatter(stick, offsets, new_vals, "f16")
+
+        gathered = hbm.gather(stick, offsets, "f16")
+        np.testing.assert_array_equal(gathered, new_vals)
+
+
+# ---------------------------------------------------------------------------
 # Equivalence: fast path == general path
 # ---------------------------------------------------------------------------
 
