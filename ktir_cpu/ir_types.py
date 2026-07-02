@@ -116,6 +116,100 @@ class MemRef:
         return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
 
 
+def _assemble_dist_extent(
+    shape: Tuple[Optional[int], ...],
+    partitions: List[MemRef],
+) -> Tuple[int, ...]:
+    """Assemble and validate a distributed view's global extent from its partitions.
+
+    Partitions are the ground truth.  For each axis the global extent is the
+    coordinate span ``max(hi) - min(lo)`` across the ``BoxSet`` partitions,
+    whose ``coordinate_set`` bounds are in global coordinates — the logical
+    size of the distributed tensor rather than the highest global coordinate.
+    For a gap-free tiling this equals the data covered; with interior gaps
+    the span still counts the uncovered middle (coverage is checked at access
+    time, not here).  Per axis:
+
+      - dynamic (``None``): filled with ``max(hi) - min(lo)``.
+      - concrete: validated ``declared >= max(hi) - min(lo)``.  An
+        under-sized declared dim raises; an over-sized one is allowed (the
+        extra surfaces as ``no partition covers`` at access time, like
+        interior gaps).
+
+    Addressing via the **BoxSet fast path** is unaffected by this value: it
+    routes via each partition's ``coordinate_set`` and ``p_i = min(B_i)`` and
+    never reads the global shape.  The **slow path** (AffineSet partition, or
+    AffineSet access tile against a BoxSet partition) does enumerate against
+    this shape (``B_i.enumerate(dist_ref.shape)``).  KNOWN LIMITATION: for a
+    non-origin tiling (``min(lo) > 0``) the span is smaller than ``max(hi)``,
+    so a slow-path enumeration would falsely reject / miss the global
+    coordinates in ``[span, max(hi))``.  Every fixture that currently reaches
+    the slow path is origin-anchored (``span == max(hi)``), so this is latent;
+    lifting non-origin + slow-path support is tracked under #74.
+
+    ``AffineSet`` partitions expose no per-axis bounds, so they are skipped
+    for extent purposes — concrete-shape views with ``AffineSet`` partitions
+    dispatch via ``find_partition`` / ``.contains()`` at access time.  A
+    dynamic axis cannot be filled from an ``AffineSet``, so they are rejected
+    only when the result shape still carries a ``?``.
+    """
+    ndim = len(shape)
+    has_dynamic = any(s is None for s in shape)
+    max_hi: List[Optional[int]] = [None] * ndim
+    min_lo: List[Optional[int]] = [None] * ndim
+    for i, part in enumerate(partitions):
+        cs = part.coordinate_set
+        if not isinstance(cs, BoxSet):
+            if has_dynamic:
+                raise ValueError(
+                    f"construct_distributed_memory_view: dynamic-shape result "
+                    f"resolution does not support {type(cs).__name__} partitions "
+                    f"(partition {i} on this op).  The concrete-shape path accepts "
+                    f"AffineSet partitions normally (they dispatch via find_partition "
+                    f"at access time).  Declare the result memref with concrete dims "
+                    f"to use this partition."
+                )
+            continue  # concrete shape: AffineSet has no per-axis bounds to check
+        if not cs.is_concrete:
+            # `ValueError` (not `assert`) so the failure is loud under `python -O`.
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} coordinate_set "
+                f"is not concrete; construct_memory_view should have specialised it "
+                f"against runtime symbols before reaching this point"
+            )
+        if cs.n_dims != ndim:
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} has rank "
+                f"{cs.n_dims}, expected {ndim} to match result memref rank"
+            )
+        for axis in range(ndim):
+            hi_a, lo_a = cs.hi[axis], cs.lo[axis]
+            if max_hi[axis] is None or hi_a > max_hi[axis]:
+                max_hi[axis] = hi_a
+            if min_lo[axis] is None or lo_a < min_lo[axis]:
+                min_lo[axis] = lo_a
+    resolved = list(shape)
+    for axis, dim in enumerate(shape):
+        # Global extent = data span across partitions (max(hi) - min(lo)),
+        # None on axes backed only by AffineSet partitions (no bounds tracked).
+        extent = None if max_hi[axis] is None else max_hi[axis] - min_lo[axis]
+        if dim is None:
+            if extent is None or extent <= 0:
+                raise ValueError(
+                    f"construct_distributed_memory_view: could not resolve "
+                    f"dynamic axis {axis}: no positive extent (max(hi)-min(lo)) "
+                    f"across partitions"
+                )
+            resolved[axis] = extent
+        elif extent is not None and dim < extent:
+            raise ValueError(
+                f"construct_distributed_memory_view: declared shape axis {axis} "
+                f"= {dim} is smaller than the partition extent (max(hi)-min(lo)) "
+                f"= {extent}; the view cannot address all covered global coordinates"
+            )
+    return tuple(resolved)
+
+
 @dataclass
 class DistributedMemRef:
     """Distributed memory view: composition of N per-partition MemRefs.
@@ -149,6 +243,10 @@ class DistributedMemRef:
                     f"DistributedMemRef partition {i} dtype {p.dtype!r} "
                     f"does not match view dtype {self.dtype!r}"
                 )
+        # Partitions are the ground truth: fill dynamic dims and validate
+        # concrete dims against the data span (max(hi) - min(lo)).
+        # See _assemble_dist_extent.
+        self.shape = _assemble_dist_extent(self.shape, self.partitions)
 
     def find_partition(self, coord: Tuple[int, ...]) -> Tuple[int, MemRef]:
         """Return ``(index, partition)`` whose coordinate_set contains *coord*.

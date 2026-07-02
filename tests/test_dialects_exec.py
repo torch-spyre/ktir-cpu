@@ -1751,29 +1751,55 @@ class TestKtdp:
         )
         assert result.shape == (192, 64)
 
-    def test_construct_distributed_memory_view_resolves_non_origin_to_max_hi(self):
-        """Non-origin tiling resolves to ``max(hi)``; coverage is not enforced.
+    def test_construct_distributed_memory_view_resolves_non_origin_to_data_span(self):
+        """Non-origin tiling resolves to the data span ``max(hi) - min(lo)``.
 
-        Partitions [10, 20) and [20, 30) on axis 0 produce shape (30, 64) —
-        the smallest shape satisfying ``BoxSet.enumerate``'s
-        ``shape >= max(hi)`` precondition.  The unreachable [0, 10) prefix
-        is not validated here; accessing global coords in that range
-        surfaces as ``no partition covers`` at
-        ``distributed_tile_access`` time.
+        Partitions [10, 20) and [20, 30) on axis 0 (10 rows each, local
+        shape (10, 4)) produce global shape (20, 4) — the amount of data
+        the partitions cover, not the highest coordinate (30).  The
+        unreachable [0, 10) prefix is not part of the logical size;
+        accessing global coords there surfaces as ``no partition covers``
+        at ``distributed_tile_access`` time.
         """
         ctx = _make_ctx()
         ctx.set_value("%a0", self._make_box_partition(
-            lo=(10, 0), hi=(20, 64), shape=(10, 64),
+            lo=(10, 0), hi=(20, 4), shape=(10, 4),
         ))
         ctx.set_value("%a1", self._make_box_partition(
-            lo=(20, 0), hi=(30, 64), shape=(10, 64),
+            lo=(20, 0), hi=(30, 4), shape=(10, 4),
         ))
         result = _call(
             "ktdp.construct_distributed_memory_view", ctx, _make_env(),
             operands=["%a0", "%a1"],
-            attributes={"shape": (None, 64), "dtype": "f16"},
+            attributes={"shape": (None, 4), "dtype": "f16"},
         )
-        assert result.shape == (30, 64)
+        assert result.shape == (20, 4)
+
+    def test_construct_distributed_memory_view_concrete_rejects_undersize(self):
+        """A concrete declared dim smaller than the partition extent is rejected.
+
+        Partitions span [0, 16) and [16, 32) on axis 1, so the extent
+        ``max(hi) - min(lo) = 32 - 0 = 32``.  The result is declared
+        ``64x20``; ``20 < 32`` means the view is smaller than the data the
+        partitions cover, so the extent check must reject it rather than
+        silently build an inconsistent ``DistributedMemRef``.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"declared shape axis 1 = 20 is smaller than the partition extent",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, 20), "dtype": "f16"},
+            )
 
     def test_construct_distributed_memory_view_dynamic_rejects_affine_set_partition(self):
         """Dynamic axis + non-BoxSet partition → ValueError naming partition + axis."""
