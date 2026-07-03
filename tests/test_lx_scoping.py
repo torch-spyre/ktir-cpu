@@ -1631,6 +1631,90 @@ class TestConstantIterArgMutation:
         assert ctx.lx.used == cst.size_bytes()
 
 
+# ---------------------------------------------------------------------------
+# MLIR for the direct-outs constant corruption test below.
+#
+# Pattern: %cst_0 is defined once outside all loops and used as the `outs`
+# operand of linalg.matmul *directly* (not via scf.for iter_arg) inside an
+# outer loop.  Each iteration should produce an independent result starting
+# from zero, but without the fix the first iteration corrupts %cst_0 in-place
+# and subsequent iterations accumulate on the dirty value.
+#
+# Concretely: A[2x2] @ B[2x2] with A=B=ones.  Result per iteration = 2.0.
+# If %cst_0 is corrupted: iteration 1 gets 2, iteration 2 gets 4, etc.
+# ---------------------------------------------------------------------------
+class TestConstantDirectOutsMutation:
+    """Regression: linalg.matmul outs(%cst) must not corrupt a shared constant.
+
+    Pattern: %cst is defined once outside an outer loop and passed *directly*
+    as the ``outs`` operand of ``linalg.matmul`` inside the loop body — not
+    via an ``scf.for iter_arg``.  The in-place update ``acc.data += result.data``
+    corrupts %cst on the first iteration; each subsequent iteration starts
+    from a dirty accumulator instead of zeros.
+
+    This is distinct from TestConstantIterArgMutation, which tests the iter_arg
+    path.  Here the constant is the ``outs`` operand itself.
+
+    The fix: when an inplace_outs op receives a 0-LX literal as its ``outs``
+    operand, it must copy the literal into a fresh working buffer before
+    accumulating, so the shared literal is never written.
+    """
+
+    def test_constant_outs_not_corrupted_across_loop_iterations(self):
+        """linalg.matmul outs(%cst) in a loop must not accumulate across iterations.
+
+        Setup: A[2x2] = B[2x2] = ones.  Each iteration computes A @ B = 2.0
+        everywhere and should store *exactly* 2.0, independent of prior iterations.
+
+        Without the fix: iteration 0 dirtied %cst to 2.0; iteration 1 starts
+        from 2.0 (not 0) and produces 4.0; iteration 2 gives 6.0; etc.
+        With the fix: every iteration produces 2.0.
+        """
+        ctx = _make_context()
+        a = _make_tile((2, 2), dtype="f32")
+        a.data[:] = 1.0
+        b = _make_tile((2, 2), dtype="f32")
+        b.data[:] = 1.0
+        cst = _make_tile((2, 2), dtype="f32")
+        cst.data[:] = 0.0
+        # Mark %cst as a 0-LX literal (arith.constant) so the handler knows
+        # it must not be mutated in place.
+        ctx.set_value("%cst", cst, charge=False)
+        ctx.set_value("%a", a)
+        ctx.set_value("%b", b)
+
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import dispatch
+
+        results = []
+        for _ in range(4):
+            op = Operation(
+                op_type="linalg.matmul",
+                operands=["%a", "%b", "%cst"],
+                attributes={},
+                result=["%r"],
+                result_type=None,
+            )
+            r = dispatch("linalg.matmul")(op, ctx, None)
+            results.append(r.data.copy())
+
+        expected = np.full((2, 2), 2.0, dtype=np.float32)
+        for i, r in enumerate(results):
+            np.testing.assert_array_equal(
+                r, expected,
+                err_msg=(
+                    f"Iteration {i}: got {r} — expected all 2.0.\n"
+                    "Non-2.0 means %cst was corrupted by in-place outs "
+                    "accumulation from a previous iteration."
+                ),
+            )
+        # The shared constant must remain clean (all zeros).
+        np.testing.assert_array_equal(
+            cst.data, np.zeros((2, 2), dtype=np.float32),
+            err_msg="The shared %cst literal was mutated — it must stay zero."
+        )
+
+
 class TestConstantNoLXCharge:
     """arith.constant tensors are 0-LX literals; consumers pay for real buffers."""
 
