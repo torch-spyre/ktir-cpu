@@ -327,6 +327,24 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "group_size": 4,
         },
     ],
+    # ---------------------------------------------------------------------------
+    # FFN-SwiGLU example (Issue #77)
+    # ---------------------------------------------------------------------------
+    "ffn_swiglu": [
+        {
+            "path": "ktir/ffn_swiglu.mlir",
+            # Single-core FFN-SwiGLU with minimal dimensions:
+            # seq=1, d_model=64, d_ffn=128
+            # Tests the complete SwiGLU feedforward network:
+            #   gate = x @ W_gate, up = x @ W_up
+            #   silu = gate * sigmoid(gate)
+            #   fused = silu * up
+            #   out = fused @ W_down
+            #   result = x + out (residual)
+            # grid = [1, 1] → single core
+            "execute_kwargs": {},
+        },
+    ],
 }
 
 

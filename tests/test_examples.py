@@ -637,3 +637,158 @@ class TestRingReduceInnerLoopExecution:
         expected = (rows.sum(axis=0) * n_iters).astype(np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2,
                                    err_msg="Core 0 output does not match n_iters * sum of input rows")
+
+
+class TestFFNSwiGLUExecution(InterpreterTestMixin):
+    """End-to-end execution of ffn_swiglu.mlir.
+
+    Tests the SwiGLU feedforward network implementation:
+        gate = x @ W_gate
+        up = x @ W_up
+        silu = gate * sigmoid(gate)  where sigmoid(x) = 1 / (1 + exp(-x))
+        fused = silu * up
+        out = fused @ W_down
+        result = x + out  (residual connection)
+
+    Phase 1: Single-core, minimal dimensions (seq=1, d_model=64, d_ffn=128)
+    """
+
+    @staticmethod
+    def _ffn_shapes(interp, func_name):
+        sizes = interp.tensor_input_output_sizes(func_name)
+        x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr = interp.arg_names(func_name)
+        seq, d_model = sizes[x_ptr]["shape"]
+        gate_rows, d_ffn = sizes[w_gate_ptr]["shape"]
+        up_rows, up_cols = sizes[w_up_ptr]["shape"]
+        down_rows, down_cols = sizes[w_down_ptr]["shape"]
+        out_seq, out_model = sizes[out_ptr]["shape"]
+
+        assert gate_rows == d_model
+        assert up_rows == d_model
+        assert up_cols == d_ffn
+        assert down_rows == d_ffn
+        assert down_cols == d_model
+        assert out_seq == seq
+        assert out_model == d_model
+
+        return (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn)
+
+    @staticmethod
+    def _ffn_reference(x, w_gate, w_up, w_down):
+        """NumPy reference for SwiGLU FFN using f32 intermediates."""
+        x_f32 = x.astype(np.float32)
+        w_gate_f32 = w_gate.astype(np.float32)
+        w_up_f32 = w_up.astype(np.float32)
+        w_down_f32 = w_down.astype(np.float32)
+
+        gate = x_f32 @ w_gate_f32
+        up = x_f32 @ w_up_f32
+        sigmoid = 1.0 / (1.0 + np.exp(-gate))
+        silu = gate * sigmoid
+        fused = silu * up
+        out_partial = fused @ w_down_f32
+        return (x_f32 + out_partial).astype(np.float16)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_ffn_swiglu_single_core(self, path, func_name, entry):
+        """Run FFN-SwiGLU on 1 core, verify output matches NumPy reference."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn) = (
+            self._ffn_shapes(interp, func_name)
+        )
+
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((seq, d_model)).astype(np.float16)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        output = np.zeros((seq, d_model), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            w_gate_ptr: w_gate,
+            w_up_ptr: w_up,
+            w_down_ptr: w_down,
+            out_ptr: output,
+        })
+
+        result = outputs[out_ptr]
+        expected = self._ffn_reference(x, w_gate, w_up, w_down)
+
+        assert result.shape == expected.shape, f"Shape mismatch: {result.shape} vs {expected.shape}"
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+
+        # Relaxed tolerance due to f16 accumulation in 3 matmuls + element-wise ops.
+        np.testing.assert_allclose(
+            result,
+            expected,
+            rtol=5e-2,
+            atol=5e-2,
+            err_msg="FFN-SwiGLU output does not match NumPy reference",
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_ffn_swiglu_zero_input(self, path, func_name, entry):
+        """Zero input should produce zero output even with non-zero weights."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn) = (
+            self._ffn_shapes(interp, func_name)
+        )
+
+        x = np.zeros((seq, d_model), dtype=np.float16)
+
+        rng = np.random.default_rng(123)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        output = np.zeros((seq, d_model), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            w_gate_ptr: w_gate,
+            w_up_ptr: w_up,
+            w_down_ptr: w_down,
+            out_ptr: output,
+        })
+
+        result = outputs[out_ptr]
+        expected = np.zeros((seq, d_model), dtype=np.float16)
+        np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_ffn_swiglu_small_weights_reference(self, path, func_name, entry):
+        """Small weights should stay finite and match the NumPy reference."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn) = (
+            self._ffn_shapes(interp, func_name)
+        )
+
+        rng = np.random.default_rng(456)
+        x = rng.standard_normal((seq, d_model)).astype(np.float16)
+
+        w_gate = (rng.standard_normal((d_model, d_ffn)) * 0.1).astype(np.float16)
+        w_up = (rng.standard_normal((d_model, d_ffn)) * 0.1).astype(np.float16)
+        w_down = (rng.standard_normal((d_ffn, d_model)) * 0.1).astype(np.float16)
+        output = np.zeros((seq, d_model), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            w_gate_ptr: w_gate,
+            w_up_ptr: w_up,
+            w_down_ptr: w_down,
+            out_ptr: output,
+        })
+
+        result = outputs[out_ptr]
+        expected = self._ffn_reference(x, w_gate, w_up, w_down)
+
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+        np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
