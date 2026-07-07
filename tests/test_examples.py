@@ -792,3 +792,90 @@ class TestFFNSwiGLUExecution(InterpreterTestMixin):
         assert not np.any(np.isnan(result)), "output contains NaN"
         assert not np.any(np.isinf(result)), "output contains Inf"
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestFFNSwiGLU4CoreExecution:
+    """End-to-end execution of ffn_swiglu_4core.mlir.
+
+    This is the distributed Phase 2 variant: 4 cores shard the FFN hidden
+    dimension, compute local output partials, all-reduce them with
+    ``ktdp.inter_tile_produce`` + ``ktdp.inter_tile_reduce``, then add the
+    residual and have only core 0 write the final [4,256] result to HBM.
+    """
+
+    @staticmethod
+    def _ffn_reference(x, w_gate, w_up, w_down):
+        x_f32 = x.astype(np.float32)
+        w_gate_f32 = w_gate.astype(np.float32)
+        w_up_f32 = w_up.astype(np.float32)
+        w_down_f32 = w_down.astype(np.float32)
+
+        gate = x_f32 @ w_gate_f32
+        up = x_f32 @ w_up_f32
+        sigmoid = 1.0 / (1.0 + np.exp(-gate))
+        silu = gate * sigmoid
+        fused = silu * up
+        out_partial = fused @ w_down_f32
+        return (x_f32 + out_partial).astype(np.float16)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_ffn_swiglu_4core_distributed(self, path, func_name, entry):
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        d_model = entry["d_model"]
+        d_ffn = entry["d_ffn"]
+        x_ptr = entry["execute_kwargs"]["x_ptr"]
+        w_gate_ptr = entry["execute_kwargs"]["w_gate_ptr"]
+        w_up_ptr = entry["execute_kwargs"]["w_up_ptr"]
+        w_down_ptr = entry["execute_kwargs"]["w_down_ptr"]
+        out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+        rng = np.random.default_rng(314159)
+        x = rng.standard_normal((seq, d_model)).astype(np.float16)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        out = np.zeros((seq, d_model), dtype=np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES  # 64
+        x_stick = x_ptr // elems_per_stick
+        w_gate_stick = w_gate_ptr // elems_per_stick
+        w_up_stick = w_up_ptr // elems_per_stick
+        w_down_stick = w_down_ptr // elems_per_stick
+        out_stick = out_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_gate_stick, w_gate.flatten())
+            interp.memory.hbm.write(w_up_stick, w_up.flatten())
+            interp.memory.hbm.write(w_down_stick, w_down.flatten())
+            interp.memory.hbm.write(out_stick, out.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **entry["execute_kwargs"])
+
+        result = interp.memory.hbm.read(out_stick, seq * d_model, "f16").reshape(seq, d_model)
+        expected = self._ffn_reference(x, w_gate, w_up, w_down)
+
+        assert result.shape == expected.shape, f"Shape mismatch: {result.shape} vs {expected.shape}"
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+        np.testing.assert_allclose(
+            result,
+            expected,
+            rtol=2.5e-1,
+            atol=1e1,
+            err_msg="Distributed FFN-SwiGLU output does not match NumPy reference",
+        )
