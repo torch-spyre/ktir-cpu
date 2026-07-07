@@ -322,15 +322,22 @@ class TestRoofline:
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
 
-        assert "arithmetic_intensity" in rf
+        # Per-core headline keys (core_ prefix) + shared detail.
+        assert "core_AI" in rf
         assert "peak_bw_gb_s" in rf
-        assert "dominant_unit" in rf
-        assert "efficiency" in rf
+        assert "core_dominant_unit" in rf
+        assert "core_efficiency" in rf
         assert "units" in rf
 
-        assert 0 < rf["efficiency"] <= 1.0
+        assert 0 < rf["core_efficiency"] <= 1.0
         for unit in rf["units"].values():
             assert unit["achieved_gflops"] <= unit["ceiling_gflops"]
+
+        # Chip-level keys (whole chip as one unit) — all peak-based ratios ≤ 1.
+        assert "AI" in rf
+        assert 0 <= rf["compute_throughput"] <= 1.0
+        assert 0 <= rf["dram_throughput"] <= 1.0
+        assert 0 <= rf["mean_core_active_frac"] <= 1.0
 
         # Chip-level fields (peak-based, Nsight SOL analogue).
         assert "cores_active" in rf
@@ -347,15 +354,15 @@ class TestRoofline:
             assert unit["chip_peak_gflops"] == pytest.approx(
                 unit["peak_gflops"] * rf["num_cores"]
             )
-            assert unit["chip_throughput"] >= 0
+            assert unit["compute_throughput"] >= 0
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
-    def test_chip_throughput_even_tiling_matches_extrapolation(self, path, func_name, entry):
+    def test_compute_throughput_even_tiling_matches_extrapolation(self, path, func_name, entry):
         """For evenly-tiled work, the chip-wide aggregate equals the
         critical-core extrapolation ``grid_coverage × (achieved / peak)``.
 
-        chip_throughput is defined as the real per-core FLOP sum over elapsed
-        time (see test_chip_throughput_uneven_split_uses_aggregate); when every
+        compute_throughput is defined as the real per-core FLOP sum over elapsed
+        time (see test_compute_throughput_uneven_split_uses_aggregate); when every
         active core does equal work the two coincide. This anchors that
         equivalence so the uneven-split divergence is meaningful, not an
         artifact of an unrelated formula change.
@@ -367,13 +374,13 @@ class TestRoofline:
             extrapolation = (rf["grid_coverage"]
                              * unit["achieved_gflops"]
                              / unit["peak_gflops"])
-            assert unit["chip_throughput"] == pytest.approx(extrapolation, abs=1e-9), (
+            assert unit["compute_throughput"] == pytest.approx(extrapolation, abs=1e-9), (
                 f"even-tiling equivalence broken for unit {unit_name!r}: "
-                f"got {unit['chip_throughput']}, expected {extrapolation}"
+                f"got {unit['compute_throughput']}, expected {extrapolation}"
             )
 
-    def test_chip_throughput_uneven_split_uses_aggregate(self):
-        """Under uneven tiling chip_throughput must aggregate the real FLOPs of
+    def test_compute_throughput_uneven_split_uses_aggregate(self):
+        """Under uneven tiling compute_throughput must aggregate the real FLOPs of
         every core, not extrapolate the critical (heaviest) core's rate to all.
 
         Three cores run for the same wall time but do 300/200/100 matmul FLOPs.
@@ -400,12 +407,168 @@ class TestRoofline:
                           for c in counters.values())  # 600
 
         expected_aggregate = (total_flops / elapsed_s) / chip_peak
-        assert unit["chip_throughput"] == pytest.approx(expected_aggregate)
+        assert unit["compute_throughput"] == pytest.approx(expected_aggregate)
 
         # The critical-core extrapolation would be strictly larger (overstated).
         extrapolation = (unit["achieved_gflops"] * 1e9 * rf["cores_active"]) / chip_peak
-        assert unit["chip_throughput"] < extrapolation
-        assert extrapolation == pytest.approx(1.5 * unit["chip_throughput"])
+        assert unit["compute_throughput"] < extrapolation
+        assert extrapolation == pytest.approx(1.5 * unit["compute_throughput"])
+
+    # -- Chip-level metrics (#148: consolidates #125 dram_throughput / #127 mean_core_active_frac) --
+
+    @staticmethod
+    def _three_core_matmul_report(cfg):
+        """Three cores, equal wall time, matmul FLOPs 300/200/100 + HBM bytes.
+
+        Shared fixture for the chip-metric tests: chip aggregates are the sum
+        over these three cores, and the critical (heaviest) core sets elapsed.
+        """
+        from ktir_cpu.latency import CoreLatencyCounters
+        counters = {}
+        for cid, (flops, nbytes) in enumerate(
+            ((300.0, 600), (200.0, 400), (100.0, 200))
+        ):
+            c = CoreLatencyCounters()
+            c.record("compute_matmul", cycles=100.0, flops=flops)
+            c.record("memory", cycles=100.0, nbytes=nbytes)
+            counters[cid] = c
+        return LatencyReport(config=cfg, counters=counters), counters
+
+    def test_chip_AI_aggregates_flops_over_dram_bytes(self):
+        """Chip AI = Σ FLOP / Σ HBM bytes over all cores (derived, not hardcoded)."""
+        cfg = HardwareConfig(num_cores=32)
+        report, counters = self._three_core_matmul_report(cfg)
+        rf = report.roofline()
+
+        sigma_flops = sum(c.total_flops for c in counters.values())        # 600
+        sigma_dram = sum(c.dram_bytes for c in counters.values())          # 1200
+        assert rf["AI"] == pytest.approx(sigma_flops / sigma_dram)
+
+    def test_compute_throughput_chip_scalar_definition(self):
+        """Chip compute_throughput = Σ FLOP / elapsed / (dominant peak × num_cores)."""
+        cfg = HardwareConfig(num_cores=32)
+        report, counters = self._three_core_matmul_report(cfg)
+        rf = report.roofline()
+
+        clock = cfg.clock_ghz * 1e9
+        elapsed_s = max(c.total_cycles for c in counters.values()) / clock
+        sigma_flops = sum(c.total_flops for c in counters.values())
+        chip_peak = cfg.systolic_flops_per_cycle * clock * cfg.num_cores
+        assert rf["compute_throughput"] == pytest.approx(
+            (sigma_flops / elapsed_s) / chip_peak
+        )
+        assert 0.0 <= rf["compute_throughput"] <= 1.0
+
+    def test_dram_throughput_uses_aggregate_bandwidth_not_per_core(self):
+        """dram_throughput reads the aggregate HBM bandwidth directly, so at a
+        fixed ``hbm_bandwidth_tb_s`` it is invariant to ``num_cores`` — proving
+        it does NOT go through the per-core ``hbm_bytes_per_cycle_per_core``
+        (aggregate ÷ num_cores) partition.
+        """
+        clock = HardwareConfig().clock_ghz * 1e9
+        results = []
+        for ncores in (8, 32):
+            cfg = HardwareConfig(num_cores=ncores, hbm_bandwidth_tb_s=2.0)
+            report, counters = self._three_core_matmul_report(cfg)
+            rf = report.roofline()
+
+            elapsed_s = max(c.total_cycles for c in counters.values()) / clock
+            sigma_dram = sum(c.dram_bytes for c in counters.values())
+            hbm_bw = cfg.hbm_bandwidth_tb_s * 1e12
+            assert rf["dram_throughput"] == pytest.approx(
+                sigma_dram / (hbm_bw * elapsed_s)
+            )
+            assert 0.0 <= rf["dram_throughput"] <= 1.0
+            results.append(rf["dram_throughput"])
+        # Same aggregate bandwidth + same traffic ⇒ identical across num_cores.
+        assert results[0] == pytest.approx(results[1])
+
+    def test_mean_core_active_frac_definition(self):
+        """mean_core_active_frac = Σ total_cycles / (num_cores × elapsed_cycles),
+        averaged over ALL hardware cores (idle cores pull it down)."""
+        cfg = HardwareConfig(num_cores=32)
+        report, counters = self._three_core_matmul_report(cfg)
+        rf = report.roofline()
+
+        sigma_cycles = sum(c.total_cycles for c in counters.values())
+        elapsed_cycles = max(c.total_cycles for c in counters.values())
+        assert rf["mean_core_active_frac"] == pytest.approx(
+            sigma_cycles / (cfg.num_cores * elapsed_cycles)
+        )
+        assert 0.0 <= rf["mean_core_active_frac"] <= 1.0
+
+    def test_mean_core_active_frac_single_full_core_is_one(self):
+        """A single core that is the whole chip and runs the whole elapsed time
+        has full time-occupancy (== 1.0)."""
+        from ktir_cpu.latency import CoreLatencyCounters
+        cfg = HardwareConfig(num_cores=1)
+        c = CoreLatencyCounters()
+        c.record("compute_matmul", cycles=100.0, flops=2048.0)
+        c.record("memory", cycles=50.0, nbytes=1024)
+        rf = LatencyReport(config=cfg, counters={0: c}).roofline()
+        assert rf["mean_core_active_frac"] == pytest.approx(1.0)
+
+    # -- chip_roofline() / core_roofline() split API --
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
+    def test_chip_and_core_roofline_split(self, path, func_name, entry):
+        """chip_roofline() and core_roofline() each return only their own group,
+        and roofline() is exactly their merge."""
+        report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
+        chip = report.chip_roofline()
+        core = report.core_roofline()
+
+        assert set(chip) == {"AI", "compute_throughput", "dram_throughput",
+                             "mean_core_active_frac", "grid_coverage", "ridge",
+                             "dominant_unit", "num_cores", "cores_active"}
+        assert set(core) == {"core_AI", "core_efficiency", "core_dominant_unit",
+                             "peak_bw_gb_s", "ridge", "units"}
+        # chip ratios are all peak-based (0..1).
+        for key in ("compute_throughput", "dram_throughput",
+                    "mean_core_active_frac", "grid_coverage"):
+            assert 0.0 <= chip[key] <= 1.0
+        # roofline() == {**core, **chip} (disjoint keys except ridge, equal).
+        assert report.roofline() == {**core, **chip}
+        assert chip["ridge"] == pytest.approx(core["ridge"])
+
+    def test_dominant_decided_chip_wide_and_shared_by_both(self):
+        """The dominant unit is decided ONCE, chip-wide (Σ cycles over ALL
+        cores), and both chip_roofline and core_roofline use that single value
+        — they can never disagree.
+
+        The critical core (heaviest total cycles) is SIMD-heavy on its own, but
+        the chip-wide bottleneck is systolic. Both granularities must therefore
+        report systolic: core_roofline does NOT fall back to the critical
+        core's local simd choice. Because they share one dominant unit, the two
+        ridges are identical.
+        """
+        from ktir_cpu.latency import CoreLatencyCounters
+        cfg = HardwareConfig(num_cores=32)
+        counters = {}
+        # Core 0 = critical (111 cycles), simd-heavy on its own (100 simd vs 10 systolic).
+        c0 = CoreLatencyCounters()
+        c0.record("compute_float", cycles=100.0, flops=6400.0)
+        c0.record("compute_matmul", cycles=10.0, flops=5120.0)
+        c0.record("memory", cycles=1.0, nbytes=2048)
+        counters[0] = c0
+        # Cores 1..3 = systolic-heavy (50 systolic each) → chip-wide dominant = systolic.
+        for cid in range(1, 4):
+            c = CoreLatencyCounters()
+            c.record("compute_matmul", cycles=50.0, flops=25600.0)
+            c.record("memory", cycles=1.0, nbytes=2048)
+            counters[cid] = c
+        report = LatencyReport(config=cfg, counters=counters)
+
+        chip = report.chip_roofline()
+        core = report.core_roofline()
+        # Single chip-wide decision applied to both — critical core's own simd
+        # lead does NOT sway the per-core headline.
+        assert chip["dominant_unit"] == "systolic"
+        assert core["core_dominant_unit"] == "systolic"
+
+        # Same dominant unit ⇒ identical ridge at both granularities.
+        assert chip["ridge"] == pytest.approx(core["ridge"])
+        assert report.roofline()["ridge"] == pytest.approx(chip["ridge"])
 
     def test_dominant_by_cycles_and_per_unit_ai(self):
         """Dominant unit is the cycle bottleneck, not the FLOP-heaviest, and each
@@ -431,7 +594,7 @@ class TestRoofline:
         rf = LatencyReport(config=HardwareConfig(), counters={0: c}).roofline()
 
         # FLOP-heaviest is systolic; cycle-heaviest (the bottleneck) is simd.
-        assert rf["dominant_unit"] == "simd"
+        assert rf["core_dominant_unit"] == "simd"
 
         # Each unit's AI is its own FLOPs over the shared DRAM bytes — distinct,
         # not one mixed value shared by both.
@@ -441,36 +604,39 @@ class TestRoofline:
         assert ai_simd == pytest.approx(28480.0 / total_bytes)
         assert ai_sys != ai_simd
 
-        # The top-level AI is sourced from the dominant (simd) unit, not a mix.
-        assert rf["arithmetic_intensity"] == pytest.approx(ai_simd)
+        # The per-core headline core_AI is sourced from the dominant (simd)
+        # unit, not a mix.
+        assert rf["core_AI"] == pytest.approx(ai_simd)
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_vector_add_is_memory_bound(self, path, func_name, entry):
         """vector_add has low arithmetic intensity → memory-bound on roofline."""
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
-        dominant = rf["dominant_unit"]
+        dominant = rf["core_dominant_unit"]
 
         # AI should be well below the dominant unit's ridge point (memory-bound)
-        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
+        assert rf["core_AI"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("reduce_explicit_region"))
     def test_vector_reduce_is_memory_bound(self, path, func_name, entry):
         """A simple vector reduce should be memory-bound on the roofline."""
         report = _run_vector_reduce(path, func_name, entry, HardwareConfig())
         rf = report.roofline()
-        assert "arithmetic_intensity" in rf
-        dominant = rf["dominant_unit"]
-        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
+        assert "core_AI" in rf
+        dominant = rf["core_dominant_unit"]
+        assert rf["core_AI"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("add_kernel"))
     def test_roofline_in_report_str(self, path, func_name, entry):
         """Roofline section should appear in report __str__."""
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         text = str(report)
-        assert "Roofline Analysis" in text
-        assert "Arithmetic intensity" in text
-        assert "Efficiency" in text
+        # Output is two clearly-separated blocks, one per granularity.
+        assert "Roofline: CHIP-LEVEL" in text
+        assert "Roofline: PER-CORE" in text
+        assert "core_AI" in text
+        assert "compute_throughput" in text
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("matmul_kernel_small"))
     def test_matmul_flops(self, path, func_name, entry):
@@ -500,8 +666,8 @@ class TestRoofline:
         report, _ = _run_vector_add(path, func_name, entry, HardwareConfig())
         assert report.bottleneck == "memory"
         rf = report.roofline()
-        dominant = rf["dominant_unit"]
-        assert rf["arithmetic_intensity"] < rf["units"][dominant]["ridge_point"]
+        dominant = rf["core_dominant_unit"]
+        assert rf["core_AI"] < rf["units"][dominant]["ridge_point"]
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("softmax_kernel_small"))
     def test_compute_bound_roofline_matches_bottleneck(self, path, func_name, entry):
@@ -511,8 +677,8 @@ class TestRoofline:
         report = _run_softmax(path, func_name, entry, cfg)
         assert report.bottleneck == "compute"
         rf = report.roofline()
-        dominant = rf["dominant_unit"]
-        assert rf["arithmetic_intensity"] > rf["units"][dominant]["ridge_point"]
+        dominant = rf["core_dominant_unit"]
+        assert rf["core_AI"] > rf["units"][dominant]["ridge_point"]
 
     def test_oversized_grid_does_not_inflate_cores_active(self):
         """An over-large grid leaves some cores with zero loop iterations; those
@@ -2170,7 +2336,7 @@ class TestRingReduceLatency:
         # (HBM only), so ring/comm bytes do not inflate the denominator and push the
         # attained point above the HBM ceiling. With the old total_bytes denominator
         # this kernel reported efficiency > 1 (point above the roof).
-        assert 0 < rep.roofline()["efficiency"] <= 1.0
+        assert 0 < rep.roofline()["core_efficiency"] <= 1.0
 
 
 # ---------------------------------------------------------------------------
