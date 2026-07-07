@@ -28,7 +28,9 @@ from enum import StrEnum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from .ir_types import AccessTile, IndirectAccessTile, MemRef, Tile, TileRef
+from .ir_types import (
+    AccessTile, DistributedTileRef, IndirectAccessTile, MemRef, Tile, TileRef,
+)
 from .dtypes import bytes_per_elem
 from .memory import HBMSimulator
 
@@ -312,6 +314,8 @@ class LatencyTracker:
             if isinstance(v, TileRef):
                 return v.memref.memory_space
             if isinstance(v, AccessTile):
+                if isinstance(v.parent_ref, DistributedTileRef):
+                    return v.parent_ref.partitions[0].memref.memory_space
                 return v.parent_ref.memref.memory_space
             if isinstance(v, IndirectAccessTile):
                 all_lx = (v.parent_ref.memory_space == "LX" and

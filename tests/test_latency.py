@@ -2262,3 +2262,341 @@ class TestRingReduceMultiGroupLatency:
         assert store_cores == expected_writers, (
             f"expected writers {expected_writers}, got {store_cores}"
         )
+
+
+# ---------------------------------------------------------------------------
+# FFN-SwiGLU single-core latency
+# ---------------------------------------------------------------------------
+
+
+def _run_ffn_swiglu(path, func_name, entry, cfg, trace=False):
+    """Run single-core FFN-SwiGLU and return latency report.
+
+    Dimensions: seq=1, d_model=64, d_ffn=128.
+    Loads: x [1,64], W_gate [64,128], W_up [64,128], W_down [128,64].
+    Matmuls: gate [1,64]×[64,128], up [1,64]×[64,128], down [1,128]×[128,64].
+    """
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+    sizes = interp.tensor_input_output_sizes(func_name)
+    rng = np.random.default_rng(42)
+
+    x = rng.standard_normal(tuple(sizes["x_ptr"]["shape"])).astype(np.float16)
+    w_gate = rng.standard_normal(tuple(sizes["w_gate_ptr"]["shape"])).astype(np.float16)
+    w_up = rng.standard_normal(tuple(sizes["w_up_ptr"]["shape"])).astype(np.float16)
+    w_down = rng.standard_normal(tuple(sizes["w_down_ptr"]["shape"])).astype(np.float16)
+    out = np.zeros(tuple(sizes["out_ptr"]["shape"]), dtype=np.float16)
+
+    interp.execute_function(
+        func_name,
+        x_ptr=x, w_gate_ptr=w_gate, w_up_ptr=w_up,
+        w_down_ptr=w_down, out_ptr=out,
+    )
+    return interp.get_latency_report()
+
+
+class TestFFNSwiGLULatency:
+    """Per-core latency for the single-core FFN-SwiGLU in
+    ``examples/ktir/ffn_swiglu.mlir``.
+
+    Kernel dimensions: seq=1, d_model=64, d_ffn=128.
+
+    HBM loads per core (only 1 core):
+      - x:      [1, 64]   = 128 bytes
+      - W_gate: [64, 128] = 16384 bytes
+      - W_up:   [64, 128] = 16384 bytes
+      - W_down: [128, 64] = 16384 bytes
+      - store:  [1, 64]   = 128 bytes
+      Total HBM: 49152 bytes load + 128 bytes store = 49408 bytes
+
+    Matmul FLOPs:
+      - gate:  2 × 1 × 128 × 64  = 16384 FLOPs
+      - up:    2 × 1 × 128 × 64  = 16384 FLOPs
+      - down:  2 × 1 × 64  × 128 = 16384 FLOPs
+      Total systolic FLOPs: 49152
+
+    SIMD elementwise ops (on [1, 128] tiles = 128 elements each):
+      - negf, exp, addf, divf, mulf (silu), mulf (fused) = 6 ops × 128 elems
+      Plus residual addf on [1, 64] = 64 elements
+      Total SIMD elements: 6 × 128 + 64 = 832
+      With exp as transcendental (4× penalty): 128 × 4 + 5 × 128 + 64 = 1216
+      effective element-cycles
+
+    With default HardwareConfig (1.0 TB/s, 32 cores, 1.5 GHz):
+      per-core HBM BW = 1e12 / 1.5e9 / 32 = 20.83 B/cycle
+      memory_cycles ≈ 49408 / 20.83 ≈ 2372
+      compute (systolic) ≈ 49152 / (2*64*64*64) ≈ 0.094 cycles
+      compute (simd) ≈ 1216 / 64 ≈ 19 cycles
+    → memory-dominated
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_memory_dominated(self, path, func_name, entry):
+        """FFN is memory-bound: weight loads dwarf the matmul/SIMD compute."""
+        cfg = HardwareConfig()
+        report = _run_ffn_swiglu(path, func_name, entry, cfg)
+        assert report.bottleneck == "memory"
+        core0 = report.counters[0]
+        assert core0.memory_cycles > core0.compute_cycles * 10
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_matmul_cycle_formula(self, path, func_name, entry):
+        """Each linalg.matmul trace entry matches 2*M*N*K / systolic throughput."""
+        cfg = HardwareConfig()
+        report = _run_ffn_swiglu(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        matmul_entries = [e for e in core0.trace if e.op_type == "linalg.matmul"]
+        assert len(matmul_entries) == 3
+
+        # gate: [1,64]×[64,128] → M=1, N=128, K=64
+        # up:   [1,64]×[64,128] → M=1, N=128, K=64
+        # down: [1,128]×[128,64] → M=1, N=64, K=128
+        expected_flops = [
+            2.0 * 1 * 128 * 64,
+            2.0 * 1 * 128 * 64,
+            2.0 * 1 * 64 * 128,
+        ]
+        for entry_e, flops in zip(matmul_entries, expected_flops):
+            assert entry_e.cycles == pytest.approx(
+                flops / cfg.systolic_flops_per_cycle
+            )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    @pytest.mark.parametrize("hbm_bw", [0.5, 1.0, 2.0, 4.0])
+    def test_memory_scales_with_bandwidth(self, path, func_name, entry, hbm_bw):
+        """Memory cycles scale inversely with HBM bandwidth."""
+        baseline_cfg = HardwareConfig(hbm_bandwidth_tb_s=1.0)
+        scaled_cfg = HardwareConfig(hbm_bandwidth_tb_s=hbm_bw)
+
+        baseline = _run_ffn_swiglu(path, func_name, entry, baseline_cfg)
+        scaled = _run_ffn_swiglu(path, func_name, entry, scaled_cfg)
+
+        baseline_mem = baseline.counters[0].memory_cycles
+        scaled_mem = scaled.counters[0].memory_cycles
+
+        expected_ratio = 1.0 / hbm_bw
+        actual_ratio = scaled_mem / baseline_mem
+        assert actual_ratio == pytest.approx(expected_ratio, rel=1e-3)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    @pytest.mark.parametrize("systolic", [
+        2 * 32 * 32 * 32,
+        2 * 64 * 64 * 64,
+        2 * 128 * 128 * 128,
+    ])
+    def test_matmul_scales_with_systolic(self, path, func_name, entry, systolic):
+        """Matmul cycles scale inversely with systolic throughput."""
+        cfg = HardwareConfig(systolic_flops_per_cycle=systolic)
+        report = _run_ffn_swiglu(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        matmul_entries = [e for e in core0.trace if e.op_type == "linalg.matmul"]
+        # All three matmuls have the same FLOP count: 2*1*128*64 = 16384
+        for entry_e in matmul_entries:
+            assert entry_e.cycles == pytest.approx(16384.0 / systolic)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_transcendental_penalty(self, path, func_name, entry):
+        """math.exp incurs the transcendental_penalty multiplier."""
+        cfg = HardwareConfig()
+        report = _run_ffn_swiglu(path, func_name, entry, cfg, trace=True)
+        core0 = report.counters[0]
+
+        exp_entries = [e for e in core0.trace if e.op_type == "math.exp"]
+        assert len(exp_entries) == 1
+        # exp on [1, 128] = 128 elements, penalty = 4
+        expected = 128.0 / cfg.simd_elements_per_cycle * cfg.transcendental_penalty
+        assert exp_entries[0].cycles == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# FFN-SwiGLU 4-core distributed latency
+# ---------------------------------------------------------------------------
+
+
+def _run_ffn_swiglu_4core(path, func_name, entry, cfg, trace=False):
+    """Run 4-core distributed FFN-SwiGLU and return latency report.
+
+    Dimensions: seq=4, d_model=256, d_ffn=1024, grid=[4].
+    Uses _prepare_execution patching to seed HBM (same as the correctness
+    test in test_examples.py and the ring_reduce latency test above).
+    """
+    meta = parse_example(path, func_name)
+    num_cores = math.prod(meta.grid)
+
+    seq = entry["seq"]
+    d_model = entry["d_model"]
+    d_ffn = entry["d_ffn"]
+
+    rng = np.random.default_rng(42)
+    x = rng.standard_normal((seq, d_model)).astype(np.float16)
+    w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+    w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+    w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+
+    x_ptr = entry["execute_kwargs"]["x_ptr"]
+    w_gate_ptr = entry["execute_kwargs"]["w_gate_ptr"]
+    w_up_ptr = entry["execute_kwargs"]["w_up_ptr"]
+    w_down_ptr = entry["execute_kwargs"]["w_down_ptr"]
+    out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+    _elems_per_stick = 64
+    x_stick = x_ptr // _elems_per_stick
+    w_gate_stick = w_gate_ptr // _elems_per_stick
+    w_up_stick = w_up_ptr // _elems_per_stick
+    w_down_stick = w_down_ptr // _elems_per_stick
+
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    _orig = interp._prepare_execution
+
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        interp.memory.hbm.write(x_stick, x.flatten())
+        interp.memory.hbm.write(w_gate_stick, w_gate.flatten())
+        interp.memory.hbm.write(w_up_stick, w_up.flatten())
+        interp.memory.hbm.write(w_down_stick, w_down.flatten())
+
+    interp._prepare_execution = _prepare_and_seed
+    interp.execute_function(func_name, **entry["execute_kwargs"])
+    return interp.get_latency_report(), num_cores
+
+
+class TestFFNSwiGLU4CoreLatency:
+    """Per-core latency for the 4-core distributed FFN-SwiGLU in
+    ``examples/ktir/ffn_swiglu_4core.mlir``.
+
+    Kernel: seq=4, d_model=256, d_ffn=1024, grid=[4].
+    Each core owns a 256-wide shard of W_gate/W_up (column-sharded)
+    and a 256-row shard of W_down (row-sharded).
+
+    Per-core HBM loads:
+      - x:      [4, 256]  = 2048 bytes (replicated, all cores load)
+      - W_gate: [256, 256] = 131072 bytes (shard)
+      - W_up:   [256, 256] = 131072 bytes (shard)
+      - W_down: [256, 256] = 131072 bytes (shard)
+      Total load: 395264 bytes/core
+
+    Per-core HBM stores (core 0 only):
+      - out:    [4, 256]  = 2048 bytes
+
+    Per-core matmuls (each core):
+      - gate: [4,256]×[256,256] → 2×4×256×256 = 524288 FLOPs
+      - up:   [4,256]×[256,256] → 2×4×256×256 = 524288 FLOPs
+      - down: [4,256]×[256,256] → 2×4×256×256 = 524288 FLOPs
+      Total systolic: 1572864 FLOPs/core
+
+    Per-core elementwise (on [4, 256] = 1024 elements):
+      - negf, exp(×4 penalty), addf, divf, mulf, mulf = 6 ops
+      - residual addf on [4, 256]
+      SIMD cycles: (128×4 + 5×1024 + 1024) / 64 ≈ 102 cycles
+
+    Per-core comm (ring all-reduce of [1024] f16 partial = 2048 bytes):
+      - Ring: 4 cores, 3 rounds, 2048 bytes/round = 6144 bytes/core
+
+    With default HardwareConfig (1.0 TB/s, 32 cores, 1.5 GHz):
+      per-core HBM BW = 20.83 B/cycle
+      memory_cycles ≈ 395264 / 20.83 ≈ 18984 cycles
+      systolic_cycles ≈ 1572864 / 524288 ≈ 3 cycles
+      comm_cycles ≈ 6144 / 4000 ≈ 1.5 cycles
+    → memory-dominated
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_memory_dominated(self, path, func_name, entry):
+        """4-core FFN is memory-bound: weight shard loads dominate."""
+        cfg = HardwareConfig()
+        report, _ = _run_ffn_swiglu_4core(path, func_name, entry, cfg)
+        assert report.bottleneck == "memory"
+        core0 = report.counters[0]
+        assert core0.memory_cycles > core0.compute_cycles
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_per_core_compute_symmetric(self, path, func_name, entry):
+        """All 4 cores execute the same matmuls and SIMD ops: equal compute."""
+        cfg = HardwareConfig()
+        report, num_cores = _run_ffn_swiglu_4core(path, func_name, entry, cfg)
+        compute_cycles = [report.counters[c].compute_cycles for c in range(num_cores)]
+        for c in range(1, num_cores):
+            assert compute_cycles[c] == pytest.approx(compute_cycles[0])
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_per_core_comm_symmetric(self, path, func_name, entry):
+        """All 4 cores participate equally in the all-reduce ring."""
+        cfg = HardwareConfig()
+        report, num_cores = _run_ffn_swiglu_4core(path, func_name, entry, cfg)
+        comm_cycles = [report.counters[c].comm_cycles for c in range(num_cores)]
+        for c in range(1, num_cores):
+            assert comm_cycles[c] == pytest.approx(comm_cycles[0])
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_comm_bytes_formula(self, path, func_name, entry):
+        """Ring comm bytes = (N_ring - 1) × partial_bytes per core."""
+        cfg = HardwareConfig()
+        report, num_cores = _run_ffn_swiglu_4core(path, func_name, entry, cfg, trace=True)
+
+        # Partial is [1024] f16 = 2048 bytes; ring does N-1 = 3 rounds.
+        partial_bytes = entry["seq"] * entry["d_model"] * 2  # [4,256] → 1024 elems × 2B
+        expected_comm_bytes = (num_cores - 1) * partial_bytes
+        expected_comm_cycles = expected_comm_bytes / cfg.ring_bytes_per_cycle
+
+        for core_id in range(num_cores):
+            cc = report.counters[core_id]
+            assert cc.comm_bytes == expected_comm_bytes
+            assert cc.comm_cycles == pytest.approx(expected_comm_cycles)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_matmul_cycle_formula(self, path, func_name, entry):
+        """Each core runs 3 matmuls of [4,256]×[256,256]; verify cycle formula."""
+        cfg = HardwareConfig()
+        report, num_cores = _run_ffn_swiglu_4core(path, func_name, entry, cfg, trace=True)
+
+        # All three matmuls: M=4, N=256, K=256 → 2*4*256*256 = 524288 FLOPs each
+        expected_per_matmul = (2.0 * 4 * 256 * 256) / cfg.systolic_flops_per_cycle
+
+        for core_id in range(num_cores):
+            cc = report.counters[core_id]
+            matmul_entries = [e for e in cc.trace if e.op_type == "linalg.matmul"]
+            assert len(matmul_entries) == 3
+            for entry_e in matmul_entries:
+                assert entry_e.cycles == pytest.approx(expected_per_matmul)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_store_only_core_0(self, path, func_name, entry):
+        """Only core 0 writes back the final output."""
+        cfg = HardwareConfig()
+        report, num_cores = _run_ffn_swiglu_4core(path, func_name, entry, cfg, trace=True)
+
+        store_cores = [
+            cid for cid, cc in report.counters.items()
+            if any(t.op_type == "ktdp.store" for t in cc.trace)
+        ]
+        assert store_cores == [0]
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_core0_heaviest(self, path, func_name, entry):
+        """Core 0 carries the extra store → highest total cycles."""
+        cfg = HardwareConfig()
+        report, num_cores = _run_ffn_swiglu_4core(path, func_name, entry, cfg)
+        per_core_total = {c: report.counters[c].total_cycles for c in range(num_cores)}
+        assert report.kernel_cycles == max(per_core_total.values())
+        assert per_core_total[0] >= max(per_core_total[c] for c in range(1, num_cores))
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    @pytest.mark.parametrize("hbm_bw", [0.5, 1.0, 2.0])
+    def test_memory_scales_with_bandwidth(self, path, func_name, entry, hbm_bw):
+        """Memory cycles scale inversely with HBM bandwidth."""
+        baseline_cfg = HardwareConfig(hbm_bandwidth_tb_s=1.0)
+        scaled_cfg = HardwareConfig(hbm_bandwidth_tb_s=hbm_bw)
+
+        baseline, _ = _run_ffn_swiglu_4core(path, func_name, entry, baseline_cfg)
+        scaled, _ = _run_ffn_swiglu_4core(path, func_name, entry, scaled_cfg)
+
+        baseline_mem = baseline.counters[0].memory_cycles
+        scaled_mem = scaled.counters[0].memory_cycles
+
+        expected_ratio = 1.0 / hbm_bw
+        actual_ratio = scaled_mem / baseline_mem
+        assert actual_ratio == pytest.approx(expected_ratio, rel=1e-3)
