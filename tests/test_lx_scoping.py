@@ -1714,6 +1714,49 @@ class TestConstantDirectOutsMutation:
             err_msg="The shared %cst literal was mutated — it must stay zero."
         )
 
+    def test_constant_outs_via_execute_op_does_not_trip_structural_assertion(self):
+        """Same scenario, but through KTIRInterpreter._execute_op (assertions live).
+
+        The direct-handler-dispatch test above never exercises the structural
+        outs-invariant assertion in interpreter.py, since that assertion lives
+        in _execute_op, not in the handler.  A handler that legitimately
+        returns a copy (because outs was an uncharged 0-LX literal) must not
+        trip "handler returned new Tile instead of mutating outs" — the
+        assertion should recognize this as the intended exception, not a bug.
+        """
+        from ktir_cpu.interpreter import KTIRInterpreter
+        from ktir_cpu.ir_types import Operation
+
+        ctx = _make_context()
+        a = _make_tile((2, 2), dtype="f32")
+        a.data[:] = 1.0
+        b = _make_tile((2, 2), dtype="f32")
+        b.data[:] = 1.0
+        cst = _make_tile((2, 2), dtype="f32")
+        cst.data[:] = 0.0
+        ctx.set_value("%cst", cst, charge=False)
+        ctx.set_value("%a", a)
+        ctx.set_value("%b", b)
+
+        interp = KTIRInterpreter()
+        interp.load('module { func.func @dummy() attributes {grid = [1]} { return } }')
+
+        expected = np.full((2, 2), 2.0, dtype=np.float32)
+        for i in range(4):
+            op = Operation(
+                op_type="linalg.matmul",
+                operands=["%a", "%b", "%cst"],
+                attributes={},
+                result="%r",
+                result_type="tensor<2x2xf32>",
+                outs_operands=["%cst"],
+            )
+            r = interp._execute_op(op, ctx)
+            np.testing.assert_array_equal(
+                r.data, expected,
+                err_msg=f"Iteration {i}: got {r.data} — expected all 2.0.",
+            )
+
 
 class TestConstantNoLXCharge:
     """arith.constant tensors are 0-LX literals; consumers pay for real buffers."""
