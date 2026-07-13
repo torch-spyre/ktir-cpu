@@ -74,14 +74,14 @@ interp.load("examples/triton-ktir/vector_add_ktir.mlir")
 
 # Query expected tensor shapes from the parsed MLIR
 sizes = interp.tensor_input_output_sizes("add_kernel")
-# {'x_ptr': {'shape': (1024,), 'dtype': 'f16'}, 'y_ptr': ..., 'output_ptr': ...}
+# {'x_ptr': {'shape': (4096,), 'dtype': 'f16'}, 'y_ptr': ..., 'output_ptr': ...}
 
 n = sizes["x_ptr"]["shape"][0]
 x = np.random.randn(n).astype(np.float16)
 y = np.random.randn(n).astype(np.float16)
 out = np.zeros(n, dtype=np.float16)
 
-outputs = interp.execute_function("add_kernel", x_ptr=x, y_ptr=y, output_ptr=out)
+outputs = interp.execute_function("add_kernel", x_ptr=x, y_ptr=y, output_ptr=out, BLOCK_SIZE=64)
 print(outputs["output_ptr"])  # x + y
 ```
 
