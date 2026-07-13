@@ -81,7 +81,7 @@ x = np.random.randn(n).astype(np.float16)
 y = np.random.randn(n).astype(np.float16)
 out = np.zeros(n, dtype=np.float16)
 
-outputs = interp.execute_function("add_kernel", x_ptr=x, y_ptr=y, output_ptr=out, BLOCK_SIZE=64)
+outputs = interp.execute_function("add_kernel", x_ptr=x, y_ptr=y, output_ptr=out, BLOCK_SIZE=128)
 print(outputs["output_ptr"])  # x + y
 ```
 
