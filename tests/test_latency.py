@@ -1228,7 +1228,8 @@ class TestIndirectAccessLatency:
         expected_load_bytes = expected_gather_bytes + _nbytes("IDX1_addr") + _nbytes("IDX2_addr")
         expected_store_bytes = _nbytes("Y_addr")
         expected_total_bytes = expected_load_bytes + expected_store_bytes
-        bw = cfg.hbm_bytes_per_cycle_per_core
+        # single core → per-core BW = chip BW / cores_active(=1), in bytes/cycle
+        bw = cfg.hbm_bw_chip / cfg.clock_hz
         expected_memory_cycles = expected_total_bytes / bw
 
         assert counters.total_bytes == expected_total_bytes, (
