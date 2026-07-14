@@ -267,10 +267,11 @@ class TestHardwareConfig:
         cfg = HardwareConfig()
         assert cfg.num_cores == 32
         assert cfg.clock_ghz == 1.0
-        assert cfg.hbm_bandwidth_tb_s == 1.0
+        assert cfg.hbm_bandwidth_tb_s == 0.064
         assert cfg.ring_bandwidth_tb_s == 4.0
         assert cfg.simd_elements_per_cycle == 64
-        assert cfg.systolic_flops_per_cycle == 2 * 64 * 64 * 64
+        assert cfg.systolic_rows == 4
+        assert cfg.systolic_flops_per_cycle == 64 * 4
         assert cfg.transcendental_penalty == 4
 
     def test_custom_config(self):
@@ -280,9 +281,9 @@ class TestHardwareConfig:
 
     def test_hbm_bytes_per_cycle_per_core(self):
         cfg = HardwareConfig()
-        # 1 TB/s at 1 GHz = 1e12 / 1e9 = 1000 bytes/cycle total
-        # Per core: 1000 / 32 = 31.25
-        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(31.25)
+        # 64 GB/s at 1 GHz = 64e9 / 1e9 = 64 bytes/cycle total
+        # Per core: 64 / 32 = 2.0
+        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(2.0)
 
     def test_ring_bytes_per_cycle(self):
         cfg = HardwareConfig()
@@ -291,9 +292,9 @@ class TestHardwareConfig:
 
     def test_derived_scales_with_clock(self):
         cfg = HardwareConfig(clock_ghz=2.0)
-        # 1 TB/s at 2 GHz = 1e12 / 2e9 = 500 bytes/cycle total
-        # Per core: 500 / 32 = 15.625
-        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(15.625)
+        # 64 GB/s at 2 GHz = 64e9 / 2e9 = 32 bytes/cycle total
+        # Per core: 32 / 32 = 1.0
+        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(1.0)
 
 
 # ---------------------------------------------------------------------------

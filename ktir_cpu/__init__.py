@@ -21,7 +21,7 @@ This module provides a CPU interpreter for KTIR to validate Triton to KTIR conve
 __version__ = "0.1.0"
 
 from .interpreter import KTIRInterpreter
-from .latency import HardwareConfig, LatencyReport
+from .latency import ExecutionModel, HardwareConfig, LatencyReport
 from .parser import KTIRParserBase
 
-__all__ = ["KTIRInterpreter", "HardwareConfig", "LatencyReport", "KTIRParserBase"]
+__all__ = ["KTIRInterpreter", "ExecutionModel", "HardwareConfig", "LatencyReport", "KTIRParserBase"]

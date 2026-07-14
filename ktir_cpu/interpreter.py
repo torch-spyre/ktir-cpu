@@ -72,6 +72,7 @@ class KTIRInterpreter:
         self.ring_backend: Optional[TransferBackend] = None
         self._env: Optional[ExecutionEnv] = None
         self._parser: Optional[KTIRParserBase] = parser
+        self._latency_config: Optional[HardwareConfig] = latency_config
         self._latency_tracker: Optional[LatencyTracker] = (
             LatencyTracker(latency_config, trace=trace_latency)
             if latency_config is not None else None
@@ -98,7 +99,8 @@ class KTIRInterpreter:
             grid_shape: (x, y, z) grid dimensions
         """
         num_cores = grid_shape[0] * grid_shape[1] * grid_shape[2]
-        self.memory = SpyreMemoryHierarchy(num_cores)
+        lx_size_mb = self._latency_config.lx_size_mb if self._latency_config else 2
+        self.memory = SpyreMemoryHierarchy(num_cores, lx_size_mb=lx_size_mb)
         # ring_backend (a TransferBackend) serves CoreContext.get_lx() —
         # remote LX peeks for distributed memory views. Passed directly
         # to GridExecutor.execute_with_communication; the scheduler
@@ -115,6 +117,7 @@ class KTIRInterpreter:
         )
         if self._latency_tracker is not None:
             self._latency_tracker.reset()
+            self._latency_tracker.set_cores_active(num_cores)
 
     def execute_function(self, func_name: str, **kwargs) -> Dict[str, np.ndarray]:
         """Execute KTIR function with given arguments.

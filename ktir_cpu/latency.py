@@ -48,6 +48,37 @@ class LatencyCategory(StrEnum):
 
 
 # ---------------------------------------------------------------------------
+# Execution model — how the hardware is programmed
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecutionModel:
+    """Modeling choices that can change independently of the silicon.
+
+    Attributes:
+        unit_categories: Which LatencyCategories each compute unit claims.
+        pipeline: How compute, memory, and comm overlap in time.
+            "serial" — no overlap: total = compute + memory + comm.
+            "overlapped" — compute overlaps with data movement (memory + comm
+                share the data-movement pipe and do NOT overlap each other):
+                total = max(compute, memory + comm).
+            "overlapped_3way" — all three stages have independent pipes and
+                overlap freely: total = max(compute, memory, comm).
+        bw_sharing: How HBM bandwidth is partitioned among cores.
+            "contended" — per-core BW = hbm_bw_chip / cores_active.
+            "static" — per-core BW = hbm_bw_chip / num_cores.
+        fallback_unit: Dominant unit when no compute cycles ran.
+    """
+    unit_categories: Dict[str, set] = field(default_factory=lambda: {
+        "systolic": {"compute_matmul"},
+        "simd": {"compute_float", "compute_transcendental", "compute_int"},
+    })
+    pipeline: str = "serial"
+    bw_sharing: str = "contended"
+    fallback_unit: str = "simd"
+
+
+# ---------------------------------------------------------------------------
 # Hardware configuration
 # ---------------------------------------------------------------------------
 
@@ -63,40 +94,63 @@ class HardwareConfig:
         num_cores: Number of cores (default 32).
         clock_ghz: Clock frequency in GHz (default 1.0, so 1 cycle = 1 ns).
         hbm_bandwidth_tb_s: Aggregate HBM bandwidth in TB/s (estimated).
-        ring_bandwidth_tb_s: Ring bandwidth per direction in TB/s.
+        ring_bandwidth_tb_s: Ring bandwidth per direction in TB/s. The ring has two
+            directions:  clock-wise and anti-clock-wise.
         simd_elements_per_cycle: SIMD throughput in f16 elements/cycle (estimated).
-        systolic_flops_per_cycle: Peak throughput of the systolic array in
-            FLOPs per cycle (estimated).  A systolic array is a grid of
-            processing elements (PEs) that perform multiply-accumulate in
-            lock-step.  For an N×N array, each PE does 1 fused multiply-add
-            (= 2 FLOPs) per cycle, giving 2×N×N FLOPs/cycle per outer-product
-            step.  The default assumes a 64×64 array executing one K-step per
-            cycle: ``2 × 64 × 64 = 8192`` FLOPs/cycle per step, times 64
-            K-steps pipelined = ``2 × 64 × 64 × 64 = 524288`` FLOPs/cycle
-            effective throughput.  A ``linalg.matmul`` with dimensions M×N×K
-            costs ``2·M·N·K / systolic_flops_per_cycle`` cycles.
-        transcendental_penalty: Multiplier for transcendental ops vs elementwise (estimated).
+        systolic_rows: Number of rows in the systolic array.  The systolic
+            peak is derived as ``2 * simd_elements_per_cycle * systolic_rows``
+            FLOPs/cycle — each row performs one FMA (= 2 FLOP) on a SIMD-width
+            vector per cycle, and rows execute in parallel.  A ``linalg.matmul``
+            with dimensions M×N×K costs ``2·M·N·K / systolic_flops_per_cycle``
+            cycles.
+        transcendental_penalty: Multiplier for transcendental ops (aka. complex ops like 
+            exp, log, sin, cos, tanh, rsqrt) vs simple elementwise ops (add, mul, max). 
+            Default 4 means a transcendental on a SIMD-width vector costs 4× the cycles 
+            of an elementwise op (estimated).
     """
     # TODO: add gather_bandwidth_tb_s if Spyre scatter/gather BW differs from
     # sequential HBM BW. Until confirmed by hardware team, both share hbm_bandwidth_tb_s.
+
+    # The values used here are example, with some level of alignment to Spyre related
+    # technical publications: ISCA'21. 
     num_cores: int = 32
     clock_ghz: float = 1.0
-    hbm_bandwidth_tb_s: float = 1.0
-    ring_bandwidth_tb_s: float = 4.0
+    hbm_bandwidth_tb_s: float = 0.128
+    ring_bandwidth_tb_s: float = 0.064
     simd_elements_per_cycle: int = 64
-    systolic_flops_per_cycle: int = 2 * 64 * 64 * 64
+    systolic_rows: int = 8
     transcendental_penalty: int = 4
+    lx_size_mb: int = 2
 
     @property
-    def hbm_bytes_per_cycle_per_core(self) -> float:
-        """HBM bytes per cycle available to each core."""
-        bytes_per_cycle_total = self.hbm_bandwidth_tb_s * 1e12 / (self.clock_ghz * 1e9)
-        return bytes_per_cycle_total / self.num_cores
+    def clock_hz(self) -> float:
+        """Clock frequency in Hz."""
+        return self.clock_ghz * 1e9
+
+    @property
+    def hbm_bw_chip(self) -> float:
+        """Aggregate HBM bandwidth in B/s."""
+        return self.hbm_bandwidth_tb_s * 1e12
+
+    @property
+    def systolic_flops_per_cycle(self) -> int:
+        """Systolic throughput in FLOPs/cycle = 2 * simd_elements * systolic_rows (FMA = 2 FLOP)."""
+        return 2 * self.simd_elements_per_cycle * self.systolic_rows
+
+    @property
+    def systolic_peak(self) -> float:
+        """Per-core systolic peak in FLOP/s."""
+        return self.systolic_flops_per_cycle * self.clock_hz
+
+    @property
+    def simd_peak(self) -> float:
+        """Per-core SIMD peak in FLOP/s."""
+        return self.simd_elements_per_cycle * self.clock_hz
 
     @property
     def ring_bytes_per_cycle(self) -> float:
         """Ring network bytes per cycle (one direction)."""
-        return self.ring_bandwidth_tb_s * 1e12 / (self.clock_ghz * 1e9)
+        return self.ring_bandwidth_tb_s * 1e12 / self.clock_hz
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +249,11 @@ class LatencyTracker:
         self.config = config
         self._trace = trace
         self.counters: Dict[int, CoreLatencyCounters] = {}
+        self._cores_active: int = config.num_cores
+
+    def set_cores_active(self, cores_active: int):
+        """Set the number of active cores (from grid shape) for BW sharing."""
+        self._cores_active = cores_active
 
     def reset(self):
         """Clear all accumulated counters."""
@@ -239,9 +298,9 @@ class LatencyTracker:
             if self._memory_space(operands) == "LX":
                 return ("memory", 0.0, 0.0, 0)
             # HBM load/store: cycles = bytes / per-core bandwidth.
-            # Pure data movement — no FLOPs, only bytes transferred.
+            # BW per core = chip BW / cores_active (contended).
             nbytes = self._data_size(result, operands)
-            bw = self.config.hbm_bytes_per_cycle_per_core
+            bw = self.config.hbm_bw_chip / self.config.clock_hz / self._cores_active
             cycles = nbytes / bw if bw > 0 else 0.0
             return ("memory", cycles, 0.0, nbytes)
 
@@ -445,25 +504,40 @@ class LatencyReport:
     """Summary of estimated execution latency."""
     config: HardwareConfig
     counters: Dict[int, CoreLatencyCounters]
+    model: ExecutionModel = field(default_factory=ExecutionModel)
+
+    def _effective_cycles(self, core: "CoreLatencyCounters") -> float:
+        """Apply the pipeline overlap model to get a core's wall-clock cycles."""
+        if self.model.pipeline == "overlapped":
+            return max(core.compute_cycles, core.memory_cycles + core.comm_cycles)
+        elif self.model.pipeline == "overlapped_3way":
+            return max(core.compute_cycles, core.memory_cycles, core.comm_cycles)
+        # serial (default)
+        return core.compute_cycles + core.memory_cycles + core.comm_cycles
+
+    @property
+    def critical_core(self) -> "CoreLatencyCounters":
+        """The core with the longest wall-clock time (the chip finishes when it finishes)."""
+        return max(self.counters.values(), key=self._effective_cycles)
 
     @property
     def kernel_cycles(self) -> float:
-        """Kernel latency = max total cycles across all cores."""
+        """Kernel latency = max effective cycles across all cores."""
         if not self.counters:
             return 0.0
-        return max(c.total_cycles for c in self.counters.values())
+        return self._effective_cycles(self.critical_core)
 
     @property
     def kernel_time_us(self) -> float:
-        """Kernel time in microseconds (cycles / clock_ghz / 1e3)."""
-        return self.kernel_cycles / (self.config.clock_ghz * 1e3)
+        """Kernel time in microseconds."""
+        return self.kernel_cycles / (self.config.clock_hz / 1e6)
 
     @property
     def bottleneck(self) -> str:
         """Identify the bottleneck category on the critical-path core."""
         if not self.counters:
             return "none"
-        critical = max(self.counters.values(), key=lambda c: c.total_cycles)
+        critical = self.critical_core
         cats = {
             "compute": critical.compute_cycles,
             "memory": critical.memory_cycles,
@@ -481,248 +555,140 @@ class LatencyReport:
                 "compute_cycles": c.compute_cycles,
                 "memory_cycles": c.memory_cycles,
                 "comm_cycles": c.comm_cycles,
-                "total_cycles": c.total_cycles,
+                "total_cycles": self._effective_cycles(c),
             })
         return summaries
 
     # ------------------------------------------------------------------
-    # Roofline — shared base, then chip / per-core fork
+    # Roofline — unified formulation
     # ------------------------------------------------------------------
-    # Two compute units are modelled: systolic (``linalg.matmul``) and SIMD
-    # (float / transcendental / int). Their FLOPs are not comparable (matmul
-    # ``2*M*N*K`` vs SIMD per-element) and their peaks differ by orders of
-    # magnitude, so every roofline reports the *dominant* unit — the one that
-    # consumed the most cycles (the bottleneck). Cycles, not FLOPs, pick it.
+
+    @staticmethod
+    def _roofline_at(scope_flops: float, scope_bytes: float,
+                     peak_compute: float, peak_bw: float,
+                     elapsed_s: float) -> Dict[str, Any]:
+        """Universal roofline from 5 inputs. Both chip and per-core call this
+        with different parameterizations — the formulas are identical."""
+        ai = scope_flops / scope_bytes if scope_bytes > 0 else float("inf")
+        achieved = scope_flops / elapsed_s if elapsed_s > 0 else 0.0
+        ceiling = min(peak_compute, peak_bw * ai) if ai != float("inf") else peak_compute
+        return {
+            "AI": ai,
+            "compute_throughput": (achieved / peak_compute
+                                   if peak_compute > 0 else 0.0),
+            "dram_throughput": (scope_bytes / (peak_bw * elapsed_s)
+                                if elapsed_s > 0 and peak_bw > 0 else 0.0),
+            "achieved_gflops": achieved / 1e9,
+            "ceiling_gflops": ceiling / 1e9,
+            "attainment": achieved / ceiling if ceiling > 0 else 0.0,
+            "ridge": peak_compute / peak_bw if peak_bw > 0 else float("inf"),
+            "peak_gflops": peak_compute / 1e9,
+        }
 
     def _roofline_common(self) -> Dict[str, Any]:
-        """Granularity-agnostic quantities shared by :meth:`chip_roofline` and
-        :meth:`core_roofline`, gathered in one place so neither method
-        re-derives them (each call builds this dict once; :meth:`roofline`,
-        which calls both, builds it twice — negligible for report sizes).
+        """Shared raw data for both granularities. Dominant unit is decided
+        once here (chip-wide cycles) so both methods always agree."""
+        critical = self.critical_core
+        elapsed_s = self.kernel_cycles / self.config.clock_hz
+        unit_cats = self.model.unit_categories
+        num_cores = self.config.num_cores
 
-        Nothing here mixes granularity: hardware peak rates, the wall-clock
-        elapsed (= the critical core's total cycles, i.e. when the whole chip
-        finishes), and core counts.
+        # Cores with nonzero effective cycles (idle grid slots excluded).
+        cores_active = sum(1 for c in self.counters.values()
+                          if self._effective_cycles(c) > 0)
 
-        The **dominant unit is decided here, once**, from cycles summed over
-        ALL cores, and both :meth:`chip_roofline` and :meth:`core_roofline`
-        consume that single value — they never re-derive it, so the two can
-        never disagree. Dominant is a workload property (every core runs the
-        same op mix in data-parallel execution), not a per-core one, so the
-        chip-wide aggregate is the right — and only — place to decide it.
-
-        ``peak_bw_core`` (per-core HBM) feeds the per-core roofline only;
-        ``hbm_bw_chip`` (aggregate HBM, read directly) feeds the chip roofline
-        only — the two never cross, so chip is never fed a ``÷ num_cores``
-        bandwidth.
-        """
-        critical = max(self.counters.values(), key=lambda c: c.total_cycles)
-        clock = self.config.clock_ghz * 1e9
-        _LC = LatencyCategory
-        unit_categories = {
-            "systolic": {str(_LC.COMPUTE_MATMUL)},
-            "simd": {str(_LC.COMPUTE_FLOAT),
-                     str(_LC.COMPUTE_TRANSCENDENTAL),
-                     str(_LC.COMPUTE_INT)},
-        }
-        # Chip-wide cycles per category (Σ over all cores) → the single
-        # dominant-unit decision, shared by both granularities.
+        # Chip-wide cycles per category → dominant unit decision.
         chip_cycles_by_cat: Dict[str, float] = {}
         for c in self.counters.values():
             for cat, cyc in c.cycles_by_category.items():
                 chip_cycles_by_cat[cat] = chip_cycles_by_cat.get(cat, 0.0) + cyc
+
+        totals = {unit: sum(chip_cycles_by_cat.get(cat, 0.0) for cat in cats)
+                  for unit, cats in unit_cats.items()}
+        dominant = (max(totals, key=totals.get) if any(totals.values())
+                    else self.model.fallback_unit)
+
         return {
             "critical": critical,
-            "clock": clock,
-            "elapsed_cycles": critical.total_cycles,          # wall clock
-            "elapsed_s": critical.total_cycles / clock if clock > 0 else 0.0,
-            "num_cores": self.config.num_cores,
-            # Cores that consumed any cycle — an oversized grid leaves some
-            # cores at 0 cycles; those must not inflate coverage. total_cycles
-            # (compute+memory+comm) so memory-only cores still count.
-            "cores_active": sum(1 for c in self.counters.values()
-                                if c.total_cycles > 0),
-            # Per-core hardware peak FLOP-rate per compute unit (hardware consts).
-            "unit_ceilings": {
-                "systolic": self.config.systolic_flops_per_cycle * clock,
-                "simd": self.config.simd_elements_per_cycle * clock,
+            "elapsed_s": elapsed_s,
+            "num_cores": num_cores,
+            "cores_active": cores_active,
+            "unit_peaks": {
+                "systolic": self.config.systolic_peak,
+                "simd": self.config.simd_peak,
             },
-            "unit_categories": unit_categories,
-            # Single dominant unit (bottleneck), chip-wide, shared by both forks.
-            "dominant_unit": self._dominant_unit(chip_cycles_by_cat,
-                                                 unit_categories),
-            # Per-core HBM bandwidth (bytes/s) — CORE roofline only.
-            "peak_bw_core": self.config.hbm_bytes_per_cycle_per_core * clock,
-            # Aggregate chip HBM bandwidth (bytes/s), read directly — CHIP only.
-            # NOT the per-core hbm_bytes_per_cycle_per_core (= this / num_cores).
-            "hbm_bw_chip": self.config.hbm_bandwidth_tb_s * 1e12,
+            "unit_cats": unit_cats,
+            "dominant_unit": dominant,
+            "hbm_bw_chip": self.config.hbm_bw_chip,
         }
-
-    @staticmethod
-    def _dominant_unit(cycles_by_category: Dict[str, float],
-                       unit_categories: Dict[str, Any]) -> str:
-        """Bottleneck unit = the one with the most cycles. Called once, from
-        :meth:`_roofline_common`, on cycles summed over all cores (dominant is
-        a chip-wide workload property). FLOPs are not comparable across units,
-        so cycles — not FLOPs — pick the bottleneck. Falls back to ``"simd"``
-        when no compute ran (every category zero).
-        """
-        totals = {
-            unit: sum(cycles_by_category.get(cat, 0.0) for cat in cats)
-            for unit, cats in unit_categories.items()
-        }
-        if not any(totals.values()):
-            return "simd"
-        return max(totals, key=totals.get)
 
     def chip_roofline(self) -> Dict[str, Any]:
-        """Chip (device) level roofline — the whole chip as ONE unit (NCU
-        device view).
-
-        Aggregates the existing per-core counters over ALL cores; no new
-        inputs, and no per-core (critical-core) quantity except the wall-clock
-        elapsed. FLOPs are the dominant unit's, summed over all cores; the
-        dominant unit is chosen chip-wide (Σ cycles over all cores), never from
-        the critical core. The HBM roof is the aggregate bandwidth read
-        directly, never per-core ``÷ num_cores``.
-
-        Returns:
-            AI: ``Σ FLOP / Σ HBM bytes`` over all cores — roofline x-axis (FLOP/B).
-            compute_throughput: ``Σ FLOP / elapsed / chip_peak`` — compute SOL
-                (Nsight "Compute (SM) Throughput %"); ``chip_peak`` = dominant
-                unit's per-core peak × ``num_cores``.
-            dram_throughput: ``Σ HBM bytes / (hbm_bw × elapsed)`` — memory SOL
-                (Nsight "DRAM Throughput %"); ``hbm_bw`` the aggregate bandwidth.
-            mean_core_active_frac: ``Σ core.total_cycles / (num_cores ×
-                elapsed_cycles)`` — time-based core occupancy over all cores
-                (Nsight "SM Active %" analogue; active = compute+memory+comm).
-            grid_coverage: ``cores_active / num_cores`` — spatial dispatch coverage.
-            ridge: ``chip_peak / hbm_bw`` (== per-core ridge — same dominant
-                unit for both, num_cores cancels).
-            dominant_unit, num_cores, cores_active.
-        """
+        """Chip-level roofline — whole chip as one unit."""
         if not self.counters:
             return {}
         k = self._roofline_common()
-        # Single dominant unit, decided chip-wide in _roofline_common.
         dom = k["dominant_unit"]
-        dom_cats = k["unit_categories"][dom]
+        dom_cats = k["unit_cats"][dom]
+        num_cores = k["num_cores"]
+        elapsed_s = k["elapsed_s"]
 
         chip_flops = sum(c.flops_by_category.get(cat, 0.0)
                          for c in self.counters.values() for cat in dom_cats)
         chip_dram_bytes = sum(c.dram_bytes for c in self.counters.values())
-        chip_cycles = sum(c.total_cycles for c in self.counters.values())
+        sum_core_cycles = sum(self._effective_cycles(c)
+                              for c in self.counters.values())
+        elapsed_cycles = self.kernel_cycles
 
-        elapsed_s = k["elapsed_s"]
-        elapsed_cycles = k["elapsed_cycles"]
-        num_cores = k["num_cores"]
-        chip_peak = k["unit_ceilings"][dom] * num_cores
+        chip_peak = k["unit_peaks"][dom] * num_cores
         hbm_bw = k["hbm_bw_chip"]
 
-        return {
-            "AI": (chip_flops / chip_dram_bytes
-                   if chip_dram_bytes > 0 else float("inf")),
-            "compute_throughput": (chip_flops / elapsed_s / chip_peak
-                                   if elapsed_s > 0 and chip_peak > 0 else 0.0),
-            "dram_throughput": (chip_dram_bytes / (hbm_bw * elapsed_s)
-                                if elapsed_s > 0 and hbm_bw > 0 else 0.0),
+        rf = self._roofline_at(chip_flops, chip_dram_bytes,
+                               chip_peak, hbm_bw, elapsed_s)
+        rf.update({
             "mean_core_active_frac": (
-                chip_cycles / (num_cores * elapsed_cycles)
+                sum_core_cycles / (num_cores * elapsed_cycles)
                 if num_cores > 0 and elapsed_cycles > 0 else 0.0),
             "grid_coverage": (k["cores_active"] / num_cores
                               if num_cores > 0 else 0.0),
-            "ridge": chip_peak / hbm_bw if hbm_bw > 0 else float("inf"),
             "dominant_unit": dom,
             "num_cores": num_cores,
             "cores_active": k["cores_active"],
-        }
+        })
+        return rf
 
     def core_roofline(self) -> Dict[str, Any]:
-        """Per-core roofline — the critical-path core only.
-
-        For each compute unit, ``achieved_gflops`` is ``unit_flops /
-        total_wall_time`` (not unit_flops / unit_cycles) so it reflects true
-        end-to-end throughput including memory stalls. The dominant unit sets
-        the ``core_*`` headline. HBM bandwidth here is the per-core figure.
-
-        .. note:: Covers compute and HBM bandwidth only. Communication cycles
-           (ring allgather/reduce) are not modelled.
-
-        Returns:
-            core_AI: dominant unit's FLOPs / HBM ``dram_bytes`` on the critical
-                core (FLOP/B; comm/ring bytes excluded).
-            core_efficiency: achieved / ceiling for the dominant unit (0..1).
-            core_dominant_unit: ``"systolic"`` or ``"simd"`` (most cycles).
-            peak_bw_gb_s: per-core HBM bandwidth (GB/s).
-            ridge: dominant unit's ridge point (peak / peak_bw_core; == chip
-                ridge — same dominant unit, num_cores cancels).
-            units: per-unit dict, each with achieved_gflops, ceiling_gflops,
-                ridge_point, efficiency, arithmetic_intensity, peak_gflops,
-                chip_peak_gflops, compute_throughput.
-        """
+        """Per-core roofline — critical-path core, per-unit breakdown."""
         if not self.counters:
             return {}
         k = self._roofline_common()
         critical = k["critical"]
         elapsed_s = k["elapsed_s"]
-        peak_bw = k["peak_bw_core"]
-        num_cores = k["num_cores"]
-        cats_of = k["unit_categories"]
-
-        units: Dict[str, Any] = {}
-        for unit_name, peak in k["unit_ceilings"].items():
-            cats = cats_of[unit_name]
-            flops = sum(critical.flops_by_category.get(c, 0.0) for c in cats)
-            achieved = flops / elapsed_s if elapsed_s > 0 else 0.0
-            # Per-unit AI: this unit's FLOPs over HBM dram_bytes (comm/ring
-            # excluded — the HBM ceiling governs HBM traffic only).
-            unit_ai = (flops / critical.dram_bytes
-                       if critical.dram_bytes > 0 else float("inf"))
-            ceiling = min(peak, peak_bw * unit_ai)
-            # Per-unit chip-wide throughput (shipped #120 metric, renamed from
-            # chip_throughput): real per-core FLOP sum over elapsed, vs the
-            # unit's chip peak. Lighter/idle cores correctly pull it down.
-            chip_peak = peak * num_cores
-            chip_flops = sum(c.flops_by_category.get(cat, 0.0)
-                             for c in self.counters.values() for cat in cats)
-            compute_throughput = (chip_flops / elapsed_s / chip_peak
-                                  if elapsed_s > 0 and chip_peak > 0 else 0.0)
-            units[unit_name] = {
-                "achieved_gflops": achieved / 1e9,
-                "ceiling_gflops": ceiling / 1e9,
-                "ridge_point": peak / peak_bw if peak_bw > 0 else float("inf"),
-                "efficiency": achieved / ceiling if ceiling > 0 else 0.0,
-                "arithmetic_intensity": unit_ai,
-                "peak_gflops": peak / 1e9,
-                "chip_peak_gflops": chip_peak / 1e9,
-                "compute_throughput": compute_throughput,
-            }
-
-        # Same single dominant unit as chip_roofline (decided chip-wide in
-        # _roofline_common) so the two granularities never disagree.
+        cores_active = k["cores_active"]
         dom = k["dominant_unit"]
 
+        # Per-core available BW = chip BW / cores_active (contended).
+        peak_bw = k["hbm_bw_chip"] / cores_active
+
+        units: Dict[str, Any] = {}
+        for unit_name, unit_peak in k["unit_peaks"].items():
+            cats = k["unit_cats"][unit_name]
+            unit_flops = sum(critical.flops_by_category.get(c, 0.0)
+                             for c in cats)
+            rf = self._roofline_at(unit_flops, critical.dram_bytes,
+                                   unit_peak, peak_bw, elapsed_s)
+            units[unit_name] = rf
+
         return {
-            "core_AI": units[dom]["arithmetic_intensity"],
-            "core_efficiency": units[dom]["efficiency"],
+            "core_AI": units[dom]["AI"],
+            "core_attainment": units[dom]["attainment"],
             "core_dominant_unit": dom,
             "peak_bw_gb_s": peak_bw / 1e9,
-            "ridge": units[dom]["ridge_point"],
+            "ridge": units[dom]["ridge"],
             "units": units,
         }
 
     def roofline(self) -> Dict[str, Any]:
-        """Combined roofline = chip-level + per-core, merged into one flat dict.
-
-        Prefer the granularity-specific methods for clarity:
-        :meth:`chip_roofline` (whole chip as one unit) and :meth:`core_roofline`
-        (critical-path core). This merges both for a single-call combined view.
-        The two key sets are disjoint — chip uses plain NCU names
-        (``AI``, ``compute_throughput``, …), per-core uses ``core_*`` / ``units``
-        / ``peak_bw_gb_s`` — except ``ridge``, which is identical at both
-        granularities: the dominant unit is decided once (chip-wide) and shared,
-        and ``num_cores`` cancels within a unit.
-        """
+        """Combined roofline = chip-level + per-core, merged into one dict."""
         if not self.counters:
             return {}
         return {**self.core_roofline(), **self.chip_roofline()}
@@ -743,7 +709,7 @@ class LatencyReport:
         lines.append("=" * 60)
         lines.append("KTIR Latency Estimation Report")
         lines.append("=" * 60)
-        lines.append(f"  Kernel cycles : {self.kernel_cycles:,.0f}")
+        lines.append(f"  Kernel cycles : {self.kernel_cycles:,.1f}")
         lines.append(f"  Kernel time   : {self.kernel_time_us:.3f} us")
         lines.append(f"  Bottleneck    : {self.bottleneck}")
         lines.append(f"  Cores         : {len(self.counters)}")
@@ -753,23 +719,17 @@ class LatencyReport:
         for core_id in sorted(self.counters):
             c = self.counters[core_id]
             lines.append(
-                f"  {core_id:>4}  {c.compute_cycles:>12.0f}  "
-                f"{c.memory_cycles:>12.0f}  {c.comm_cycles:>12.0f}  "
-                f"{c.total_cycles:>12.0f}"
+                f"  {core_id:>4}  {c.compute_cycles:>12.1f}  "
+                f"{c.memory_cycles:>12.1f}  {c.comm_cycles:>12.1f}  "
+                f"{self._effective_cycles(c):>12.1f}"
             )
         lines.append("=" * 60)
 
-        # Roofline section — two clearly-separated blocks (chip, then per-core),
-        # each sourced from its own method. Only if there are flops or bytes.
-        critical = max(self.counters.values(), key=lambda c: c.total_cycles)
+        critical = self.critical_core
         if critical.total_flops > 0 or critical.total_bytes > 0:
             chip = self.chip_roofline()
             core = self.core_roofline()
 
-            # AI == inf means no HBM bytes moved. Split by total_bytes, not by
-            # naming a transport, so a comm-only kernel (or a future non-HBM
-            # interconnect) reads "no HBM traffic" instead of the misleading "no
-            # memory traffic" — it did move bytes, just not over HBM.
             def _fmt_ai(ai: float) -> str:
                 if ai != float('inf'):
                     return f"{ai:.2f} FLOP/B"
@@ -777,13 +737,14 @@ class LatencyReport:
                     return "inf (no HBM traffic)"
                 return "inf (no memory traffic)"
 
-            # --- CHIP-LEVEL block (whole chip as one unit) ---
+            # --- CHIP-LEVEL block ---
             lines.append("")
             lines.append("Roofline: CHIP-LEVEL  (whole chip as one unit)")
             lines.append("-" * 60)
             lines.append(f"  AI                    : {_fmt_ai(chip['AI'])}")
             lines.append(f"  compute_throughput    : {chip['compute_throughput']:.1%}")
             lines.append(f"  dram_throughput       : {chip['dram_throughput']:.1%}")
+            lines.append(f"  attainment            : {chip['attainment']:.1%}")
             lines.append(f"  mean_core_active_frac : {chip['mean_core_active_frac']:.1%}")
             lines.append(
                 f"  grid_coverage         : {chip['cores_active']}/{chip['num_cores']}  "
@@ -791,22 +752,22 @@ class LatencyReport:
             )
             lines.append(f"  dominant_unit         : {chip['dominant_unit']}")
 
-            # --- PER-CORE block (critical-path core) ---
+            # --- PER-CORE block ---
             dom = core["core_dominant_unit"]
             lines.append("")
             lines.append("Roofline: PER-CORE  (critical-path core)")
             lines.append("-" * 60)
             lines.append(f"  core_AI               : {_fmt_ai(core['core_AI'])}")
-            lines.append(f"  core_efficiency       : {core['core_efficiency']:.1%}")
+            lines.append(f"  core_attainment       : {core['core_attainment']:.1%}")
             lines.append(f"  core_dominant_unit    : {dom}")
             lines.append(f"  peak_bw (per-core)    : {core['peak_bw_gb_s']:.2f} GB/s")
             lines.append("")
             lines.append(
                 f"  {'Unit':>10}  {'Achieved':>12}  {'Ceiling':>12}  "
-                f"{'Ridge':>10}  {'Eff':>7}  {'CompThru':>9}"
+                f"{'Ridge':>10}  {'Attain':>7}"
             )
             lines.append(
-                f"  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*7}  {'-'*9}"
+                f"  {'-'*10}  {'-'*12}  {'-'*12}  {'-'*10}  {'-'*7}"
             )
             for unit_name, u in core["units"].items():
                 marker = " *" if unit_name == dom else "  "
@@ -814,9 +775,8 @@ class LatencyReport:
                     f"{marker} {unit_name:>10}  "
                     f"{u['achieved_gflops']:>10.2f} G  "
                     f"{u['ceiling_gflops']:>10.2f} G  "
-                    f"{u['ridge_point']:>8.1f} F/B  "
-                    f"{u['efficiency']:>6.1%}  "
-                    f"{u['compute_throughput']:>8.2%}"
+                    f"{u['ridge']:>8.1f} F/B  "
+                    f"{u['attainment']:>6.1%}"
                 )
             lines.append("=" * 60)
 

@@ -258,11 +258,12 @@ GFLOP/s
 - **BW ceiling** (the slope): `peak_bw × AI`. When a kernel has low arithmetic intensity it cannot feed the compute units fast enough — performance is limited by memory bandwidth.
 - **Compute ceiling** (the flat top): `peak_gflops`. Once AI is high enough, the compute units are fully utilized.
 - **Ridge point**: `peak_gflops / peak_bw`. Left of it the kernel is memory-bound; right of it, compute-bound.
-- **Efficiency**: `achieved / ceiling` — how close the kernel gets to the roofline at its operating point (reported per-core as `core_efficiency`).
+- **Attainment**: `achieved / ceiling` — how close the kernel gets to the roofline at its operating AI (reported per-core as `core_attainment`).
 
 The roofline is split **by granularity into two methods**: `chip_roofline()` (the whole chip as one unit,
 plain NCU-style names) and `core_roofline()` (the critical-path core, `core_*` names). `roofline()` returns
-both merged into one flat dict for a single-call / back-compatible view.
+both merged into one flat dict. Both call the same unified `_roofline_at()` formula with different
+parameterizations — see the table below.
 
 ```python
 report = interp.get_latency_report()
@@ -272,23 +273,32 @@ chip = report.chip_roofline()
 print(chip["AI"])                     # FLOP/B — Σ FLOP / Σ HBM bytes over all cores
 print(chip["compute_throughput"])     # 0..1  — compute SOL
 print(chip["dram_throughput"])        # 0..1  — memory SOL
+print(chip["attainment"])            # 0..1  — achieved / ceiling at operating AI
 print(chip["mean_core_active_frac"])  # 0..1  — time-based core occupancy
 print(chip["grid_coverage"])          # 0..1  — spatial dispatch coverage
 
-# Per-core (critical-path core)
+# Per-core (critical-path core) — BW = hbm_bw_chip / cores_active
 core = report.core_roofline()
 print(core["core_AI"])                # FLOP/B
-print(core["core_efficiency"])        # 0..1
+print(core["core_attainment"])        # 0..1
 print(core["core_dominant_unit"])     # "systolic" | "simd"
 print(core["units"])                  # per-unit breakdown (systolic / simd)
 
-rf = report.roofline()                # chip + core merged (== {**core, **chip})
+rf = report.roofline()                # chip + core merged
 ```
 
-The two methods **do not share inputs across granularity**: `chip_roofline()` aggregates every core's counters
-and reads the *aggregate* `hbm_bandwidth_tb_s` directly (never the per-core `÷ num_cores` figure), and picks
-its dominant unit chip-wide; `core_roofline()` uses the critical core and the per-core bandwidth. Only the
-wall-clock `elapsed` (the critical core's total cycles) is shared — it is when the whole chip finishes.
+### Unified parameterization
+
+Both granularities compute identical metrics via `_roofline_at(scope_flops, scope_bytes, peak_compute, peak_bw, elapsed_s)`:
+
+| Parameter | Chip | Per-Core |
+|-----------|------|----------|
+| `scope_flops` | Σ FLOPs (dominant unit, all cores) | critical core's FLOPs (dominant unit) |
+| `scope_bytes` | Σ dram_bytes (all cores) | critical core's dram_bytes |
+| `peak_compute` | per_core_peak × num_cores | per_core_peak |
+| `peak_bw` | hbm_bw_chip (aggregate) | hbm_bw_chip / cores_active (contended) |
+
+The per-core BW uses `hbm_bw_chip / cores_active` because HBM is a shared bus — idle cores don't compete. Under uniform workload this gives: `chip.throughput = grid_coverage × core.throughput`.
 
 > **Note:** The roofline model only covers compute and HBM bandwidth. Communication cycles (ring allgather/reduce) are not modelled. For comm-dominated kernels, `report.bottleneck` may report `"comm"` while the roofline classifies based on the compute-vs-HBM ratio alone. For `"compute"` or `"memory"` bottlenecks, the roofline bound always agrees with `bottleneck`.
 
@@ -306,9 +316,17 @@ The chip-level metrics treat the **whole chip as one unit** (the way Nsight Comp
 | `mean_core_active_frac` | `Σ core.total_cycles / (num_cores × elapsed_cycles)` | time-based core occupancy over all cores (*SM Active %*). Two deliberate differences: *active* = compute + memory + comm cycles, and `elapsed_cycles` is the critical core's total cycles (a wall-clock proxy) |
 | `grid_coverage` | `cores_active / num_cores` | **spatial** dispatch coverage — fraction of chip cores dispatched any work; not core busyness (so it is *not* the *SM Active %* — that role is `mean_core_active_frac`) |
 
-The `ridge_point` (`chip_peak / hbm_bw`) is identical at chip and per-core granularity: the dominant unit is decided **once, chip-wide** (from cycles summed over all cores) and shared by both granularities, and `num_cores` cancels within a unit. So the normalised roofline (throughput as a fraction of peak vs AI) is granularity-invariant — the notebook plots the chip point and the per-core point under one shared roof, each labelled by granularity.
+The `ridge` differs between levels: chip uses `chip_peak / hbm_bw_chip`, per-core uses `unit_peak / (hbm_bw_chip / cores_active)`. They are equal only when `cores_active == num_cores` (fully loaded chip).
 
-**Per-core rename.** The plain NCU names belong to the chip level, so the per-core headline fields carry a `core_` prefix: `core_AI`, `core_efficiency`, `core_dominant_unit` (semantics unchanged). The per-unit `units[...]` breakdown also exposes each unit's own chip-wide `compute_throughput`.
+**Per-core naming.** The per-core headline fields carry a `core_` prefix: `core_AI`, `core_attainment`, `core_dominant_unit`. The per-unit `units[...]` breakdown returns the full `_roofline_at()` output per compute unit.
+
+### Execution model
+
+An `ExecutionModel` dataclass (alongside `HardwareConfig`) makes modeling choices explicit:
+
+- **pipeline**: `"serial"` (default, total = compute + memory + comm), `"overlapped"` (compute overlaps data movement: total = max(compute, memory + comm)), or `"overlapped_3way"` (all three independent: total = max(compute, memory, comm)).
+- **bw_sharing**: `"contended"` (per-core BW = hbm_bw_chip / cores_active) or `"static"` (/ num_cores).
+- **unit_categories**: which LatencyCategories each compute unit claims.
 
 ### Example: vector_add (memory-bound)
 
@@ -331,7 +349,7 @@ Achieved    = 1024 FLOPs / 212.6 cycles × 1 GHz = 4.82 GFLOP/s
 Efficiency  = 4.82 / 5.21 = 92.5%
 ```
 
-The kernel is deep in the memory-bound region. The 92.5% efficiency means it nearly saturates the bandwidth ceiling — the small gap comes from compute cycles (16 out of 213 total) that aren't overlapped with memory.
+The kernel is deep in the memory-bound region. The 92.5% attainment means it nearly saturates the bandwidth ceiling — the small gap comes from compute cycles (16 out of 213 total) that aren't overlapped with memory.
 
 ### Example: softmax (compute-bound at 1 core)
 
@@ -353,4 +371,4 @@ Achieved   ≈ 38.8 GFLOP/s
 Efficiency ≈ 60.6%
 ```
 
-The AI is far above the ridge point because the bulk of the work (exp, subtract, divide, reduce) happens on tiles already in LX scratchpad — only the initial load and final store touch HBM. The 60% efficiency reflects that transcendental ops take 4× longer per element than the SIMD peak assumes.
+The AI is far above the ridge point because the bulk of the work (exp, subtract, divide, reduce) happens on tiles already in LX scratchpad — only the initial load and final store touch HBM. The 60% attainment reflects that transcendental ops take 4× longer per element than the SIMD peak assumes.
