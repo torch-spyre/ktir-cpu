@@ -91,15 +91,25 @@ pub fn apply_flash_attention(module: &mut IRModule, needs_flash: impl Fn(usize) 
         // formula (`m*cap*bytes`) as the head island, so Contract B's monotone
         // predicate routes each node to exactly one pass.
         if let Some(island) = recognize_rerolled_attention(func) {
-            if !needs_flash(island.scores_bytes()) {
-                continue; // below the cap: leave head_rewrite's whole-tensor form.
+            // Fire flash when the `[m, cap]` SCORES tile is over the LX budget
+            // (`needs_flash` — the large-query regime) OR the `[cap, d]` CONTEXT
+            // K/V tile is too large to keep whole in LX (the long-context /
+            // small-query regime: decode `m=1`, chunked prefill, where scores stay
+            // tiny but the context read overflows LX — the case the scores-only
+            // gate missed and left un-tiled ⇒ `LX capacity exceeded`).
+            if !needs_flash(island.scores_bytes())
+                && island.context_bytes() <= FLASH_CONTEXT_TILE_MAX
+            {
+                continue; // both tiles fit whole: leave head_rewrite's form.
             }
-            // Choose the KV block so the per-block CONTEXT scores tile `[m, blk]`
-            // fits below the cap (`!needs_flash`), threading the SAME budget the
-            // caller injected. This is the actual long-context fix: `blk < cap`.
+            // Choose the KV block so BOTH the per-block scores tile `[m, blk]` fits
+            // the injected budget AND the per-block context K/V tile `[blk, d]`
+            // fits `FLASH_CONTEXT_TILE_MAX`. This is the actual long-context fix:
+            // `blk < cap`.
             let blk = choose_block_budgeted(
                 island.m,
                 island.cap,
+                island.d,
                 dtype_bytes(&island.dtype),
                 &needs_flash,
             );
@@ -239,7 +249,27 @@ impl ReRolledIsland {
             .saturating_mul(self.cap as usize)
             .saturating_mul(dtype_bytes(&self.dtype))
     }
+
+    /// CONTEXT K/V-tile footprint `[cap, d]` × dtype bytes. UNLIKE `scores_bytes`
+    /// (`m·cap`) this is m-INDEPENDENT: it grows with the context length `cap`
+    /// alone. In the small-query/long-context regime (decode `m=1`, chunked
+    /// prefill `m≪cap`) the whole `[cap, d]` context K (and V) read is what
+    /// overflows LX while the `[m, cap]` scores tile stays tiny — the case the
+    /// scores-only gate misses. Flash-tiling the cap axis shrinks BOTH tiles.
+    pub fn context_bytes(&self) -> usize {
+        (self.cap as usize)
+            .saturating_mul(self.d as usize)
+            .saturating_mul(dtype_bytes(&self.dtype))
+    }
 }
+
+/// Max per-block CONTEXT K/V tile `[blk, d]` bytes flash keeps whole in LX. The
+/// cap-tiled online-softmax loop holds one K block AND one V block resident at a
+/// time, so `2 · this` must fit alongside the fused segment's other resident
+/// live-set (~1.5 MiB of a 2 MiB per-core LX on Llama-3B). 128 KiB ⇒ 256 KiB for
+/// K+V, leaving comfortable headroom. Numerics are exact for ANY block size
+/// (online softmax), so this only trades a few extra blocks for fitting LX.
+const FLASH_CONTEXT_TILE_MAX: usize = 128 * 1024;
 
 // ===========================================================================
 // Recognition
@@ -591,21 +621,33 @@ fn cap_divisors(cap: i64) -> Vec<i64> {
 /// can emit. In all cases `b <= cap`; when `cap` has a proper divisor `< cap`
 /// (the real caps are 64-multiples) and the full `[m, cap]` tile overflows, the
 /// returned `b` is strictly `< cap`, so REAL tiling happens.
+/// Constrains BOTH per-block tiles: the `[m, blk]` scores tile must fit the
+/// injected LX budget (`!needs_flash`) AND the `[blk, d]` context K/V tile must
+/// fit [`FLASH_CONTEXT_TILE_MAX`]. In the small-query/long-context regime the KV
+/// constraint binds (scores are already tiny), so a scores-only chooser would
+/// pick `blk = cap` (no tiling) and overflow LX; this picks the largest cap
+/// divisor that satisfies both.
 fn choose_block_budgeted(
     m: i64,
     cap: i64,
+    d: i64,
     bytes: usize,
     needs_flash: &impl Fn(usize) -> bool,
 ) -> i64 {
     let divisors = cap_divisors(cap);
-    let footprint = |b: i64| {
+    let scores = |b: i64| {
         (m as usize)
             .saturating_mul(b as usize)
             .saturating_mul(bytes)
     };
-    // Largest divisor whose per-block tile fits below the cap.
+    let kv = |b: i64| {
+        (d as usize)
+            .saturating_mul(b as usize)
+            .saturating_mul(bytes)
+    };
+    // Largest divisor whose per-block scores AND context K/V tiles both fit.
     for &b in &divisors {
-        if !needs_flash(footprint(b)) {
+        if !needs_flash(scores(b)) && kv(b) <= FLASH_CONTEXT_TILE_MAX {
             return b;
         }
     }
@@ -1634,7 +1676,6 @@ pub fn tile_rerolled_attention(isl: &ReRolledIsland, blk: i64) -> IRFunction {
     } else {
         choose_block(cap)
     };
-    let nb = cap / blk;
     let mut g = NameGen::new("fa");
     let mut ops: Vec<Operation> = Vec::new();
 
@@ -1684,16 +1725,55 @@ pub fn tile_rerolled_attention(isl: &ReRolledIsland, blk: i64) -> IRFunction {
     // ---- loop bounds + block-size constant ----
     let lb = g.next("lb");
     ops.push(const_index(&lb, 0));
-    let ub = g.next("ub");
-    ops.push(const_index(&ub, nb));
     let step = g.next("st");
     ops.push(const_index(&step, 1));
     let blk_c = g.next("blk");
     ops.push(const_index(&blk_c, blk));
 
-    // ---- iter-arg inits: running max [m,1]=-inf, sum [m,1]=0, acc [m,d]=empty ----
+    // ---- RUNTIME loop bound: iterate ONLY the KV blocks that hold valid context.
+    // The context mask [1, cap] is 0 on valid columns and -inf past valid_len, so
+    // exp(mask) is a 1/0 valid-column indicator. Sum it (WIDENED to f32 — an f16
+    // sum saturates integer precision past 2048 and would undercount valid_len at a
+    // block boundary, silently dropping context) to recover valid_len, then run
+    // ceil(valid_len / blk) blocks. valid_len = 0 (empty prefix) => 0 blocks: the
+    // diagonal alone carries the result. This makes attention O(actual context)
+    // instead of O(cap) — a 32-token prefill chunk runs 1 block, not cap/blk — which
+    // is the whole point of the rewrite for the long-context/small-query regime.
+    let mask_full = mk_whole_load(&mut g, &mut ops, &mask_view, &[1, cap]);
+    let vind = g.next("vind");
+    ops.push(Operation::new(Some(&vind), "math.exp", &[&mask_full]));
+    let vind32 = g.next("vind32");
+    ops.push(Operation::new(Some(&vind32), "arith.convertf", &[&vind]));
+    let vzero = g.next("vzero");
+    ops.push(const_f(&vzero, 0.0));
+    let vinit = g.next("vinit");
+    ops.push(mk_splat(&vinit, &vzero, &[1], "f32"));
+    let vsum = g.next("vsum");
+    ops.push(mk_reduce(&vsum, &vind32, &vinit, "arith.addf"));
+    let vscalar = g.next("vsc");
+    ops.push(Operation::new(Some(&vscalar), "tensor.extract", &[&vsum]));
+    let vidx = g.next("vidx");
+    ops.push(Operation::new(Some(&vidx), "arith.index_cast", &[&vscalar]));
+    let ub = g.next("ub");
+    ops.push(Operation::new(
+        Some(&ub),
+        "arith.ceildivui",
+        &[&vidx, &blk_c],
+    ));
+
+    // ---- iter-arg inits: running max [m,1]=FLOOR, sum [m,1]=0, acc [m,d]=empty ----
+    // The running max seeds a FINITE floor, NOT -inf: a fresh prefill's prefix
+    // CONTEXT is empty, so every context KV block is fully mask-additive `-inf`.
+    // With a -inf seed, `m_new = max(-inf,-inf) = -inf` and `exp(Sj - m_new) =
+    // exp(-inf - -inf) = NaN`. A finite floor (well below any real scaled score,
+    // within f16 range) makes a fully-masked block yield `exp(-inf - floor) = 0`
+    // (contributes nothing, as it must), while any valid block's real max exceeds
+    // the floor so its arithmetic is unchanged. The whole-tensor path never hit
+    // this because its reduce_max spans the valid diagonal (a finite global max).
+    let mfloor_c = g.next("mfloor");
+    ops.push(const_f(&mfloor_c, -3.0e4));
     let m0 = g.next("m0");
-    ops.push(mk_splat(&m0, &ninf_c, &[m, 1], dt));
+    ops.push(mk_splat(&m0, &mfloor_c, &[m, 1], dt));
     let l0 = g.next("l0");
     ops.push(mk_splat(&l0, &zero_c, &[m, 1], dt));
     let acc0 = g.next("acc0");
@@ -2276,7 +2356,7 @@ mod tests {
         let mut rerolled = rewrite_head_attention(&head);
         rerolled.name = "attn".into();
         let isl = recognize_rerolled_attention(&rerolled).unwrap();
-        let blk = choose_block_budgeted(isl.m, isl.cap, 2, &|sb| sb >= 1024);
+        let blk = choose_block_budgeted(isl.m, isl.cap, isl.d, 2, &|sb| sb >= 1024);
         let tiled = tile_rerolled_attention(&isl, blk);
 
         // Grid + args preserved (7 args, [H,1,1]).
@@ -2336,7 +2416,7 @@ mod tests {
             needs(isl.scores_bytes()),
             "full tile must overflow at this budget"
         );
-        let blk = choose_block_budgeted(isl.m, isl.cap, bytes, &needs);
+        let blk = choose_block_budgeted(isl.m, isl.cap, isl.d, bytes, &needs);
         assert!(blk < isl.cap, "must tile: blk {blk} < cap {}", isl.cap);
         assert_eq!(isl.cap % blk, 0, "blk divides cap");
         let per_block = (isl.m as usize) * (blk as usize) * bytes;
