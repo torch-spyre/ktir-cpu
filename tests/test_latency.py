@@ -999,6 +999,34 @@ class TestLatencyEdgeCases:
         assert report.kernel_cycles == 0.0
         assert report.kernel_time_us == 0.0
 
+    def test_memory_space_distributed_tile_ref(self):
+        """_memory_space() returns the partition memory space for distributed views."""
+        from ktir_cpu.latency import LatencyTracker
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import (
+            AccessTile, DistributedTileRef, MemRef, TileRef,
+        )
+        from ktir_cpu.parser_ast import parse_affine_map
+
+        memref = MemRef(base_ptr=0, shape=(256, 256), strides=[256, 1],
+                        memory_space="HBM", dtype="f16")
+        partition = TileRef(
+            base_ptr=0, shape=(256, 256), strides=[256, 1], memref=memref,
+            dtype="f16", coordinate_set=BoxSet(lo=(0, 0), hi=(256, 256)),
+            partition_origin=(0, 0),
+        )
+        dist_ref = DistributedTileRef(
+            partitions=[partition], shape=(256, 1024), dtype="f16",
+            global_base=(0, 0),
+        )
+        access_tile = AccessTile(
+            parent_ref=dist_ref, shape=(256, 256),
+            base_map=parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+            coordinate_set=BoxSet(lo=(0, 0), hi=(256, 256)),
+            coordinate_order=None,
+        )
+        assert LatencyTracker._memory_space([access_tile]) == "HBM"
+
 
 class TestIndirectAccessLatency:
     """Verify that indirect access loads account for index tensor HBM traffic."""

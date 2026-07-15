@@ -878,6 +878,8 @@ class TestFFNSwiGLU4CoreExecution:
         assert not np.any(np.isinf(result)), "output contains Inf"
         # Looser than single-core (5e-2) because f16 overflow in exp() during
         # SiLU causes a handful of outliers in 4-core accumulated outputs.
+        # This does not affect latency counts (cycle model is structural, not
+        # data-dependent), only the numerical correctness tolerance here.
         np.testing.assert_allclose(
             result,
             expected,
