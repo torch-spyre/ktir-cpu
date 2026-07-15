@@ -1751,15 +1751,16 @@ class TestKtdp:
         )
         assert result.shape == (192, 64)
 
-    def test_construct_distributed_memory_view_resolves_non_origin_to_data_span(self):
-        """Non-origin tiling resolves to the data span ``max(hi) - min(lo)``.
+    def test_construct_distributed_memory_view_resolves_non_origin_to_max_hi(self):
+        """Non-origin tiling resolves the dynamic axis to ``max(hi)``.
 
         Partitions [10, 20) and [20, 30) on axis 0 (10 rows each, local
-        shape (10, 4)) produce global shape (20, 4) — the amount of data
-        the partitions cover, not the highest coordinate (30).  The
-        unreachable [0, 10) prefix is not part of the logical size;
-        accessing global coords there surfaces as ``no partition covers``
-        at ``distributed_tile_access`` time.
+        shape (10, 4)) produce global shape (30, 4) — the global bounding
+        box from 0 (the highest coordinate), per RFC 0682's "global
+        coordinate domain is the union of the coordinate_set attributes".
+        The [0, 10) prefix is not covered by any partition; accessing
+        global coords there has undefined semantics and surfaces as ``no
+        partition covers`` only when the entire access region is uncovered.
         """
         ctx = _make_ctx()
         ctx.set_value("%a0", self._make_box_partition(
@@ -1773,7 +1774,7 @@ class TestKtdp:
             operands=["%a0", "%a1"],
             attributes={"shape": (None, 4), "dtype": "f16"},
         )
-        assert result.shape == (20, 4)
+        assert result.shape == (30, 4)
 
     def test_construct_distributed_memory_view_concrete_rejects_undersize(self):
         """A concrete declared dim smaller than the partition extent is rejected.

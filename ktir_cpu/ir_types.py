@@ -124,9 +124,9 @@ def _infer_partition_extent(
 
     Validates **every** partition up front, regardless of kind: its
     coordinate set must match the result rank (``BoxSet`` partitions must
-    additionally be concrete).  For each axis the extent is the coordinate
-    span ``max(hi) - min(lo)`` across the ``BoxSet`` partitions, whose bounds
-    are in global coordinates; an axis with no ``BoxSet`` contribution stays
+    additionally be concrete).  For each axis the extent is ``max(hi)``, the
+    highest global coordinate across the ``BoxSet`` partitions (the global
+    bounding box from 0); an axis with no ``BoxSet`` contribution stays
     ``None``.
 
     ``AffineSet`` partitions expose no per-axis bounds, so they add no extent
@@ -137,7 +137,6 @@ def _infer_partition_extent(
     Returns ``(inferred_extent, affine_partition_indices)``.
     """
     max_hi: List[Optional[int]] = [None] * ndim
-    min_lo: List[Optional[int]] = [None] * ndim
     affine_indices: List[int] = []
     for i, part in enumerate(partitions):
         cs = part.coordinate_set
@@ -160,15 +159,10 @@ def _infer_partition_extent(
                 f"against runtime symbols before reaching this point"
             )
         for axis in range(ndim):
-            hi_a, lo_a = cs.hi[axis], cs.lo[axis]
+            hi_a = cs.hi[axis]
             if max_hi[axis] is None or hi_a > max_hi[axis]:
                 max_hi[axis] = hi_a
-            if min_lo[axis] is None or lo_a < min_lo[axis]:
-                min_lo[axis] = lo_a
-    inferred = tuple(
-        None if max_hi[axis] is None else max_hi[axis] - min_lo[axis]
-        for axis in range(ndim)
-    )
+    inferred = tuple(max_hi[axis] for axis in range(ndim))
     return inferred, affine_indices
 
 
@@ -179,8 +173,8 @@ def _assemble_dist_extent(
     """Assemble and validate a distributed view's global extent from its partitions.
 
     Splits into inference (:func:`_infer_partition_extent`) and decision.
-    Per axis, using the inferred span ``max(hi) - min(lo)`` over the ``BoxSet``
-    partitions:
+    Per axis, using the inferred extent ``max(hi)`` (the global bounding box
+    from 0) over the ``BoxSet`` partitions:
 
       - dynamic (``None``): filled with the inferred extent, which must exist
         and be positive.
@@ -223,14 +217,14 @@ def _assemble_dist_extent(
             if extent is None or extent <= 0:
                 raise ValueError(
                     f"construct_distributed_memory_view: could not resolve "
-                    f"dynamic axis {axis}: no positive extent (max(hi)-min(lo)) "
+                    f"dynamic axis {axis}: no positive extent (max(hi)) "
                     f"across partitions"
                 )
             resolved[axis] = extent
         elif extent is not None and dim < extent:
             raise ValueError(
                 f"construct_distributed_memory_view: declared shape axis {axis} "
-                f"= {dim} is smaller than the partition extent (max(hi)-min(lo)) "
+                f"= {dim} is smaller than the partition extent (max(hi)) "
                 f"= {extent}; the view cannot address all covered global coordinates"
             )
     return tuple(resolved)
