@@ -1860,6 +1860,34 @@ class TestKtdp:
                 attributes={"shape": (64, None), "dtype": "f16"},
             )
 
+    def test_construct_distributed_memory_view_concrete_rejects_affine_set_rank_mismatch(self):
+        """Concrete result + wrong-rank AffineSet partition is caught.
+
+        Rank is now checked ahead of the partition-kind dispatch, so a rank-2
+        AffineSet against a rank-3 concrete result raises instead of silently
+        slipping through the AffineSet skip (which only tracked BoxSet bounds).
+        """
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        ctx = _make_ctx()
+        # 2-D non-axis-aligned constraint stays an AffineSet (not a BoxSet).
+        affine_cs = parse_affine_set(
+            "affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0,"
+            " d1 - 16 >= 0, d0 - d1 >= 0)>"
+        )
+        ctx.set_value("%a0", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=affine_cs,
+        ))
+        with pytest.raises(ValueError, match=r"partition 0 has rank 2, expected 3"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, 16, 8), "dtype": "f16"},
+            )
+
     def test_construct_distributed_memory_view_dynamic_rejects_non_concrete_partition(self):
         """Non-concrete partition coord_set raises ValueError (clean under -O too)."""
         from ktir_cpu.affine import BoxSet

@@ -116,60 +116,42 @@ class MemRef:
         return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
 
 
-def _assemble_dist_extent(
-    shape: Tuple[Optional[int], ...],
+def _infer_partition_extent(
     partitions: List[MemRef],
-) -> Tuple[int, ...]:
-    """Assemble and validate a distributed view's global extent from its partitions.
+    ndim: int,
+) -> Tuple[Tuple[Optional[int], ...], List[int]]:
+    """Infer the per-axis global extent from the partitions (ground truth).
 
-    Partitions are the ground truth.  For each axis the global extent is the
-    coordinate span ``max(hi) - min(lo)`` across the ``BoxSet`` partitions,
-    whose ``coordinate_set`` bounds are in global coordinates — the logical
-    size of the distributed tensor rather than the highest global coordinate.
-    For a gap-free tiling this equals the data covered; with interior gaps
-    the span still counts the uncovered middle (coverage is checked at access
-    time, not here).  Per axis:
+    Validates **every** partition up front, regardless of kind: its
+    coordinate set must match the result rank (``BoxSet`` partitions must
+    additionally be concrete).  For each axis the extent is the coordinate
+    span ``max(hi) - min(lo)`` across the ``BoxSet`` partitions, whose bounds
+    are in global coordinates; an axis with no ``BoxSet`` contribution stays
+    ``None``.
 
-      - dynamic (``None``): filled with ``max(hi) - min(lo)``.
-      - concrete: validated ``declared >= max(hi) - min(lo)``.  An
-        under-sized declared dim raises; an over-sized one is allowed (the
-        extra surfaces as ``no partition covers`` at access time, like
-        interior gaps).
+    ``AffineSet`` partitions expose no per-axis bounds, so they add no extent
+    (on the concrete path they dispatch via ``find_partition`` / ``.contains()``
+    at access time).  Their indices are returned so the caller can reject them
+    on the dynamic-shape path, where a missing extent cannot be filled.
 
-    Addressing via the **BoxSet fast path** is unaffected by this value: it
-    routes via each partition's ``coordinate_set`` and ``p_i = min(B_i)`` and
-    never reads the global shape.  The **slow path** (AffineSet partition, or
-    AffineSet access tile against a BoxSet partition) does enumerate against
-    this shape (``B_i.enumerate(dist_ref.shape)``).  KNOWN LIMITATION: for a
-    non-origin tiling (``min(lo) > 0``) the span is smaller than ``max(hi)``,
-    so a slow-path enumeration would falsely reject / miss the global
-    coordinates in ``[span, max(hi))``.  Every fixture that currently reaches
-    the slow path is origin-anchored (``span == max(hi)``), so this is latent;
-    lifting non-origin + slow-path support is tracked under #74.
-
-    ``AffineSet`` partitions expose no per-axis bounds, so they are skipped
-    for extent purposes — concrete-shape views with ``AffineSet`` partitions
-    dispatch via ``find_partition`` / ``.contains()`` at access time.  A
-    dynamic axis cannot be filled from an ``AffineSet``, so they are rejected
-    only when the result shape still carries a ``?``.
+    Returns ``(inferred_extent, affine_partition_indices)``.
     """
-    ndim = len(shape)
-    has_dynamic = any(s is None for s in shape)
     max_hi: List[Optional[int]] = [None] * ndim
     min_lo: List[Optional[int]] = [None] * ndim
+    affine_indices: List[int] = []
     for i, part in enumerate(partitions):
         cs = part.coordinate_set
+        # Rank is checked for every partition kind, ahead of the kind
+        # dispatch, so a wrong-rank AffineSet against a concrete result is
+        # caught too (it previously slipped through the AffineSet skip).
+        if cs.n_dims != ndim:
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} has rank "
+                f"{cs.n_dims}, expected {ndim} to match result memref rank"
+            )
         if not isinstance(cs, BoxSet):
-            if has_dynamic:
-                raise ValueError(
-                    f"construct_distributed_memory_view: dynamic-shape result "
-                    f"resolution does not support {type(cs).__name__} partitions "
-                    f"(partition {i} on this op).  The concrete-shape path accepts "
-                    f"AffineSet partitions normally (they dispatch via find_partition "
-                    f"at access time).  Declare the result memref with concrete dims "
-                    f"to use this partition."
-                )
-            continue  # concrete shape: AffineSet has no per-axis bounds to check
+            affine_indices.append(i)
+            continue
         if not cs.is_concrete:
             # `ValueError` (not `assert`) so the failure is loud under `python -O`.
             raise ValueError(
@@ -177,22 +159,66 @@ def _assemble_dist_extent(
                 f"is not concrete; construct_memory_view should have specialised it "
                 f"against runtime symbols before reaching this point"
             )
-        if cs.n_dims != ndim:
-            raise ValueError(
-                f"construct_distributed_memory_view: partition {i} has rank "
-                f"{cs.n_dims}, expected {ndim} to match result memref rank"
-            )
         for axis in range(ndim):
             hi_a, lo_a = cs.hi[axis], cs.lo[axis]
             if max_hi[axis] is None or hi_a > max_hi[axis]:
                 max_hi[axis] = hi_a
             if min_lo[axis] is None or lo_a < min_lo[axis]:
                 min_lo[axis] = lo_a
+    inferred = tuple(
+        None if max_hi[axis] is None else max_hi[axis] - min_lo[axis]
+        for axis in range(ndim)
+    )
+    return inferred, affine_indices
+
+
+def _assemble_dist_extent(
+    shape: Tuple[Optional[int], ...],
+    partitions: List[MemRef],
+) -> Tuple[int, ...]:
+    """Assemble and validate a distributed view's global extent from its partitions.
+
+    Splits into inference (:func:`_infer_partition_extent`) and decision.
+    Per axis, using the inferred span ``max(hi) - min(lo)`` over the ``BoxSet``
+    partitions:
+
+      - dynamic (``None``): filled with the inferred extent, which must exist
+        and be positive.
+      - concrete: validated ``declared >= inferred``.  An under-sized declared
+        dim raises; an over-sized one is allowed (the extra surfaces as
+        ``no partition covers`` at access time, like interior gaps).
+
+    Scope of the concrete check: only ``BoxSet`` partitions contribute an
+    inferred bound, so an axis covered solely by ``AffineSet`` partitions has
+    ``inferred = None`` and its declared dim passes unchecked (a wrong-rank
+    partition is still rejected in ``_infer_partition_extent``).  On the
+    dynamic-shape path an ``AffineSet`` partition is rejected outright, since a
+    missing extent cannot be filled.  Bounding-box derivation for ``AffineSet``
+    is tracked under #74.
+
+    This value does not affect addressing.  The ``BoxSet`` fast path routes via
+    each partition's ``coordinate_set`` and ``p_i = min(B_i)``; the slow path
+    enumerates each ``BoxSet`` partition against its own bounds
+    (``B_i.enumerate()``), not the global shape.  Only an ``AffineSet``
+    partition on the slow path still needs an external search box — the
+    remaining #74 limitation.
+    """
+    ndim = len(shape)
+    inferred, affine_indices = _infer_partition_extent(partitions, ndim)
+    if affine_indices and any(s is None for s in shape):
+        i = affine_indices[0]
+        cs = partitions[i].coordinate_set
+        raise ValueError(
+            f"construct_distributed_memory_view: dynamic-shape result "
+            f"resolution does not support {type(cs).__name__} partitions "
+            f"(partition {i} on this op).  The concrete-shape path accepts "
+            f"AffineSet partitions normally (they dispatch via find_partition "
+            f"at access time).  Declare the result memref with concrete dims "
+            f"to use this partition."
+        )
     resolved = list(shape)
     for axis, dim in enumerate(shape):
-        # Global extent = data span across partitions (max(hi) - min(lo)),
-        # None on axes backed only by AffineSet partitions (no bounds tracked).
-        extent = None if max_hi[axis] is None else max_hi[axis] - min_lo[axis]
+        extent = inferred[axis]
         if dim is None:
             if extent is None or extent <= 0:
                 raise ValueError(

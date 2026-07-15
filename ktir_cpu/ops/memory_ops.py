@@ -754,7 +754,16 @@ class MemoryOps:
                 coordinate_set_out: CoordinateSet = C_i
             else:
                 # Slow path: brute-force enumerate + filter.
-                B_i_pts = B_i.enumerate(dist_ref.shape)
+                # BoxSet is self-bounded — enumerate its own [lo, hi).  Passing
+                # the global shape would raise on a non-origin partition whose
+                # hi exceeds the (data-span) shape, so addressing must not depend
+                # on it.  AffineSet has no bounds of its own and still needs an
+                # external search box; a tight per-partition box for AffineSet is
+                # tracked under #74.
+                if isinstance(B_i, BoxSet):
+                    B_i_pts = B_i.enumerate()
+                else:
+                    B_i_pts = B_i.enumerate(dist_ref.shape)
                 if not B_i_pts:
                     continue
                 p_i = tuple(min(pt[d] for pt in B_i_pts) for d in range(ndim))
