@@ -1209,3 +1209,50 @@ def test_parse_distributed_view_index_dtype():
     assert op2.result == "%dv"
     assert op2.attributes["shape"] == (128, 32)
     assert op2.attributes["dtype"] == "index"
+
+
+def _extent_partitions():
+    """Two BoxSet partitions covering [0,4)x[0,4): axis extents max(hi)=(4, 4)."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.ir_types import MemRef
+
+    P0 = MemRef(base_ptr=0, shape=(2, 4), strides=[4, 1], memory_space="HBM",
+                coordinate_set=BoxSet(lo=(0, 0), hi=(2, 4)))
+    P1 = MemRef(base_ptr=32, shape=(2, 4), strides=[4, 1], memory_space="HBM",
+                coordinate_set=BoxSet(lo=(2, 0), hi=(4, 4)))
+    return [P0, P1]
+
+
+def test_distributed_memory_view_post_init_rejects_unresolved_none_shape():
+    """Constructing directly with a residual dynamic (None) dim is rejected.
+
+    Dynamic dims are resolved upstream in the op handler
+    (``_assemble_dist_extent``); by the time a ``DistributedMemRef`` is built the
+    shape must be concrete.  ``__post_init__`` validation must therefore reject a
+    lingering ``None`` rather than silently accept an unresolved shape.
+    """
+    from ktir_cpu.ir_types import DistributedMemRef
+
+    with pytest.raises(
+        ValueError,
+        match=r"declared shape must be fully resolved before construction; axis 1 is None",
+    ):
+        DistributedMemRef(partitions=_extent_partitions(), shape=(4, None), dtype="f16")
+
+
+def test_distributed_memory_view_post_init_rejects_shape_mismatch_off_handler():
+    """The extent invariant is enforced on direct construction, not just via the op.
+
+    The extent check lives in ``__post_init__`` so it guards *every*
+    ``DistributedMemRef`` construction — including code that builds one directly
+    instead of through ``ktdp.construct_distributed_memory_view``.  Partitions
+    cover axis 1 up to ``max(hi)=4``; a declared ``4x8`` must be rejected here,
+    with no op handler in the call path.
+    """
+    from ktir_cpu.ir_types import DistributedMemRef
+
+    with pytest.raises(
+        ValueError,
+        match=r"declared shape axis 1 = 8 does not match the partition extent",
+    ):
+        DistributedMemRef(partitions=_extent_partitions(), shape=(4, 8), dtype="f16")

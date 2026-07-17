@@ -1780,10 +1780,10 @@ class TestKtdp:
         """A concrete declared dim smaller than the partition extent is rejected.
 
         Partitions span [0, 16) and [16, 32) on axis 1, so the extent
-        ``max(hi) - min(lo) = 32 - 0 = 32``.  The result is declared
-        ``64x20``; ``20 < 32`` means the view is smaller than the data the
-        partitions cover, so the extent check must reject it rather than
-        silently build an inconsistent ``DistributedMemRef``.
+        ``max(hi) = 32``.  The result is declared ``64x20``; ``20 != 32`` means
+        the declared shape does not match the data the partitions cover, so the
+        extent check must reject it rather than silently build an inconsistent
+        ``DistributedMemRef``.
         """
         ctx = _make_ctx()
         ctx.set_value("%a0", self._make_box_partition(
@@ -1794,12 +1794,38 @@ class TestKtdp:
         ))
         with pytest.raises(
             ValueError,
-            match=r"declared shape axis 1 = 20 is smaller than the partition extent",
+            match=r"declared shape axis 1 = 20 does not match the partition extent",
         ):
             _call(
                 "ktdp.construct_distributed_memory_view", ctx, _make_env(),
                 operands=["%a0", "%a1"],
                 attributes={"shape": (64, 20), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_concrete_rejects_oversize(self):
+        """A concrete declared dim larger than the partition extent is rejected.
+
+        Same partitions as the undersize case span [0, 16) and [16, 32) on
+        axis 1, so the extent ``max(hi) = 32``.  The result is declared
+        ``64x48``; ``48 != 32`` means the declared shape claims coordinates no
+        partition covers, so the extent check must reject it — the declared
+        shape must equal the extent exactly, not merely be at least it.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"declared shape axis 1 = 48 does not match the partition extent",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, 48), "dtype": "f16"},
             )
 
     def test_construct_distributed_memory_view_dynamic_rejects_affine_set_partition(self):

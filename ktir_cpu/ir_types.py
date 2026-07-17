@@ -170,25 +170,21 @@ def _assemble_dist_extent(
     shape: Tuple[Optional[int], ...],
     partitions: List[MemRef],
 ) -> Tuple[int, ...]:
-    """Assemble and validate a distributed view's global extent from its partitions.
+    """Assemble a distributed view's concrete global shape from its partitions.
 
-    Splits into inference (:func:`_infer_partition_extent`) and decision.
-    Per axis, using the inferred extent ``max(hi)`` (the global bounding box
-    from 0) over the ``BoxSet`` partitions:
+    Resolution only: each dynamic axis (``None``, parsed from ``?`` in the
+    result type) is filled with the inferred extent ``max(hi)`` — the highest
+    global coordinate across the ``BoxSet`` partitions (the global bounding box
+    from 0), per :func:`_infer_partition_extent`.  Concrete axes pass through
+    untouched; they are checked separately in :func:`_validate_dist_extent`,
+    which every :class:`DistributedMemRef` construction runs.
 
-      - dynamic (``None``): filled with the inferred extent, which must exist
-        and be positive.
-      - concrete: validated ``declared >= inferred``.  An under-sized declared
-        dim raises; an over-sized one is allowed (the extra surfaces as
-        ``no partition covers`` at access time, like interior gaps).
-
-    Scope of the concrete check: only ``BoxSet`` partitions contribute an
-    inferred bound, so an axis covered solely by ``AffineSet`` partitions has
-    ``inferred = None`` and its declared dim passes unchecked (a wrong-rank
-    partition is still rejected in ``_infer_partition_extent``).  On the
-    dynamic-shape path an ``AffineSet`` partition is rejected outright, since a
-    missing extent cannot be filled.  Bounding-box derivation for ``AffineSet``
-    is tracked under #74.
+    An axis with no ``BoxSet`` contribution has no inferred extent (``None``).
+    A dynamic axis cannot be filled from such an extent, so a dynamic result
+    with any ``AffineSet`` partition is rejected outright.  The concrete path
+    accepts ``AffineSet`` partitions normally (they dispatch via
+    ``find_partition`` at access time); bounding-box derivation for
+    ``AffineSet`` is tracked under #74.
 
     This value does not affect addressing.  The ``BoxSet`` fast path routes via
     each partition's ``coordinate_set`` and ``p_i = min(B_i)``; the slow path
@@ -212,8 +208,8 @@ def _assemble_dist_extent(
         )
     resolved = list(shape)
     for axis, dim in enumerate(shape):
-        extent = inferred[axis]
         if dim is None:
+            extent = inferred[axis]
             if extent is None or extent <= 0:
                 raise ValueError(
                     f"construct_distributed_memory_view: could not resolve "
@@ -221,13 +217,43 @@ def _assemble_dist_extent(
                     f"across partitions"
                 )
             resolved[axis] = extent
-        elif extent is not None and dim < extent:
+    return tuple(resolved)
+
+
+def _validate_dist_extent(
+    shape: Tuple[int, ...],
+    partitions: List[MemRef],
+) -> None:
+    """Validate a resolved global shape against the partition extent.
+
+    Invariant enforced on **every** :class:`DistributedMemRef` construction
+    (not only those built through the op handler): the shape must be fully
+    concrete, and each axis with an inferred bound must equal that bound —
+    ``declared == max(hi)`` — so the declared shape names exactly the global
+    coordinate extent its partitions cover.  Resolution of dynamic dims happens
+    upstream in :func:`_assemble_dist_extent`, so a residual ``None`` here is a
+    construction error, not a shape to fill.
+
+    An axis covered solely by ``AffineSet`` partitions has no inferred bound
+    (``None``) and passes unchecked (a wrong-rank partition is still rejected in
+    :func:`_infer_partition_extent`); bounding-box derivation for ``AffineSet``
+    is tracked under #74.
+    """
+    inferred, _ = _infer_partition_extent(partitions, len(shape))
+    for axis, dim in enumerate(shape):
+        if dim is None:
+            raise ValueError(
+                f"construct_distributed_memory_view: declared shape must be "
+                f"fully resolved before construction; axis {axis} is None"
+            )
+        extent = inferred[axis]
+        if extent is not None and dim != extent:
             raise ValueError(
                 f"construct_distributed_memory_view: declared shape axis {axis} "
-                f"= {dim} is smaller than the partition extent (max(hi)) "
-                f"= {extent}; the view cannot address all covered global coordinates"
+                f"= {dim} does not match the partition extent (max(hi)) = {extent}; "
+                f"the view's declared shape must equal the global coordinate extent "
+                f"covered by its partitions"
             )
-    return tuple(resolved)
 
 
 @dataclass
@@ -263,10 +289,10 @@ class DistributedMemRef:
                     f"DistributedMemRef partition {i} dtype {p.dtype!r} "
                     f"does not match view dtype {self.dtype!r}"
                 )
-        # Partitions are the ground truth: fill dynamic dims and validate
-        # concrete dims against the data span (max(hi) - min(lo)).
-        # See _assemble_dist_extent.
-        self.shape = _assemble_dist_extent(self.shape, self.partitions)
+        # Partitions are the ground truth: the shape must already be resolved
+        # (dynamic dims filled by the op handler) and equal to the partition
+        # extent max(hi) on every bounded axis.  See _validate_dist_extent.
+        _validate_dist_extent(self.shape, self.partitions)
 
     def find_partition(self, coord: Tuple[int, ...]) -> Tuple[int, MemRef]:
         """Return ``(index, partition)`` whose coordinate_set contains *coord*.
