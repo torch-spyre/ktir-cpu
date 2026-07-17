@@ -304,6 +304,23 @@ def linalg__broadcast(op, context, env):
     return Tile(result, inp.dtype, out_shape)
 
 
+def _accumulate_inplace(acc: "Tile", result: "Tile", context) -> "Tile":
+    """Accumulate *result* into *acc* in place and return *acc*.
+
+    Mirrors the logic of ``_materialize_iter_inits`` in ``scf_ops.py``:
+    if *acc* is a 0-LX literal (an ``arith.constant`` bound with
+    ``charge=False``), copy it into a fresh working buffer first so the
+    shared literal is never mutated.  Without this guard, a constant used
+    as the ``outs`` operand of ``linalg.matmul`` inside a loop is corrupted
+    on the first iteration; every subsequent iteration starts from the dirty
+    value instead of the intended initial value (typically zero).
+    """
+    if id(acc) in context._uncharged_tiles:
+        acc = acc.copy()
+    acc.data += result.data
+    return acc
+
+
 @register("linalg.matmul", latency_category=LC.COMPUTE_MATMUL, inplace_outs=True)
 def linalg__matmul(op, context, env):
     """Execute linalg.matmul: result = outs + ins[0] @ ins[1].
@@ -323,15 +340,10 @@ def linalg__matmul(op, context, env):
     tile_a = context.get_value(op.operands[0])  # ins[0] = A
     tile_b = context.get_value(op.operands[1])  # ins[1] = B
     result = ArithOps.matmul(tile_a, tile_b)    # A @ B
-    # Accumulate into outs (operands[2] = C) when present.
-    # In-place update: mirrors hardware behavior where the accumulator is a
-    # physical buffer written in-place. Returning the same Tile object means
-    # alias_dedup sees the same id() and doesn't double-charge LX.
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
-            acc.data += result.data
-            return acc
+            return _accumulate_inplace(acc, result, context)
     return result
 
 
@@ -353,8 +365,7 @@ def linalg__batch_matmul(op, context, env):
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
-            acc.data += result.data
-            return acc
+            return _accumulate_inplace(acc, result, context)
     return result
 
 
