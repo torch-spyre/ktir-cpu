@@ -228,6 +228,7 @@ class KTIRInterpreter:
 
         # Structural invariant: accumulating ops must return the same outs object.
         # Only applies to ops where result = f(ins) + outs (in-place accumulation).
+        # Not enforced when outs is an uncharged (0-LX literal) tile.
         if (op.outs_operands and not op.regions
                 and result is not None and not inspect.isgenerator(result)):
             for outs_name in op.outs_operands:
@@ -235,7 +236,8 @@ class KTIRInterpreter:
                     outs_tile = context.get_value(outs_name, peek=True)
                 except KeyError:
                     continue
-                if isinstance(outs_tile, Tile) and isinstance(result, Tile):
+                if (isinstance(outs_tile, Tile) and isinstance(result, Tile)
+                        and id(outs_tile) not in context._uncharged_tiles):
                     assert id(result) == id(outs_tile), (
                         f"{op.op_type}: handler returned new Tile instead of "
                         f"mutating outs {outs_name!r}"
