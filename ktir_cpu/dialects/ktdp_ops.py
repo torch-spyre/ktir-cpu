@@ -27,6 +27,7 @@ from ..ir_types import (
     Operation,
     Tile,
     TileFuture,
+    _assemble_dist_extent,
 )
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
@@ -102,6 +103,12 @@ def ktdp__construct_distributed_memory_view(op, context, env):
     ``coordinate_set`` (= B_i in global coords).  The op does not allocate
     or move data — partition resolution at access time is performed by
     ``MemoryOps.distributed_tile_access``.
+
+    The global shape is resolved here, against the partitions: dynamic dims
+    (``None``, parsed from ``?`` in the result type) are filled with the
+    per-axis extent ``max(hi)`` (the global bounding box from 0) via
+    ``_assemble_dist_extent``.  :meth:`DistributedMemRef.__post_init__` then
+    validates the resolved shape — every bounded axis must equal that extent.
     """
     partitions = [context.get_value(name) for name in op.operands]
     for i, p in enumerate(partitions):
@@ -114,9 +121,10 @@ def ktdp__construct_distributed_memory_view(op, context, env):
         raise ValueError(
             "construct_distributed_memory_view: missing required attributes 'shape'/'dtype'"
         )
+    shape = _assemble_dist_extent(tuple(op.attributes["shape"]), partitions)
     return DistributedMemRef(
         partitions=partitions,
-        shape=tuple(op.attributes["shape"]),
+        shape=shape,
         dtype=op.attributes["dtype"],
     )
 
@@ -456,7 +464,9 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
         raise ValueError(
             "construct_distributed_memory_view: could not parse result memref<> type"
         )
-    info = parse_tensor_or_memref_type(memref_match.group(1))
+    # Dynamic dims stay None here; ktdp__construct_distributed_memory_view
+    # resolves them from the partition coordinate sets.
+    info = parse_tensor_or_memref_type(memref_match.group(1), keep_dynamic_dims=True)
     if not info:
         raise ValueError(
             f"construct_distributed_memory_view: memref<{memref_match.group(1)}> "
@@ -470,7 +480,9 @@ def parse_construct_distributed_memory_view(op_text, parse_ctx: ParseContext):
         op_type="ktdp.construct_distributed_memory_view",
         operands=operands,
         attributes={"shape": shape, "dtype": dtype},
-        result_type=f"memref<{'x'.join(str(s) for s in shape)}x{dtype}>"
+        result_type=(
+            f"memref<{'x'.join('?' if s is None else str(s) for s in shape)}x{dtype}>"
+        ),
     )
 
 

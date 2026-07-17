@@ -1700,6 +1700,247 @@ class TestKtdp:
         _call("ktdp.store", ctx, env, operands=["%tile", "%acc2"])
         assert np.array_equal(hbm.read(ptr, 8, "f16"), data * 2)
 
+    # --- construct_distributed_memory_view: dynamic-shape result resolution -------
+
+    def _make_box_partition(self, lo, hi, shape):
+        """Helper: build a MemRef partition with a concrete BoxSet coord_set."""
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+
+        return MemRef(
+            base_ptr=0, shape=shape, strides=[1] * len(shape),
+            memory_space="HBM", dtype="f16",
+            coordinate_set=BoxSet(lo=tuple(lo), hi=tuple(hi)),
+        )
+
+    def test_construct_distributed_memory_view_resolves_dynamic_dim(self):
+        """``None`` in shape attr is resolved by max(partition upper bound)."""
+        ctx = _make_ctx()
+        # Two partitions covering [0, 16) and [16, 32) on axis 1; global = 32.
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1"],
+            attributes={"shape": (64, None), "dtype": "f16"},
+        )
+        assert result.shape == (64, 32)
+        assert result.dtype == "f16"
+        assert len(result.partitions) == 2
+
+    def test_construct_distributed_memory_view_resolves_3_partition_axis0(self):
+        """Mirror the concrete RFC layout (192x64 / 3 partition) on a dynamic axis."""
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(96, 64), shape=(96, 64),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(96, 0), hi=(128, 64), shape=(32, 64),
+        ))
+        ctx.set_value("%a2", self._make_box_partition(
+            lo=(128, 0), hi=(192, 64), shape=(64, 64),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1", "%a2"],
+            attributes={"shape": (None, 64), "dtype": "f16"},
+        )
+        assert result.shape == (192, 64)
+
+    def test_construct_distributed_memory_view_resolves_non_origin_to_max_hi(self):
+        """Non-origin tiling resolves the dynamic axis to ``max(hi)``.
+
+        Partitions [10, 20) and [20, 30) on axis 0 (10 rows each, local
+        shape (10, 4)) produce global shape (30, 4) — the global bounding
+        box from 0 (the highest coordinate), per RFC 0682's "global
+        coordinate domain is the union of the coordinate_set attributes".
+        The [0, 10) prefix is not covered by any partition; accessing
+        global coords there has undefined semantics and surfaces as ``no
+        partition covers`` only when the entire access region is uncovered.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(10, 0), hi=(20, 4), shape=(10, 4),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(20, 0), hi=(30, 4), shape=(10, 4),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1"],
+            attributes={"shape": (None, 4), "dtype": "f16"},
+        )
+        assert result.shape == (30, 4)
+
+    def test_construct_distributed_memory_view_concrete_rejects_undersize(self):
+        """A concrete declared dim smaller than the partition extent is rejected.
+
+        Partitions span [0, 16) and [16, 32) on axis 1, so the extent
+        ``max(hi) = 32``.  The result is declared ``64x20``; ``20 != 32`` means
+        the declared shape does not match the data the partitions cover, so the
+        extent check must reject it rather than silently build an inconsistent
+        ``DistributedMemRef``.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"declared shape axis 1 = 20 does not match the partition extent",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, 20), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_concrete_rejects_oversize(self):
+        """A concrete declared dim larger than the partition extent is rejected.
+
+        Same partitions as the undersize case span [0, 16) and [16, 32) on
+        axis 1, so the extent ``max(hi) = 32``.  The result is declared
+        ``64x48``; ``48 != 32`` means the declared shape claims coordinates no
+        partition covers, so the extent check must reject it — the declared
+        shape must equal the extent exactly, not merely be at least it.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"declared shape axis 1 = 48 does not match the partition extent",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, 48), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_affine_set_partition(self):
+        """Dynamic axis + non-BoxSet partition → ValueError naming partition + axis."""
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        # Triangular constraint: not axis-aligned, parser falls back to AffineSet.
+        affine_cs = parse_affine_set(
+            "affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0,"
+            " d1 - 16 >= 0, d0 - d1 >= 0)>"
+        )
+        ctx.set_value("%a1", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=affine_cs,
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"dynamic-shape result resolution does not support AffineSet partitions",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_empty_upper_bound(self):
+        """Dynamic axis where every partition has hi <= 0 raises a clear error."""
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 0), shape=(64, 0),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 0), hi=(64, 0), shape=(64, 0),
+        ))
+        with pytest.raises(ValueError, match=r"could not resolve dynamic axis"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_rank_mismatch(self):
+        """Partition rank != result memref rank raises a clear error."""
+        ctx = _make_ctx()
+        # 1-D partition fed to a 2-D dynamic-shape result.
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0,), hi=(64,), shape=(64,),
+        ))
+        with pytest.raises(ValueError, match=r"partition 0 has rank 1, expected 2"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_concrete_rejects_affine_set_rank_mismatch(self):
+        """Concrete result + wrong-rank AffineSet partition is caught.
+
+        Rank is now checked ahead of the partition-kind dispatch, so a rank-2
+        AffineSet against a rank-3 concrete result raises instead of silently
+        slipping through the AffineSet skip (which only tracked BoxSet bounds).
+        """
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        ctx = _make_ctx()
+        # 2-D non-axis-aligned constraint stays an AffineSet (not a BoxSet).
+        affine_cs = parse_affine_set(
+            "affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0,"
+            " d1 - 16 >= 0, d0 - d1 >= 0)>"
+        )
+        ctx.set_value("%a0", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=affine_cs,
+        ))
+        with pytest.raises(ValueError, match=r"partition 0 has rank 2, expected 3"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, 16, 8), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_non_concrete_partition(self):
+        """Non-concrete partition coord_set raises ValueError (clean under -O too)."""
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+
+        # Symbolic BoxSet with a string symbol — bypass construct_memory_view's
+        # specialise step by injecting the partition directly.
+        sym_cs = BoxSet(lo=(0, 0), hi=(64, ("sym", "s0")))
+        assert not sym_cs.is_concrete
+
+        ctx = _make_ctx()
+        ctx.set_value("%a0", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=sym_cs,
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"partition 0 coordinate_set is not concrete",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
     def test_load_respects_non_contiguous_middle_stride_via_handler(self):
         """Same scenario as test_load_respects_non_contiguous_middle_stride but
         exercised through the full ktdp.load dispatch handler and _subtile_ref
