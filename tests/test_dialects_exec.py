@@ -1940,3 +1940,151 @@ class TestKtdp:
                 operands=["%a0"],
                 attributes={"shape": (64, None), "dtype": "f16"},
             )
+
+    def test_load_respects_non_contiguous_middle_stride_via_handler(self):
+        """Same scenario as test_load_respects_non_contiguous_middle_stride but
+        exercised through the full ktdp.load dispatch handler and _subtile_ref
+        path, to catch any stride-dropping in the BoxSet fast path.
+
+        This is the path the full interpreter takes and is where the real bug
+        surfaces in the spyre_chained_scratchpad kernel.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import AccessTile, MemRef
+        from ktir_cpu.ops.memory_ops import MemoryOps
+        from ktir_cpu.parser_ast import parse_affine_map
+        from ktir_cpu.ir_types import Operation
+
+        K2, N, S = 4, 8, 4
+        n_sticks = N // S
+        M_logical = np.arange(K2 * N, dtype=np.float16).reshape(K2, N)
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(M_logical.nbytes)
+        hbm.write(ptr, M_logical.ravel())
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        env = _make_env()
+
+        base_elem = stick_to_elem_idx(ptr, "f16")
+        memref = MemRef(base_ptr=base_elem, shape=(n_sticks, K2, S),
+                        strides=[S, N, 1], memory_space="HBM", dtype="f16")
+        identity_map = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
+        tile_ref = MemoryOps.tile_access(ctx, memref, indices=[1, 0, 0],
+                                         access_shape=(1, K2, S), base_map=identity_map)
+        access_tile = AccessTile(
+            parent_ref=tile_ref, shape=(1, K2, S), base_map=identity_map,
+            coordinate_set=BoxSet(lo=(0, 0, 0), hi=(1, K2, S)), coordinate_order=None,
+        )
+        ctx.set_value("%acc", access_tile)
+
+        # Go through the full dispatch handler (not MemoryOps.load directly).
+        loaded = _call("ktdp.load", ctx, env, operands=["%acc"])
+        assert isinstance(loaded, Tile)
+        assert loaded.data.shape == (1, K2, S)
+        expected = M_logical[:, S:].reshape(1, K2, S)
+        assert np.array_equal(loaded.data, expected), (
+            f"ktdp.load handler (BoxSet fast path via _subtile_ref) dropped strides.\n"
+            f"Got:\n{loaded.data}\nExpected:\n{expected}"
+        )
+
+    def test_load_respects_non_contiguous_middle_stride(self):
+        """ktdp.load must respect non-unit strides on the memory view.
+
+        Scenario: a logical [K2=4, N=8] matrix physicalized as stick-on-N
+        with stick size S=4, giving physical shape [N//4=2, K2=4, N%4=4]
+        and physical strides [4, 8, 1] (N_floor stride=S=4, K2 stride=N=8,
+        lane stride=1).
+
+        Loading the tile for N-stick 1 (n_floor=1, K2=0..3, lane=0..3)
+        should yield a [1,4,4] tensor whose element [0, k2, lane] equals
+        M_logical[k2, 4 + lane] — i.e. columns 4-7 of the logical matrix.
+
+        A naive contiguous read starting at flat offset n_floor*S = 4
+        would read elements 4..19 from the flat array, which gives the
+        wrong K2 rows because K2 stride is 8 (= N), not 4 (= S).
+
+        This is the root cause of the spyre_chained_scratchpad numerical
+        failure: C[K2=128, N=256] physicalized stick-on-N has K2 stride
+        256, but ktdp.load was reading it contiguously with effective
+        K2 stride 64 (= S).
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_map
+
+        # Logical matrix M[K2=4, N=8], row-major: strides [8, 1].
+        # Physical (stick-on-N, S=4): shape [2, 4, 4], strides [4, 8, 1].
+        #   phys[n_floor, k2, lane] = M_logical[k2, n_floor*4 + lane]
+        K2, N, S = 4, 8, 4
+        n_sticks = N // S  # 2
+
+        M_logical = np.arange(K2 * N, dtype=np.float16).reshape(K2, N)
+        # flat layout: M_logical.ravel() = [0,1,...,7, 8,...,15, 16,...,23, 24,...,31]
+        # phys[0, k2, lane] = M_logical[k2, 0+lane] = flat[k2*8 + lane]
+        # phys[1, k2, lane] = M_logical[k2, 4+lane] = flat[k2*8 + 4 + lane]
+
+        from ktir_cpu.ir_types import AccessTile, MemRef
+        from ktir_cpu.parser_ast import parse_affine_map
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(M_logical.nbytes)
+        hbm.write(ptr, M_logical.ravel())
+
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        env = _make_env()
+
+        # Build MemRef and AccessTile directly — the same approach as
+        # test_load_store_roundtrip, which is the authoritative pattern for
+        # hand-building tiles for ktdp.load tests.
+        # base_ptr is a byte-level element index (stick_to_elem_idx converts
+        # the stick-index ptr to an element offset for f16 data).
+        base_elem = stick_to_elem_idx(ptr, "f16")
+        phys_strides = [S, N, 1]      # [4, 8, 1] — K2 stride = N = 8, not S = 4
+        phys_shape   = (n_sticks, K2, S)
+
+        memref = MemRef(
+            base_ptr=base_elem,
+            shape=phys_shape,
+            strides=phys_strides,
+            memory_space="HBM",
+            dtype="f16",
+        )
+
+        # Access tile for N-stick 1: origin [n_floor=1, k2=0, lane=0].
+        # The byte offset to the tile start is 1*S * bytes_per_elem = 1*4*2 = 8.
+        # tile_access computes: offset_elems = 1*S + 0*N + 0*1 = 4 elems.
+        identity_map = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
+        from ktir_cpu.ops.memory_ops import MemoryOps
+        tile_ref = MemoryOps.tile_access(
+            ctx, memref, indices=[1, 0, 0],
+            access_shape=(1, K2, S), base_map=identity_map,
+        )
+        access_tile = AccessTile(
+            parent_ref=tile_ref,
+            shape=(1, K2, S),
+            base_map=identity_map,
+            coordinate_set=BoxSet(lo=(0, 0, 0), hi=(1, K2, S)),
+            coordinate_order=None,
+        )
+        ctx.set_value("%acc", access_tile)
+
+        # Load the tile.
+        loaded = _call("ktdp.load", ctx, env, operands=["%acc"])
+        assert isinstance(loaded, Tile)
+        assert loaded.data.shape == (1, K2, S), (
+            f"Expected shape (1, {K2}, {S}), got {loaded.data.shape}"
+        )
+
+        # Expected: loaded[0, k2, lane] == M_logical[k2, S + lane] (columns 4-7).
+        # A naive contiguous read gives loaded[0, k2, lane] == M_logical.ravel()[4 + k2*S + lane]
+        # which is M_logical[0, 4+k2] — wrong rows for k2 > 0.
+        expected = M_logical[:, S:].reshape(1, K2, S)  # [1, 4, 4]
+        assert np.array_equal(loaded.data, expected), (
+            f"ktdp.load did not respect strides [S={S}, N={N}, 1].\n"
+            f"Got:\n{loaded.data}\n"
+            f"Expected (columns {S}..{N-1} of logical matrix):\n{expected}\n"
+            "Hint: a naive contiguous read from flat offset n_floor*S ignores "
+            "the K2 stride and gives wrong rows for k2 > 0."
+        )

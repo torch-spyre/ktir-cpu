@@ -1631,6 +1631,344 @@ class TestConstantIterArgMutation:
         assert ctx.lx.used == cst.size_bytes()
 
 
+# ---------------------------------------------------------------------------
+# MLIR for the direct-outs constant corruption test below.
+#
+# Pattern: %cst_0 is defined once outside all loops and used as the `outs`
+# operand of linalg.matmul *directly* (not via scf.for iter_arg) inside an
+# outer loop.  Each iteration should produce an independent result starting
+# from zero, but without the fix the first iteration corrupts %cst_0 in-place
+# and subsequent iterations accumulate on the dirty value.
+#
+# Concretely: A[2x2] @ B[2x2] with A=B=ones.  Result per iteration = 2.0.
+# If %cst_0 is corrupted: iteration 1 gets 2, iteration 2 gets 4, etc.
+# ---------------------------------------------------------------------------
+class TestConstantDirectOutsMutation:
+    """Regression: linalg.matmul outs(%cst) must not corrupt a shared constant.
+
+    Pattern: %cst is defined once outside an outer loop and passed *directly*
+    as the ``outs`` operand of ``linalg.matmul`` inside the loop body — not
+    via an ``scf.for iter_arg``.  The in-place update ``acc.data += result.data``
+    corrupts %cst on the first iteration; each subsequent iteration starts
+    from a dirty accumulator instead of zeros.
+
+    This is distinct from TestConstantIterArgMutation, which tests the iter_arg
+    path.  Here the constant is the ``outs`` operand itself.
+
+    The fix: when an inplace_outs op receives a 0-LX literal as its ``outs``
+    operand, it must copy the literal into a fresh working buffer before
+    accumulating, so the shared literal is never written.
+    """
+
+    def test_constant_outs_not_corrupted_across_loop_iterations(self):
+        """linalg.matmul outs(%cst) in a loop must not accumulate across iterations.
+
+        Setup: A[2x2] = B[2x2] = ones.  Each iteration computes A @ B = 2.0
+        everywhere and should store *exactly* 2.0, independent of prior iterations.
+
+        Without the fix: iteration 0 dirtied %cst to 2.0; iteration 1 starts
+        from 2.0 (not 0) and produces 4.0; iteration 2 gives 6.0; etc.
+        With the fix: every iteration produces 2.0.
+        """
+        ctx = _make_context()
+        a = _make_tile((2, 2), dtype="f32")
+        a.data[:] = 1.0
+        b = _make_tile((2, 2), dtype="f32")
+        b.data[:] = 1.0
+        cst = _make_tile((2, 2), dtype="f32")
+        cst.data[:] = 0.0
+        # Mark %cst as a 0-LX literal (arith.constant) so the handler knows
+        # it must not be mutated in place.
+        ctx.set_value("%cst", cst, charge=False)
+        ctx.set_value("%a", a)
+        ctx.set_value("%b", b)
+
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import dispatch
+
+        results = []
+        for _ in range(4):
+            op = Operation(
+                op_type="linalg.matmul",
+                operands=["%a", "%b", "%cst"],
+                attributes={},
+                result=["%r"],
+                result_type=None,
+            )
+            r = dispatch("linalg.matmul")(op, ctx, None)
+            results.append(r.data.copy())
+
+        expected = np.full((2, 2), 2.0, dtype=np.float32)
+        for i, r in enumerate(results):
+            np.testing.assert_array_equal(
+                r, expected,
+                err_msg=(
+                    f"Iteration {i}: got {r} — expected all 2.0.\n"
+                    "Non-2.0 means %cst was corrupted by in-place outs "
+                    "accumulation from a previous iteration."
+                ),
+            )
+        # The shared constant must remain clean (all zeros).
+        np.testing.assert_array_equal(
+            cst.data, np.zeros((2, 2), dtype=np.float32),
+            err_msg="The shared %cst literal was mutated — it must stay zero."
+        )
+
+    def test_constant_outs_not_corrupted_across_loop_iterations_f16(self):
+        """Same as above, but in f16 — the dtype of every real repro.
+
+        spyre_chained_scratchpad and ohadeytan's #157 flash-attention repro
+        are both f16; the f32-only coverage above never exercises Tile.copy()
+        at the precision where the bug was actually found.
+        """
+        ctx = _make_context()
+        a = _make_tile((2, 2), dtype="f16")
+        a.data[:] = 1.0
+        b = _make_tile((2, 2), dtype="f16")
+        b.data[:] = 1.0
+        cst = _make_tile((2, 2), dtype="f16")
+        cst.data[:] = 0.0
+        ctx.set_value("%cst", cst, charge=False)
+        ctx.set_value("%a", a)
+        ctx.set_value("%b", b)
+
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import dispatch
+
+        results = []
+        for _ in range(4):
+            op = Operation(
+                op_type="linalg.matmul",
+                operands=["%a", "%b", "%cst"],
+                attributes={},
+                result=["%r"],
+                result_type=None,
+            )
+            r = dispatch("linalg.matmul")(op, ctx, None)
+            results.append(r.data.copy())
+
+        expected = np.full((2, 2), 2.0, dtype=np.float16)
+        for i, r in enumerate(results):
+            np.testing.assert_array_equal(
+                r, expected,
+                err_msg=(
+                    f"Iteration {i}: got {r} — expected all 2.0 (f16).\n"
+                    "Non-2.0 means %cst was corrupted by in-place outs "
+                    "accumulation from a previous iteration."
+                ),
+            )
+        np.testing.assert_array_equal(
+            cst.data, np.zeros((2, 2), dtype=np.float16),
+            err_msg="The shared %cst literal (f16) was mutated — it must stay zero."
+        )
+
+    def test_batch_matmul_constant_outs_not_corrupted_across_loop_iterations(self):
+        """linalg.batch_matmul outs(%cst) must not corrupt a shared constant.
+
+        Mirrors test_constant_outs_not_corrupted_across_loop_iterations but for
+        linalg.batch_matmul, dispatched directly (not via scf.for iter_arg), so
+        this actually exercises _accumulate_inplace's batch_matmul call site —
+        the only prior batch_matmul constant-outs coverage
+        (test_multi_tile_bmm_correctness) goes through _materialize_iter_inits
+        in scf_ops.py instead.
+
+        Setup: A[1x2x2] = B[1x2x2] = ones. Each iteration computes A @ B = 2.0
+        everywhere and should store *exactly* 2.0, independent of prior iterations.
+        """
+        ctx = _make_context()
+        a = _make_tile((1, 2, 2), dtype="f32")
+        a.data[:] = 1.0
+        b = _make_tile((1, 2, 2), dtype="f32")
+        b.data[:] = 1.0
+        cst = _make_tile((1, 2, 2), dtype="f32")
+        cst.data[:] = 0.0
+        ctx.set_value("%cst", cst, charge=False)
+        ctx.set_value("%a", a)
+        ctx.set_value("%b", b)
+
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import dispatch
+
+        results = []
+        for _ in range(4):
+            op = Operation(
+                op_type="linalg.batch_matmul",
+                operands=["%a", "%b", "%cst"],
+                attributes={},
+                result=["%r"],
+                result_type=None,
+            )
+            r = dispatch("linalg.batch_matmul")(op, ctx, None)
+            results.append(r.data.copy())
+
+        expected = np.full((1, 2, 2), 2.0, dtype=np.float32)
+        for i, r in enumerate(results):
+            np.testing.assert_array_equal(
+                r, expected,
+                err_msg=(
+                    f"Iteration {i}: got {r} — expected all 2.0.\n"
+                    "Non-2.0 means %cst was corrupted by in-place batch_matmul "
+                    "outs accumulation from a previous iteration."
+                ),
+            )
+        np.testing.assert_array_equal(
+            cst.data, np.zeros((1, 2, 2), dtype=np.float32),
+            err_msg="The shared %cst literal was mutated by batch_matmul — it must stay zero."
+        )
+
+    def test_accumulate_inplace_returns_distinct_chargeable_copy(self):
+        """_accumulate_inplace's copy must be a distinct, chargeable object.
+
+        Parallel to test_iter_arg_init_is_distinct_object_from_constant (the
+        iter_arg path's accounting test): when the outs operand is an uncharged
+        0-LX literal, the copy _accumulate_inplace returns must (a) be a
+        different object than the literal, and (b) not itself be recorded in
+        _uncharged_tiles — i.e. it is real, chargeable buffer once bound.
+        """
+        from ktir_cpu.dialects.linalg_ops import _accumulate_inplace
+        from ktir_cpu.ir_types import Tile as _Tile
+
+        ctx = _make_context()
+        cst = _make_tile((4, 4), dtype="f32")
+        ctx.set_value("%cst", cst, charge=False)
+        assert id(cst) in ctx._uncharged_tiles
+
+        result = _Tile(np.ones((4, 4), dtype=np.float32), "f32", (4, 4))
+        copy = _accumulate_inplace(cst, result, ctx)
+
+        assert copy is not cst, "_accumulate_inplace must not mutate the shared literal in place"
+        assert id(copy) not in ctx._uncharged_tiles, "the copy must be a real (chargeable) buffer"
+
+    def test_accumulate_inplace_lx_used_increases_when_copy_is_bound(self):
+        """Binding the copy from _accumulate_inplace must charge LX, and the
+        original constant must stay uncharged and untouched in _uncharged_tiles.
+
+        Parallel to test_constant_init_is_uncharged_before_materialize. Unlike
+        the iter_arg path (_materialize_iter_inits, which rebinds the iter_arg
+        SSA name to the fresh copy), _accumulate_inplace does not rebind the
+        outs SSA name itself — the caller decides what to do with the returned
+        value. So %cst's own binding is untouched: its id remains in
+        _uncharged_tiles until %cst itself is released.
+        """
+        from ktir_cpu.dialects.linalg_ops import _accumulate_inplace
+        from ktir_cpu.ir_types import Tile as _Tile
+
+        ctx = _make_context()
+        cst = _make_tile((4, 4), dtype="f32")  # 32 bytes if charged
+        ctx.set_value("%cst", cst, charge=False)
+        assert ctx.lx.used == 0
+        assert id(cst) in ctx._uncharged_tiles
+
+        result = _Tile(np.ones((4, 4), dtype=np.float32), "f32", (4, 4))
+        copy = _accumulate_inplace(cst, result, ctx)
+
+        # The copy is not yet bound to any name, so it hasn't been charged.
+        assert ctx.lx.used == 0
+
+        ctx.set_value("%r", copy)
+        assert ctx.lx.used == copy.size_bytes(), "binding the copy must charge LX"
+
+        # %cst's own binding is untouched — _accumulate_inplace never rebinds it.
+        assert id(cst) in ctx._uncharged_tiles, "%cst's uncharged binding must survive the call"
+        assert ctx.get_value("%cst") is cst, "%cst must still refer to the original literal"
+
+    def test_shared_constant_two_matmuls_independent_copies(self):
+        """Two matmuls sharing one %cst literal in the same iteration must each
+        get an independent, correctly-accumulated copy — the shared literal
+        must never be touched by either.
+
+        Regression for refcount interaction: naively copying and mutating
+        %cst twice must not leave the second copy seeing the first copy's
+        mutation, and must not corrupt %cst for later use.
+        """
+        ctx = _make_context()
+        cst = _make_tile((2, 2), dtype="f32")
+        cst.data[:] = 0.0
+        ctx.set_value("%cst", cst, charge=False)
+
+        a1 = _make_tile((2, 2), dtype="f32"); a1.data[:] = 1.0
+        b1 = _make_tile((2, 2), dtype="f32"); b1.data[:] = 1.0
+        a2 = _make_tile((2, 2), dtype="f32"); a2.data[:] = 2.0
+        b2 = _make_tile((2, 2), dtype="f32"); b2.data[:] = 3.0
+        ctx.set_value("%a1", a1)
+        ctx.set_value("%b1", b1)
+        ctx.set_value("%a2", a2)
+        ctx.set_value("%b2", b2)
+
+        from ktir_cpu.ir_types import Operation
+        from ktir_cpu.dialects.registry import dispatch
+
+        op1 = Operation(
+            op_type="linalg.matmul", operands=["%a1", "%b1", "%cst"],
+            attributes={}, result=["%r1"], result_type=None,
+        )
+        op2 = Operation(
+            op_type="linalg.matmul", operands=["%a2", "%b2", "%cst"],
+            attributes={}, result=["%r2"], result_type=None,
+        )
+
+        r1 = dispatch("linalg.matmul")(op1, ctx, None)
+        r2 = dispatch("linalg.matmul")(op2, ctx, None)
+
+        # A1@B1 = 1*1*2 = 2.0; A2@B2 = 2*3*2 = 12.0. Each starts fresh from %cst=0.
+        np.testing.assert_array_equal(
+            r1.data, np.full((2, 2), 2.0, dtype=np.float32),
+            err_msg="first matmul's copy of %cst was not independent",
+        )
+        np.testing.assert_array_equal(
+            r2.data, np.full((2, 2), 12.0, dtype=np.float32),
+            err_msg="second matmul's copy of %cst was not independent — likely aliased r1's copy",
+        )
+        assert r1.data is not r2.data
+        np.testing.assert_array_equal(
+            cst.data, np.zeros((2, 2), dtype=np.float32),
+            err_msg="the shared %cst literal was mutated by one of the two matmuls",
+        )
+
+    def test_constant_outs_via_execute_op_does_not_trip_structural_assertion(self):
+        """Same scenario, but through KTIRInterpreter._execute_op (assertions live).
+
+        The direct-handler-dispatch test above never exercises the structural
+        outs-invariant assertion in interpreter.py, since that assertion lives
+        in _execute_op, not in the handler.  A handler that legitimately
+        returns a copy (because outs was an uncharged 0-LX literal) must not
+        trip "handler returned new Tile instead of mutating outs" — the
+        assertion should recognize this as the intended exception, not a bug.
+        """
+        from ktir_cpu.interpreter import KTIRInterpreter
+        from ktir_cpu.ir_types import Operation
+
+        ctx = _make_context()
+        a = _make_tile((2, 2), dtype="f32")
+        a.data[:] = 1.0
+        b = _make_tile((2, 2), dtype="f32")
+        b.data[:] = 1.0
+        cst = _make_tile((2, 2), dtype="f32")
+        cst.data[:] = 0.0
+        ctx.set_value("%cst", cst, charge=False)
+        ctx.set_value("%a", a)
+        ctx.set_value("%b", b)
+
+        interp = KTIRInterpreter()
+        interp.load('module { func.func @dummy() attributes {grid = [1]} { return } }')
+
+        expected = np.full((2, 2), 2.0, dtype=np.float32)
+        for i in range(4):
+            op = Operation(
+                op_type="linalg.matmul",
+                operands=["%a", "%b", "%cst"],
+                attributes={},
+                result="%r",
+                result_type="tensor<2x2xf32>",
+                outs_operands=["%cst"],
+            )
+            r = interp._execute_op(op, ctx)
+            np.testing.assert_array_equal(
+                r.data, expected,
+                err_msg=f"Iteration {i}: got {r.data} — expected all 2.0.",
+            )
+
+
 class TestConstantNoLXCharge:
     """arith.constant tensors are 0-LX literals; consumers pay for real buffers."""
 

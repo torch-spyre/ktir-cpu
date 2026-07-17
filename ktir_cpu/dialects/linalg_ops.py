@@ -246,20 +246,27 @@ def linalg__reduce(op, context, env):
     return result
 
 
-@register("linalg.add", latency_category=LC.COMPUTE_FLOAT)
-def linalg__add(op, context, env):
-    """Elementwise tensor add — ``%c = linalg.add ins(%a, %b) outs(%init)``.
+_LINALG_BINOP = {
+    "linalg.add": lambda a, b: a + b,
+    "linalg.max": np.maximum,
+}
 
-    Standard MLIR named op: result = a + b (the outs buffer provides the
-    destination shape only; its values are not accumulated into in v1).
+
+@register("linalg.add", "linalg.max", latency_category=LC.COMPUTE_FLOAT)
+def linalg__binop(op, context, env):
+    """Elementwise binary named ops (add, max) — ins(%a, %b) outs(%init).
+
+    The outs buffer provides the destination shape only; its values are
+    not accumulated into the result.
     """
     tile_a = context.get_value(op.operands[0])
     tile_b = context.get_value(op.operands[1])
     if not isinstance(tile_a, Tile) or not isinstance(tile_b, Tile):
         raise TypeError(
-            f"linalg.add: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
+            f"{op.op_type}: ins must be Tiles, got {type(tile_a)} and {type(tile_b)}"
         )
-    return Tile(tile_a.data + tile_b.data, tile_a.dtype, tile_a.shape)
+    fn = _LINALG_BINOP[op.op_type]
+    return Tile(fn(tile_a.data, tile_b.data), tile_a.dtype, tile_a.shape)
 
 
 @register("linalg.fill")
@@ -297,6 +304,23 @@ def linalg__broadcast(op, context, env):
     return Tile(result, inp.dtype, out_shape)
 
 
+def _accumulate_inplace(acc: "Tile", result: "Tile", context) -> "Tile":
+    """Accumulate *result* into *acc* in place and return *acc*.
+
+    Mirrors the logic of ``_materialize_iter_inits`` in ``scf_ops.py``:
+    if *acc* is a 0-LX literal (an ``arith.constant`` bound with
+    ``charge=False``), copy it into a fresh working buffer first so the
+    shared literal is never mutated.  Without this guard, a constant used
+    as the ``outs`` operand of ``linalg.matmul`` inside a loop is corrupted
+    on the first iteration; every subsequent iteration starts from the dirty
+    value instead of the intended initial value (typically zero).
+    """
+    if id(acc) in context._uncharged_tiles:
+        acc = acc.copy()
+    acc.data += result.data
+    return acc
+
+
 @register("linalg.matmul", latency_category=LC.COMPUTE_MATMUL, inplace_outs=True)
 def linalg__matmul(op, context, env):
     """Execute linalg.matmul: result = outs + ins[0] @ ins[1].
@@ -316,15 +340,10 @@ def linalg__matmul(op, context, env):
     tile_a = context.get_value(op.operands[0])  # ins[0] = A
     tile_b = context.get_value(op.operands[1])  # ins[1] = B
     result = ArithOps.matmul(tile_a, tile_b)    # A @ B
-    # Accumulate into outs (operands[2] = C) when present.
-    # In-place update: mirrors hardware behavior where the accumulator is a
-    # physical buffer written in-place. Returning the same Tile object means
-    # alias_dedup sees the same id() and doesn't double-charge LX.
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
-            acc.data += result.data
-            return acc
+            return _accumulate_inplace(acc, result, context)
     return result
 
 
@@ -346,8 +365,7 @@ def linalg__batch_matmul(op, context, env):
     if len(op.operands) > 2:
         acc = context.get_value(op.operands[2])
         if isinstance(acc, Tile):
-            acc.data += result.data
-            return acc
+            return _accumulate_inplace(acc, result, context)
     return result
 
 
