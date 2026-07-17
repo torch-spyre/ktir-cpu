@@ -28,7 +28,9 @@ from enum import StrEnum
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
-from .ir_types import AccessTile, IndirectAccessTile, MemRef, Tile, TileRef
+from .ir_types import (
+    AccessTile, DistributedTileRef, IndirectAccessTile, MemRef, Tile, TileRef,
+)
 from .dtypes import bytes_per_elem
 from .memory import HBMSimulator
 
@@ -92,6 +94,14 @@ class HardwareConfig:
         """HBM bytes per cycle available to each core."""
         bytes_per_cycle_total = self.hbm_bandwidth_tb_s * 1e12 / (self.clock_ghz * 1e9)
         return bytes_per_cycle_total / self.num_cores
+
+    def lx_bytes_per_cycle(self) -> float:
+        """LX bandwidth in bytes/cycle (derived: ring_bandwidth_tb_s * 1)."""
+        return self.ring_bandwidth_tb_s * 1e12 / (self.clock_ghz * 1e9)
+
+    def lx_bytes_per_cycle_per_core(self) -> float:
+        """LX bytes/cycle for one core (private scratchpad, same as lx_bytes_per_cycle)."""
+        return self.lx_bytes_per_cycle()
 
     @property
     def ring_bytes_per_cycle(self) -> float:
@@ -238,7 +248,18 @@ class LatencyTracker:
             # lives in LX as an SSA value, so no DMA occurs.
             if self._memory_space(operands) == "LX":
                 return ("memory", 0.0, 0.0, 0)
-            # HBM load/store: cycles = bytes / per-core bandwidth.
+            # Distributed view with mixed HBM + LX partitions:
+            # decompose cost per memory space, take max (overlapped).
+            if self._is_distributed_mixed(operands):
+                hbm_bytes = self._data_size(result, operands)
+                lx_bytes = self._lx_partition_bytes(operands)
+                hbm_bw = self.config.hbm_bytes_per_cycle_per_core
+                lx_bw = self.config.lx_bytes_per_cycle_per_core()
+                hbm_cycles = hbm_bytes / hbm_bw if hbm_bw > 0 else 0.0
+                lx_cycles = lx_bytes / lx_bw if lx_bw > 0 else 0.0
+                cycles = max(hbm_cycles, lx_cycles)
+                return ("memory", cycles, 0.0, hbm_bytes + lx_bytes)
+            # Uniform HBM: cycles = bytes / per-core bandwidth.
             # Pure data movement — no FLOPs, only bytes transferred.
             nbytes = self._data_size(result, operands)
             bw = self.config.hbm_bytes_per_cycle_per_core
@@ -312,12 +333,37 @@ class LatencyTracker:
             if isinstance(v, TileRef):
                 return v.memref.memory_space
             if isinstance(v, AccessTile):
+                if isinstance(v.parent_ref, DistributedTileRef):
+                    if any(p.memref.memory_space == "HBM"
+                           for p in v.parent_ref.partitions):
+                        return "HBM"
+                    return v.parent_ref.partitions[0].memref.memory_space
                 return v.parent_ref.memref.memory_space
             if isinstance(v, IndirectAccessTile):
                 all_lx = (v.parent_ref.memory_space == "LX" and
                           all(iv.memory_space == "LX" for iv in v.index_views))
                 return "LX" if all_lx else "HBM"
         return "HBM"
+
+    @staticmethod
+    def _is_distributed_mixed(operands: List[Any]) -> bool:
+        """True if operands contain a DistributedTileRef with heterogeneous memory spaces."""
+        for v in operands:
+            if isinstance(v, AccessTile) and isinstance(v.parent_ref, DistributedTileRef):
+                spaces = {p.memref.memory_space for p in v.parent_ref.partitions}
+                return len(spaces) > 1
+        return False
+
+    @staticmethod
+    def _lx_partition_bytes(operands: List[Any]) -> int:
+        """Sum bytes from LX partitions in a distributed view."""
+        for v in operands:
+            if isinstance(v, AccessTile) and isinstance(v.parent_ref, DistributedTileRef):
+                return sum(
+                    p.size_bytes() for p in v.parent_ref.partitions
+                    if p.memref.memory_space == "LX"
+                )
+        return 0
 
     @staticmethod
     def _data_size(result: Any, operands: List[Any]) -> int:

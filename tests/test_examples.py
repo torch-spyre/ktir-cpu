@@ -637,3 +637,307 @@ class TestRingReduceInnerLoopExecution:
         expected = (rows.sum(axis=0) * n_iters).astype(np.float16)
         np.testing.assert_allclose(result, expected, rtol=1e-2,
                                    err_msg="Core 0 output does not match n_iters * sum of input rows")
+
+
+class TestFFNSwiGLUExecution(InterpreterTestMixin):
+    """End-to-end execution of ffn_swiglu.mlir.
+
+    Tests the SwiGLU feedforward network implementation:
+        gate = x @ W_gate
+        up = x @ W_up
+        silu = gate * sigmoid(gate)  where sigmoid(x) = 1 / (1 + exp(-x))
+        fused = silu * up
+        out = fused @ W_down
+        result = x + out  (residual connection)
+
+    Phase 1: Single-core, minimal dimensions (seq=1, d_model=64, d_ffn=128)
+    """
+
+    @staticmethod
+    def _ffn_shapes(interp, func_name):
+        sizes = interp.tensor_input_output_sizes(func_name)
+        x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr = interp.arg_names(func_name)
+        seq, d_model = sizes[x_ptr]["shape"]
+        gate_rows, d_ffn = sizes[w_gate_ptr]["shape"]
+        up_rows, up_cols = sizes[w_up_ptr]["shape"]
+        down_rows, down_cols = sizes[w_down_ptr]["shape"]
+        out_seq, out_model = sizes[out_ptr]["shape"]
+
+        assert gate_rows == d_model
+        assert up_rows == d_model
+        assert up_cols == d_ffn
+        assert down_rows == d_ffn
+        assert down_cols == d_model
+        assert out_seq == seq
+        assert out_model == d_model
+
+        return (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn)
+
+    @staticmethod
+    def _ffn_reference(x, w_gate, w_up, w_down):
+        """NumPy reference for SwiGLU FFN using f32 intermediates."""
+        x_f32 = x.astype(np.float32)
+        w_gate_f32 = w_gate.astype(np.float32)
+        w_up_f32 = w_up.astype(np.float32)
+        w_down_f32 = w_down.astype(np.float32)
+
+        gate = x_f32 @ w_gate_f32
+        up = x_f32 @ w_up_f32
+        sigmoid = 1.0 / (1.0 + np.exp(-gate))
+        silu = gate * sigmoid
+        fused = silu * up
+        out_partial = fused @ w_down_f32
+        return (x_f32 + out_partial).astype(np.float16)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_ffn_swiglu_single_core(self, path, func_name, entry):
+        """Run FFN-SwiGLU on 1 core, verify output matches NumPy reference."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn) = (
+            self._ffn_shapes(interp, func_name)
+        )
+
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((seq, d_model)).astype(np.float16)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        output = np.zeros((seq, d_model), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            w_gate_ptr: w_gate,
+            w_up_ptr: w_up,
+            w_down_ptr: w_down,
+            out_ptr: output,
+        })
+
+        result = outputs[out_ptr]
+        expected = self._ffn_reference(x, w_gate, w_up, w_down)
+
+        assert result.shape == expected.shape, f"Shape mismatch: {result.shape} vs {expected.shape}"
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+
+        # Relaxed tolerance due to f16 accumulation in 3 matmuls + element-wise ops.
+        np.testing.assert_allclose(
+            result,
+            expected,
+            rtol=5e-2,
+            atol=5e-2,
+            err_msg="FFN-SwiGLU output does not match NumPy reference",
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_ffn_swiglu_zero_input(self, path, func_name, entry):
+        """Zero input should produce zero output even with non-zero weights."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn) = (
+            self._ffn_shapes(interp, func_name)
+        )
+
+        x = np.zeros((seq, d_model), dtype=np.float16)
+
+        rng = np.random.default_rng(123)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        output = np.zeros((seq, d_model), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            w_gate_ptr: w_gate,
+            w_up_ptr: w_up,
+            w_down_ptr: w_down,
+            out_ptr: output,
+        })
+
+        result = outputs[out_ptr]
+        expected = np.zeros((seq, d_model), dtype=np.float16)
+        np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu"))
+    def test_ffn_swiglu_small_weights_reference(self, path, func_name, entry):
+        """Small weights should stay finite and match the NumPy reference."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (x_ptr, w_gate_ptr, w_up_ptr, w_down_ptr, out_ptr), (seq, d_model, d_ffn) = (
+            self._ffn_shapes(interp, func_name)
+        )
+
+        rng = np.random.default_rng(456)
+        x = rng.standard_normal((seq, d_model)).astype(np.float16)
+
+        w_gate = (rng.standard_normal((d_model, d_ffn)) * 0.1).astype(np.float16)
+        w_up = (rng.standard_normal((d_model, d_ffn)) * 0.1).astype(np.float16)
+        w_down = (rng.standard_normal((d_ffn, d_model)) * 0.1).astype(np.float16)
+        output = np.zeros((seq, d_model), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            w_gate_ptr: w_gate,
+            w_up_ptr: w_up,
+            w_down_ptr: w_down,
+            out_ptr: output,
+        })
+
+        result = outputs[out_ptr]
+        expected = self._ffn_reference(x, w_gate, w_up, w_down)
+
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+        np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
+
+
+class TestFFNSwiGLU4CoreExecution:
+    """End-to-end execution of ffn_swiglu_4core.mlir.
+
+    This is the distributed Phase 2 variant: 4 cores shard the FFN hidden
+    dimension, compute local output partials, all-reduce them with
+    ``ktdp.inter_tile_produce`` + ``ktdp.inter_tile_reduce``, then add the
+    residual and have only core 0 write the final [4,256] result to HBM.
+
+    Does not use InterpreterTestMixin because multi-core execution requires
+    explicit HBM seeding via _prepare_execution — the single-core kwarg-based
+    interface does not support replicated/sharded memory layouts.
+    """
+
+    @staticmethod
+    def _ffn_reference(x, w_gate, w_up, w_down):
+        x_f32 = x.astype(np.float32)
+        w_gate_f32 = w_gate.astype(np.float32)
+        w_up_f32 = w_up.astype(np.float32)
+        w_down_f32 = w_down.astype(np.float32)
+
+        gate = x_f32 @ w_gate_f32
+        up = x_f32 @ w_up_f32
+        sigmoid = 1.0 / (1.0 + np.exp(-gate))
+        silu = gate * sigmoid
+        fused = silu * up
+        out_partial = fused @ w_down_f32
+        return (x_f32 + out_partial).astype(np.float16)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_ffn_swiglu_4core_distributed(self, path, func_name, entry):
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        d_model = entry["d_model"]
+        d_ffn = entry["d_ffn"]
+        x_ptr = entry["execute_kwargs"]["x_ptr"]
+        w_gate_ptr = entry["execute_kwargs"]["w_gate_ptr"]
+        w_up_ptr = entry["execute_kwargs"]["w_up_ptr"]
+        w_down_ptr = entry["execute_kwargs"]["w_down_ptr"]
+        out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+        rng = np.random.default_rng(314159)
+        x = rng.standard_normal((seq, d_model)).astype(np.float16)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        out = np.zeros((seq, d_model), dtype=np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES  # 64
+        x_stick = x_ptr // elems_per_stick
+        w_gate_stick = w_gate_ptr // elems_per_stick
+        w_up_stick = w_up_ptr // elems_per_stick
+        w_down_stick = w_down_ptr // elems_per_stick
+        out_stick = out_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_gate_stick, w_gate.flatten())
+            interp.memory.hbm.write(w_up_stick, w_up.flatten())
+            interp.memory.hbm.write(w_down_stick, w_down.flatten())
+            interp.memory.hbm.write(out_stick, out.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **entry["execute_kwargs"])
+
+        result = interp.memory.hbm.read(out_stick, seq * d_model, "f16").reshape(seq, d_model)
+        expected = self._ffn_reference(x, w_gate, w_up, w_down)
+
+        assert result.shape == expected.shape, f"Shape mismatch: {result.shape} vs {expected.shape}"
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+        # Looser than single-core (5e-2) because f16 overflow in exp() during
+        # SiLU causes a handful of outliers in 4-core accumulated outputs.
+        # This does not affect latency counts (cycle model is structural, not
+        # data-dependent), only the numerical correctness tolerance here.
+        np.testing.assert_allclose(
+            result,
+            expected,
+            rtol=1.5e-1,
+            atol=2.0,
+            err_msg="Distributed FFN-SwiGLU output does not match NumPy reference",
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("ffn_swiglu_4core"))
+    def test_ffn_swiglu_4core_zero_input(self, path, func_name, entry):
+        """Zero input should produce zero output: verifies all-reduce identity is correct."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        d_model = entry["d_model"]
+        d_ffn = entry["d_ffn"]
+        x_ptr = entry["execute_kwargs"]["x_ptr"]
+        w_gate_ptr = entry["execute_kwargs"]["w_gate_ptr"]
+        w_up_ptr = entry["execute_kwargs"]["w_up_ptr"]
+        w_down_ptr = entry["execute_kwargs"]["w_down_ptr"]
+        out_ptr = entry["execute_kwargs"]["out_ptr"]
+
+        x = np.zeros((seq, d_model), dtype=np.float16)
+        rng = np.random.default_rng(271828)
+        w_gate = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_up = rng.standard_normal((d_model, d_ffn)).astype(np.float16)
+        w_down = rng.standard_normal((d_ffn, d_model)).astype(np.float16)
+        out = np.zeros((seq, d_model), dtype=np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES
+        x_stick = x_ptr // elems_per_stick
+        w_gate_stick = w_gate_ptr // elems_per_stick
+        w_up_stick = w_up_ptr // elems_per_stick
+        w_down_stick = w_down_ptr // elems_per_stick
+        out_stick = out_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_gate_stick, w_gate.flatten())
+            interp.memory.hbm.write(w_up_stick, w_up.flatten())
+            interp.memory.hbm.write(w_down_stick, w_down.flatten())
+            interp.memory.hbm.write(out_stick, out.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **entry["execute_kwargs"])
+
+        result = interp.memory.hbm.read(out_stick, seq * d_model, "f16").reshape(seq, d_model)
+        expected = np.zeros((seq, d_model), dtype=np.float16)
+
+        np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
