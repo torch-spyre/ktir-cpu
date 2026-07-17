@@ -46,11 +46,12 @@ CoordinateSet = Union[BoxSet, AffineSet, List[Tuple[int, ...]]]
 class MemRef:
     """Hardware-aware memory view (result of construct_memory_view).
 
-    Represents a logical view over allocated memory.  ``base_ptr`` is a
-    stick index for HBM or a byte address for LX.  Use ``byte_address``
-    to get the absolute byte position regardless of memory space.
+    Represents a logical view over allocated memory.  ``base_ptr`` is an
+    element index — the number of elements from the start of the address
+    space, matching what MLIR pointer operands carry.  Use ``byte_address``
+    to get the absolute byte position for load/store.
     """
-    base_ptr: int              # stick index (HBM) or byte address (LX)
+    base_ptr: int              # element index (both HBM and LX)
     shape: Tuple[int, ...]
     strides: List[int]         # element counts
     memory_space: str          # "HBM" or "LX"
@@ -82,10 +83,8 @@ class MemRef:
     @property
     def byte_address(self) -> int:
         """Absolute byte address of this memref's base in its memory space."""
-        if self.memory_space == "HBM":
-            from .memory import HBMSimulator
-            return self.base_ptr * HBMSimulator.STICK_BYTES
-        return self.base_ptr
+        from .dtypes import bytes_per_elem
+        return self.base_ptr * bytes_per_elem(self.dtype)
 
     def to_tile_ref(self) -> 'TileRef':
         """Convert to a byte-addressed TileRef for load/store operations."""
@@ -115,6 +114,146 @@ class MemRef:
         """Calculate size in bytes."""
         from .dtypes import bytes_per_elem
         return int(np.prod(self.shape) * bytes_per_elem(self.dtype))
+
+
+def _infer_partition_extent(
+    partitions: List[MemRef],
+    ndim: int,
+) -> Tuple[Tuple[Optional[int], ...], List[int]]:
+    """Infer the per-axis global extent from the partitions (ground truth).
+
+    Validates **every** partition up front, regardless of kind: its
+    coordinate set must match the result rank (``BoxSet`` partitions must
+    additionally be concrete).  For each axis the extent is ``max(hi)``, the
+    highest global coordinate across the ``BoxSet`` partitions (the global
+    bounding box from 0); an axis with no ``BoxSet`` contribution stays
+    ``None``.
+
+    ``AffineSet`` partitions expose no per-axis bounds, so they add no extent
+    (on the concrete path they dispatch via ``find_partition`` / ``.contains()``
+    at access time).  Their indices are returned so the caller can reject them
+    on the dynamic-shape path, where a missing extent cannot be filled.
+
+    Returns ``(inferred_extent, affine_partition_indices)``.
+    """
+    max_hi: List[Optional[int]] = [None] * ndim
+    affine_indices: List[int] = []
+    for i, part in enumerate(partitions):
+        cs = part.coordinate_set
+        # Rank is checked for every partition kind, ahead of the kind
+        # dispatch, so a wrong-rank AffineSet against a concrete result is
+        # caught too (it previously slipped through the AffineSet skip).
+        if cs.n_dims != ndim:
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} has rank "
+                f"{cs.n_dims}, expected {ndim} to match result memref rank"
+            )
+        if not isinstance(cs, BoxSet):
+            affine_indices.append(i)
+            continue
+        if not cs.is_concrete:
+            # `ValueError` (not `assert`) so the failure is loud under `python -O`.
+            raise ValueError(
+                f"construct_distributed_memory_view: partition {i} coordinate_set "
+                f"is not concrete; construct_memory_view should have specialised it "
+                f"against runtime symbols before reaching this point"
+            )
+        for axis in range(ndim):
+            hi_a = cs.hi[axis]
+            if max_hi[axis] is None or hi_a > max_hi[axis]:
+                max_hi[axis] = hi_a
+    inferred = tuple(max_hi[axis] for axis in range(ndim))
+    return inferred, affine_indices
+
+
+def _assemble_dist_extent(
+    shape: Tuple[Optional[int], ...],
+    partitions: List[MemRef],
+) -> Tuple[int, ...]:
+    """Assemble a distributed view's concrete global shape from its partitions.
+
+    Resolution only: each dynamic axis (``None``, parsed from ``?`` in the
+    result type) is filled with the inferred extent ``max(hi)`` — the highest
+    global coordinate across the ``BoxSet`` partitions (the global bounding box
+    from 0), per :func:`_infer_partition_extent`.  Concrete axes pass through
+    untouched; they are checked separately in :func:`_validate_dist_extent`,
+    which every :class:`DistributedMemRef` construction runs.
+
+    An axis with no ``BoxSet`` contribution has no inferred extent (``None``).
+    A dynamic axis cannot be filled from such an extent, so a dynamic result
+    with any ``AffineSet`` partition is rejected outright.  The concrete path
+    accepts ``AffineSet`` partitions normally (they dispatch via
+    ``find_partition`` at access time); bounding-box derivation for
+    ``AffineSet`` is tracked under #74.
+
+    This value does not affect addressing.  The ``BoxSet`` fast path routes via
+    each partition's ``coordinate_set`` and ``p_i = min(B_i)``; the slow path
+    enumerates each ``BoxSet`` partition against its own bounds
+    (``B_i.enumerate()``), not the global shape.  Only an ``AffineSet``
+    partition on the slow path still needs an external search box — the
+    remaining #74 limitation.
+    """
+    ndim = len(shape)
+    inferred, affine_indices = _infer_partition_extent(partitions, ndim)
+    if affine_indices and any(s is None for s in shape):
+        i = affine_indices[0]
+        cs = partitions[i].coordinate_set
+        raise ValueError(
+            f"construct_distributed_memory_view: dynamic-shape result "
+            f"resolution does not support {type(cs).__name__} partitions "
+            f"(partition {i} on this op).  The concrete-shape path accepts "
+            f"AffineSet partitions normally (they dispatch via find_partition "
+            f"at access time).  Declare the result memref with concrete dims "
+            f"to use this partition."
+        )
+    resolved = list(shape)
+    for axis, dim in enumerate(shape):
+        if dim is None:
+            extent = inferred[axis]
+            if extent is None or extent <= 0:
+                raise ValueError(
+                    f"construct_distributed_memory_view: could not resolve "
+                    f"dynamic axis {axis}: no positive extent (max(hi)) "
+                    f"across partitions"
+                )
+            resolved[axis] = extent
+    return tuple(resolved)
+
+
+def _validate_dist_extent(
+    shape: Tuple[int, ...],
+    partitions: List[MemRef],
+) -> None:
+    """Validate a resolved global shape against the partition extent.
+
+    Invariant enforced on **every** :class:`DistributedMemRef` construction
+    (not only those built through the op handler): the shape must be fully
+    concrete, and each axis with an inferred bound must equal that bound —
+    ``declared == max(hi)`` — so the declared shape names exactly the global
+    coordinate extent its partitions cover.  Resolution of dynamic dims happens
+    upstream in :func:`_assemble_dist_extent`, so a residual ``None`` here is a
+    construction error, not a shape to fill.
+
+    An axis covered solely by ``AffineSet`` partitions has no inferred bound
+    (``None``) and passes unchecked (a wrong-rank partition is still rejected in
+    :func:`_infer_partition_extent`); bounding-box derivation for ``AffineSet``
+    is tracked under #74.
+    """
+    inferred, _ = _infer_partition_extent(partitions, len(shape))
+    for axis, dim in enumerate(shape):
+        if dim is None:
+            raise ValueError(
+                f"construct_distributed_memory_view: declared shape must be "
+                f"fully resolved before construction; axis {axis} is None"
+            )
+        extent = inferred[axis]
+        if extent is not None and dim != extent:
+            raise ValueError(
+                f"construct_distributed_memory_view: declared shape axis {axis} "
+                f"= {dim} does not match the partition extent (max(hi)) = {extent}; "
+                f"the view's declared shape must equal the global coordinate extent "
+                f"covered by its partitions"
+            )
 
 
 @dataclass
@@ -150,6 +289,10 @@ class DistributedMemRef:
                     f"DistributedMemRef partition {i} dtype {p.dtype!r} "
                     f"does not match view dtype {self.dtype!r}"
                 )
+        # Partitions are the ground truth: the shape must already be resolved
+        # (dynamic dims filled by the op handler) and equal to the partition
+        # extent max(hi) on every bounded axis.  See _validate_dist_extent.
+        _validate_dist_extent(self.shape, self.partitions)
 
     def find_partition(self, coord: Tuple[int, ...]) -> Tuple[int, MemRef]:
         """Return ``(index, partition)`` whose coordinate_set contains *coord*.
@@ -380,6 +523,7 @@ class Operation:
     attributes: Dict[str, Any]  # Operation attributes
     result_type: Optional[str]  # Result type string
     regions: List[List['Operation']] = field(default_factory=list)  # For control flow
+    outs_operands: List[str] = field(default_factory=list)  # SSA names from outs(...)
 
     def __repr__(self):
         if self.result:
@@ -403,6 +547,7 @@ class IRFunction:
     arguments: List[Tuple[str, str]]  # [(name, type), ...]
     operations: List[Operation]
     grid: Tuple[int, int, int]  # Grid shape from function attributes
+    use_counts: Dict[str, int] = field(default_factory=dict)  # SSA name -> use count for function body
     return_type: Optional[str] = None
     tensor_sizes: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 

@@ -133,6 +133,21 @@ class MLIRTypeAdapter:
             )
         handler(mlir_op, attributes, result_type, operands)
 
+        from ..dialects.registry import is_inplace_outs
+        from ..parser_utils import extract_outs_operands, extract_bb0_arg_names
+        op_asm = mlir_op.get_asm()
+        outs_operands = (extract_outs_operands(op_asm)
+                         if is_inplace_outs(mlir_op.name) else [])
+        bb0_names = extract_bb0_arg_names(op_asm)
+        if bb0_names and regions:
+            regions[0].insert(0, Operation(
+                result=None,
+                op_type="region.bb0_args",
+                operands=[],
+                attributes={"names": bb0_names},
+                result_type=None,
+            ))
+
         return Operation(
             result=result,
             op_type=mlir_op.name,
@@ -140,6 +155,7 @@ class MLIRTypeAdapter:
             attributes=attributes,
             result_type=result_type,
             regions=regions,
+            outs_operands=outs_operands,
         )
 
     def adapt_block(self, block) -> List[Operation]:
@@ -157,12 +173,13 @@ def _no_attrs(mlir_op, attributes, result_type, operands):
 MLIRTypeAdapter.install(
     "func.return",
     "linalg.add",
+    "linalg.max",
     "linalg.fill",
-    "linalg.matmul",
-    "linalg.batch_matmul",
     "linalg.yield",
     "scf.yield",
     "scf.if",
+    "ktdp.yield_partial",
+    "ktdp.yield_reduced",
     # float binary
     "arith.addf", "arith.subf", "arith.mulf", "arith.divf", "arith.remf",
     # float unary
@@ -215,6 +232,8 @@ MLIRTypeAdapter.install(
     "ktdp.get_compute_tile_id",
     "ktdp.load",
     "ktdp.store",
+    "linalg.matmul",
+    "linalg.batch_matmul",
     # emitted by the bindings walk but not present in text IR
     "ktdp.region_terminator",
 )(_no_attrs)
@@ -305,20 +324,37 @@ def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
     if not m:
         raise ValueError(f"ktdp.construct_memory_view: cannot parse dtype from {result_type!r}")
     attributes["dtype"] = m.group(1)
-    # str(memory_space attr) → "#ktdp.spyre_memory_space<HBM>"
-    ms = re.search(r'#ktdp\.spyre_memory_space<(\w+)>',
-                   str(mlir_op.attributes["memory_space"]))
+    # str(memory_space attr) -> "#ktdp.spyre_memory_space<HBM>" or "<LX, core = 0>"
+    ms = re.search(
+        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
+        str(mlir_op.attributes["memory_space"]),
+    )
     if not ms:
         raise ValueError(
             f"ktdp.construct_memory_view: cannot parse memory_space from "
             f"{mlir_op.attributes['memory_space']!r}"
         )
     attributes["memory_space"] = ms.group(1)
+    if ms.group(2) is not None:
+        attributes["lx_core_id"] = int(ms.group(2))
     # str(coordinate_set attr) → "affine_set<(d0) : ...>"
     if "coordinate_set" in mlir_op.attributes:
         attributes["coordinate_set"] = parse_affine_set(
             str(mlir_op.attributes["coordinate_set"])
         )
+
+
+@MLIRTypeAdapter.install("ktdp.construct_distributed_memory_view")
+def _adapt_construct_distributed_memory_view(mlir_op, attributes, result_type, operands):
+    """Extract shape and dtype from the result memref type."""
+    from ..parser_utils import parse_memref_dims
+
+    m = re.search(r'memref<([^>]+)>\s*$', result_type)
+    if not m:
+        raise ValueError(
+            f"ktdp.construct_distributed_memory_view: cannot parse result type {result_type!r}"
+        )
+    attributes["shape"], attributes["dtype"] = parse_memref_dims(m.group(1))
 
 
 @MLIRTypeAdapter.install("ktdp.construct_indirect_access_tile")
@@ -422,7 +458,7 @@ def _adapt_construct_indirect_access_tile(mlir_op, attributes, result_type, oper
 @MLIRTypeAdapter.install("linalg.reduce")
 def _adapt_linalg_reduce(mlir_op, attributes, result_type, operands):
     """Extract scalar dim; synthesize outs_var and reduce_fn; drop outs from operands."""
-    attributes["dim"] = list(DenseI64ArrayAttr(mlir_op.attributes["dimensions"]))[0]
+    attributes["dims"] = list(DenseI64ArrayAttr(mlir_op.attributes["dimensions"]))
     n_ins = len(operands) // 2
     attributes["outs_var"] = operands[n_ins]
     del operands[n_ins:]  # drop outs — executor only uses ins operands
@@ -433,8 +469,8 @@ def _adapt_linalg_reduce(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.empty")
 def _adapt_tensor_empty(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.empty: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -444,8 +480,8 @@ def _adapt_tensor_empty(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.expand_shape")
 def _adapt_tensor_expand_shape(mlir_op, attributes, result_type, operands):
     """Synthesize target_shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.expand_shape: cannot parse result type {result_type!r}")
     attributes["target_shape"] = info["shape"]
@@ -455,8 +491,8 @@ def _adapt_tensor_expand_shape(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.collapse_shape")
 def _adapt_tensor_collapse_shape(mlir_op, attributes, result_type, operands):
     """Synthesize target_shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.collapse_shape: cannot parse result type {result_type!r}")
     attributes["target_shape"] = info["shape"]
@@ -471,8 +507,8 @@ def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
     well-formed; only the result type is consulted, since it always pins
     the target shape statically.
     """
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.reshape: cannot parse result type {result_type!r}")
     attributes["target_shape"] = info["shape"]
@@ -482,8 +518,8 @@ def _adapt_tensor_reshape(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.from_elements")
 def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type — operands carry the values."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.from_elements: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -493,8 +529,8 @@ def _adapt_tensor_from_elements(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.splat")
 def _adapt_tensor_splat(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.splat: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
@@ -531,8 +567,8 @@ def _adapt_arith_constant(mlir_op, attributes, result_type, operands):
     else:
         raise TypeError(f"arith.constant: unhandled value attr type {type(val_attr)}")
     if result_type and "tensor<" in result_type:
-        from ..parser_utils import parse_tensor_type
-        info = parse_tensor_type(result_type)
+        from ..parser_utils import parse_tensor_or_memref_type
+        info = parse_tensor_or_memref_type(result_type)
         attributes["shape"] = info["shape"]
         attributes["dtype"] = info["dtype"]
         attributes["is_tensor"] = True
@@ -638,12 +674,91 @@ def _adapt_arith_cmpf(mlir_op, attributes, result_type, operands):
 @MLIRTypeAdapter.install("tensor.generate")
 def _adapt_tensor_generate(mlir_op, attributes, result_type, operands):
     """Synthesize shape/dtype from result type."""
-    from ..parser_utils import parse_tensor_type
-    info = parse_tensor_type(result_type)
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
     if info is None:
         raise ValueError(f"tensor.generate: cannot parse result type {result_type!r}")
     attributes["shape"] = info["shape"]
     attributes["dtype"] = info["dtype"]
+
+
+@MLIRTypeAdapter.install("ktdp.inter_tile_produce")
+def _adapt_inter_tile_produce(mlir_op, attributes, result_type, operands):
+    """Extract producer_tiles_per_group, groups, and partial_tensor_types from result type.
+
+    result_type is "!ktdp.tile_future<T_p_1, ...>" — split the inner content to
+    produce partial_tensor_types, matching what the regex parser produces.
+    """
+    from ..parser_utils import split_top_level
+    attributes["producer_tiles_per_group"] = parse_affine_set(
+        str(mlir_op.attributes["producer_tiles_per_group"])
+    )
+    attributes["groups"] = parse_affine_set(
+        str(mlir_op.attributes["groups"])
+    )
+    # Parse "!ktdp.tile_future<T1, T2, ...>" → ("T1", "T2", ...)
+    m = re.match(r"!ktdp\.tile_future<(.+)>", result_type or "")
+    if not m:
+        raise ValueError(
+            f"ktdp.inter_tile_produce: cannot parse tile_future result type {result_type!r}"
+        )
+    inner = m.group(1).strip()
+    attributes["partial_tensor_types"] = tuple(
+        p.strip() for p in split_top_level(inner)
+    )
+
+
+@MLIRTypeAdapter.install("ktdp.inter_tile_reduce")
+def _adapt_inter_tile_reduce(mlir_op, attributes, result_type, operands):
+    """Extract consumer_tiles_per_group, groups, optional producer_dependency_per_consumer,
+    and _result_shape from the result type, matching the regex parser's output.
+    """
+    from ..parser_utils import parse_tensor_or_memref_type
+    attributes["consumer_tiles_per_group"] = parse_affine_set(
+        str(mlir_op.attributes["consumer_tiles_per_group"])
+    )
+    attributes["groups"] = parse_affine_set(
+        str(mlir_op.attributes["groups"])
+    )
+    if "producer_dependency_per_consumer" in mlir_op.attributes:
+        attributes["producer_dependency_per_consumer"] = parse_affine_set(
+            str(mlir_op.attributes["producer_dependency_per_consumer"])
+        )
+    if result_type is not None:
+        parsed = parse_tensor_or_memref_type(result_type)
+        if parsed is not None:
+            attributes["_result_shape"] = parsed["shape"]
+
+
+_DYNAMIC_SIZE = -(1 << 63)  # ShapedType::kDynamic in MLIR
+
+
+@MLIRTypeAdapter.install("tensor.extract_slice")
+def _adapt_tensor_extract_slice(mlir_op, attributes, result_type, operands):
+    """Extract static_offsets/sizes/strides and result shape from the op."""
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.extract_slice: cannot parse result type {result_type!r}")
+    attributes["result_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+    attributes["static_offsets"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_offsets"]))
+    attributes["static_sizes"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
+    attributes["static_strides"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
+
+
+@MLIRTypeAdapter.install("tensor.insert_slice")
+def _adapt_tensor_insert_slice(mlir_op, attributes, result_type, operands):
+    """Extract static_offsets/sizes/strides and result shape from the op."""
+    from ..parser_utils import parse_tensor_or_memref_type
+    info = parse_tensor_or_memref_type(result_type)
+    if info is None:
+        raise ValueError(f"tensor.insert_slice: cannot parse result type {result_type!r}")
+    attributes["result_shape"] = info["shape"]
+    attributes["dtype"] = info["dtype"]
+    attributes["static_offsets"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_offsets"]))
+    attributes["static_sizes"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
+    attributes["static_strides"] = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
 
 
 # ---------------------------------------------------------------------------
@@ -743,9 +858,12 @@ class MLIRFrontendParser(KTIRParserBase):
             dims += [1] * (3 - len(dims))
             grid = tuple(dims)
 
+        operations = self._adapter.adapt_block(block)
+        from ..parser_utils import build_use_counts
         return IRFunction(
             name=sym_name,
             arguments=arguments,
-            operations=self._adapter.adapt_block(block),
+            operations=operations,
             grid=grid,
+            use_counts=build_use_counts(operations),
         )

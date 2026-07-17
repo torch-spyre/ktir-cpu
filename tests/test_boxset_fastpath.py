@@ -66,10 +66,11 @@ class TestSubTileRefShortcut:
         test."""
         ctx, hbm = _make_ctx()
         data = np.arange(16, dtype=np.float16).reshape(4, 4)
-        ptr = hbm.allocate(data.nbytes)
-        hbm.write(ptr, data)
+        stick = hbm.allocate(data.nbytes)
+        hbm.write(stick, data)
+        elem_idx = stick * HBMSimulator.STICK_BYTES // bytes_per_elem("f16")
         tile_ref = MemRef(
-            base_ptr=ptr, shape=(4, 4), strides=[4, 1],
+            base_ptr=elem_idx, shape=(4, 4), strides=[4, 1],
             memory_space="HBM", dtype="f16",
         ).to_tile_ref()
 
@@ -88,14 +89,15 @@ class TestSubTileRefShortcut:
         ROWS, COLS = 4, 4
         SENTINEL = np.float16(-3.0)
         elems = ROWS * COLS
-        ptr = hbm.allocate(elems * bytes_per_elem("f16"))
-        hbm.write(ptr, np.full(elems, SENTINEL, dtype=np.float16))
+        stick = hbm.allocate(elems * bytes_per_elem("f16"))
+        hbm.write(stick, np.full(elems, SENTINEL, dtype=np.float16))
+        elem_idx = stick * HBMSimulator.STICK_BYTES // bytes_per_elem("f16")
 
         # Column-packed: strides=[1, ROWS] means consecutive elements
         # along axis 0 are 1 element apart in memory, and consecutive
         # elements along axis 1 are ROWS elements apart.
         tile_ref = MemRef(
-            base_ptr=ptr, shape=(ROWS, COLS), strides=[1, ROWS],
+            base_ptr=elem_idx, shape=(ROWS, COLS), strides=[1, ROWS],
             memory_space="HBM", dtype="f16",
         ).to_tile_ref()
 
@@ -105,7 +107,7 @@ class TestSubTileRefShortcut:
         MemoryOps.store(ctx, Tile(payload, "f16", (2, 2)), sub_ref)
 
         # Reconstruct logical view from column-packed bytes.
-        flat = hbm.read(ptr, elems, "f16")
+        flat = hbm.read(stick, elems, "f16")
         logical = np.empty((ROWS, COLS), dtype=np.float16)
         for r in range(ROWS):
             for c in range(COLS):
@@ -128,11 +130,12 @@ class TestSubTileRefShortcut:
         ctx, hbm = _make_ctx()
         SENTINEL = np.float16(-1.0)
         elems = 16
-        ptr = hbm.allocate(elems * bytes_per_elem("f16"))
-        hbm.write(ptr, np.full(elems, SENTINEL, dtype=np.float16))
+        stick = hbm.allocate(elems * bytes_per_elem("f16"))
+        hbm.write(stick, np.full(elems, SENTINEL, dtype=np.float16))
+        elem_idx = stick * HBMSimulator.STICK_BYTES // bytes_per_elem("f16")
 
         tile_ref = MemRef(
-            base_ptr=ptr, shape=(4, 4), strides=[4, 1],
+            base_ptr=elem_idx, shape=(4, 4), strides=[4, 1],
             memory_space="HBM", dtype="f16",
         ).to_tile_ref()
 
@@ -145,7 +148,7 @@ class TestSubTileRefShortcut:
         empty_tile = Tile(np.zeros((0, 2), dtype=np.float16), "f16", (0, 2))
         sticks = MemoryOps.store(ctx, empty_tile, sub_ref)
         assert sticks == 0
-        assert np.all(hbm.read(ptr, elems, "f16") == SENTINEL)
+        assert np.all(hbm.read(stick, elems, "f16") == SENTINEL)
 
 
 # ---------------------------------------------------------------------------
@@ -156,8 +159,8 @@ _VECTOR_ADD_MLIR = """
 module {
   func.func @add() attributes {grid = [1, 1]} {
     %X_addr = arith.constant 0 : index
-    %Y_addr = arith.constant 1 : index
-    %Z_addr = arith.constant 2 : index
+    %Y_addr = arith.constant 64 : index
+    %Z_addr = arith.constant 128 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [8], strides: [1] {
         memory_space = #ktdp.spyre_memory_space<HBM>
@@ -221,9 +224,9 @@ class TestKtdpDispatchTakesBoxSetPath:
             def _seed(grid_shape):
                 _orig(grid_shape)
                 hbm = interp.memory.hbm
-                hbm.write(0, x_in)
-                hbm.write(1, y_in)
-                hbm.write(2, np.zeros(8, dtype=np.float16))
+                hbm.write(0, x_in)   # stick 0 = elem idx 0
+                hbm.write(1, y_in)   # stick 1 = elem idx 64
+                hbm.write(2, np.zeros(8, dtype=np.float16))  # stick 2 = elem idx 128
             interp._prepare_execution = _seed
             interp.execute_function("add")
 
@@ -232,7 +235,7 @@ class TestKtdpDispatchTakesBoxSetPath:
             f"called {len(seen)} time(s) — expected 0 because every "
             f"access tile in this fixture is rectangular."
         )
-        z_out = interp.memory.hbm.read(2, 8, "f16")
+        z_out = interp.memory.hbm.read(2, 8, "f16")  # read back from stick 2
         np.testing.assert_array_equal(z_out, x_in + y_in)
 
     def test_parser_lowers_full_rect_affine_set_to_boxset(self):
@@ -271,10 +274,11 @@ class TestSlowPathFallbackOnNonIdentityCoordinateOrder:
     def test_non_identity_order_calls_flat_memory_offsets(self):
         ctx, hbm = _make_ctx()
         data = np.arange(16, dtype=np.float16).reshape(4, 4)
-        ptr = hbm.allocate(data.nbytes)
-        hbm.write(ptr, data)
+        stick = hbm.allocate(data.nbytes)
+        hbm.write(stick, data)
+        elem_idx = stick * HBMSimulator.STICK_BYTES // bytes_per_elem("f16")
         parent_ref = MemRef(
-            base_ptr=ptr, shape=(4, 4), strides=[4, 1],
+            base_ptr=elem_idx, shape=(4, 4), strides=[4, 1],
             memory_space="HBM", dtype="f16",
         ).to_tile_ref()
 
@@ -329,10 +333,11 @@ class TestExplicitIdentityCoordinateOrder:
     def test_identity_affine_map_takes_fast_path(self):
         ctx, hbm = _make_ctx()
         data = np.arange(16, dtype=np.float16).reshape(4, 4)
-        ptr = hbm.allocate(data.nbytes)
-        hbm.write(ptr, data)
+        stick = hbm.allocate(data.nbytes)
+        hbm.write(stick, data)
+        elem_idx = stick * HBMSimulator.STICK_BYTES // bytes_per_elem("f16")
         parent_ref = MemRef(
-            base_ptr=ptr, shape=(4, 4), strides=[4, 1],
+            base_ptr=elem_idx, shape=(4, 4), strides=[4, 1],
             memory_space="HBM", dtype="f16",
         ).to_tile_ref()
 

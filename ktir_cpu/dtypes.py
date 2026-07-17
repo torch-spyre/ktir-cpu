@@ -76,6 +76,15 @@ def bytes_per_elem(dtype: str) -> int:
     return int(to_np_dtype(dtype).itemsize)
 
 
+def stick_to_elem_idx(stick: int, dtype: str, stick_bytes: int = 128) -> int:
+    """Convert an HBM stick index to an element index for the given dtype.
+
+    Element indices are what MLIR programs use as pointer operands.
+    ``stick_bytes`` is the HBM stick size (128 bytes by default).
+    """
+    return (stick * stick_bytes) // bytes_per_elem(dtype)
+
+
 def to_ktir_dtype(np_dtype: np.dtype) -> str:
     """Map a NumPy dtype to a canonical KTIR dtype string.
 

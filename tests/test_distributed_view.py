@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 
 from ktir_cpu import KTIRInterpreter
+from ktir_cpu.dtypes import stick_to_elem_idx
 from conftest import get_test_params
 
 
@@ -41,11 +42,14 @@ from conftest import get_test_params
 # ---------------------------------------------------------------------------
 
 def _write_strided(mem, base_ptr: int, block: np.ndarray, strides: List[int]):
-    """Write *block* (f16) into *mem* at *base_ptr* using *strides* (element units).
+    """Write *block* (f16) into *mem* at *base_ptr* (element index) using *strides* (element units).
 
     Element (i, j) lands at byte offset ``(base_ptr + (i*strides[0] + j*strides[1])) * 2``.
     Holes from non-contiguous layouts are left as zero.
+    For HBM, *base_ptr* is converted to a stick index before writing.
+    For LX, *base_ptr* is converted to a byte address before writing.
     """
+    from ktir_cpu.memory import HBMSimulator
     assert block.dtype == np.float16
     ndim = block.ndim
     assert len(strides) == ndim
@@ -55,7 +59,12 @@ def _write_strided(mem, base_ptr: int, block: np.ndarray, strides: List[int]):
     span = int(offsets.max()) + 1 if offsets.size else 1
     buf = np.zeros(span, dtype=np.float16)
     buf[offsets] = block.flatten()
-    mem.write(base_ptr, buf)
+    if isinstance(mem, HBMSimulator):
+        byte_addr = base_ptr * 2  # f16
+        stick, intra = divmod(byte_addr, HBMSimulator.STICK_BYTES)
+        mem.write(stick, buf, intra_byte=intra)
+    else:
+        mem.write(base_ptr * 2, buf)
 
 
 def _get_mem(interp, space: str):
@@ -482,7 +491,8 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
         p1_mem = _get_mem(interp, p1.memory_space)
         _write_strided(p0_mem, p0.base_ptr, p0_block.copy(), p0.strides)
         _write_strided(p1_mem, p1.base_ptr, p1_block.copy(), p1.strides)
-        interp.memory.hbm.write(spec.out_ptr, np.zeros(ac[0] * ac[1], dtype=np.float16))
+        out_stick = (spec.out_ptr * 2) // interp.memory.hbm.STICK_BYTES
+        interp.memory.hbm.write(out_stick, np.zeros(ac[0] * ac[1], dtype=np.float16))
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function("dist_copy")
@@ -490,7 +500,8 @@ def _seed_and_run(spec: DistCopySpec) -> Tuple[np.ndarray, np.ndarray]:
     r0, c0 = idx[0], idx[1]
     expected = full[r0:r0 + ac[0], c0:c0 + ac[1]]
     n_out = ac[0] * ac[1]
-    actual = interp.memory.hbm.read(spec.out_ptr, n_out, "f16").reshape(ac)
+    out_stick = (spec.out_ptr * 2) // interp.memory.hbm.STICK_BYTES
+    actual = interp.memory.hbm.read(out_stick, n_out, "f16").reshape(ac)
     return expected, actual
 
 
@@ -518,22 +529,26 @@ def test_distributed_view_copy_rfc(path, func_name, entry):
         lx0 = interp.memory.get_lx(0)
         lx1 = interp.memory.get_lx(1)
         full = np.arange(192 * 64, dtype=np.float16).reshape(192, 64)
+        # MLIR constants are element indices (f16, 2 bytes/elem).
+        # A_HBM_addr=0  → byte 0   → stick 0
+        # A_LX0_addr=12288 → byte 24576 (via _write_strided element-index path)
+        # A_LX1_addr=16384 → byte 32768
+        # B_addr=24576 → byte 49152 → stick 384
         hbm.write(0, full[0:96, :].flatten())
         _write_strided(lx0, 12288, full[96:128, :].copy(), strides=[1, 64])
-        lx1.write(16384, full[128:192, :].flatten())
-        hbm.write(24576, np.zeros(192 * 64, dtype=np.float16))
-        # Advance each LX next_ptr past its seeded region so that _write_to_lx
-        # staging (which bumps from next_ptr upward) does not overwrite source data.
-        # lx0 seeded at 12288, col-packed span = 31 + 63*64 + 1 = 4064 elems = 8128 bytes
-        # lx1 seeded at 16384, row-major span = 64*64 = 4096 elems = 8192 bytes
-        lx0.next_ptr = 12288 + 8128
-        lx1.next_ptr = 16384 + 8192
+        lx1.write(16384 * 2, full[128:192, :].flatten())
+        hbm.write(24576 * 2 // hbm.STICK_BYTES, np.zeros(192 * 64, dtype=np.float16))
+        # Advance each LX next_ptr past its seeded region.
+        # lx0 seeded at byte 24576, col-packed span = 31 + 63*64 + 1 = 4064 elems = 8128 bytes
+        # lx1 seeded at byte 32768, row-major span = 64*64 = 4096 elems = 8192 bytes
+        lx0.next_ptr = 16384 * 2 + 8128
+        lx1.next_ptr = 16384 * 2 + 8192
 
     interp._prepare_execution = _prepare_and_seed
     interp.execute_function(func_name)
 
     expected = np.arange(192 * 64, dtype=np.float16).reshape(192, 64)
-    b = interp.memory.hbm.read(24576, 192 * 64, "f16").reshape(192, 64)
+    b = interp.memory.hbm.read(24576 * 2 // interp.memory.hbm.STICK_BYTES, 192 * 64, "f16").reshape(192, 64)
     np.testing.assert_array_equal(b, expected)
 
 
@@ -894,9 +909,9 @@ def test_distributed_store_does_not_trample_outside_C_i():
     B1 = parse_affine_set("affine_set<(d0, d1) : (d0 - 8 >= 0, -d0 + 15 >= 0, d1 >= 0, -d1 + 15 >= 0)>")
     assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
 
-    P0 = MemRef(base_ptr=P0_STICK, shape=PART_SHAPE, strides=[NCOLS, 1],
+    P0 = MemRef(base_ptr=stick_to_elem_idx(P0_STICK, DTYPE), shape=PART_SHAPE, strides=[NCOLS, 1],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
-    P1 = MemRef(base_ptr=P1_STICK, shape=PART_SHAPE, strides=[NCOLS, 1],
+    P1 = MemRef(base_ptr=stick_to_elem_idx(P1_STICK, DTYPE), shape=PART_SHAPE, strides=[NCOLS, 1],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
     dist = DistributedMemRef(partitions=[P0, P1], shape=(16, 16), dtype=DTYPE)
 
@@ -976,9 +991,9 @@ def test_distributed_store_col_packed_does_not_trample_outside_C_i():
     assert isinstance(B0, BoxSet) and isinstance(B1, BoxSet)
 
     # strides=[1, NROWS] → column-packed: element (r, c) at offset r + c*NROWS.
-    P0 = MemRef(base_ptr=P0_STICK, shape=PART_SHAPE, strides=[1, NROWS],
+    P0 = MemRef(base_ptr=stick_to_elem_idx(P0_STICK, DTYPE), shape=PART_SHAPE, strides=[1, NROWS],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B0)
-    P1 = MemRef(base_ptr=P1_STICK, shape=PART_SHAPE, strides=[1, NROWS],
+    P1 = MemRef(base_ptr=stick_to_elem_idx(P1_STICK, DTYPE), shape=PART_SHAPE, strides=[1, NROWS],
                 memory_space="HBM", dtype=DTYPE, coordinate_set=B1)
     dist = DistributedMemRef(partitions=[P0, P1], shape=(16, 16), dtype=DTYPE)
 
@@ -1019,3 +1034,225 @@ def test_distributed_store_col_packed_does_not_trample_outside_C_i():
         f"P0 col-packed: {(outside != SENTINEL).sum()} cell(s) outside C_i "
         f"differ from sentinel — strides inheritance is broken."
     )
+
+
+# ---------------------------------------------------------------------------
+# distributed_load / distributed_store SLOW path (non-BoxSet C_i)
+#
+# When a partition's coordinate_set is a plain List[Tuple] (parsed via
+# parse_affine_set_raw, which skips BoxSet lowering), distributed_tile_access
+# stores an enumerated point list on each survivor, forcing distributed_load
+# and distributed_store onto their slow paths.  Those slow paths now use NumPy
+# fancy-indexing (one vectorized gather/scatter per partition) instead of a
+# per-coordinate Python loop.  These tests cross a partition boundary so the
+# fancy-index write lands in different access-local regions for each survivor,
+# and assert the survivors are genuinely on the slow path (coordinate_set is a
+# list, not a BoxSet) so a regression to BoxSet wouldn't silently bypass them.
+# ---------------------------------------------------------------------------
+
+def _build_raw_row_band_partitions(p0_stick, p1_stick, part_shape, ncols, dtype):
+    """Two row-band partitions with raw (non-BoxSet) coordinate sets.
+
+    P0 covers rows ``[0, R)``, P1 rows ``[R, 2R)``; both span all *ncols*
+    columns with row-major strides.  Parsing via ``parse_affine_set_raw``
+    keeps the sets as ``AffineSet`` so the surviving C_i is enumerated to a
+    point list — the slow path.
+    """
+    from ktir_cpu.dtypes import stick_to_elem_idx
+    from ktir_cpu.ir_types import MemRef
+    from ktir_cpu.parser_ast import parse_affine_set_raw
+
+    R = part_shape[0]
+    B0 = parse_affine_set_raw(
+        f"affine_set<(d0, d1) : (d0 >= 0, -d0 + {R - 1} >= 0, "
+        f"d1 >= 0, -d1 + {ncols - 1} >= 0)>"
+    )
+    B1 = parse_affine_set_raw(
+        f"affine_set<(d0, d1) : (d0 - {R} >= 0, -d0 + {2 * R - 1} >= 0, "
+        f"d1 >= 0, -d1 + {ncols - 1} >= 0)>"
+    )
+    P0 = MemRef(base_ptr=stick_to_elem_idx(p0_stick, dtype), shape=part_shape, strides=[ncols, 1],
+                memory_space="HBM", dtype=dtype, coordinate_set=B0)
+    P1 = MemRef(base_ptr=stick_to_elem_idx(p1_stick, dtype), shape=part_shape, strides=[ncols, 1],
+                memory_space="HBM", dtype=dtype, coordinate_set=B1)
+    return P0, P1
+
+
+def test_distributed_load_slow_path_cross_boundary():
+    """distributed_load slow path (list C_i) gathers correctly across partitions."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.dtypes import bytes_per_elem
+    from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import DistributedMemRef
+    from ktir_cpu.memory import HBMSimulator, LXScratchpad
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map
+
+    PART_SHAPE = (8, 16)
+    NCOLS = 16
+    DTYPE = "f16"
+    GLOBAL = (16, 16)
+    bpe = bytes_per_elem(DTYPE)
+    elems_per_part = PART_SHAPE[0] * PART_SHAPE[1]
+
+    full = np.arange(GLOBAL[0] * GLOBAL[1], dtype=np.float16).reshape(GLOBAL)
+
+    hbm = HBMSimulator(size_gb=1)
+    P0_STICK = hbm.allocate(elems_per_part * bpe)
+    P1_STICK = hbm.allocate(elems_per_part * bpe)
+    # Row-major contiguous → flatten writes the block verbatim.
+    hbm.write(P0_STICK, full[0:8, :].copy().flatten())
+    hbm.write(P1_STICK, full[8:16, :].copy().flatten())
+    ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                      lx=LXScratchpad(size_mb=1, core_id=0), hbm=hbm)
+
+    P0, P1 = _build_raw_row_band_partitions(P0_STICK, P1_STICK, PART_SHAPE, NCOLS, DTYPE)
+    dist = DistributedMemRef(partitions=[P0, P1], shape=GLOBAL, dtype=DTYPE)
+
+    # 4×4 access at (6, 4): rows 6,7 in P0 and rows 8,9 in P1 → both survive.
+    access_shape = (4, 4)
+    indices = (6, 4)
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    resolved = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=access_shape, base_map=base_map,
+        indices=list(indices), access_tile_set=None,
+    )
+    assert len(resolved.partitions) == 2, "access must straddle both partitions"
+    for part in resolved.partitions:
+        assert not isinstance(part.coordinate_set, BoxSet), \
+            "slow path requires a non-BoxSet (list) coordinate_set"
+        assert isinstance(part.coordinate_set, list)
+
+    tile = MemoryOps.distributed_load(ctx, resolved, result_shape=access_shape)
+    np.testing.assert_array_equal(tile.data, full[6:10, 4:8])
+
+
+def test_distributed_store_slow_path_cross_boundary():
+    """distributed_store slow path (list C_i) scatters across partitions without trampling."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.dtypes import bytes_per_elem
+    from ktir_cpu.grid import CoreContext
+    from ktir_cpu.ir_types import DistributedMemRef, Tile
+    from ktir_cpu.memory import HBMSimulator, LXScratchpad
+    from ktir_cpu.ops.memory_ops import MemoryOps
+    from ktir_cpu.parser_ast import parse_affine_map
+
+    PART_SHAPE = (8, 16)
+    NCOLS = 16
+    DTYPE = "f16"
+    GLOBAL = (16, 16)
+    bpe = bytes_per_elem(DTYPE)
+    elems_per_part = PART_SHAPE[0] * PART_SHAPE[1]
+    SENTINEL = np.float16(-7.0)
+
+    hbm = HBMSimulator(size_gb=1)
+    P0_STICK = hbm.allocate(elems_per_part * bpe)
+    P1_STICK = hbm.allocate(elems_per_part * bpe)
+    hbm.write(P0_STICK, np.full(elems_per_part, SENTINEL, dtype=np.float16))
+    hbm.write(P1_STICK, np.full(elems_per_part, SENTINEL, dtype=np.float16))
+    ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                      lx=LXScratchpad(size_mb=1, core_id=0), hbm=hbm)
+
+    P0, P1 = _build_raw_row_band_partitions(P0_STICK, P1_STICK, PART_SHAPE, NCOLS, DTYPE)
+    dist = DistributedMemRef(partitions=[P0, P1], shape=GLOBAL, dtype=DTYPE)
+
+    # 4×4 access at (6, 4): rows 6,7 → P0, rows 8,9 → P1.
+    access_shape = (4, 4)
+    indices = (6, 4)
+    base_map = parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>")
+    resolved = MemoryOps.distributed_tile_access(
+        dist_ref=dist, access_shape=access_shape, base_map=base_map,
+        indices=list(indices), access_tile_set=None,
+    )
+    assert len(resolved.partitions) == 2
+    for part in resolved.partitions:
+        assert isinstance(part.coordinate_set, list), "slow path requires list C_i"
+
+    payload = np.arange(1, 17, dtype=np.float16).reshape(4, 4)
+    MemoryOps.distributed_store(ctx, Tile(payload, DTYPE, access_shape), resolved)
+
+    p0_full = hbm.read(P0_STICK, elems_per_part, DTYPE).reshape(PART_SHAPE)
+    p1_full = hbm.read(P1_STICK, elems_per_part, DTYPE).reshape(PART_SHAPE)
+
+    # P0 receives the top two access rows (global rows 6,7 → local 6,7) at cols 4..7.
+    # P1 receives the bottom two access rows (global rows 8,9 → local 0,1) at cols 4..7.
+    np.testing.assert_array_equal(p0_full[6:8, 4:8], payload[0:2, :])
+    np.testing.assert_array_equal(p1_full[0:2, 4:8], payload[2:4, :])
+
+    # Everything outside the two written sub-rectangles stays sentinel.
+    p0_mask = np.zeros(PART_SHAPE, dtype=bool)
+    p0_mask[6:8, 4:8] = True
+    p1_mask = np.zeros(PART_SHAPE, dtype=bool)
+    p1_mask[0:2, 4:8] = True
+    assert np.all(p0_full[~p0_mask] == SENTINEL), "P0 trampled outside C_i (slow path)"
+    assert np.all(p1_full[~p1_mask] == SENTINEL), "P1 trampled outside C_i (slow path)"
+
+
+def test_parse_distributed_view_index_dtype():
+    """split('x') must not break on dtypes containing 'x' like 'index'."""
+    from ktir_cpu.dialects.ktdp_ops import parse_construct_distributed_memory_view
+    from ktir_cpu.parser import KTIRParser, ParseContext
+
+    # Dialect parser directly (body only, no LHS — as the dispatcher delivers it)
+    body_text = (
+        "ktdp.construct_distributed_memory_view "
+        "(%v0, %v1 : memref<64x32xindex>, memref<64x32xindex>) "
+        ": memref<128x32xindex>"
+    )
+    op = parse_construct_distributed_memory_view(body_text, ParseContext(aliases={}))
+    assert op.attributes["shape"] == (128, 32)
+    assert op.attributes["dtype"] == "index"
+
+    # Dispatcher integration (full op line with LHS assignment)
+    full_op = "%dv = " + body_text
+    op2 = KTIRParser()._parse_operation_text(full_op)
+    assert op2.result == "%dv"
+    assert op2.attributes["shape"] == (128, 32)
+    assert op2.attributes["dtype"] == "index"
+
+
+def _extent_partitions():
+    """Two BoxSet partitions covering [0,4)x[0,4): axis extents max(hi)=(4, 4)."""
+    from ktir_cpu.affine import BoxSet
+    from ktir_cpu.ir_types import MemRef
+
+    P0 = MemRef(base_ptr=0, shape=(2, 4), strides=[4, 1], memory_space="HBM",
+                coordinate_set=BoxSet(lo=(0, 0), hi=(2, 4)))
+    P1 = MemRef(base_ptr=32, shape=(2, 4), strides=[4, 1], memory_space="HBM",
+                coordinate_set=BoxSet(lo=(2, 0), hi=(4, 4)))
+    return [P0, P1]
+
+
+def test_distributed_memory_view_post_init_rejects_unresolved_none_shape():
+    """Constructing directly with a residual dynamic (None) dim is rejected.
+
+    Dynamic dims are resolved upstream in the op handler
+    (``_assemble_dist_extent``); by the time a ``DistributedMemRef`` is built the
+    shape must be concrete.  ``__post_init__`` validation must therefore reject a
+    lingering ``None`` rather than silently accept an unresolved shape.
+    """
+    from ktir_cpu.ir_types import DistributedMemRef
+
+    with pytest.raises(
+        ValueError,
+        match=r"declared shape must be fully resolved before construction; axis 1 is None",
+    ):
+        DistributedMemRef(partitions=_extent_partitions(), shape=(4, None), dtype="f16")
+
+
+def test_distributed_memory_view_post_init_rejects_shape_mismatch_off_handler():
+    """The extent invariant is enforced on direct construction, not just via the op.
+
+    The extent check lives in ``__post_init__`` so it guards *every*
+    ``DistributedMemRef`` construction — including code that builds one directly
+    instead of through ``ktdp.construct_distributed_memory_view``.  Partitions
+    cover axis 1 up to ``max(hi)=4``; a declared ``4x8`` must be rejected here,
+    with no op handler in the call path.
+    """
+    from ktir_cpu.ir_types import DistributedMemRef
+
+    with pytest.raises(
+        ValueError,
+        match=r"declared shape axis 1 = 8 does not match the partition extent",
+    ):
+        DistributedMemRef(partitions=_extent_partitions(), shape=(4, 8), dtype="f16")

@@ -2,12 +2,12 @@
 //
 // Grid: [16, 1, 1] — axis 0 distributes work across 16 cores.
 //
-// HBM addressing.  ``%in_ptr`` / ``%out_ptr`` are *stick* indices on
-// HBM; one stick is 128 bytes (= 64 f16 elements), so each 1×128 f16
-// row spans **2 sticks**.  Per-core stride = 2 sticks.
+// HBM addressing.  ``%in_ptr`` / ``%out_ptr`` are *element* indices for
+// f16 (base_ptr convention after RFC fix).  Each 1×128 f16 row is 128
+// elements.  Per-core stride = 128 elements.
 //
 // Each core c:
-//   1. Constructs a memory view for its row at in_ptr + c*2 sticks.
+//   1. Constructs a memory view for its row at in_ptr + c*128 elements.
 //   2. Loads it into a tensor<1x128xf16> partial.
 //   3. Calls ktdp.inter_tile_produce + ktdp.inter_tile_reduce — every
 //      core in group g (= c / 4) ends up holding the sum of that
@@ -38,13 +38,13 @@ module {
 
     %c0 = arith.constant 0 : index
     %c4 = arith.constant 4 : index
-    // 1×128 f16 = 256 bytes = 2 HBM sticks per row.
-    %row_sticks = arith.constant 2 : index
+    // 1×128 f16 = 128 elements per row.
+    %row_elems = arith.constant 128 : index
 
     %pid = ktdp.get_compute_tile_id : index
 
-    // Stick-index of this core's input row: in_ptr + pid * 2.
-    %in_offs = arith.muli %pid, %row_sticks : index
+    // Element-index of this core's input row: in_ptr + pid * 128.
+    %in_offs = arith.muli %pid, %row_elems : index
     %row_ptr = arith.addi %in_ptr, %in_offs : index
 
     // (1) Memory view over this core's 1×128 row
@@ -97,10 +97,10 @@ module {
     }
 
     // (4) The first core of each group writes its group's result.
-    //     Writer condition: pid % 4 == 0.  Output offset: g * 2 sticks
+    //     Writer condition: pid % 4 == 0.  Output offset: g * 128 elements
     //     where g = pid / 4.  So core 0 writes to out_ptr+0, core 4
-    //     writes to out_ptr+2, core 8 writes to out_ptr+4, core 12
-    //     writes to out_ptr+6.
+    //     writes to out_ptr+128, core 8 writes to out_ptr+256, core 12
+    //     writes to out_ptr+384.
     %lane      = arith.remui %pid, %c4 : index
     %is_writer = arith.cmpi eq, %lane, %c0 : index
     scf.if %is_writer {
@@ -108,7 +108,7 @@ module {
                       : tensor<128xf16> into tensor<1x128xf16>
 
       %group_idx = arith.divui %pid, %c4 : index
-      %out_offs  = arith.muli %group_idx, %row_sticks : index
+      %out_offs  = arith.muli %group_idx, %row_elems : index
       %group_out = arith.addi %out_ptr, %out_offs : index
 
       %out_view = ktdp.construct_memory_view %group_out,

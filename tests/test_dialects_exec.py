@@ -28,6 +28,7 @@ import pytest
 from ktir_cpu.ir_types import Operation, Tile
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
+from ktir_cpu.dtypes import stick_to_elem_idx
 from ktir_cpu.dialects.registry import dispatch, ExecutionEnv
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,20 @@ def _make_ctx(grid_pos=(0, 0, 0), core_id=0):
         lx=LXScratchpad(size_mb=2, core_id=core_id),
         hbm=HBMSimulator(),
     )
+
+
+def _drive(gen):
+    """Exhaust a scf handler generator synchronously (no scheduler needed).
+    scf__for / scf__if are generator functions; tests that call them directly
+    use this to get the return value without a real scheduler."""
+    import inspect
+    if not inspect.isgenerator(gen):
+        return gen
+    try:
+        while True:
+            next(gen)
+    except StopIteration as e:
+        return e.value
 
 
 def _make_env(grid_shape=(1, 1, 1)):
@@ -838,7 +853,7 @@ class TestMath:
 
 class TestLinalg:
     def test_reduce_along_dim(self):
-        # reduce a 1×4 tile along dim 1 — result is a (1,) tile summing to 10
+        # reduce a 1x4 tile along dim 1 - result is a (1,) tile summing to 10
         data = np.array([[1, 2, 3, 4]], dtype=np.float16)
         t = Tile(data, "f16", data.shape)
         ctx = _ctx_with(**{"%x": t, "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
@@ -882,8 +897,8 @@ class TestLinalg:
 
     def test_reduce_multiop_combiner(self):
         # MULTI-OP combiner: max expressed as cmpf(ogt) + select. The general
-        # tree fold must run BOTH region ops — there is no single combiner name
-        # to map to a NumPy reduction — and still return the correct max.
+        # tree fold must run BOTH region ops - there is no single combiner name
+        # to map to a NumPy reduction - and still return the correct max.
         data = np.array([[0.1, 0.9, 0.3, 0.2, 0.5, 0.05, 0.7, 0.05]], dtype=np.float16)
         neg_inf = np.float16("-inf")
         ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
@@ -901,27 +916,83 @@ class TestLinalg:
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(float(data.max()), abs=1e-2)
 
-    @pytest.mark.xfail(reason="multi-axis reduce not supported: parser keeps only "
-                              "dims[0] and the tree fold indexes a single axis. "
-                              "Tracked in issue #85.",
-                       strict=True)
     def test_reduce_multi_axis(self):
         # dimensions = [0, 1] should reduce BOTH axes (2x3 -> scalar 15).
         data = np.arange(6, dtype=np.float16).reshape(2, 3)  # sum = 15
         ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
-                           "%init": Tile(np.zeros((1,), dtype=np.float16), "f16", (1,))})
+                           "%init": Tile(np.zeros((), dtype=np.float16), "f16", ())})
         result = _call("linalg.reduce", ctx, _make_env(),
                        operands=["%x"],
-                       attributes={"reduce_fn": "arith.addf", "dim": [0, 1],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 1],
                                    "outs_var": "%init"})
         val = float(result.data.flat[0]) if isinstance(result, Tile) else float(result)
         assert val == pytest.approx(15.0, abs=1e-2)
 
-    @pytest.mark.xfail(reason="outs init value is not folded into the reduction; "
-                              "the tree fold seeds from the input only. Harmless "
-                              "while the frontend inits outs to the identity. "
-                              "Tracked in issue #85.",
+    def test_reduce_multi_axis_3d_disjoint_2d(self):
+        # dimensions = [0, 2] on a (3, 4, 2) tensor - disjoint axes.
+        # Output shape (4,): for each dim1 slot, sum over dim0 and dim2.
+        data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
+        expected = data.sum(axis=(0, 2))  # shape (4,)
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
+                                   "outs_var": "%init"})
+        assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
+    def test_reduce_multi_axis_3d_0d(self):
+        # dimensions = [] on a (3, 4, 2) tensor - zero reduce dims is a no-op.
+        # Output shape must equal input shape; values unchanged.
+        data = np.arange(24, dtype=np.float16).reshape(3, 4, 2)
+        expected = data.copy()  # no reduction - identity
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros_like(data), "f16", data.shape)})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [],
+                                   "outs_var": "%init"})
+        assert result.shape == (3, 4, 2)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
+    @pytest.mark.xfail(reason="tree-fold (pairwise halving) breaks the "
+                              "linalg.reduce associativity-only contract: "
+                              "partial sums across axes reorder elements, "
+                              "producing different f16 rounding than the "
+                              "left-associative sequential reduction MLIR "
+                              "semantics prescribe.",
                        strict=True)
+    # Tree-fold vs. MLIR sequential order for dims=[0, 1] on shape (2, 3):
+    #
+    #   data = [[a, b, c],
+    #            [d, e, f]]
+    #
+    # MLIR (scalar loop, row-major left-associative):
+    #   ((((( a + b ) + c ) + d ) + e ) + f )
+    #
+    # Tree-fold (this impl): fold axis 1 first, then axis 0:
+    #   axis-1: (a+b)+c,  (d+e)+f
+    #   axis-0: ((a+b)+c) + ((d+e)+f)
+    #
+    # These groupings differ, so f16 rounding can diverge.
+    def test_reduce_multi_axis_treefold_bug(self):
+        # (3,4,2) reduce dims=[0,2]. Large cancelling values at [0,:,0] and
+        # [2,:,0] expose the reordering: tree fold pairs partial sums from
+        # dim2 before folding dim0, changing which elements cancel first.
+        data = np.ones((3, 4, 2), dtype=np.float16)
+        data[0, :, 0] = 10000
+        data[2, :, 0] = -10000
+        expected = data.sum(axis=(0, 2))  # numpy left-associative: [1,1,1,1]
+        ctx = _ctx_with(**{"%x": Tile(data, "f16", data.shape),
+                           "%init": Tile(np.zeros((4,), dtype=np.float16), "f16", (4,))})
+        result = _call("linalg.reduce", ctx, _make_env(),
+                       operands=["%x"],
+                       attributes={"reduce_fn": "arith.addf", "dims": [0, 2],
+                                   "outs_var": "%init"})
+        assert result.shape == (4,)
+        np.testing.assert_allclose(result.data, expected, rtol=1e-2)
+
     def test_reduce_folds_outs_init(self):
         # MLIR semantics: outs is the initial accumulator. sum([1,2,3,4]) with
         # outs init = 100 should be 110, not 10.
@@ -1157,6 +1228,160 @@ class TestTensor:
         assert result.shape == (1,)
         assert list(result.data) == [128]
 
+    def test_extract_slice(self):
+        # slice rows 2-3, cols 1-3 (offsets=[2,1], sizes=[2,2], strides=[1,1])
+        data = np.arange(16, dtype=np.float16).reshape(4, 4)
+        t = Tile(data, "f16", (4, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [2, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (2, 2),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (2, 2)
+        assert np.array_equal(result.data, data[2:4, 1:3])
+
+    def test_extract_slice_rank_reduce(self):
+        # size-1 leading dim dropped: result_shape (4,) from a (1,4) sub-slice
+        data = np.arange(8, dtype=np.float16).reshape(2, 4)
+        t = Tile(data, "f16", (2, 4))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1, 0],
+                           "static_sizes": [1, 4],
+                           "static_strides": [1, 1],
+                           "result_shape": (4,),
+                           "dtype": "f16",
+                       })
+        assert result.shape == (4,)
+        assert np.array_equal(result.data, data[1, :])
+
+    def test_insert_slice(self):
+        # insert a 2x2 patch at offset [1, 1] into a 4x4 tensor
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base = Tile(np.zeros((4, 4), dtype=np.float16), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1, 1],
+                           "static_sizes": [2, 2],
+                           "static_strides": [1, 1],
+                           "result_shape": (4, 4),
+                           "dtype": "f16",
+                       })
+        assert isinstance(result, Tile)
+        assert result.shape == (4, 4)
+        expected = np.zeros((4, 4), dtype=np.float16)
+        expected[1:3, 1:3] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_insert_slice_no_alias(self):
+        # insert_slice must not mutate the original destination tile
+        patch = Tile(np.ones((2, 2), dtype=np.float16), "f16", (2, 2))
+        base_data = np.zeros((4, 4), dtype=np.float16)
+        base = Tile(base_data.copy(), "f16", (4, 4))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        _call("tensor.insert_slice", ctx, _make_env(),
+              operands=["%patch", "%base"],
+              attributes={
+                  "static_offsets": [0, 0],
+                  "static_sizes": [2, 2],
+                  "static_strides": [1, 1],
+                  "result_shape": (4, 4),
+                  "dtype": "f16",
+              })
+        assert np.array_equal(base.data, base_data)
+
+    def test_extract_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array).
+
+        Mirrors the Spyre matmul lowering pattern:
+            %sl = tensor.extract_slice %b[0, %off, 0][1, 64, 64][1, 1, 1]
+                    : tensor<1x128x64xf32> to tensor<64x64xf32>
+        where %off = k * 64 is a runtime value.
+        """
+        _KDYNAMIC = -(1 << 63)
+        data = np.arange(128 * 64, dtype=np.float32).reshape(1, 128, 64)
+        t = Tile(data, "f32", (1, 128, 64))
+        ctx = _ctx_with(**{"%t": t, "%off": 64})  # second stick: offset=64
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t", "%off"],
+                       attributes={
+                           "static_offsets": [0, _KDYNAMIC, 0],
+                           "static_sizes":   [1, 64, 64],
+                           "static_strides": [1, 1, 1],
+                           "result_shape": (64, 64),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (64, 64)
+        assert np.array_equal(result.data, data[0, 64:128, :])
+
+    def test_insert_slice_dynamic_offset(self):
+        """Dynamic offset resolved from SSA operand (kDynamic sentinel in static array)."""
+        _KDYNAMIC = -(1 << 63)
+        patch = Tile(np.ones((64,), dtype=np.float32), "f32", (64,))
+        base_data = np.zeros((128,), dtype=np.float32)
+        base = Tile(base_data.copy(), "f32", (128,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base, "%off": 64})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base", "%off"],
+                       attributes={
+                           "static_offsets": [_KDYNAMIC],
+                           "static_sizes":   [64],
+                           "static_strides": [1],
+                           "result_shape": (128,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (128,)
+        expected = np.zeros((128,), dtype=np.float32)
+        expected[64:] = 1.0
+        assert np.array_equal(result.data, expected)
+
+    def test_extract_slice_stride_gt1(self):
+        # stride=2: select every other element — requires stop = off + sz * st
+        data = np.arange(10, dtype=np.float32)
+        t = Tile(data, "f32", (10,))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.extract_slice", ctx, _make_env(),
+                       operands=["%t"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (3,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (3,)
+        # off=1, sz=3, st=2 → elements at indices 1, 3, 5
+        assert np.array_equal(result.data, data[1:7:2])
+
+    def test_insert_slice_stride_gt1(self):
+        # stride=2: write to every other element — requires stop = off + sz * st
+        patch = Tile(np.array([10.0, 20.0, 30.0], dtype=np.float32), "f32", (3,))
+        base = Tile(np.zeros((10,), dtype=np.float32), "f32", (10,))
+        ctx = _ctx_with(**{"%patch": patch, "%base": base})
+        result = _call("tensor.insert_slice", ctx, _make_env(),
+                       operands=["%patch", "%base"],
+                       attributes={
+                           "static_offsets": [1],
+                           "static_sizes":   [3],
+                           "static_strides": [2],
+                           "result_shape": (10,),
+                           "dtype": "f32",
+                       })
+        assert result.shape == (10,)
+        expected = np.zeros((10,), dtype=np.float32)
+        expected[1:7:2] = [10.0, 20.0, 30.0]
+        assert np.array_equal(result.data, expected)
+
 
 # ---------------------------------------------------------------------------
 # tensor.generate exec
@@ -1243,8 +1468,10 @@ class TestScfFunc:
                        result=None, result_type=None,
                        regions=[[lambda c: ran.append("then")], []])
         env = _make_env()
-        env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
-        dispatch("scf.if")(op, ctx, env)
+        _exec = lambda ctx, ops: [f(ctx) for f in ops]
+        env.execute_region = _exec
+        env.execute_region_with_comms = _exec
+        _drive(dispatch("scf.if")(op, ctx, env))
         assert ran == ["then"]
 
     def test_if_else_branch(self):
@@ -1255,8 +1482,10 @@ class TestScfFunc:
                        result=None, result_type=None,
                        regions=[[], [lambda c: ran.append("else")]])
         env = _make_env()
-        env.execute_region = lambda ctx, ops: [f(ctx) for f in ops]
-        dispatch("scf.if")(op, ctx, env)
+        _exec = lambda ctx, ops: [f(ctx) for f in ops]
+        env.execute_region = _exec
+        env.execute_region_with_comms = _exec
+        _drive(dispatch("scf.if")(op, ctx, env))
         assert ran == ["else"]
 
     def test_if_then_else_yield_result(self):
@@ -1275,8 +1504,13 @@ class TestScfFunc:
                 result = dispatch(o.op_type)(o, ctx, env)
             return result
 
+        def real_execute_region_gen(ctx, ops):
+            return real_execute_region(ctx, ops)
+            yield  # make it a generator function
+
         env.execute_region = real_execute_region
-        result = dispatch("scf.if")(op, ctx, env)
+        env.execute_region_with_comms = real_execute_region_gen
+        result = _drive(dispatch("scf.if")(op, ctx, env))
         assert result == 42, f"expected 42, got {result!r}"
 
 # ---------------------------------------------------------------------------
@@ -1446,7 +1680,7 @@ class TestKtdp:
         ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
                          lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
         identity_map = parse_affine_map("affine_map<(d0) -> (d0)>")
-        memref = MemRef(base_ptr=ptr, shape=(8,), strides=[1],
+        memref = MemRef(base_ptr=stick_to_elem_idx(ptr, "f16"), shape=(8,), strides=[1],
                         memory_space="HBM", dtype="f16")
         tile_ref = memref.to_tile_ref()
         access_tile = AccessTile(parent_ref=tile_ref, shape=(8,),
@@ -1465,3 +1699,392 @@ class TestKtdp:
         ctx.set_value("%acc2", access_tile)
         _call("ktdp.store", ctx, env, operands=["%tile", "%acc2"])
         assert np.array_equal(hbm.read(ptr, 8, "f16"), data * 2)
+
+    # --- construct_distributed_memory_view: dynamic-shape result resolution -------
+
+    def _make_box_partition(self, lo, hi, shape):
+        """Helper: build a MemRef partition with a concrete BoxSet coord_set."""
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+
+        return MemRef(
+            base_ptr=0, shape=shape, strides=[1] * len(shape),
+            memory_space="HBM", dtype="f16",
+            coordinate_set=BoxSet(lo=tuple(lo), hi=tuple(hi)),
+        )
+
+    def test_construct_distributed_memory_view_resolves_dynamic_dim(self):
+        """``None`` in shape attr is resolved by max(partition upper bound)."""
+        ctx = _make_ctx()
+        # Two partitions covering [0, 16) and [16, 32) on axis 1; global = 32.
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1"],
+            attributes={"shape": (64, None), "dtype": "f16"},
+        )
+        assert result.shape == (64, 32)
+        assert result.dtype == "f16"
+        assert len(result.partitions) == 2
+
+    def test_construct_distributed_memory_view_resolves_3_partition_axis0(self):
+        """Mirror the concrete RFC layout (192x64 / 3 partition) on a dynamic axis."""
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(96, 64), shape=(96, 64),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(96, 0), hi=(128, 64), shape=(32, 64),
+        ))
+        ctx.set_value("%a2", self._make_box_partition(
+            lo=(128, 0), hi=(192, 64), shape=(64, 64),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1", "%a2"],
+            attributes={"shape": (None, 64), "dtype": "f16"},
+        )
+        assert result.shape == (192, 64)
+
+    def test_construct_distributed_memory_view_resolves_non_origin_to_max_hi(self):
+        """Non-origin tiling resolves the dynamic axis to ``max(hi)``.
+
+        Partitions [10, 20) and [20, 30) on axis 0 (10 rows each, local
+        shape (10, 4)) produce global shape (30, 4) — the global bounding
+        box from 0 (the highest coordinate), per RFC 0682's "global
+        coordinate domain is the union of the coordinate_set attributes".
+        The [0, 10) prefix is not covered by any partition; accessing
+        global coords there has undefined semantics and surfaces as ``no
+        partition covers`` only when the entire access region is uncovered.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(10, 0), hi=(20, 4), shape=(10, 4),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(20, 0), hi=(30, 4), shape=(10, 4),
+        ))
+        result = _call(
+            "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+            operands=["%a0", "%a1"],
+            attributes={"shape": (None, 4), "dtype": "f16"},
+        )
+        assert result.shape == (30, 4)
+
+    def test_construct_distributed_memory_view_concrete_rejects_undersize(self):
+        """A concrete declared dim smaller than the partition extent is rejected.
+
+        Partitions span [0, 16) and [16, 32) on axis 1, so the extent
+        ``max(hi) = 32``.  The result is declared ``64x20``; ``20 != 32`` means
+        the declared shape does not match the data the partitions cover, so the
+        extent check must reject it rather than silently build an inconsistent
+        ``DistributedMemRef``.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"declared shape axis 1 = 20 does not match the partition extent",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, 20), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_concrete_rejects_oversize(self):
+        """A concrete declared dim larger than the partition extent is rejected.
+
+        Same partitions as the undersize case span [0, 16) and [16, 32) on
+        axis 1, so the extent ``max(hi) = 32``.  The result is declared
+        ``64x48``; ``48 != 32`` means the declared shape claims coordinates no
+        partition covers, so the extent check must reject it — the declared
+        shape must equal the extent exactly, not merely be at least it.
+        """
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 16), hi=(64, 32), shape=(64, 16),
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"declared shape axis 1 = 48 does not match the partition extent",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, 48), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_affine_set_partition(self):
+        """Dynamic axis + non-BoxSet partition → ValueError naming partition + axis."""
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 16), shape=(64, 16),
+        ))
+        # Triangular constraint: not axis-aligned, parser falls back to AffineSet.
+        affine_cs = parse_affine_set(
+            "affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0,"
+            " d1 - 16 >= 0, d0 - d1 >= 0)>"
+        )
+        ctx.set_value("%a1", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=affine_cs,
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"dynamic-shape result resolution does not support AffineSet partitions",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_empty_upper_bound(self):
+        """Dynamic axis where every partition has hi <= 0 raises a clear error."""
+        ctx = _make_ctx()
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0, 0), hi=(64, 0), shape=(64, 0),
+        ))
+        ctx.set_value("%a1", self._make_box_partition(
+            lo=(0, 0), hi=(64, 0), shape=(64, 0),
+        ))
+        with pytest.raises(ValueError, match=r"could not resolve dynamic axis"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0", "%a1"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_rank_mismatch(self):
+        """Partition rank != result memref rank raises a clear error."""
+        ctx = _make_ctx()
+        # 1-D partition fed to a 2-D dynamic-shape result.
+        ctx.set_value("%a0", self._make_box_partition(
+            lo=(0,), hi=(64,), shape=(64,),
+        ))
+        with pytest.raises(ValueError, match=r"partition 0 has rank 1, expected 2"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_concrete_rejects_affine_set_rank_mismatch(self):
+        """Concrete result + wrong-rank AffineSet partition is caught.
+
+        Rank is now checked ahead of the partition-kind dispatch, so a rank-2
+        AffineSet against a rank-3 concrete result raises instead of silently
+        slipping through the AffineSet skip (which only tracked BoxSet bounds).
+        """
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_set
+
+        ctx = _make_ctx()
+        # 2-D non-axis-aligned constraint stays an AffineSet (not a BoxSet).
+        affine_cs = parse_affine_set(
+            "affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0,"
+            " d1 - 16 >= 0, d0 - d1 >= 0)>"
+        )
+        ctx.set_value("%a0", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=affine_cs,
+        ))
+        with pytest.raises(ValueError, match=r"partition 0 has rank 2, expected 3"):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, 16, 8), "dtype": "f16"},
+            )
+
+    def test_construct_distributed_memory_view_dynamic_rejects_non_concrete_partition(self):
+        """Non-concrete partition coord_set raises ValueError (clean under -O too)."""
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+
+        # Symbolic BoxSet with a string symbol — bypass construct_memory_view's
+        # specialise step by injecting the partition directly.
+        sym_cs = BoxSet(lo=(0, 0), hi=(64, ("sym", "s0")))
+        assert not sym_cs.is_concrete
+
+        ctx = _make_ctx()
+        ctx.set_value("%a0", MemRef(
+            base_ptr=0, shape=(64, 16), strides=[16, 1],
+            memory_space="HBM", dtype="f16",
+            coordinate_set=sym_cs,
+        ))
+        with pytest.raises(
+            ValueError,
+            match=r"partition 0 coordinate_set is not concrete",
+        ):
+            _call(
+                "ktdp.construct_distributed_memory_view", ctx, _make_env(),
+                operands=["%a0"],
+                attributes={"shape": (64, None), "dtype": "f16"},
+            )
+
+    def test_load_respects_non_contiguous_middle_stride_via_handler(self):
+        """Same scenario as test_load_respects_non_contiguous_middle_stride but
+        exercised through the full ktdp.load dispatch handler and _subtile_ref
+        path, to catch any stride-dropping in the BoxSet fast path.
+
+        This is the path the full interpreter takes and is where the real bug
+        surfaces in the spyre_chained_scratchpad kernel.
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import AccessTile, MemRef
+        from ktir_cpu.ops.memory_ops import MemoryOps
+        from ktir_cpu.parser_ast import parse_affine_map
+        from ktir_cpu.ir_types import Operation
+
+        K2, N, S = 4, 8, 4
+        n_sticks = N // S
+        M_logical = np.arange(K2 * N, dtype=np.float16).reshape(K2, N)
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(M_logical.nbytes)
+        hbm.write(ptr, M_logical.ravel())
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        env = _make_env()
+
+        base_elem = stick_to_elem_idx(ptr, "f16")
+        memref = MemRef(base_ptr=base_elem, shape=(n_sticks, K2, S),
+                        strides=[S, N, 1], memory_space="HBM", dtype="f16")
+        identity_map = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
+        tile_ref = MemoryOps.tile_access(ctx, memref, indices=[1, 0, 0],
+                                         access_shape=(1, K2, S), base_map=identity_map)
+        access_tile = AccessTile(
+            parent_ref=tile_ref, shape=(1, K2, S), base_map=identity_map,
+            coordinate_set=BoxSet(lo=(0, 0, 0), hi=(1, K2, S)), coordinate_order=None,
+        )
+        ctx.set_value("%acc", access_tile)
+
+        # Go through the full dispatch handler (not MemoryOps.load directly).
+        loaded = _call("ktdp.load", ctx, env, operands=["%acc"])
+        assert isinstance(loaded, Tile)
+        assert loaded.data.shape == (1, K2, S)
+        expected = M_logical[:, S:].reshape(1, K2, S)
+        assert np.array_equal(loaded.data, expected), (
+            f"ktdp.load handler (BoxSet fast path via _subtile_ref) dropped strides.\n"
+            f"Got:\n{loaded.data}\nExpected:\n{expected}"
+        )
+
+    def test_load_respects_non_contiguous_middle_stride(self):
+        """ktdp.load must respect non-unit strides on the memory view.
+
+        Scenario: a logical [K2=4, N=8] matrix physicalized as stick-on-N
+        with stick size S=4, giving physical shape [N//4=2, K2=4, N%4=4]
+        and physical strides [4, 8, 1] (N_floor stride=S=4, K2 stride=N=8,
+        lane stride=1).
+
+        Loading the tile for N-stick 1 (n_floor=1, K2=0..3, lane=0..3)
+        should yield a [1,4,4] tensor whose element [0, k2, lane] equals
+        M_logical[k2, 4 + lane] — i.e. columns 4-7 of the logical matrix.
+
+        A naive contiguous read starting at flat offset n_floor*S = 4
+        would read elements 4..19 from the flat array, which gives the
+        wrong K2 rows because K2 stride is 8 (= N), not 4 (= S).
+
+        This is the root cause of the spyre_chained_scratchpad numerical
+        failure: C[K2=128, N=256] physicalized stick-on-N has K2 stride
+        256, but ktdp.load was reading it contiguously with effective
+        K2 stride 64 (= S).
+        """
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef
+        from ktir_cpu.parser_ast import parse_affine_map
+
+        # Logical matrix M[K2=4, N=8], row-major: strides [8, 1].
+        # Physical (stick-on-N, S=4): shape [2, 4, 4], strides [4, 8, 1].
+        #   phys[n_floor, k2, lane] = M_logical[k2, n_floor*4 + lane]
+        K2, N, S = 4, 8, 4
+        n_sticks = N // S  # 2
+
+        M_logical = np.arange(K2 * N, dtype=np.float16).reshape(K2, N)
+        # flat layout: M_logical.ravel() = [0,1,...,7, 8,...,15, 16,...,23, 24,...,31]
+        # phys[0, k2, lane] = M_logical[k2, 0+lane] = flat[k2*8 + lane]
+        # phys[1, k2, lane] = M_logical[k2, 4+lane] = flat[k2*8 + 4 + lane]
+
+        from ktir_cpu.ir_types import AccessTile, MemRef
+        from ktir_cpu.parser_ast import parse_affine_map
+
+        hbm = HBMSimulator()
+        ptr = hbm.allocate(M_logical.nbytes)
+        hbm.write(ptr, M_logical.ravel())
+
+        ctx = CoreContext(core_id=0, grid_pos=(0, 0, 0),
+                         lx=LXScratchpad(size_mb=2, core_id=0), hbm=hbm)
+        env = _make_env()
+
+        # Build MemRef and AccessTile directly — the same approach as
+        # test_load_store_roundtrip, which is the authoritative pattern for
+        # hand-building tiles for ktdp.load tests.
+        # base_ptr is a byte-level element index (stick_to_elem_idx converts
+        # the stick-index ptr to an element offset for f16 data).
+        base_elem = stick_to_elem_idx(ptr, "f16")
+        phys_strides = [S, N, 1]      # [4, 8, 1] — K2 stride = N = 8, not S = 4
+        phys_shape   = (n_sticks, K2, S)
+
+        memref = MemRef(
+            base_ptr=base_elem,
+            shape=phys_shape,
+            strides=phys_strides,
+            memory_space="HBM",
+            dtype="f16",
+        )
+
+        # Access tile for N-stick 1: origin [n_floor=1, k2=0, lane=0].
+        # The byte offset to the tile start is 1*S * bytes_per_elem = 1*4*2 = 8.
+        # tile_access computes: offset_elems = 1*S + 0*N + 0*1 = 4 elems.
+        identity_map = parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1, d2)>")
+        from ktir_cpu.ops.memory_ops import MemoryOps
+        tile_ref = MemoryOps.tile_access(
+            ctx, memref, indices=[1, 0, 0],
+            access_shape=(1, K2, S), base_map=identity_map,
+        )
+        access_tile = AccessTile(
+            parent_ref=tile_ref,
+            shape=(1, K2, S),
+            base_map=identity_map,
+            coordinate_set=BoxSet(lo=(0, 0, 0), hi=(1, K2, S)),
+            coordinate_order=None,
+        )
+        ctx.set_value("%acc", access_tile)
+
+        # Load the tile.
+        loaded = _call("ktdp.load", ctx, env, operands=["%acc"])
+        assert isinstance(loaded, Tile)
+        assert loaded.data.shape == (1, K2, S), (
+            f"Expected shape (1, {K2}, {S}), got {loaded.data.shape}"
+        )
+
+        # Expected: loaded[0, k2, lane] == M_logical[k2, S + lane] (columns 4-7).
+        # A naive contiguous read gives loaded[0, k2, lane] == M_logical.ravel()[4 + k2*S + lane]
+        # which is M_logical[0, 4+k2] — wrong rows for k2 > 0.
+        expected = M_logical[:, S:].reshape(1, K2, S)  # [1, 4, 4]
+        assert np.array_equal(loaded.data, expected), (
+            f"ktdp.load did not respect strides [S={S}, N={N}, 1].\n"
+            f"Got:\n{loaded.data}\n"
+            f"Expected (columns {S}..{N-1} of logical matrix):\n{expected}\n"
+            "Hint: a naive contiguous read from flat offset n_floor*S ignores "
+            "the K2 stride and gives wrong rows for k2 > 0."
+        )

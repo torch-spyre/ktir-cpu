@@ -23,7 +23,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, Generator, List, Optional, Set, Tuple, Any
 from .ir_types import Tile
-from .memory import LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
+from .memory import LXOptions, LXScratchpad, SpyreMemoryHierarchy, HBMSimulator
 
 if TYPE_CHECKING:
     from .ops.comm_ops import TransferBackend
@@ -80,18 +80,24 @@ class CoreContext:
           {"%m_acc": Tile(32x1), "%l_acc": Tile(32x1), ...},  # function
           {"%col": 0, "%tile": Tile(32x256), "%m_new": Tile(32x1)}  # body
         ]
-        # At yield: save %m_new, %l_new. pop_scope() frees body LX.
-        # Re-bind %m_acc = %m_new in parent scope, re-track LX.
+        # At yield: save %m_new, %l_new. pop_scope() decrements body Tile refcounts.
+        # set_value("%m_acc", %m_new) in parent scope: refcount tracks automatically.
     """
 
-    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator):
+    def __init__(self, core_id: int, grid_pos: Tuple[int, int, int], lx: LXScratchpad, hbm: HBMSimulator, lx_options: LXOptions = None):
         self.core_id = core_id
         self.grid_pos = grid_pos  # (x, y, z) position in grid
         self.lx = lx              # Core-local LX scratchpad
         self.hbm = hbm            # Shared HBM
+        self.lx_options = lx_options if lx_options is not None else LXOptions()
         self._scope_stack: List[Dict[str, Any]] = [{}]  # bottom = function body
-        self._lx_bytes: Dict[str, int] = {}  # SSA name -> LX bytes (single source of truth)
+        self._tile_refcount: Dict[int, int] = {}  # id(Tile) -> refcount
+        # id(Tile) for tiles that do not occupy LX (compile-time literals from
+        # no_lx_charge ops, e.g. arith.constant). Their binds/unbinds skip every
+        # lx.used adjustment so the scratchpad reflects only real working tiles.
+        self._uncharged_tiles: set = set()
         self._lx_next_ptr_stack: List[int] = []  # watermarks for lx.next_ptr rewind on pop_scope
+        self._use_counts: Dict[str, int] = {}  # SSA name -> use count for current region
         # Scheduler-managed cross-core access — both functions are set by
         # GridExecutor.execute_with_communication via attach_scheduler() and
         # cleared via detach_scheduler() at the end of the run.
@@ -214,16 +220,16 @@ class CoreContext:
     def pop_scope(self):
         """Exit the current region scope.
 
-        Discards all SSA values in the topmost scope, frees their LX
-        via ``untrack_lx``, and rewinds ``lx.next_ptr`` to its
-        pre-push value so the bump-pointer reclaims address space
-        alongside the byte counter.
+        Discards all SSA values in the topmost scope, decrements refcounts
+        for any Tiles, and rewinds ``lx.next_ptr`` to its pre-push value so
+        the bump-pointer reclaims address space alongside the byte counter.
         """
         if len(self._scope_stack) <= 1:
             raise RuntimeError("Cannot pop the function-body scope")
         scope = self._scope_stack.pop()
-        for name in scope:
-            self.untrack_lx(name)
+        for value in scope.values():
+            if isinstance(value, Tile):
+                self._release_tile(value)
         self.lx.next_ptr = self._lx_next_ptr_stack.pop()
         assert len(self._lx_next_ptr_stack) == len(self._scope_stack) - 1
 
@@ -246,22 +252,83 @@ class CoreContext:
     # SSA value access
     # ------------------------------------------------------------------
 
-    def set_value(self, name: str, value: Any):
-        """Set SSA value in the topmost scope.
+    def set_value(self, name: str, value: Any, *, charge: bool = True):
+        """Set SSA value in the topmost scope, auto-tracking Tile LX usage.
+
+        - First binding of a Tile id: charges lx.used once.
+        - Subsequent bindings (aliases, iter_arg rebinds): refcount increments, no double-charge.
+        - Overwriting an existing name: decrements refcount of the old Tile.
 
         Multiple SSA names may legally map to the same underlying tensor object
         (e.g. when ``linalg.reduce`` binds its result to both the SSA result name
         and the ``outs`` buffer name).  This is valid because Python assignment
         creates a second reference to the same object — it does not copy the data.
-        If you need to detect aliasing, compare ``id(a) == id(b)`` on the values.
-        """
-        self._scope_stack[-1][name] = value
 
-    def get_value(self, name: str) -> Any:
+        ``charge=False`` binds a Tile that does not occupy LX — a compile-time
+        literal from a ``no_lx_charge`` op (e.g. ``arith.constant``). Its id is
+        recorded in ``_uncharged_tiles`` so this bind and every later unbind
+        (overwrite, pop_scope, consume) skips the lx.used adjustment. A
+        consuming op pays for the real buffer when it materializes the literal.
+        """
+        old = self._scope_stack[-1].get(name)
+        if isinstance(old, Tile):
+            self._release_tile(old)
+        self._scope_stack[-1][name] = value
+        if isinstance(value, Tile):
+            uncharged = (not charge) or id(value) in self._uncharged_tiles
+            if uncharged:
+                self._uncharged_tiles.add(id(value))
+                # Still refcount so the id is released cleanly, but never touch lx.used.
+                if self.lx_options.alias_dedup:
+                    self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
+                return
+            if self.lx_options.alias_dedup:
+                if self._tile_refcount.get(id(value), 0) == 0:
+                    self._charge_lx(value)
+                self._tile_refcount[id(value)] = self._tile_refcount.get(id(value), 0) + 1
+            else:
+                self._charge_lx(value)
+
+    def _charge_lx(self, value: "Tile") -> None:
+        """Add *value*'s footprint to lx.used, raising on overflow."""
+        if self.lx.used + value.size_bytes() > self.lx.capacity:
+            raise MemoryError(
+                f"LX scratchpad overflow on core {self.core_id}: "
+                f"requested {value.size_bytes()} bytes, "
+                f"available {self.lx.capacity - self.lx.used} bytes "
+                f"(capacity {self.lx.capacity} bytes)"
+            )
+        self.lx.used += value.size_bytes()
+
+    def _release_tile(self, tile: "Tile") -> None:
+        """Drop one reference to *tile*, freeing its LX when the last one goes.
+
+        Uncharged tiles (compile-time literals) never touched lx.used, so their
+        release only updates bookkeeping.
+        """
+        uncharged = id(tile) in self._uncharged_tiles
+        if self.lx_options.alias_dedup:
+            self._tile_refcount[id(tile)] -= 1
+            if self._tile_refcount[id(tile)] == 0:
+                del self._tile_refcount[id(tile)]
+                self._uncharged_tiles.discard(id(tile))
+                if not uncharged:
+                    self.lx.used -= tile.size_bytes()
+        else:
+            self._uncharged_tiles.discard(id(tile))
+            if not uncharged:
+                self.lx.used -= tile.size_bytes()
+
+    def get_value(self, name: str, *, peek: bool = False) -> Any:
         """Get SSA value, searching top-to-bottom.
+
+        On last use (use_count == 1), pops the value from scope and frees LX
+        immediately so the caller can reuse or replace the buffer at no net cost.
 
         Args:
             name: SSA value name (e.g., "%x_tile")
+            peek: If True, suppress consume-on-last-use (used by latency
+                pre-resolution, which reads operand values without consuming them).
 
         Returns:
             The value
@@ -271,7 +338,15 @@ class CoreContext:
         """
         for scope in reversed(self._scope_stack):
             if name in scope:
-                return scope[name]
+                value = scope[name]
+                if (not peek
+                        and self.lx_options.consume_last_use
+                        and isinstance(value, Tile)
+                        and self._use_counts.get(name, 0) == 1
+                        and scope is self._scope_stack[-1]):
+                    del scope[name]
+                    self._release_tile(value)
+                return value
         raise KeyError(f"Value '{name}' not found in core {self.core_id}")
 
     def has_value(self, name: str) -> bool:
@@ -281,34 +356,15 @@ class CoreContext:
     def clear_values(self):
         """Clear all scopes and LX (for next round of execution)."""
         self._scope_stack = [{}]
-        self._lx_bytes.clear()
+        self._tile_refcount.clear()
+        self._uncharged_tiles.clear()
         self._lx_next_ptr_stack.clear()
         self.lx.clear()
 
     # ------------------------------------------------------------------
     # LX tracking — single source of truth for lx.used
+    # Tracking is now automatic via set_value / pop_scope.
     # ------------------------------------------------------------------
-
-    def track_lx(self, name: str, size_bytes: int):
-        """Record that SSA value *name* occupies *size_bytes* in LX.
-
-        Increments ``lx.used``.  Raises ``MemoryError`` if the
-        allocation would exceed the 2 MB LX capacity.
-        """
-        if self.lx.used + size_bytes > self.lx.capacity:
-            raise MemoryError(
-                f"LX scratchpad overflow on core {self.core_id}: "
-                f"requested {size_bytes} bytes, "
-                f"available {self.lx.capacity - self.lx.used} bytes "
-                f"(capacity {self.lx.capacity} bytes)"
-            )
-        self._lx_bytes[name] = size_bytes
-        self.lx.used += size_bytes
-
-    def untrack_lx(self, name: str):
-        """Free LX for SSA value *name*.  Decrements ``lx.used``."""
-        if name in self._lx_bytes:
-            self.lx.used -= self._lx_bytes.pop(name)
 
 
 class CoreExecutionStack:
@@ -358,9 +414,6 @@ class CoreExecutionStack:
                     context.set_value(name, val)
             else:
                 context.set_value(op.result, result)
-                from .ir_types import Tile as _Tile
-                if isinstance(result, _Tile):
-                    context.track_lx(op.result, result.size_bytes())
 
     def resume(self, send_val: Any = None) -> Any:
         """Step the generator.  Returns the final value when done."""

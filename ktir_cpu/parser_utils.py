@@ -30,58 +30,153 @@ def find_ssa_names(text: str) -> list[str]:
     return _SSA_RE.findall(text)
 
 
+_OUTS_RE = re.compile(r'\bouts\s*\(([^)]+)\)')
+_BB0_RE = re.compile(r'\^bb0\s*\(([^)]*)\)')
+
+
+def extract_bb0_arg_names(op_text: str) -> list[str]:
+    """Extract block argument names from a ``^bb0(...)`` label in *op_text*.
+
+    Returns the list of SSA names (e.g. ``['%arg3', '%arg4']``) when the op's
+    ASM contains a region body with explicit block arguments, or an empty list
+    when no ``^bb0(...)`` label is present (e.g. scf.for, which carries its
+    block-arg names as op attributes instead).
+    """
+    m = _BB0_RE.search(op_text)
+    if not m:
+        return []
+    return find_ssa_names(m.group(1))
+
+
+def extract_outs_operands(op_text: str) -> list[str]:
+    """Extract SSA names from the ``outs(...)`` clause of a linalg op text."""
+    m = _OUTS_RE.search(op_text)
+    if not m:
+        return []
+    names = []
+    for segment in split_top_level(m.group(1)):
+        names.extend(find_ssa_names(segment.split(':')[0]))
+    return names
+
+
+def build_use_counts(ops) -> Dict[str, int]:
+    """Count operand uses recursively across all ops and nested regions.
+
+    Shared by both parsers (regex ``KTIRParser`` and ``MLIRFrontendParser``)
+    so they produce identical ``use_counts``. Operates on duck-typed
+    ``Operation`` objects (``.result``, ``.operands``, ``.regions``) — no
+    import of ir_types needed.
+
+    This is a purely *textual* operand count — a name used once syntactically
+    has count 1 even if that use sits inside a loop body and runs many times.
+    ``consume_last_use`` (the only consumer) compensates with its
+    topmost-scope guard, which blocks early-free of outer-scope names fetched
+    per iteration. Loop-carried-state safety (constant accumulator inits) is
+    handled separately by the ``no_lx_charge`` literal model, not by counting.
+    """
+    counts: Dict[str, int] = {}
+    for op in ops:
+        for name in op.operands:
+            counts[name] = counts.get(name, 0) + 1
+        for region in op.regions:
+            for name, n in build_use_counts(region).items():
+                counts[name] = counts.get(name, 0) + n
+    return counts
+
+
 def parse_multi_result_lhs(lhs_text: str) -> list[str]:
     """Parse the LHS of a multi-result MLIR assignment.
 
+    Implements the MLIR grammar production::
+
+        op-result-list ::= op-result (`,` op-result)* `=`
+        op-result      ::= value-id (`:` integer-literal)?
+
+    Always produces a flat list of individual SSA names that get bound
+    1:1 to the operation's result values.
+
     Accepts:
-      bundled form  ``"%g:2"``    -> ``["%g#0", "%g#1"]``
-      comma form    ``"%x, %y"``  -> ``["%x", "%y"]``
-      single        ``"%x"``      -> ``["%x"]``
+      bundled form  ``"%g:2"``        -> ``["%g#0", "%g#1"]``
+      comma form    ``"%x, %y"``      -> ``["%x", "%y"]``
+      mixed form    ``"%a:2, %b"``    -> ``["%a#0", "%a#1", "%b"]``
+      single        ``"%x"``          -> ``["%x"]``
 
     Raises ``ValueError`` on malformed input.
     """
-    m = re.fullmatch(r'(%\w+):([1-9]\d*)', lhs_text.strip())
-    if m:
-        base, n = m.group(1), int(m.group(2))
-        return [f"{base}#{i}" for i in range(n)]
-    parts = [p.strip() for p in lhs_text.split(",")]
-    if all(re.fullmatch(r'%\w+', p) for p in parts):
-        return parts
-    raise ValueError(f"cannot parse multi-result LHS: {lhs_text!r}")
+    parts = [p.strip() for p in lhs_text.strip().split(",")]
+    names = []
+    for part in parts:
+        m = re.fullmatch(r'(%\w+):([1-9]\d*)', part)
+        if m:
+            base, n = m.group(1), int(m.group(2))
+            names.extend(f"{base}#{i}" for i in range(n))
+        elif re.fullmatch(r'%\w+', part):
+            names.append(part)
+        else:
+            raise ValueError(f"cannot parse multi-result LHS: {lhs_text!r}")
+    return names
 
 
-def parse_tensor_type(type_str: str) -> Optional[Dict]:
-    """Parse a tensor type string, returning shape and dtype if it matches.
+def parse_tensor_or_memref_type(type_str: str, *, keep_dynamic_dims=False) -> Optional[Dict]:
+    """Parse a tensor/memref type or bare dims string into shape and dtype.
+
+    Accepts:
+      - ``"tensor<128x32xf16>"``
+      - ``"memref<128x32xf16, #mem_space>"``
+      - ``"128x32xf16"``  (bare inner content)
 
     Args:
-        type_str: Type string (e.g., "tensor<256xf16>")
+        keep_dynamic_dims: If True, dynamic dims (``?``) are kept as None
+            in the shape tuple. If False (default), they are dropped.
 
     Returns:
-        {"shape": tuple, "dtype": str} if tensor type, else None
-
-    Walks the leading dim prefix by matching digit-tokens followed by 'x',
-    taking the remainder as dtype. Handles dtypes containing 'x' (e.g.
-    ``index``). Dynamic dims (``?``) are silently dropped, matching prior
-    behaviour.
+        {"shape": tuple, "dtype": str} or None on failure.
     """
-    m = re.match(r'tensor<([^>]+)>', type_str)
-    if not m:
-        return None
-    inner = m.group(1).strip()
-    # Match all ``NNN x`` dim tokens from the left. The dtype cannot start
-    # with a digit followed by 'x', so the pattern terminates at the right
-    # boundary even when the dtype itself contains 'x' (e.g. ``index``).
-    # Dynamic dims (``?``) are skipped, matching prior behaviour.
+    m = re.match(r'(?:tensor|memref)<([^>]+)>', type_str)
+    inner = m.group(1).strip() if m else type_str.strip()
     prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
     if not prefix:
         return None
-    dims = [int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1))]
+    if keep_dynamic_dims:
+        dims = tuple(
+            None if d == '?' else int(d)
+            for d in re.findall(r'(\d+|[?])\s*x', prefix.group(1))
+        )
+    else:
+        dims = tuple(int(d) for d in re.findall(r'(\d+)\s*x', prefix.group(1)))
     if not dims:
         return None
     dtype = inner[prefix.end():].split(',')[0].strip()
     if not dtype:
         return None
-    return {"shape": tuple(dims), "dtype": dtype}
+    return {"shape": dims, "dtype": dtype}
+
+
+def parse_memref_dims(inner: str):
+    """Parse the inner content of memref<...> or similar into (dims, dtype).
+
+    Handles dtypes containing 'x' (e.g. 'index') by matching dim tokens
+    from the left. Dynamic dims ('?') are returned as None.
+
+    Args:
+        inner: The string inside angle brackets, e.g. "128x32xindex"
+
+    Returns:
+        (dims, dtype) where dims is a tuple of int|None and dtype is a string.
+
+    Raises:
+        ValueError: if no dimension tokens are found.
+    """
+    prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
+    if not prefix:
+        raise ValueError(f"no dimensions found in '{inner}'")
+    dims = tuple(
+        None if d == '?' else int(d)
+        for d in re.findall(r'(\d+|[?])\s*x', prefix.group(1))
+    )
+    dtype = inner[prefix.end():].split(',')[0].strip()
+    return dims, dtype
+
 
 def parse_numeric(s: str, dtype: Optional[str] = None) -> Any:
     """Parse a numeric string to a Python int or float.

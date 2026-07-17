@@ -32,7 +32,9 @@ from .latency import HardwareConfig, LatencyTracker, LatencyReport
 from .dialects import dispatch, ExecutionEnv
 
 
-from .dtypes import to_ktir_dtype as _ktir_dtype
+from .dtypes import to_ktir_dtype as _ktir_dtype, stick_to_elem_idx as _stick_to_elem_idx
+from .memory import HBMSimulator
+from .ops.memory_ops import hbm_read, hbm_write
 
 
 class KTIRInterpreter:
@@ -109,6 +111,7 @@ class KTIRInterpreter:
         self._env = ExecutionEnv(
             grid_executor=self.grid_executor,
             execute_region=self.execute_region,
+            execute_region_with_comms=self.execute_region_with_comms,
         )
         if self._latency_tracker is not None:
             self._latency_tracker.reset()
@@ -147,31 +150,42 @@ class KTIRInterpreter:
             if len(kwargs) == len(declared):
                 kwargs = dict(zip(declared, kwargs.values()))
 
-        # Allocate input tensors in HBM
+        # Allocate input tensors in HBM.
+        # input_byte_ptrs: byte address for read-back (use case B).
+        # input_ptrs: element index for the kernel SSA env (MemRef.base_ptr contract).
+        input_byte_ptrs = {}
         input_ptrs = {}
-        input_dtypes = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
+                dtype = _ktir_dtype(tensor.dtype)
                 stick = self.memory.hbm.allocate(tensor.nbytes)
-                self.memory.hbm.write(stick, tensor)
-                input_ptrs[arg_name] = stick
-                input_dtypes[arg_name] = _ktir_dtype(tensor.dtype)
+                byte_addr = stick * HBMSimulator.STICK_BYTES
+                hbm_write(self.memory.hbm, byte_addr, tensor.flatten())
+                input_byte_ptrs[arg_name] = byte_addr
+                # MLIR pointer operands are element indices.
+                input_ptrs[arg_name] = _stick_to_elem_idx(stick, dtype)
             else:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
+
+        for core in self.grid_executor.cores:
+            core._use_counts = func.use_counts
 
         self.grid_executor.execute_with_communication(
             func.operations, input_ptrs, self._execute_op,
             transfer_backend=self.ring_backend,
         )
 
-        # Read output tensors from HBM
+        # Read output tensors from HBM via byte address (use case B).
         outputs = {}
         for arg_name, tensor in kwargs.items():
             if isinstance(tensor, np.ndarray):
-                stick = input_ptrs[arg_name]
+                byte_addr = input_byte_ptrs[arg_name]
                 n_elements = math.prod(tensor.shape)
-                output_data = self.memory.hbm.read(stick, n_elements, input_dtypes[arg_name]).reshape(tensor.shape)
+                dtype = _ktir_dtype(tensor.dtype)
+                output_data = hbm_read(
+                    self.memory.hbm, byte_addr, n_elements, dtype
+                ).reshape(tensor.shape)
                 outputs[arg_name] = output_data
 
         return outputs
@@ -194,7 +208,7 @@ class KTIRInterpreter:
             resolved_operands = []
             for name in op.operands:
                 try:
-                    resolved_operands.append(context.get_value(name))
+                    resolved_operands.append(context.get_value(name, peek=True))
                 except KeyError:
                     resolved_operands.append(None)
 
@@ -209,21 +223,40 @@ class KTIRInterpreter:
             print(f"Error executing {op.op_type} on core {context.core_id}: {e}")
             raise
 
+        # Structural invariant: accumulating ops must return the same outs object.
+        # Only applies to ops where result = f(ins) + outs (in-place accumulation).
+        # Not enforced when outs is an uncharged (0-LX literal) tile.
+        if (op.outs_operands and not op.regions
+                and result is not None and not inspect.isgenerator(result)):
+            for outs_name in op.outs_operands:
+                try:
+                    outs_tile = context.get_value(outs_name, peek=True)
+                except KeyError:
+                    continue
+                if (isinstance(outs_tile, Tile) and isinstance(result, Tile)
+                        and id(outs_tile) not in context._uncharged_tiles):
+                    assert id(result) == id(outs_tile), (
+                        f"{op.op_type}: handler returned new Tile instead of "
+                        f"mutating outs {outs_name!r}"
+                    )
+
         # Store result in context.
         # Only Tile values (tensor data backed by NumPy arrays) occupy LX.
         # Other result types — TileRef (metadata), AccessTile (coordinates),
         # int/index (scalars) — are bookkeeping and use no scratchpad memory.
-        if op.result and result is not None:
+        # Generator results (comm ops, scf.for/if with comm bodies) are stored
+        # after the scheduler drives them to completion — skip here.
+        if op.result and result is not None and not inspect.isgenerator(result):
             names = op.result if isinstance(op.result, list) else [op.result]
             values = result if isinstance(result, tuple) else [result]
             if len(names) != len(values):
                 raise RuntimeError(
                     f"{op.op_type}: expected {len(names)} result(s), got {len(values)}"
                 )
+            from .dialects.registry import is_no_lx_charge
+            charge = not is_no_lx_charge(op.op_type)
             for name, val in zip(names, values):
-                context.set_value(name, val)
-                if isinstance(val, Tile):
-                    context.track_lx(name, val.size_bytes())
+                context.set_value(name, val, charge=charge)
 
         # Record latency.
         # Sync handlers: charge now, with the final value.
@@ -307,10 +340,37 @@ class KTIRInterpreter:
     def execute_region(self, context: CoreContext, operations: List[Operation]) -> Any:
         """Execute a nested region synchronously (scf.for body, scf.if branch, etc.).
 
-        Comm ops cannot appear inside nested regions in the current spec, so
-        this stays sync — no generator machinery needed.
+        Comm ops cannot appear inside compute-only regions (linalg combiners,
+        tensor.generate bodies, ktdp combiner bodies).  For scf regions that
+        may contain comm ops use ``execute_region_with_comms`` instead.
         """
         result = None
         for op in operations:
             result = self._execute_op(op, context)
+        return result
+
+    def execute_region_with_comms(self, context: CoreContext, operations: List[Operation]):
+        """Execute a nested region that may contain comm ops (scf.for / scf.if bodies).
+
+        Generator-aware: if an op returns a generator (comm op), propagates it
+        via ``yield from`` so the scheduler can drive it.  The resolved result
+        overwrites the placeholder generator binding that ``_execute_op`` stored
+        before returning.  When no comm op fires this runs synchronously —
+        ``yield from`` on a generator that never yields returns immediately.
+        """
+        result = None
+        for op in operations:
+            result = self._execute_op(op, context)
+            if inspect.isgenerator(result):
+                result = yield from result
+                # _execute_op stored the raw generator under op.result before
+                # returning it.  Overwrite with the resolved tile now that the
+                # scheduler has driven the generator to completion.
+                if op.result is not None and result is not None:
+                    from .dialects.registry import is_no_lx_charge
+                    charge = not is_no_lx_charge(op.op_type)
+                    names = op.result if isinstance(op.result, list) else [op.result]
+                    values = result if isinstance(result, tuple) else [result]
+                    for name, val in zip(names, values):
+                        context.set_value(name, val, charge=charge)
         return result

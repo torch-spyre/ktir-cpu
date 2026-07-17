@@ -467,9 +467,33 @@ class TestLinalgParsers(ParseTestMixin):
         )
         self.assert_op_type(op, "linalg.reduce")
         self.assert_attribute(op, "reduce_fn", "arith.maxnumf")
-        self.assert_attribute(op, "dim", 1)
+        self.assert_attribute(op, "dims", [1])
         self.assert_num_operands(op, 1)
         self.assert_operand_names(op, "%x")
+
+    def test_reduce_empty_dims(self):
+        # dimensions = [] means zero reduce dimensions (shape-preserving no-op)
+        op = self._parse(
+            "%r = linalg.reduce { arith.addf }"
+            " ins(%x : tensor<4x8xf16>)"
+            " outs(%init : tensor<4x8xf16>)"
+            " dimensions = []",
+            args={"%x": "tensor<4x8xf16>", "%init": "tensor<4x8xf16>"},
+        )
+        self.assert_op_type(op, "linalg.reduce")
+        self.assert_attribute(op, "dims", [])
+
+    def test_reduce_multi_dims(self):
+        # dimensions = [0, 2] - multiple axes
+        op = self._parse(
+            "%r = linalg.reduce { arith.addf }"
+            " ins(%x : tensor<2x3x4xf16>)"
+            " outs(%init : tensor<3xf16>)"
+            " dimensions = [0, 2]",
+            args={"%x": "tensor<2x3x4xf16>", "%init": "tensor<3xf16>"},
+        )
+        self.assert_op_type(op, "linalg.reduce")
+        self.assert_attribute(op, "dims", [0, 2])
 
     def test_fill(self):
         # fill records both ins and outs operands
@@ -660,6 +684,70 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_num_operands(op, 3)
         self.assert_operand_names(op, "%a", "%b", "%c")
         self.assert_attribute(op, "shape", (3,))
+
+    def test_extract_slice(self):
+        """tensor.extract_slice parses offsets/sizes/strides and result type."""
+        op = self._parse(
+            "%sl = tensor.extract_slice %src[0, 4][2, 4][1, 1]"
+            " : tensor<8x8xf16> to tensor<2x4xf16>",
+            args={"%src": "tensor<8x8xf16>"},
+        )
+        self.assert_op_type(op, "tensor.extract_slice")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%src")
+        self.assert_attribute(op, "static_offsets", [0, 4])
+        self.assert_attribute(op, "static_sizes", [2, 4])
+        self.assert_attribute(op, "static_strides", [1, 1])
+        self.assert_attribute(op, "result_shape", (2, 4))
+        self.assert_attribute(op, "dtype", "f16")
+
+    def test_insert_slice(self):
+        """tensor.insert_slice parses src, dst, offsets/sizes/strides, and result type."""
+        op = self._parse(
+            "%out = tensor.insert_slice %src into %dst[0, 4][2, 4][1, 1]"
+            " : tensor<2x4xf16> into tensor<8x8xf16>",
+            args={"%src": "tensor<2x4xf16>", "%dst": "tensor<8x8xf16>"},
+        )
+        self.assert_op_type(op, "tensor.insert_slice")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%src", "%dst")
+        self.assert_attribute(op, "static_offsets", [0, 4])
+        self.assert_attribute(op, "static_sizes", [2, 4])
+        self.assert_attribute(op, "static_strides", [1, 1])
+        self.assert_attribute(op, "result_shape", (8, 8))
+        self.assert_attribute(op, "dtype", "f16")
+
+    def test_extract_slice_dynamic_offset(self):
+        """Dynamic offset %off becomes kDynamic sentinel + extra operand."""
+        _KDYNAMIC = -(1 << 63)
+        op = self._parse(
+            "%sl = tensor.extract_slice %src[0, %off][1, 64][1, 1]"
+            " : tensor<1x128xf32> to tensor<64xf32>",
+            args={"%src": "tensor<1x128xf32>", "%off": "index"},
+        )
+        self.assert_op_type(op, "tensor.extract_slice")
+        # operands: source + dynamic offset name
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%src", "%off")
+        assert op.attributes["static_offsets"] == [0, _KDYNAMIC]
+        self.assert_attribute(op, "static_sizes", [1, 64])
+        self.assert_attribute(op, "static_strides", [1, 1])
+
+    def test_insert_slice_dynamic_offset(self):
+        """Dynamic offset %off becomes kDynamic sentinel + extra operand."""
+        _KDYNAMIC = -(1 << 63)
+        op = self._parse(
+            "%out = tensor.insert_slice %src into %dst[0, %off][1, 64][1, 1]"
+            " : tensor<1x64xf32> into tensor<1x128xf32>",
+            args={"%src": "tensor<1x64xf32>", "%dst": "tensor<1x128xf32>", "%off": "index"},
+        )
+        self.assert_op_type(op, "tensor.insert_slice")
+        # operands: src + dst + dynamic offset name
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%src", "%dst", "%off")
+        assert op.attributes["static_offsets"] == [0, _KDYNAMIC]
+        self.assert_attribute(op, "static_sizes", [1, 64])
+        self.assert_attribute(op, "static_strides", [1, 1])
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1018,44 @@ class TestKtdpParsers(ParseTestMixin):
                 args={"%ptr": "index"},
             )
 
+    @pytest.mark.regex_only
+    def test_construct_distributed_memory_view_concrete_shape(self):
+        # Sanity: the existing concrete-shape path is untouched by the '?' fix.
+        op = self._parse(
+            "%dv = ktdp.construct_distributed_memory_view"
+            " (%a0, %a1 : memref<64x16xf16>, memref<64x16xf16>)"
+            " : memref<64x32xf16>",
+            args={"%a0": "memref<64x16xf16>", "%a1": "memref<64x16xf16>"},
+        )
+        self.assert_op_type(op, "ktdp.construct_distributed_memory_view")
+        self.assert_attribute(op, "shape", (64, 32))
+        self.assert_attribute(op, "dtype", "f16")
+        self.assert_result_type(op, "memref<64x32xf16>")
+
+    @pytest.mark.regex_only
+    def test_construct_distributed_memory_view_dynamic_dim(self):
+        # '?' in result type: parser stores None in shape attr; the handler
+        # resolves it from partition coordinate sets (see exec test).
+        op = self._parse(
+            "%dv = ktdp.construct_distributed_memory_view"
+            " (%a0, %a1 : memref<64x?xf16>, memref<64x?xf16>)"
+            " : memref<64x?xf16>",
+            args={"%a0": "memref<64x?xf16>", "%a1": "memref<64x?xf16>"},
+        )
+        self.assert_attribute(op, "shape", (64, None))
+        self.assert_result_type(op, "memref<64x?xf16>")
+
+    @pytest.mark.regex_only
+    def test_construct_distributed_memory_view_all_dynamic(self):
+        op = self._parse(
+            "%dv = ktdp.construct_distributed_memory_view"
+            " (%a0, %a1 : memref<?x?xf16>, memref<?x?xf16>)"
+            " : memref<?x?xf16>",
+            args={"%a0": "memref<?x?xf16>", "%a1": "memref<?x?xf16>"},
+        )
+        self.assert_attribute(op, "shape", (None, None))
+        self.assert_result_type(op, "memref<?x?xf16>")
+
     def test_construct_access_tile_dynamic_memref(self):
         # construct_access_tile already handles memref<?xf32> correctly:
         # it reads shape only from the !ktdp.access_tile<...> result type,
@@ -1009,6 +1135,33 @@ class TestScfParsers(ParseTestMixin):
         )
         assert isinstance(op.result, list)
         assert len(op.result) == 2
+
+    def test_for_bundled_result(self):
+        # bundled form %acc:2 = scf.for ... produces a list of 2 names
+        op = self._parse(
+            "%acc:2 = scf.for %i = %c0 to %n step %c1"
+            " iter_args(%a = %init0, %b = %init1) -> (f16, f16) {\n"
+            "      scf.yield %a, %b : f16, f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index",
+                  "%init0": "f16", "%init1": "f16"},
+        )
+        self.assert_op_type(op, "scf.for")
+        assert isinstance(op.result, list)
+        assert len(op.result) == 2
+        assert all(r.startswith("%") for r in op.result)
+        assert len(set(op.result)) == 2
+
+    def test_for_bundled_result_single(self):
+        # %r:1 = scf.for ... collapses to a single str (convention)
+        op = self._parse(
+            "%r:1 = scf.for %i = %c0 to %n step %c1"
+            " iter_args(%acc = %init) -> (f16) {\n"
+            "      scf.yield %acc : f16\n    }",
+            args={"%c0": "index", "%n": "index", "%c1": "index", "%init": "f16"},
+        )
+        self.assert_op_type(op, "scf.for")
+        assert isinstance(op.result, str)
+        assert op.result.startswith("%")
 
     def test_yield_single(self):
         # scf.yield with one value records the operand
@@ -1208,34 +1361,36 @@ class TestParseAttrList:
         assert len(result) == 1
 
 
-from ktir_cpu.parser_utils import parse_tensor_type
+from ktir_cpu.parser_utils import parse_tensor_or_memref_type
 
 
-class TestParseTensorType:
+class TestParseTensorOrMemrefType:
     def test_basic_float(self):
-        assert parse_tensor_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
+        assert parse_tensor_or_memref_type("tensor<256xf16>") == {"shape": (256,), "dtype": "f16"}
 
     def test_basic_int(self):
-        assert parse_tensor_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
+        assert parse_tensor_or_memref_type("tensor<10xi32>") == {"shape": (10,), "dtype": "i32"}
 
     def test_multi_dim(self):
-        assert parse_tensor_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("tensor<1x64xf32>") == {"shape": (1, 64), "dtype": "f32"}
 
     def test_index_dtype(self):
         # Regression: 'index' contains 'x'; old split('x') would corrupt the dtype.
-        assert parse_tensor_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
-        assert parse_tensor_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
+        assert parse_tensor_or_memref_type("tensor<2xindex>") == {"shape": (2,), "dtype": "index"}
+        assert parse_tensor_or_memref_type("tensor<2x3xindex>") == {"shape": (2, 3), "dtype": "index"}
 
     def test_dynamic_dims_dropped(self):
-        assert parse_tensor_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
-        assert parse_tensor_type("tensor<?xf16>") is None
+        assert parse_tensor_or_memref_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("tensor<?xf16>") is None
 
     def test_rank0_returns_none(self):
-        assert parse_tensor_type("tensor<f32>") is None
+        assert parse_tensor_or_memref_type("tensor<f32>") is None
 
-    def test_non_tensor_returns_none(self):
-        assert parse_tensor_type("memref<10xf32>") is None
-        assert parse_tensor_type("f32") is None
+    def test_memref_accepted(self):
+        assert parse_tensor_or_memref_type("memref<10xf32>") == {"shape": (10,), "dtype": "f32"}
+
+    def test_non_type_returns_none(self):
+        assert parse_tensor_or_memref_type("f32") is None
 
     @pytest.mark.xfail(strict=True, reason="nested '<>' in dtype unsupported; regex stops at first '>'")
     @pytest.mark.parametrize("type_str,expected", [
@@ -1244,7 +1399,7 @@ class TestParseTensorType:
         ("tensor<4xvector<4xf32>>", {"shape": (4,), "dtype": "vector<4xf32>"}),
     ])
     def test_nested_bracket_dtype_unsupported(self, type_str, expected):
-        assert parse_tensor_type(type_str) == expected
+        assert parse_tensor_or_memref_type(type_str) == expected
 
 
 # ---------------------------------------------------------------------------

@@ -303,10 +303,24 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             # 4-core all-reduce sum via ktdp.inter_tile_produce +
             # ktdp.inter_tile_reduce; only core 0 writes back.
             # grid = [4, 1, 1] → 4 cores; n_cols = 128 (from construct_memory_view sizes).
-            # HBM stick layout (1 stick = 128 bytes = 64 f16):
-            #   sticks [0..7]  → 4 input rows × 2 sticks each (1024 bytes total)
-            #   sticks [8..9]  → 1 output row × 2 sticks (256 bytes)
-            "execute_kwargs": {"in_ptr": 0, "out_ptr": 8},
+            # HBM element-index layout (f16, 1 elem = 2 bytes, 1 stick = 64 f16):
+            #   elems [0..511]   → 4 input rows × 128 elems each
+            #   elems [512..639] → 1 output row × 128 elems
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 512},
+            "n_cols": 128,
+        },
+    ],
+    "ring_reduce_inner_loop": [
+        {
+            "path": "ktir/ring_reduce_inner_loop.mlir",
+            # 4-core all-reduce sum inside scf.for; loop runs n_iters times,
+            # accumulating the per-iteration reduce into an iter_arg.
+            # Only core 0 writes the final accumulator back.
+            # grid = [4, 1, 1] → 4 cores; n_cols = 128.
+            # HBM element-index layout (f16, 1 elem = 2 bytes, 1 stick = 64 f16):
+            #   elems [0..511]   → 4 input rows × 128 elems each
+            #   elems [512..639] → 1 output row × 128 elems
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 512, "n_iters": 3},
             "n_cols": 128,
         },
     ],
@@ -318,13 +332,57 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             # each group (pid % 4 == 0) writes back to a per-group
             # output row.
             # grid = [16, 1, 1] → 16 cores; n_cols = 128.
-            # HBM stick layout:
-            #   sticks [0..31]  → 16 input rows × 2 sticks each (4096 bytes)
-            #   sticks [32..39] → 4 output rows × 2 sticks each (1024 bytes)
-            "execute_kwargs": {"in_ptr": 0, "out_ptr": 32},
+            # HBM element-index layout (f16, 1 stick = 64 f16):
+            #   elems [0..2047]    → 16 input rows × 128 elems each
+            #   elems [2048..2559] → 4 output rows × 128 elems each
+            "execute_kwargs": {"in_ptr": 0, "out_ptr": 2048},
             "n_cols": 128,
             "n_groups": 4,
             "group_size": 4,
+        },
+    ],
+    # ---------------------------------------------------------------------------
+    # FFN-SwiGLU example (Issue #77)
+    # ---------------------------------------------------------------------------
+    "ffn_swiglu": [
+        {
+            "path": "ktir/ffn_swiglu.mlir",
+            # Single-core FFN-SwiGLU with minimal dimensions:
+            # seq=1, d_model=64, d_ffn=128
+            # Tests the complete SwiGLU feedforward network:
+            #   gate = x @ W_gate, up = x @ W_up
+            #   silu = gate * sigmoid(gate)
+            #   fused = silu * up
+            #   out = fused @ W_down
+            #   result = x + out (residual)
+            # grid = [1, 1] → single core
+            "execute_kwargs": {},
+        },
+    ],
+    "ffn_swiglu_4core": [
+        {
+            "path": "ktir/ffn_swiglu_4core.mlir",
+            # 4-core distributed FFN-SwiGLU with hidden-dimension sharding.
+            # Global dimensions: seq=4, d_model=256, d_ffn=1024, grid=[4].
+            # x is replicated, each core owns a 256-wide FFN shard of W_gate/W_up
+            # and a 256-row shard of W_down, computes a local [4,256] partial,
+            # all-reduces it, adds the residual, and only core 0 writes back.
+            # HBM element-index layout (f16, 1 stick = 64 f16):
+            #   elems [0..1023]        → x        [4,256]
+            #   elems [1024..263167]   → W_gate   [256,1024]
+            #   elems [263168..525311] → W_up     [256,1024]
+            #   elems [525312..787455] → W_down   [1024,256]
+            #   elems [787456..788479] → out      [4,256]
+            "execute_kwargs": {
+                "x_ptr": 0,
+                "w_gate_ptr": 1024,
+                "w_up_ptr": 263168,
+                "w_down_ptr": 525312,
+                "out_ptr": 787456,
+            },
+            "seq": 4,
+            "d_model": 256,
+            "d_ffn": 1024,
         },
     ],
 }
