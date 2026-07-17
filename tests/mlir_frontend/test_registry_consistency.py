@@ -57,16 +57,6 @@ FRONTEND_UNSUPPORTED = {
     "ktdp.coreid": "non-spec op (not in the ktdp dialect). Reconcile to the "
                    "real core-identity form or remove. See issue #88.",
 
-    # Real spec ops missing a frontend adapter handler — pending
-    # ktir-mlir-frontend#23 (inter-tile communication ops).
-    "ktdp.inter_tile_produce": "🧪 experimental op; no frontend adapter yet. "
-                               "Blocked on ktir-mlir-frontend#23.",
-    "ktdp.inter_tile_reduce": "🧪 experimental op; no frontend adapter yet. "
-                              "Blocked on ktir-mlir-frontend#23.",
-    "ktdp.yield_partial": "🧪 experimental terminator; no frontend adapter yet. "
-                          "Blocked on ktir-mlir-frontend#23.",
-    "ktdp.yield_reduced": "🧪 experimental terminator; no frontend adapter yet. "
-                          "Blocked on ktir-mlir-frontend#23.",
 }
 
 
