@@ -999,33 +999,112 @@ class TestLatencyEdgeCases:
         assert report.kernel_cycles == 0.0
         assert report.kernel_time_us == 0.0
 
+    # -- Shared helpers for distributed-view unit tests ----------------------
+
+    @staticmethod
+    def _make_partition(shape, memory_space, coord_lo, base_ptr=0):
+        """Build a TileRef partition with the given space and bounding box."""
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import MemRef, TileRef
+        rows, cols = shape
+        memref = MemRef(base_ptr=base_ptr, shape=shape,
+                        strides=[cols, 1], memory_space=memory_space, dtype="f16")
+        hi = (coord_lo[0] + rows, coord_lo[1] + cols)
+        return TileRef(
+            base_ptr=base_ptr, shape=shape, strides=[cols, 1], memref=memref,
+            dtype="f16", coordinate_set=BoxSet(lo=coord_lo, hi=hi),
+            partition_origin=coord_lo,
+        )
+
+    @staticmethod
+    def _make_access_tile(partitions, global_shape):
+        """Build an AccessTile over a DistributedTileRef from partitions."""
+        from ktir_cpu.affine import BoxSet
+        from ktir_cpu.ir_types import AccessTile, DistributedTileRef
+        from ktir_cpu.parser_ast import parse_affine_map
+        dist_ref = DistributedTileRef(
+            partitions=partitions, shape=global_shape, dtype="f16",
+            global_base=(0, 0),
+        )
+        return AccessTile(
+            parent_ref=dist_ref, shape=global_shape,
+            base_map=parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+            coordinate_set=BoxSet(lo=(0, 0), hi=global_shape),
+            coordinate_order=None,
+        )
+
+    # -- Tests -------------------------------------------------------------
+
     def test_memory_space_distributed_tile_ref(self):
         """_memory_space() returns the partition memory space for distributed views."""
         from ktir_cpu.latency import LatencyTracker
-        from ktir_cpu.affine import BoxSet
-        from ktir_cpu.ir_types import (
-            AccessTile, DistributedTileRef, MemRef, TileRef,
-        )
-        from ktir_cpu.parser_ast import parse_affine_map
+        part = self._make_partition((256, 256), "HBM", (0, 0))
+        at = self._make_access_tile([part], (256, 1024))
+        assert LatencyTracker._memory_space([at]) == "HBM"
 
-        memref = MemRef(base_ptr=0, shape=(256, 256), strides=[256, 1],
-                        memory_space="HBM", dtype="f16")
-        partition = TileRef(
-            base_ptr=0, shape=(256, 256), strides=[256, 1], memref=memref,
-            dtype="f16", coordinate_set=BoxSet(lo=(0, 0), hi=(256, 256)),
-            partition_origin=(0, 0),
+    def test_is_distributed_mixed(self):
+        """_is_distributed_mixed detects heterogeneous memory spaces."""
+        from ktir_cpu.latency import LatencyTracker
+
+        hbm_part = self._make_partition((64, 64), "HBM", (0, 0))
+        lx_part = self._make_partition((64, 64), "LX", (64, 0))
+
+        # Mixed: one HBM + one LX partition
+        mixed_at = self._make_access_tile([hbm_part, lx_part], (128, 64))
+        assert LatencyTracker._is_distributed_mixed([mixed_at]) is True
+
+        # Uniform HBM: both partitions on HBM
+        hbm_part2 = self._make_partition((64, 64), "HBM", (64, 0), base_ptr=8192)
+        uniform_at = self._make_access_tile([hbm_part, hbm_part2], (128, 64))
+        assert LatencyTracker._is_distributed_mixed([uniform_at]) is False
+
+    def test_lx_bytes_per_cycle_per_core(self):
+        """lx_bytes_per_cycle_per_core equals ring_bandwidth converted to bytes/cycle."""
+        cfg = HardwareConfig(ring_bandwidth_tb_s=4.0, clock_ghz=1.0)
+        expected = 4.0e12 / 1.0e9  # 4000 bytes/cycle
+        assert cfg.lx_bytes_per_cycle_per_core() == expected
+
+        cfg2 = HardwareConfig(ring_bandwidth_tb_s=2.0, clock_ghz=2.0)
+        expected2 = 2.0e12 / 2.0e9  # 1000 bytes/cycle
+        assert cfg2.lx_bytes_per_cycle_per_core() == expected2
+
+    def test_decomposed_memory_cost_mixed(self):
+        """Mixed distributed view uses max(hbm_cycles, lx_cycles) decomposition."""
+        from ktir_cpu.latency import LatencyTracker
+        from ktir_cpu.ir_types import Tile
+        import numpy as np
+
+        cfg = HardwareConfig(
+            num_cores=1, clock_ghz=1.0,
+            hbm_bandwidth_tb_s=1.0, ring_bandwidth_tb_s=4.0,
         )
-        dist_ref = DistributedTileRef(
-            partitions=[partition], shape=(256, 1024), dtype="f16",
-            global_base=(0, 0),
+        tracker = LatencyTracker(cfg)
+
+        hbm_part = self._make_partition((64, 64), "HBM", (0, 0))
+        lx_part = self._make_partition((64, 64), "LX", (64, 0))
+        access_tile = self._make_access_tile([hbm_part, lx_part], (128, 64))
+
+        # Simulate a load result: unique_sticks counts only HBM partition
+        # 64*64 f16 = 8192 bytes; at 128 bytes/stick = 64 sticks
+        result_tile = Tile(
+            data=np.zeros((128, 64), dtype=np.float16),
+            dtype="f16", shape=(128, 64),
+            unique_sticks=64,
         )
-        access_tile = AccessTile(
-            parent_ref=dist_ref, shape=(256, 256),
-            base_map=parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
-            coordinate_set=BoxSet(lo=(0, 0), hi=(256, 256)),
-            coordinate_order=None,
-        )
-        assert LatencyTracker._memory_space([access_tile]) == "HBM"
+
+        cat, cycles, flops, nbytes = tracker._estimate(
+            "ktdp.load", result_tile, [access_tile])
+
+        hbm_bytes = 64 * 128  # stick-granular HBM
+        lx_bytes = 64 * 64 * 2  # logical LX partition size
+        hbm_bw = cfg.hbm_bytes_per_cycle_per_core
+        lx_bw = cfg.lx_bytes_per_cycle_per_core()
+        expected_cycles = max(hbm_bytes / hbm_bw, lx_bytes / lx_bw)
+
+        assert cat == "memory"
+        assert cycles == pytest.approx(expected_cycles)
+        assert nbytes == hbm_bytes + lx_bytes
+        assert flops == 0.0
 
 
 class TestIndirectAccessLatency:
