@@ -325,7 +325,7 @@ The `ridge` differs between levels: chip uses `chip_peak / hbm_bw_chip`, per-cor
 An `ExecutionModel` dataclass (alongside `HardwareConfig`) makes modeling choices explicit:
 
 - **pipeline**: `"serial"` (default, total = compute + memory + comm), `"overlapped"` (compute overlaps data movement: total = max(compute, memory + comm)), or `"overlapped_3way"` (all three independent: total = max(compute, memory, comm)).
-- **bw_sharing**: `"contended"` (per-core BW = hbm_bw_chip / cores_active) or `"static"` (/ num_cores).
+- **bw_sharing**: `"contended"` (implemented — per-core BW = hbm_bw_chip / cores_active). `"static"` (per-core BW = hbm_bw_chip / num_cores) is reserved and not yet implemented.
 - **unit_categories**: which LatencyCategories each compute unit claims.
 
 ### Example: vector_add (memory-bound)

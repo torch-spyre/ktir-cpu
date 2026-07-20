@@ -27,7 +27,7 @@ import textwrap
 import numpy as np
 import pytest
 
-from ktir_cpu import KTIRInterpreter, HardwareConfig
+from ktir_cpu import KTIRInterpreter, HardwareConfig, ExecutionModel
 from ktir_cpu.ir_types import _iter_ops
 
 from ktir_cpu.parser_ast import parse_affine_set
@@ -298,6 +298,21 @@ class TestHardwareConfig:
         # per-cycle byte quantities scale inversely with clock:
         # 0.064 TB/s at 2 GHz = 0.064e12 / 2e9 = 32 bytes/cycle
         assert cfg.ring_bytes_per_cycle == pytest.approx(32.0)
+
+
+class TestExecutionModel:
+    def test_default_bw_sharing_is_contended(self):
+        assert ExecutionModel().bw_sharing == "contended"
+
+    def test_static_bw_sharing_rejected_as_unimplemented(self):
+        # "static" is documented as reserved; it must fail loudly rather than
+        # silently fall through to the contended bandwidth path.
+        with pytest.raises(NotImplementedError, match="static"):
+            ExecutionModel(bw_sharing="static")
+
+    def test_unknown_bw_sharing_rejected(self):
+        with pytest.raises(ValueError, match="bw_sharing"):
+            ExecutionModel(bw_sharing="shared")
 
 
 # ---------------------------------------------------------------------------

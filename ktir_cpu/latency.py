@@ -66,9 +66,13 @@ class ExecutionModel:
                 total = max(compute, memory + comm).
             "overlapped_3way" — all three stages have independent pipes and
                 overlap freely: total = max(compute, memory, comm).
-        bw_sharing: How HBM bandwidth is partitioned among cores.
-            "contended" — per-core BW = hbm_bw_chip / cores_active.
-            "static" — per-core BW = hbm_bw_chip / num_cores.
+        bw_sharing: How HBM bandwidth is partitioned among cores. The model
+            implements contended sharing; static partitioning is reserved as a
+            future modeling choice and is not yet wired into the bandwidth path.
+            "contended" — per-core BW = hbm_bw_chip / cores_active: the active
+                cores share the whole chip's bandwidth (the implemented model).
+            "static" — per-core BW = hbm_bw_chip / num_cores: a fixed per-core
+                slice regardless of how many cores are active (reserved).
         fallback_unit: Dominant unit when no compute cycles ran.
     """
     unit_categories: Dict[str, set] = field(default_factory=lambda: {
@@ -78,6 +82,19 @@ class ExecutionModel:
     pipeline: str = "serial"
     bw_sharing: str = "contended"
     fallback_unit: str = "simd"
+
+    def __post_init__(self):
+        # Reject unimplemented / unknown bw_sharing so it cannot silently fall
+        # through to the contended path (see attribute docstring above).
+        if self.bw_sharing == "static":
+            raise NotImplementedError(
+                "bw_sharing='static' (fixed per-core partition) is reserved "
+                "and not yet implemented; only 'contended' is available."
+            )
+        if self.bw_sharing != "contended":
+            raise ValueError(
+                f"bw_sharing must be 'contended' (got {self.bw_sharing!r})"
+            )
 
 
 # ---------------------------------------------------------------------------
