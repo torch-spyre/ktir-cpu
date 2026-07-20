@@ -7,24 +7,27 @@
 //                -> distributed_tile_access (per-partition routing)
 //                -> ktdp.load / ktdp.store
 //
-// Layout (logical 64x32 row-major, s0 = 16):
+// Layout (logical 64 x 2*s0 row-major):
 //   A0 = cols [0, s0),     stored on HBM (memref<64x?xf16>)
 //   A1 = cols [s0, 2*s0),  stored on HBM (memref<64x?xf16>)
-//   B  = full 64x32,       stored on HBM (output)
+//   B  = full 64 x 2*s0,   stored on HBM (output, memref<64x?xf16>)
 //
-// A 32-wide access tile straddles both 16-wide partitions, so the
-// per-partition routing C_i = B_i ∩ (x+A) splits non-trivially on each
-// side.  A sibling fixture (-s32.mlir) covers the dual case where each
-// tile lands inside one partition and the other is correctly excluded.
+// Every shape stays dynamic at the memory-view level -- the partitions,
+// the composed distributed view, and the output B.  The concrete 64x32
+// shape appears only at the access-tile level, mirroring how the
+// non-distributed dynamic examples (e.g. vector_add_dynamic_ktir.mlir)
+// keep the memory view symbolic and resolve to a concrete tile.
 //
-// The global distributed view, B, and the access tile are concrete
-// because the regex parser does not accept '?' in distributed-view
-// result types or in access_tile<NxMxindex> shapes.  Symbolic binding
-// is exercised on every construct_memory_view call for the partitions.
+// Parametrized over s0 (see conftest EXAMPLE_PARAMS):
+//   s0 = 16 (global 32): a single 32-wide tile straddles both 16-wide
+//     partitions -> C_i = B_i n (x+A) splits non-trivially on each side.
+//   s0 = 32 (global 64): two 32-wide tiles each land inside one
+//     partition -> the other partition is correctly excluded.
+// Symbolic binding is exercised on every construct_memory_view call.
 
 #A0_set = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + s0 - 1 >= 0)>
 #A1_set = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + 63 >= 0, d1 - s0 >= 0, -d1 + 2*s0 - 1 >= 0)>
-#full   = affine_set<(d0, d1)     : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>
+#B_set  = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + s0 - 1 >= 0)>
 #tile   = affine_set<(d0, d1)     : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>
 #order  = affine_map<(d0, d1) -> (d0, d1)>
 
@@ -52,29 +55,29 @@ module {
       memory_space = #ktdp.spyre_memory_space<HBM>
     } : memref<64x?xf16>
 
-    // (1) Compose into a single logical 64x32 distributed view.
+    // (1) Compose into a single logical distributed view.  Inputs are
+    // dynamic, so the composed view stays dynamic too.
     %A_view = ktdp.construct_distributed_memory_view
         (%A0_view, %A1_view : memref<64x?xf16>, memref<64x?xf16>)
-        : memref<64x32xf16>
+        : memref<64x?xf16>
 
-    // (1) Output view B (concrete).
-    %B_view = ktdp.construct_memory_view %b_ptr, sizes: [64, 32], strides: [32, 1] {
-      coordinate_set = #full,
+    // (1) Output view B, dynamic like the partitions (trailing dim = 2*s0).
+    %B_view = ktdp.construct_memory_view %b_ptr, sizes: [64, %ub], strides: [%ub, 1] {
+      coordinate_set = #B_set,
       memory_space = #ktdp.spyre_memory_space<HBM>
-    } : memref<64x32xf16>
+    } : memref<64x?xf16>
 
     // (2)+(3) Iterate access tiles across the global domain.  Trip count
-    // = 2*s0 / 32; for s0=16 this is exactly 1 (tile spans both
-    // partitions).  Constructing a fresh access tile per iteration with
-    // %off as the column index keeps access_tile_set concrete.
+    // = 2*s0 / 32.  The concrete 64x32 shape appears only here, at the
+    // access-tile level.
     scf.for %off = %c0 to %ub step %c32 {
       %A_tile = ktdp.construct_access_tile %A_view[%c0, %off] {
         access_tile_set = #tile, access_tile_order = #order
-      } : memref<64x32xf16> -> !ktdp.access_tile<64x32xindex>
+      } : memref<64x?xf16> -> !ktdp.access_tile<64x32xindex>
 
       %B_tile = ktdp.construct_access_tile %B_view[%c0, %off] {
         access_tile_set = #tile, access_tile_order = #order
-      } : memref<64x32xf16> -> !ktdp.access_tile<64x32xindex>
+      } : memref<64x?xf16> -> !ktdp.access_tile<64x32xindex>
 
       %data = ktdp.load %A_tile : !ktdp.access_tile<64x32xindex> -> tensor<64x32xf16>
       ktdp.store %data, %B_tile : tensor<64x32xf16>, !ktdp.access_tile<64x32xindex>
