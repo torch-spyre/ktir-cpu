@@ -941,3 +941,230 @@ class TestFFNSwiGLU4CoreExecution:
         expected = np.zeros((seq, d_model), dtype=np.float16)
 
         np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
+
+
+class TestRMSNormExecution:
+    """End-to-end execution of rmsnorm_4core_4x1.mlir.
+
+    4-core embarrassingly parallel RMSNorm: grid=[4,1], no allreduce.
+    Each core independently normalizes its stride-4 rows over the full
+    4096 hidden dimension.
+    """
+
+    @staticmethod
+    def _rmsnorm_reference(x, w, eps=1e-5):
+        """NumPy reference: RMSNorm(x) = x / sqrt(mean(x^2) + eps) * w."""
+        x_f32 = x.astype(np.float32)
+        w_f32 = w.astype(np.float32)
+        rms = np.sqrt(np.mean(x_f32 ** 2, axis=1, keepdims=True) + eps)
+        return (x_f32 / rms * w_f32).astype(np.float16)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_4x1"))
+    def test_rmsnorm_distributed(self, path, func_name, entry):
+        """4-core RMSNorm: output matches NumPy reference."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        hidden_dim = entry["hidden_dim"]
+        ek = entry["execute_kwargs"]
+        x_ptr = ek["X"]
+        y_ptr = ek["Y"]
+        w_ptr = ek["W"]
+
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((seq, hidden_dim)).astype(np.float16)
+        w_1d = rng.uniform(0.5, 1.5, size=hidden_dim).astype(np.float16)
+        w = np.tile(w_1d, (seq, 1))
+        y = np.zeros((seq, hidden_dim), dtype=np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES  # 64
+        x_stick = x_ptr // elems_per_stick
+        w_stick = w_ptr // elems_per_stick
+        y_stick = y_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_stick, w.flatten())
+            interp.memory.hbm.write(y_stick, y.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **ek)
+
+        result = interp.memory.hbm.read(y_stick, seq * hidden_dim, "f16").reshape(seq, hidden_dim)
+        expected = self._rmsnorm_reference(x, w_1d, eps=ek["eps"])
+
+        assert result.shape == expected.shape, f"Shape mismatch: {result.shape} vs {expected.shape}"
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+        np.testing.assert_allclose(
+            result, expected, rtol=1e-2, atol=1e-2,
+            err_msg="Distributed RMSNorm output does not match NumPy reference",
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_4x1"))
+    def test_rmsnorm_zero_input(self, path, func_name, entry):
+        """Zero input should produce zero output."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        hidden_dim = entry["hidden_dim"]
+        ek = entry["execute_kwargs"]
+        x_ptr = ek["X"]
+        y_ptr = ek["Y"]
+        w_ptr = ek["W"]
+
+        x = np.zeros((seq, hidden_dim), dtype=np.float16)
+        w_1d = np.ones(hidden_dim, dtype=np.float16)
+        w = np.tile(w_1d, (seq, 1))
+        y = np.zeros((seq, hidden_dim), dtype=np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES
+        x_stick = x_ptr // elems_per_stick
+        w_stick = w_ptr // elems_per_stick
+        y_stick = y_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_stick, w.flatten())
+            interp.memory.hbm.write(y_stick, y.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **ek)
+
+        result = interp.memory.hbm.read(y_stick, seq * hidden_dim, "f16").reshape(seq, hidden_dim)
+        np.testing.assert_allclose(
+            result, np.zeros_like(result), atol=1e-3,
+            err_msg="Zero input should produce zero output",
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_4x1"))
+    def test_rmsnorm_unit_weight(self, path, func_name, entry):
+        """Unit weight isolates the normalization: output = x / rms(x)."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        hidden_dim = entry["hidden_dim"]
+        ek = entry["execute_kwargs"]
+        x_ptr = ek["X"]
+        y_ptr = ek["Y"]
+        w_ptr = ek["W"]
+
+        rng = np.random.default_rng(123)
+        x = rng.standard_normal((seq, hidden_dim)).astype(np.float16)
+        w_1d = np.ones(hidden_dim, dtype=np.float16)
+        w = np.tile(w_1d, (seq, 1))
+        y = np.zeros((seq, hidden_dim), dtype=np.float16)
+
+        interp = KTIRInterpreter()
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES
+        x_stick = x_ptr // elems_per_stick
+        w_stick = w_ptr // elems_per_stick
+        y_stick = y_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_stick, w.flatten())
+            interp.memory.hbm.write(y_stick, y.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **ek)
+
+        result = interp.memory.hbm.read(y_stick, seq * hidden_dim, "f16").reshape(seq, hidden_dim)
+        expected = self._rmsnorm_reference(x, w_1d, eps=ek["eps"])
+
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        np.testing.assert_allclose(
+            result, expected, rtol=1e-2, atol=1e-2,
+            err_msg="Unit-weight RMSNorm output does not match reference",
+        )
+
+
+class TestRMSNorm2x2Execution:
+    """Lightweight test for distributed RMSNorm with construct_distributed_memory_view.
+
+    Only verifies that the allreduce fires (inter-core communication exists).
+    Full correctness is tested via the 4x1 variant which computes the same result.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_2x2"))
+    def test_rmsnorm_2x2_has_inter_core_comm(self, path, func_name, entry):
+        """Distributed 2x2 kernel must produce inter-core communication."""
+        meta = parse_example(path, func_name)
+        import math
+        num_cores = math.prod(meta.grid)
+        assert num_cores == 4
+
+        seq = entry["seq"]
+        hidden_dim = entry["hidden_dim"]
+        ek = entry["execute_kwargs"]
+        x_ptr = ek["X"]
+        y_ptr = ek["Y"]
+        w_ptr = ek["W"]
+
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((seq, hidden_dim)).astype(np.float16)
+        w_1d = rng.uniform(0.5, 1.5, size=hidden_dim).astype(np.float16)
+        w = np.tile(w_1d, (seq, 1))
+        y = np.zeros((seq, hidden_dim), dtype=np.float16)
+
+        from ktir_cpu import KTIRInterpreter
+        from ktir_cpu.latency import HardwareConfig
+
+        interp = KTIRInterpreter(latency_config=HardwareConfig())
+        interp.load(path)
+
+        STICK_BYTES = 128
+        F16_BYTES = 2
+        elems_per_stick = STICK_BYTES // F16_BYTES
+        x_stick = x_ptr // elems_per_stick
+        w_stick = w_ptr // elems_per_stick
+        y_stick = y_ptr // elems_per_stick
+
+        _orig = interp._prepare_execution
+
+        def _prepare_and_seed(grid_shape):
+            _orig(grid_shape)
+            interp.memory.hbm.write(x_stick, x.flatten())
+            interp.memory.hbm.write(w_stick, w.flatten())
+            interp.memory.hbm.write(y_stick, y.flatten())
+
+        interp._prepare_execution = _prepare_and_seed
+        interp.execute_function(func_name, **ek)
+
+        report = interp.get_latency_report()
+        for core_id in range(num_cores):
+            assert report.counters[core_id].comm_cycles > 0, (
+                f"Core {core_id} has no inter-core communication"
+            )
