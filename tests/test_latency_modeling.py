@@ -27,7 +27,7 @@ import textwrap
 import numpy as np
 import pytest
 
-from ktir_cpu import KTIRInterpreter, HardwareConfig
+from ktir_cpu import KTIRInterpreter, HardwareConfig, ExecutionModel
 from ktir_cpu.ir_types import _iter_ops
 
 from ktir_cpu.parser_ast import parse_affine_set
@@ -57,6 +57,15 @@ def build_inputs(interp, func_name, entry=None):
             if v is not None:
                 kwargs[k] = v
     return kwargs
+
+
+def _bw_per_core(cfg, cores_active):
+    """Per-core HBM bandwidth in bytes/cycle — chip BW shared across active cores.
+
+    Mirrors latency.py's contended model (hbm_bw_chip / clock / cores_active);
+    for a full grid, cores_active == num_cores.
+    """
+    return cfg.hbm_bw_chip / cfg.clock_hz / cores_active
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +276,11 @@ class TestHardwareConfig:
         cfg = HardwareConfig()
         assert cfg.num_cores == 32
         assert cfg.clock_ghz == 1.0
-        assert cfg.hbm_bandwidth_tb_s == 1.0
-        assert cfg.ring_bandwidth_tb_s == 4.0
+        assert cfg.hbm_bandwidth_tb_s == 0.128
+        assert cfg.ring_bandwidth_tb_s == 0.064
         assert cfg.simd_elements_per_cycle == 64
-        assert cfg.systolic_flops_per_cycle == 2 * 64 * 64 * 64
+        assert cfg.systolic_rows == 8
+        assert cfg.systolic_flops_per_cycle == 2 * 64 * 8  # 2 (FMA) * simd * rows
         assert cfg.transcendental_penalty == 4
 
     def test_custom_config(self):
@@ -278,22 +288,31 @@ class TestHardwareConfig:
         assert cfg.num_cores == 8
         assert cfg.hbm_bandwidth_tb_s == 2.0
 
-    def test_hbm_bytes_per_cycle_per_core(self):
-        cfg = HardwareConfig()
-        # 1 TB/s at 1 GHz = 1e12 / 1e9 = 1000 bytes/cycle total
-        # Per core: 1000 / 32 = 31.25
-        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(31.25)
-
     def test_ring_bytes_per_cycle(self):
         cfg = HardwareConfig()
-        # 4 TB/s at 1 GHz = 4e12 / 1e9 = 4000 bytes/cycle
-        assert cfg.ring_bytes_per_cycle == pytest.approx(4000.0)
+        # 0.064 TB/s at 1 GHz = 0.064e12 / 1e9 = 64 bytes/cycle
+        assert cfg.ring_bytes_per_cycle == pytest.approx(64.0)
 
     def test_derived_scales_with_clock(self):
         cfg = HardwareConfig(clock_ghz=2.0)
-        # 1 TB/s at 2 GHz = 1e12 / 2e9 = 500 bytes/cycle total
-        # Per core: 500 / 32 = 15.625
-        assert cfg.hbm_bytes_per_cycle_per_core == pytest.approx(15.625)
+        # per-cycle byte quantities scale inversely with clock:
+        # 0.064 TB/s at 2 GHz = 0.064e12 / 2e9 = 32 bytes/cycle
+        assert cfg.ring_bytes_per_cycle == pytest.approx(32.0)
+
+
+class TestExecutionModel:
+    def test_default_bw_sharing_is_contended(self):
+        assert ExecutionModel().bw_sharing == "contended"
+
+    def test_static_bw_sharing_rejected_as_unimplemented(self):
+        # "static" is documented as reserved; it must fail loudly rather than
+        # silently fall through to the contended bandwidth path.
+        with pytest.raises(NotImplementedError, match="static"):
+            ExecutionModel(bw_sharing="static")
+
+    def test_unknown_bw_sharing_rejected(self):
+        with pytest.raises(ValueError, match="bw_sharing"):
+            ExecutionModel(bw_sharing="shared")
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +369,7 @@ class TestModelingAssumptions:
         expected_compute = tile_elements / cfg.simd_elements_per_cycle  # 1 addf per element
         assert compute_vals[0] == pytest.approx(expected_compute, rel=1e-6)
         bytes_per_core = tile_elements * 2 * 3  # 2 loads + 1 store, f16
-        expected_mem = bytes_per_core / cfg.hbm_bytes_per_cycle_per_core
+        expected_mem = bytes_per_core / _bw_per_core(cfg, num_cores)
         assert memory_vals[0] == pytest.approx(expected_mem, rel=1e-6)
 
     # --- Test 1b: work-splitting elementwise ---
@@ -413,7 +432,7 @@ class TestModelingAssumptions:
         sticks_per_op = (tile_bytes + STICK_BYTES - 1) // STICK_BYTES
         bytes_per_op = sticks_per_op * STICK_BYTES
         mem_bytes_per_core = 3 * bytes_per_op
-        expected_mem = mem_bytes_per_core / cfg.hbm_bytes_per_cycle_per_core
+        expected_mem = mem_bytes_per_core / _bw_per_core(cfg, num_cores)
         assert report.counters[0].memory_cycles == pytest.approx(expected_mem, rel=1e-6)
 
     # --- Test 2: work-splitting matmul ---
@@ -562,7 +581,7 @@ class TestModelingAssumptions:
         tile_bytes = tile * bpe
         sticks_per_op = (tile_bytes + STICK_BYTES - 1) // STICK_BYTES
         bytes_per_op = sticks_per_op * STICK_BYTES
-        expected_memory = (2 * bytes_per_op) / cfg.hbm_bytes_per_cycle_per_core
+        expected_memory = (2 * bytes_per_op) / _bw_per_core(cfg, num_cores)
         assert memory_vals[0] == pytest.approx(expected_memory, rel=1e-6)
 
     # --- Test 4: tile size → memory cycles proportional ---
@@ -596,7 +615,7 @@ class TestModelingAssumptions:
         core0 = report.counters[0]
         # 3 HBM ops (2 loads + 1 store), each transferring tile_size * 2 bytes (f16)
         expected_bytes = tile_size * 2 * 3
-        expected_mem = expected_bytes / cfg.hbm_bytes_per_cycle_per_core
+        expected_mem = expected_bytes / _bw_per_core(cfg, 1)  # single core
         assert core0.memory_cycles == pytest.approx(expected_mem, rel=1e-6)
 
     # --- Test 5: LX ops cost zero memory cycles ---

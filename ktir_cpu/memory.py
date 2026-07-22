@@ -439,10 +439,10 @@ class SpyreMemoryHierarchy:
     ``TileRef.memory_space`` to determine the source/destination.
     """
 
-    def __init__(self, num_cores: int):
+    def __init__(self, num_cores: int, lx_size_mb: int = 2):
         self.num_cores = num_cores
         self.hbm = HBMSimulator()
-        self.lx_scratchpads = [LXScratchpad(core_id=i) for i in range(num_cores)]
+        self.lx_scratchpads = [LXScratchpad(size_mb=lx_size_mb, core_id=i) for i in range(num_cores)]
 
     def get_lx(self, core_id: int) -> LXScratchpad:
         """Get LX scratchpad for a specific core."""
