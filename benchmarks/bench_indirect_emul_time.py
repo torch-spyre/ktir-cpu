@@ -3,10 +3,12 @@
 Subcommands:
   block   — block-gather fast path vs general inspector (summary + breakdown)
   gather  — 3-memcpy (old) vs 1-memcpy (new) gather step comparison
+  4way    — 4-path evolution comparison (pre-147 elem, 147 block, cur elem, cur block)
 
 Usage:
     uv run python benchmarks/bench_indirect_emul_time.py block
     uv run python benchmarks/bench_indirect_emul_time.py gather
+    uv run python benchmarks/bench_indirect_emul_time.py 4way
     uv run python benchmarks/bench_indirect_emul_time.py block --config configs/custom.toml
 """
 
@@ -272,6 +274,197 @@ def cmd_gather(config):
 
 
 # ---------------------------------------------------------------------------
+# 4way subcommand — path evolution comparison
+# ---------------------------------------------------------------------------
+
+def _pre147_7_steps(ctx, iat) -> dict:
+    """Path 1: Pre-PR-147 element-wise with span-read gather."""
+    reset_lx(ctx)
+    t0 = time.perf_counter()
+    _enumerate_in_vso_order(iat)
+    t1 = time.perf_counter()
+    idx_values, _ = _resolve_idx_reads(ctx, iat)
+    t2 = time.perf_counter()
+    coords = _build_indirect_coords(iat, idx_values)
+    t3 = time.perf_counter()
+    tile_ref = iat.parent_ref.to_tile_ref()
+    mgr = _MemAccessor(ctx, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
+    offsets, _ = MemoryOps._flat_memory_offsets(
+        tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
+        coords, stick_bytes=mgr.stick_bytes,
+    )
+    t4 = time.perf_counter()
+    span = int(offsets.max()) + 1 if offsets.size else 1
+    np_dtype = to_np_dtype(tile_ref.dtype)
+    elem_size = bytes_per_elem(tile_ref.dtype)
+    flat = _read_flat(ctx.hbm.memory, tile_ref.base_ptr, span, np_dtype, elem_size)
+    gathered = flat[offsets]
+    t5 = time.perf_counter()
+    data = gathered.reshape(iat.shape)
+    t6 = time.perf_counter()
+    MemoryOps._place_in_lx(ctx, data)
+    t7 = time.perf_counter()
+    return {
+        "1. Enumerate iteration space": (t1 - t0) * 1000,
+        "2. Read index tensors": (t2 - t1) * 1000,
+        "3. Build coordinate list": (t3 - t2) * 1000,
+        "4. Linearize flat offsets": (t4 - t3) * 1000,
+        "5. Span-read + slice": (t5 - t4) * 1000,
+        "6. Reshape": (t6 - t5) * 1000,
+        "7. Write to LX": (t7 - t6) * 1000,
+    }
+
+
+def _orig_3_steps_with_sticks(ctx, iat, info) -> dict:
+    """Path 2: PR-147 block-path (direct mgr.gather + stick counting)."""
+    reset_lx(ctx)
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
+
+    t0 = time.perf_counter()
+    idx_values_map, _ = _block_gather_read_idx(ctx, iat, indirect_subs, dep_vars, dep_var_list)
+    t1 = time.perf_counter()
+    offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback)
+    t2 = time.perf_counter()
+    tile_ref = iat.parent_ref.to_tile_ref()
+    mgr = _MemAccessor(ctx, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
+    bpe = bytes_per_elem(tile_ref.dtype)
+    _MemAccessor.count_sticks_array(
+        tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
+    )
+    gathered = mgr.gather(offsets, tile_ref.dtype)
+    data = gathered.reshape(iat.shape)
+    MemoryOps._place_in_lx(ctx, data)
+    t3 = time.perf_counter()
+    return {
+        "1. Read K index values": (t1 - t0) * 1000,
+        "2. Numpy broadcast offsets": (t2 - t1) * 1000,
+        "3. Sticks + gather + LX": (t3 - t2) * 1000,
+    }
+
+
+def _refactored_3_steps(ctx, iat, info) -> dict:
+    """Path 4: Current block-path via MemoryOps.load(offsets=...)."""
+    reset_lx(ctx)
+    indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
+
+    t0 = time.perf_counter()
+    idx_values_map, _ = _block_gather_read_idx(ctx, iat, indirect_subs, dep_vars, dep_var_list)
+    t1 = time.perf_counter()
+    offsets = _block_gather_offsets(iat, idx_values_map, indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback)
+    t2 = time.perf_counter()
+    tile_ref = iat.parent_ref.to_tile_ref()
+    MemoryOps.load(ctx, tile_ref, offsets=offsets, result_shape=iat.shape)
+    t3 = time.perf_counter()
+    return {
+        "1. Read K index values": (t1 - t0) * 1000,
+        "2. Numpy broadcast offsets": (t2 - t1) * 1000,
+        "3. MemoryOps.load(offsets=)": (t3 - t2) * 1000,
+    }
+
+
+def cmd_4way(config):
+    """4-path evolution comparison: pre-147 elem, 147 block, cur elem, cur block."""
+    print("4-Way Performance Comparison: Evolution of Indirect Load Paths")
+    print("=" * 95)
+    print()
+    print("  P1: Pre-PR-147 elem-wise  (7-step: per-point reads -> coords -> span-read -> slice)")
+    print("  P2: PR-147 block-path     (3-step: broadcast offsets -> direct mgr.gather())")
+    print("  P3: Current elem-wise     (7-step: per-point reads -> coords -> direct gather)")
+    print("  P4: Current block-path    (3-step: broadcast offsets -> MemoryOps.load(offsets=))")
+    print()
+
+    table = BenchTable(
+        headers=["Workload", "Points", "P1 pre147", "P2 orig-blk", "P3 cur-elem", "P4 cur-blk", "P1->P3", "P2->P4"],
+    )
+
+    last_w, last_ctx, last_iat, last_info = None, None, None, None
+
+    for w in config.workloads:
+        ctx = make_bench_context()
+        iat = _build_iat(ctx, w)
+        info = _block_gather_analyze(iat)
+        if info is None:
+            continue
+
+        n_warmup = w.get("warmup", config.defaults.get("warmup", 2))
+        n_rounds = w.get("n_rounds", config.defaults.get("n_rounds", 5))
+
+        for _ in range(n_warmup):
+            _pre147_7_steps(ctx, iat)
+            _orig_3_steps_with_sticks(ctx, iat, info)
+            _old_7_steps(ctx, iat)
+            _refactored_3_steps(ctx, iat, info)
+
+        t_p1, t_p2, t_p3, t_p4 = [], [], [], []
+        for _ in range(n_rounds):
+            t_p1.append(sum(_pre147_7_steps(ctx, iat).values()))
+            t_p2.append(sum(_orig_3_steps_with_sticks(ctx, iat, info).values()))
+            t_p3.append(sum(_old_7_steps(ctx, iat).values()))
+            t_p4.append(sum(_refactored_3_steps(ctx, iat, info).values()))
+
+        p1 = np.median(t_p1)
+        p2 = np.median(t_p2)
+        p3 = np.median(t_p3)
+        p4 = np.median(t_p4)
+
+        n_points = _count_points(iat)
+        d13 = ((p3 - p1) / p1 * 100) if p1 > 0 else 0
+        d24 = ((p4 - p2) / p2 * 100) if p2 > 0 else 0
+
+        table.add_row([
+            w["label"], f"{n_points:,}",
+            f"{p1:.2f}", f"{p2:.2f}", f"{p3:.2f}", f"{p4:.2f}",
+            f"{d13:+.1f}%", f"{d24:+.1f}%",
+        ])
+        last_w, last_ctx, last_iat, last_info = w, ctx, iat, info
+
+    table.print(notes=[
+        "P1->P3: elem-wise delta from gather change (near-zero expected)",
+        "P2->P4: block-path overhead from MemoryOps routing (near-zero = no cost)",
+    ])
+
+    if last_w is None or not config.modes.get("breakdown"):
+        return
+
+    print()
+    print(f"Step Breakdown: {last_w['label']} ({_count_points(last_iat):,} points)")
+    print("=" * 95)
+
+    n_rounds = last_w.get("n_rounds", config.defaults.get("n_rounds", 5))
+
+    def avg_steps(fn, rounds=n_rounds):
+        results = [fn() for _ in range(rounds)]
+        keys = results[0].keys()
+        return {k: np.median([r[k] for r in results]) for k in keys}
+
+    def print_steps(label, steps):
+        total = sum(steps.values())
+        print(f"\n  {label}")
+        print("  " + "-" * 60)
+        for step, ms in steps.items():
+            pct = ms / total * 100
+            print(f"    {step}:{' ' * (35 - len(step))}{ms:>9.3f} ms  ({pct:>5.1f}%)")
+        print(f"    {'TOTAL':{35}}{total:>9.3f} ms")
+        return total
+
+    p1_total = print_steps("P1: Pre-PR-147 element-wise (span-read)",
+                           avg_steps(lambda: _pre147_7_steps(last_ctx, last_iat)))
+    p2_total = print_steps("P2: PR-147 block-path (direct mgr.gather)",
+                           avg_steps(lambda: _orig_3_steps_with_sticks(last_ctx, last_iat, last_info)))
+    p3_total = print_steps("P3: Current element-wise (direct gather)",
+                           avg_steps(lambda: _old_7_steps(last_ctx, last_iat)))
+    p4_total = print_steps("P4: Current block-path (MemoryOps.load(offsets=...))",
+                           avg_steps(lambda: _refactored_3_steps(last_ctx, last_iat, last_info)))
+
+    print(f"\n  Speedups:")
+    print(f"    P1 -> P3 (elem-wise improvement):  {p1_total/p3_total:.2f}x")
+    print(f"    P1 -> P4 (old-elem vs new-block):  {p1_total/p4_total:.0f}x")
+    print(f"    P2 -> P4 (block routing overhead):  {p2_total/p4_total:.2f}x (1.00 = no cost)")
+    print(f"    P3 -> P4 (elem vs block, current):  {p3_total/p4_total:.0f}x")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -280,9 +473,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Indirect memory access emulation timing",
     )
-    parser.add_argument("mode", choices=["block", "gather"],
-                        help="'block': fast-path vs general (summary + breakdown). "
-                             "'gather': 3-copy vs 1-copy gather step.")
+    parser.add_argument("mode", choices=["block", "gather", "4way"],
+                        help="'block': fast-path vs general. "
+                             "'gather': 3-copy vs 1-copy. "
+                             "'4way': 4-path evolution comparison.")
     parser.add_argument("--config", default="configs/indirect_emul.toml",
                         help="Path to TOML config (default: configs/indirect_emul.toml)")
     args = parser.parse_args()
@@ -292,6 +486,8 @@ def main():
         cmd_block(config)
     elif args.mode == "gather":
         cmd_gather(config)
+    elif args.mode == "4way":
+        cmd_4way(config)
 
 
 if __name__ == "__main__":
