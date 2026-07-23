@@ -272,6 +272,33 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {},
         },
     ],
+    "distributed_view_copy_dynamic": [
+        {
+            # s0 = 16: global = 32, one 32-wide tile straddles both
+            # 16-wide partitions (non-trivial intersection on each side).
+            "path": "rfc/distributed-view-copy-dynamic.mlir",
+            "execute_kwargs": {"s0_in": 16},
+        },
+        {
+            # s0 = 32: global = 64, two iterations of a 32-wide tile
+            # each land inside one partition (other partition excluded).
+            "path": "rfc/distributed-view-copy-dynamic.mlir",
+            "execute_kwargs": {"s0_in": 32},
+        },
+    ],
+    "distributed_view_copy_rowmerge_dynamic": [
+        {
+            # SPIKE: merge on the concrete row axis, symbolic col dim s0.
+            # s0 = 16: one col offset, two row tiles each land in one partition.
+            "path": "rfc/distributed-view-copy-rowmerge-dynamic.mlir",
+            "execute_kwargs": {"s0_in": 16},
+        },
+        {
+            # s0 = 32: two col offsets over the symbolic extent.
+            "path": "rfc/distributed-view-copy-rowmerge-dynamic.mlir",
+            "execute_kwargs": {"s0_in": 32},
+        },
+    ],
     "add": [
         {
             "path": "rfc/add-with-control-flow.mlir",
