@@ -286,6 +286,19 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {"s0_in": 32},
         },
     ],
+    "distributed_view_copy_rowmerge_dynamic": [
+        {
+            # SPIKE: merge on the concrete row axis, symbolic col dim s0.
+            # s0 = 16: one col offset, two row tiles each land in one partition.
+            "path": "rfc/distributed-view-copy-rowmerge-dynamic.mlir",
+            "execute_kwargs": {"s0_in": 16},
+        },
+        {
+            # s0 = 32: two col offsets over the symbolic extent.
+            "path": "rfc/distributed-view-copy-rowmerge-dynamic.mlir",
+            "execute_kwargs": {"s0_in": 32},
+        },
+    ],
     "add": [
         {
             "path": "rfc/add-with-control-flow.mlir",

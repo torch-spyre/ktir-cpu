@@ -251,6 +251,37 @@ class TestDistributedViewCopyDynamicExecution(InterpreterTestMixin):
         np.testing.assert_array_equal(result, a_full)
 
 
+class TestDistributedViewCopyRowMergeDynamicExecution(InterpreterTestMixin):
+    """SPIKE: distributed view merged on the concrete row axis while the
+    symbolic col dim s0 is shared by both partitions and passed through."""
+
+    @pytest.mark.parametrize(
+        "path,func_name,entry", get_test_params("distributed_view_copy_rowmerge_dynamic")
+    )
+    def test_distributed_view_copy_rowmerge_dynamic(self, path, func_name, entry):
+        interp = self._make_interp()
+        interp.load(path)
+
+        a0_ptr, a1_ptr, b_ptr, s0_in = interp.arg_names(func_name)
+        s0 = entry["execute_kwargs"]["s0_in"]
+
+        rng = np.random.default_rng(42)
+        # Partition split is on rows: A0 = rows[0:64], A1 = rows[64:128];
+        # both share the symbolic col extent s0.
+        a_full = rng.standard_normal((128, s0)).astype(np.float16)
+        a0 = np.ascontiguousarray(a_full[:64, :])
+        a1 = np.ascontiguousarray(a_full[64:, :])
+        b = np.zeros((128, s0), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            a0_ptr: a0, a1_ptr: a1, b_ptr: b,
+            s0_in: np.int32(s0),
+        })
+
+        result = outputs[b_ptr]
+        np.testing.assert_array_equal(result, a_full)
+
+
 class TestSoftmaxExecution(InterpreterTestMixin):
     """End-to-end execution of softmax MLIR."""
 
