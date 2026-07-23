@@ -63,7 +63,7 @@ class TestTileFutureType:
             #ptpg      = affine_set<(i)[g] : (i - g == 0, i >= 0, -i + 3 >= 0)>
             #one_group = affine_set<(g) : (g == 0)>
             module {
-              func.func @_k(%p: tensor<1x64xf16>) -> tensor<64xf16>
+              func.func @_k(%p: tensor<1x64xf16>) -> tensor<1x64xf16>
                   attributes { grid = [4] }
               {
                 %f = ktdp.inter_tile_produce
@@ -77,7 +77,7 @@ class TestTileFutureType:
                 %r = ktdp.inter_tile_reduce(%f)
                     consumer_tiles_per_group = #ptpg,
                     identity(%id : tensor<1x64xf16>)
-                    : <(tensor<1x64xf16>), groups = #one_group> -> tensor<64xf16>
+                    : <(tensor<1x64xf16>), groups = #one_group> -> tensor<1x64xf16>
                 {
                   ^bb0(%lhs: tensor<1x64xf16>, %rhs: tensor<1x64xf16>):
                     %sum = linalg.add ins(%lhs, %rhs : tensor<1x64xf16>, tensor<1x64xf16>)
@@ -85,7 +85,7 @@ class TestTileFutureType:
                                       -> tensor<1x64xf16>
                     ktdp.yield_reduced %sum : tensor<1x64xf16>
                 }
-                return %r : tensor<64xf16>
+                return %r : tensor<1x64xf16>
               }
             }
             """)
