@@ -91,6 +91,19 @@ class _MemAccessor:
             return None
         return len({a // HBMSimulator.STICK_BYTES for a in byte_addresses})
 
+    @classmethod
+    def count_sticks_array(
+        cls, memory_space: str, base_ptr: int, offsets: np.ndarray, bpe: int,
+    ) -> Optional[int]:
+        """Vectorized stick counting for large offset arrays.
+
+        Same semantics as :meth:`count_sticks` but avoids Python iteration
+        over element offsets — uses numpy unique on the stick indices directly.
+        """
+        if memory_space != "HBM":
+            return None
+        return int(np.unique((base_ptr + offsets * bpe) // HBMSimulator.STICK_BYTES).size)
+
     def read(self, n: int, dtype: str) -> np.ndarray:
         return self._sim.read(*self._args, n, dtype, **self._kwargs)
 
@@ -330,6 +343,12 @@ def _block_gather_read_idx(
         else:
             arr = np.array([], dtype=np.int32)
 
+        if arr.size and (arr < 0).any():
+            raise IndexError(
+                f"Negative indirect index in view {iv_idx}: "
+                f"min value {int(arr.min())}"
+            )
+
         idx_values_map[sub_i] = arr
 
     return idx_values_map, total_sticks
@@ -456,11 +475,13 @@ def _block_gather_offsets_fallback(
 def _block_gather_load(
     context: CoreContext, iat: "IndirectAccessTile",
     result_shape: Optional[Tuple[int, ...]] = None,
+    info: Optional[tuple] = None,
 ) -> Tile:
     """Fast-path indirect load for block-gather patterns."""
-    info = _block_gather_analyze(iat)
     if info is None:
-        raise ValueError("IAT does not qualify for block-gather fast path")
+        info = _block_gather_analyze(iat)
+        if info is None:
+            raise ValueError("IAT does not qualify for block-gather fast path")
     indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
 
     vss = iat.variables_space_set
@@ -487,29 +508,20 @@ def _block_gather_load(
     )
 
     tile_ref = iat.parent_ref.to_tile_ref()
-    mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
-    stick_bytes = mgr.stick_bytes
-    if stick_bytes:
-        bpe = _bytes_per_elem(tile_ref.dtype)
-        unique_sticks = int(np.unique((tile_ref.base_ptr + offsets * bpe) // stick_bytes).size)
-    else:
-        unique_sticks = None
-
-    gathered = mgr.gather(offsets, tile_ref.dtype)
-    data = gathered.reshape(out_shape)
-    MemoryOps._place_in_lx(context, data)
-    result = Tile(data, tile_ref.dtype, out_shape, unique_sticks)
+    result = MemoryOps.load(context, tile_ref, offsets=offsets, result_shape=out_shape)
     result.index_unique_sticks = idx_sticks
     return result
 
 
 def _block_gather_store(
     context: CoreContext, tile: Tile, iat: "IndirectAccessTile",
+    info: Optional[tuple] = None,
 ) -> int:
     """Fast-path indirect store for block-gather patterns."""
-    info = _block_gather_analyze(iat)
     if info is None:
-        raise ValueError("IAT does not qualify for block-gather fast path")
+        info = _block_gather_analyze(iat)
+        if info is None:
+            raise ValueError("IAT does not qualify for block-gather fast path")
     indirect_subs, dep_vars, dep_var_list, dep_extents, dep_los, use_fallback = info
 
     vss = iat.variables_space_set
@@ -532,15 +544,7 @@ def _block_gather_store(
     )
 
     tile_ref = iat.parent_ref.to_tile_ref()
-    mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
-    stick_bytes = mgr.stick_bytes
-    if stick_bytes:
-        bpe = _bytes_per_elem(tile_ref.dtype)
-        unique_sticks = int(np.unique((tile_ref.base_ptr + offsets * bpe) // stick_bytes).size)
-    else:
-        unique_sticks = 0
-
-    mgr.scatter(offsets, tile.data.ravel(), tile_ref.dtype)
+    unique_sticks = MemoryOps.store(context, tile, tile_ref, offsets=offsets)
     return unique_sticks + idx_sticks
 
 
@@ -851,6 +855,7 @@ class MemoryOps:
         context: CoreContext,
         tile_ref: TileRef,
         coords: Optional[List[Tuple[int, ...]]] = None,
+        offsets: Optional[np.ndarray] = None,
         result_shape: Optional[Tuple[int, ...]] = None,
     ) -> Tile:
         """Load data from HBM or LX into LX and return a Tile.
@@ -859,45 +864,42 @@ class MemoryOps:
         - HBM source → DMA read from HBM, write into LX scratchpad.
         - LX source  → logical copy within LX (no physical movement).
 
-        When *coords* is given (coordinate-set path), gathers only the
-        elements at those local coordinates and reshapes to *result_shape*.
-        When *coords* is None, loads the full tile described by tile_ref
-        (contiguous or strided).
+        Three dispatch modes (checked in order):
+        1. *offsets* — pre-computed flat element offsets (block-gather fast
+           path). Skips coordinate linearization entirely.
+        2. *coords* — gathers elements at those local coordinates.
+        3. Neither — loads the full tile (contiguous or strided).
 
         A single ``mem.read`` covers the entire element footprint; no
         per-element dict scans occur.
-
-        Example — loading column 2 of a 4×4 f16 matrix (strided, coords=None)::
-
-            # Parent 4×4 allocation at base_ptr=0x1000, values 0..15
-            # tile_ref for column 2: base_ptr=0x1004, shape=(4,), strides=[4]
-            #   flat offsets: [0*4, 1*4, 2*4, 3*4] = [0, 4, 8, 12]
-            #   span = 13  (max offset + 1)
-            #   mem.read(0x1004, 13) -> [2,3,4,5,6,7,8,9,10,11,12,13,14]
-            #   gathered = flat[[0,4,8,12]] = [2, 6, 10, 14]  ✓
-
-        Example — upper-triangular load from a 4×4 tile (coords provided)::
-
-            # tile_ref: base_ptr=0x1000, shape=(4,4), strides=[4,1]
-            # coords = [(0,0),(0,1),...,(3,3)]  — 10 upper-tri tuples
-            #   flat offsets = [0*4+0, 0*4+1, ..., 3*4+3] = [0,1,2,3,5,6,7,10,11,15]
-            #   span = 16
-            #   mem.read(0x1000, 16) -> flat 0..15
-            #   gathered = flat[[0,1,2,3,5,6,7,10,11,15]] = [0,1,2,3,5,6,7,10,11,15]
 
         Args:
             context: Core execution context
             tile_ref: Tile reference (memref) describing source
             coords: Optional list of local coordinate tuples to gather.
                     Each tuple is 0-based within tile_ref.shape.
-            result_shape: Output shape when coords is given; defaults to
-                          tile_ref.shape when coords is None.
+            offsets: Optional pre-computed flat element offsets (int64 ndarray).
+                     Mutually exclusive with coords.
+            result_shape: Output shape; defaults to tile_ref.shape when
+                          neither coords nor offsets is given.
 
         Returns:
             Tile value (tensor) loaded into LX
         """
         mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
         stick_bytes = mgr.stick_bytes
+
+        # Pre-computed offsets path (block-gather fast path).
+        if offsets is not None:
+            bpe = _bytes_per_elem(tile_ref.dtype)
+            unique_sticks = _MemAccessor.count_sticks_array(
+                tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
+            )
+            gathered = mgr.gather(offsets, tile_ref.dtype)
+            out_shape = result_shape if result_shape is not None else tile_ref.shape
+            data = gathered.reshape(out_shape)
+            MemoryOps._place_in_lx(context, data)
+            return Tile(data, tile_ref.dtype, out_shape, unique_sticks)
 
         # Fast path: contiguous tile, no coord filtering — single dict-key read.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
@@ -916,11 +918,11 @@ class MemoryOps:
             return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
 
         # Strided or coord-set path: linearize coords, gather directly from allocation.
-        offsets, unique_sticks = MemoryOps._flat_memory_offsets(
+        flat_offsets, unique_sticks = MemoryOps._flat_memory_offsets(
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes
         )
-        gathered = mgr.gather(offsets, tile_ref.dtype)
+        gathered = mgr.gather(flat_offsets, tile_ref.dtype)
         out_shape = result_shape if result_shape is not None else tile_ref.shape
         data = gathered.reshape(out_shape)
 
@@ -933,46 +935,47 @@ class MemoryOps:
         tile: Tile,
         tile_ref: TileRef,
         coords: Optional[List[Tuple[int, ...]]] = None,
+        offsets: Optional[np.ndarray] = None,
     ) -> int:
         """Store tile data to HBM or LX.
 
         - HBM target → DMA write from LX to HBM.
         - LX target  → write directly to LX.
 
-        When *coords* is given (coordinate-set path), scatters tile elements
-        to those local coordinates via a read-modify-write on the allocation.
-        When *coords* is None, stores the full tile (contiguous or strided).
-
-        Source data layout: ``tile.data`` is read in C-order via
-        ``numpy.ndarray.flatten()``, which always returns a contiguous copy.
-        Non-contiguous source arrays are handled internally — callers do not
-        need to pre-``ascontiguousarray`` the tile. When *coords* is supplied,
-        ``coords[i]`` receives the i-th element of ``tile.data`` in C-order.
-
-        A single ``mem.read`` + ``mem.write`` covers the entire footprint;
-        no per-element dict scans occur.
+        Three dispatch modes (checked in order):
+        1. *offsets* — pre-computed flat element offsets (block-gather fast
+           path). Skips coordinate linearization entirely.
+        2. *coords* — scatters tile elements to those coordinates via
+           read-modify-write on the allocation.
+        3. Neither — stores the full tile (contiguous or strided).
 
         Args:
             context: Core execution context
             tile: Tile value (tensor data) to store
             tile_ref: Tile reference (memref) describing destination
             coords: Optional list of local coordinate tuples to scatter into.
+            offsets: Optional pre-computed flat element offsets (int64 ndarray).
+                     Mutually exclusive with coords.
 
         Returns:
             ``unique_sticks`` (int) — the number of distinct 128-byte HBM
-            sticks the write touches. ``0`` for LX destinations (no stick
-            concept; LX HBM traffic is zero by definition). The dialect
-            handler returns this value so :meth:`LatencyTracker._data_size`
-            charges HBM traffic at stick granularity
-            (``unique_sticks * STICK_BYTES``) instead of the source tile's
-            logical ``nbytes``, which would undercount scatter writes.
+            sticks the write touches. ``0`` for LX destinations.
         """
         mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
         stick_bytes = mgr.stick_bytes
 
+        # Pre-computed offsets path (block-gather fast path).
+        if offsets is not None:
+            bpe = _bytes_per_elem(tile_ref.dtype)
+            unique_sticks = _MemAccessor.count_sticks_array(
+                tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
+            )
+            mgr.scatter(offsets, tile.data.ravel(), tile_ref.dtype)
+            return unique_sticks if unique_sticks is not None else 0
+
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
         if coords is None and MemoryOps._is_contiguous(tile_ref.shape, tile_ref.strides):
-            mgr.write(tile.data.ravel())  # write reads it (copies into store) — view is fine
+            mgr.write(tile.data.ravel())
             if not stick_bytes:
                 return 0
             n = int(np.prod(tile_ref.shape))
@@ -984,11 +987,11 @@ class MemoryOps:
             )
 
         # Strided or coord-set path: read-modify-write via scatter offsets.
-        offsets, unique_sticks = MemoryOps._flat_memory_offsets(
+        flat_offsets, unique_sticks = MemoryOps._flat_memory_offsets(
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes,
         )
-        mgr.scatter(offsets, tile.data.ravel(), tile_ref.dtype)
+        mgr.scatter(flat_offsets, tile.data.ravel(), tile_ref.dtype)
         return unique_sticks if unique_sticks is not None else 0
 
     @staticmethod
@@ -1020,8 +1023,9 @@ class MemoryOps:
         # Fast path: block-gather patterns (MoE, paged attention) where the
         # index lookup depends on a small subset of iteration variables.
         # Bypasses the O(N) Python loops in _resolve_idx_reads / _build_indirect_coords.
-        if _is_block_gather(iat):
-            return _block_gather_load(context, iat, result_shape)
+        block_info = _block_gather_analyze(iat)
+        if block_info is not None:
+            return _block_gather_load(context, iat, result_shape, info=block_info)
 
         # Resolve every idx-tensor read up front: one accessor per index
         # view, one read_scattered call, sticks deduped inside the accessor.
@@ -1378,8 +1382,9 @@ class MemoryOps:
             )
 
         # Fast path: block-gather patterns (MoE, paged attention).
-        if _is_block_gather(iat):
-            return _block_gather_store(context, tile, iat)
+        block_info = _block_gather_analyze(iat)
+        if block_info is not None:
+            return _block_gather_store(context, tile, iat, info=block_info)
 
         # Resolve idx reads (returns idx_unique_sticks: int, 0 for all-LX
         # views) and delegate the data write to MemoryOps.store (returns

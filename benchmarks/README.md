@@ -1,4 +1,4 @@
-# Benchmarks: Block-Gather Fast Path
+# Benchmarks: Indirect Memory Access Emulation
 
 Measures the blocked-gather optimization against the general 7-step
 inspector-executor path for indirect memory access emulation.
@@ -17,167 +17,126 @@ index lookups exceeds 16×.
 | `sparse_attn` | `cache[page_idx[b], token_idx[t], d]` | 2 | 1 | Sparse attention: select page+token pairs from a large cache |
 | `multi_head` | `W[expert_idx[e], head_idx[h], m, n]` | 2 | 2 | Multi-head expert routing: select (expert, head) weight blocks |
 
-## Summary
+## 4-Way Path Comparison
 
-All patterns show 100–190× end-to-end speedup over the general path.
-The blocked-gather replaces 7 sequential steps with 3 steps whose cost is
-dominated by a single NumPy broadcast (offset computation) and a flat gather.
+Four distinct implementations compared end-to-end:
 
-| Pattern | Points | General (ms) | Fast (ms) | Speedup |
-|---------|--------|--------------|-----------|---------|
-| `moe_ffn` | 1,024,000 | 1,084 | 9.4 | 115× |
-| `paged_attn` | 1,048,576 | 1,176 | 10.5 | 112× |
-| `sparse_attn` | 128,000 | 227 | 1.2 | 190× |
-| `multi_head` | 4,096,000 | 7,745 | 40.5 | 191× |
+| Path | Description | Data movement |
+|------|-------------|---------------|
+| **P1** Pre-PR-147 elem-wise | 7-step: enumerate → per-point reads → coords → span-read → slice | `mgr.read(span)` then `flat[offsets]` (intermediate alloc) |
+| **P2** PR-147 block-path | 3-step: broadcast offsets → direct `mgr.gather()` | `_gather_from`: `data.ravel()[elem_offset + offsets]` |
+| **P3** Current elem-wise | 7-step: enumerate → per-point reads → coords → direct gather | Same as P2 at terminal step |
+| **P4** Current block-path | 3-step: broadcast offsets → `MemoryOps.load(offsets=...)` | Routes through unified load API, same terminal gather |
 
-## Step Breakdown by Pattern
+### Summary Table
 
-### `moe_ffn` — MoE feed-forward weight selection
+| Workload | Points | P1 pre147 (ms) | P2 orig-blk (ms) | P3 cur-elem (ms) | P4 cur-blk (ms) | Δ P1→P3 | Δ P2→P4 |
+|----------|--------|----------------|-------------------|-------------------|-----------------|---------|---------|
+| `moe-262K` | 262,144 | 278 | 2.4 | 278 | 2.4 | ~0% | ~0% |
+| `moe-1M` | 1,024,000 | 1,101 | 9.4 | 1,129 | 9.2 | ~0% | ~0% |
+| `paged-attn-256K` | 262,144 | 290 | 2.6 | 291 | 2.7 | ~0% | ~0% |
+| `paged-attn-1M` | 1,048,576 | 1,182 | 10.0 | 1,181 | 10.3 | ~0% | ~0% |
+| `sparse-attn-32K` | 32,000 | 57 | 0.5 | 57 | 0.5 | ~0% | ~0% |
+| `sparse-attn-128K` | 128,000 | 228 | 1.3 | 228 | 1.4 | ~0% | ~0% |
+| `multi-head-512K` | 512,000 | 958 | 5.2 | 948 | 5.1 | ~0% | ~0% |
+| `multi-head-4M` | 4,096,000 | 7,663 | 40.7 | 7,696 | 40.4 | ~0% | ~0% |
 
-1M points (256 experts × 64 × 2K, selecting 8).
+### Key Findings
 
-The general path spends 67% of its time resolving index tensor reads
-element-by-element. The fast path reads all 8 index values in one call,
-then computes offsets via a single broadcast multiply-add.
+1. **Δ P1→P3 ≈ 0%** — The element-wise path is NOT faster after the gather
+   change. The terminal gather step (5ms) is <0.1% of total time. The
+   bottleneck is steps 2–4: per-point index reads (74%) and coordinate
+   building (17%) — pure Python loops that dominate regardless of how the
+   final data movement is done.
 
-**General path (7 steps):**
+2. **Δ P2→P4 ≈ 0%** — Routing through `MemoryOps.load(offsets=...)` adds
+   zero measurable overhead versus calling `mgr.gather()` directly. The
+   refactoring is free.
+
+3. **P3→P4 = 190×** — The block-path speedup is fully preserved. The
+   algorithmic difference (numpy broadcast vs per-point Python loop) is
+   what matters, not which API the gather routes through.
+
+### Conclusion
+
+The element-wise path's slowness is **algorithmic**, not API-level: O(N)
+Python-loop index reads + coordinate assembly. No amount of terminal-step
+optimization (gather vs span-read) can fix it — the 190× speedup comes
+entirely from collapsing those loops into numpy broadcast. The unified
+`MemoryOps.load(offsets=...)` API is structurally cleaner without any
+performance cost.
+
+## Step Breakdown (multi-head-4M, 4,096,000 points)
+
+### Path 1: Pre-PR-147 element-wise (span-read)
 
 | Step | Time (ms) | Share |
 |------|-----------|-------|
-| Enumerate iteration space | 23.7 | 2.1% |
-| Read index tensors | 765.5 | 67.1% |
-| Build coordinate list | 230.9 | 20.2% |
-| Linearize flat offsets | 120.2 | 10.5% |
-| Gather from HBM | 1.2 | 0.1% |
+| Enumerate iteration space | 102 | 1.3% |
+| Read index tensors | 5,725 | 74.3% |
+| Build coordinate list | 1,315 | 17.1% |
+| Linearize flat offsets | 554 | 7.2% |
+| Span-read + slice | 5.0 | 0.1% |
+| Reshape | 0.002 | — |
+| Write to LX | 0.004 | — |
+| **Total** | **7,701** | |
+
+### Path 2: PR-147 block-path (direct mgr.gather)
+
+| Step | Time (ms) | Share |
+|------|-----------|-------|
+| Read K index values | 0.10 | 0.2% |
+| NumPy broadcast offsets | 10.1 | 25.0% |
+| Sticks + gather + LX | 30.3 | 74.8% |
+| **Total** | **40.6** | |
+
+### Path 3: Current element-wise (direct gather)
+
+| Step | Time (ms) | Share |
+|------|-----------|-------|
+| Enumerate iteration space | 100 | 1.3% |
+| Read index tensors | 5,750 | 74.3% |
+| Build coordinate list | 1,321 | 17.1% |
+| Linearize flat offsets | 563 | 7.3% |
+| Direct gather | 3.7 | 0.0% |
 | Reshape | 0.003 | — |
 | Write to LX | 0.004 | — |
-| **Total** | **1,141** | |
+| **Total** | **7,738** | |
 
-**Fast path (3 steps):**
-
-| Step | Time (ms) | Share |
-|------|-----------|-------|
-| Read K index values | 0.023 | 0.7% |
-| NumPy broadcast offsets | 2.12 | 68.6% |
-| Gather + reshape + LX | 0.95 | 30.7% |
-| **Total** | **3.1** | |
-
-**Step-level speedup: 369×**
-
----
-
-### `paged_attn` — Paged KV-cache page gather
-
-1M points (256 pages × 16 heads × 16 block_size × 128 head_dim, selecting 32 pages).
-
-Same bottleneck structure as MoE. The 3-direct-dim block (heads × bs × hd = 32K
-elements per page) gives high reuse per index lookup.
-
-**General path (7 steps):**
+### Path 4: Current block-path (MemoryOps.load(offsets=...))
 
 | Step | Time (ms) | Share |
 |------|-----------|-------|
-| Enumerate iteration space | 23.5 | 2.0% |
-| Read index tensors | 758.1 | 63.5% |
-| Build coordinate list | 266.6 | 22.3% |
-| Linearize flat offsets | 143.8 | 12.1% |
-| Gather from HBM | 1.0 | 0.1% |
-| Reshape | 0.002 | — |
-| Write to LX | 0.003 | — |
-| **Total** | **1,193** | |
+| Read K index values | 0.10 | 0.2% |
+| NumPy broadcast offsets | 10.2 | 25.3% |
+| MemoryOps.load(offsets=) | 30.1 | 74.4% |
+| **Total** | **40.4** | |
 
-**Fast path (3 steps):**
+### Speedups
 
-| Step | Time (ms) | Share |
-|------|-----------|-------|
-| Read K index values | 0.038 | 1.2% |
-| NumPy broadcast offsets | 2.19 | 71.7% |
-| Gather + reshape + LX | 0.82 | 27.0% |
-| **Total** | **3.0** | |
-
-**Step-level speedup: 391×**
-
----
-
-### `sparse_attn` — Sparse attention page+token selection
-
-128K points (128 pages × 64 tokens × 2K hidden, selecting 8 pages × 8 tokens).
-
-Two indirect dimensions multiply the general path's per-element index resolution
-cost. The fast path reads each index tensor once (8 + 8 = 16 values total), then
-broadcasts both into a combined offset grid.
-
-**General path (7 steps):**
-
-| Step | Time (ms) | Share |
-|------|-----------|-------|
-| Enumerate iteration space | 2.3 | 1.0% |
-| Read index tensors | 174.7 | 76.6% |
-| Build coordinate list | 36.2 | 15.9% |
-| Linearize flat offsets | 14.7 | 6.4% |
-| Gather from HBM | 0.08 | — |
-| Reshape | 0.002 | — |
-| Write to LX | 0.002 | — |
-| **Total** | **228** | |
-
-**Fast path (3 steps):**
-
-| Step | Time (ms) | Share |
-|------|-----------|-------|
-| Read K index values | 0.11 | 27.8% |
-| NumPy broadcast offsets | 0.21 | 52.9% |
-| Gather + reshape + LX | 0.08 | 19.3% |
-| **Total** | **0.41** | |
-
-**Step-level speedup: 563×**
-
----
-
-### `multi_head` — Multi-head expert weight routing
-
-4M points (32 experts × 8 heads × 64 × 2K, selecting 8 experts × 4 heads).
-
-Largest workload: the general path takes nearly 8 seconds due to 5.8s spent
-resolving index reads across 4M points. The fast path reads 8 + 4 = 12 index
-values and computes the full 4M-element offset grid in under 5 ms.
-
-**General path (7 steps):**
-
-| Step | Time (ms) | Share |
-|------|-----------|-------|
-| Enumerate iteration space | 95.5 | 1.2% |
-| Read index tensors | 5,822 | 74.7% |
-| Build coordinate list | 1,328 | 17.0% |
-| Linearize flat offsets | 544.5 | 7.0% |
-| Gather from HBM | 3.9 | 0.1% |
-| Reshape | 0.003 | — |
-| Write to LX | 0.004 | — |
-| **Total** | **7,794** | |
-
-**Fast path (3 steps):**
-
-| Step | Time (ms) | Share |
-|------|-----------|-------|
-| Read K index values | 0.076 | 1.1% |
-| NumPy broadcast offsets | 4.54 | 63.2% |
-| Gather + reshape + LX | 2.57 | 35.8% |
-| **Total** | **7.2** | |
-
-**Step-level speedup: 1,084×**
+| Comparison | Factor | Interpretation |
+|------------|--------|----------------|
+| P1 → P3 | 1.00× | Gather change doesn't help (bottleneck elsewhere) |
+| P1 → P4 | 190× | Old elem-wise vs new block-path |
+| P2 → P4 | 1.00× | No routing overhead from refactoring |
+| P3 → P4 | 191× | Current elem-wise vs current block-path |
 
 ## Usage
 
 ```bash
 cd ktir-cpu
 
-# Summary table + step breakdown (all patterns)
+# 4-way path evolution comparison (summary + step breakdown)
+uv run python benchmarks/bench_indirect_emul_time.py 4way
+
+# Original 2-way: fast-path vs general (summary + breakdown)
 uv run python benchmarks/bench_indirect_emul_time.py block
 
 # Gather memcpy optimization (3-copy vs 1-copy)
 uv run python benchmarks/bench_indirect_emul_time.py gather
 
 # Custom config
-uv run python benchmarks/bench_indirect_emul_time.py block --config configs/custom.toml
+uv run python benchmarks/bench_indirect_emul_time.py 4way --config configs/custom.toml
 ```
 
 ## Config
@@ -190,7 +149,7 @@ auto-parsed. List fields require explicit `mode = "product"` or `"zip"`.
 ## Code Structure
 
 ```
-bench_indirect_emul_time.py   — CLI entry point (block/gather subcommands)
+bench_indirect_emul_time.py   — CLI entry point (block/gather/4way subcommands)
 bench_utils.py                — BenchTimer, BenchTable, IAT builders, config loader
 configs/indirect_emul.toml    — workload definitions (4 patterns × 2 sizes)
 ```
