@@ -612,13 +612,12 @@ def _adapt_linalg_generic(mlir_op, attributes, result_type, operands):
     n_ins = seg[0]
     attributes["n_ins"] = n_ins
 
-    # Extract dimension index list per operand from AffineMapAttr array
+    # Parse each indexing map into an AffineMap for the executor.
+    from ..parser_ast import parse_affine_map
     maps = []
     for map_attr in mlir_op.attributes["indexing_maps"]:
         map_val_str = str(AffineMapAttr(map_attr).value)
-        results_str = re.search(r"->\s*(\(.*\))\s*$", map_val_str).group(1)
-        nodes = _Parser(_tokenise(results_str)).parse_expr_list()
-        maps.append([n[1] for n in nodes if n[0] == "dim"])
+        maps.append(parse_affine_map(map_val_str))
     attributes["indexing_maps"] = maps
 
     # Block arguments are the bb0 names; stored in attributes for the executor fallback

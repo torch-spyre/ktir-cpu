@@ -400,14 +400,25 @@ def linalg__generic(op, context, env):
     # Store output shape so linalg.index can build index arrays.
     context.set_value("__linalg_shape__", out_shape)
 
-    # Broadcast each input to the iteration space and bind to its bb0 arg.
+    # Gather each input into the iteration space and bind to its bb0 arg.
     for i, (val, imap) in enumerate(zip(ins_vals, indexing_maps[:n_ins])):
         if isinstance(val, Tile):
             data = val.data
-            for d in range(out_ndim):
-                if d not in imap:
-                    data = np.expand_dims(data, axis=d)
-            arg_val = Tile(np.broadcast_to(data, out_shape).copy(), val.dtype, out_shape)
+            dims = getattr(imap, 'exprs', None)
+            # Fast path: plain dim-projection map (all exprs are bare ('dim', N) nodes).
+            # This covers the common case of a simple axis permutation/broadcast.
+            if dims is not None and all(e[0] == 'dim' for e in dims):
+                plain_dims = [e[1] for e in dims]
+                for d in range(out_ndim):
+                    if d not in plain_dims:
+                        data = np.expand_dims(data, axis=d)
+                arg_val = Tile(np.broadcast_to(data, out_shape).copy(), val.dtype, out_shape)
+            else:
+                # General path: evaluate the affine map for every output index.
+                gathered = np.empty(out_shape, dtype=data.dtype)
+                for idx in np.ndindex(*out_shape):
+                    gathered[idx] = data[imap.eval(list(idx))]
+                arg_val = Tile(gathered, val.dtype, out_shape)
         else:
             arg_val = val
         if i < len(bb0_names):
@@ -588,9 +599,7 @@ def parse_linalg_generic(op_text, parse_ctx):
     if maps_match:
         raw_maps = parse_attr_list(op_text[maps_match.end() - 1:])
         for raw in raw_maps:
-            amap = parse_affine_map(raw)
-            dims = [e[1] for e in amap.exprs if e[0] == 'dim']
-            maps.append(dims)
+            maps.append(parse_affine_map(raw))
 
     ins_operands = []
     ins_match = re.search(r'\bins\s*\(([^)]+)\)', op_text)
