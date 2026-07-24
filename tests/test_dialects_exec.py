@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from ktir_cpu.ir_types import Operation, Tile
+from ktir_cpu.parser_ast import parse_affine_map
 from ktir_cpu.grid import CoreContext, GridExecutor
 from ktir_cpu.memory import HBMSimulator, LXScratchpad, SpyreMemoryHierarchy
 from ktir_cpu.dtypes import stick_to_elem_idx
@@ -1080,7 +1081,7 @@ class TestLinalg:
             operands=["%ins", "%outs"],
             attributes={
                 "n_ins": 1,
-                "indexing_maps": [[0]],
+                "indexing_maps": [parse_affine_map("affine_map<(d0) -> (d0)>")],
             },
             regions=[[
                 Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
