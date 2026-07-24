@@ -947,8 +947,8 @@ class TestRMSNormExecution:
     """End-to-end execution of rmsnorm_4core_4x1.mlir.
 
     4-core embarrassingly parallel RMSNorm: grid=[4,1], no allreduce.
-    Each core independently normalizes its stride-4 rows over the full
-    4096 hidden dimension.
+    Each core independently normalizes a contiguous block of 64 rows
+    over the full 4096 hidden dimension.
     """
 
     @staticmethod
@@ -1112,15 +1112,24 @@ class TestRMSNormExecution:
 
 
 class TestRMSNorm2x2Execution:
-    """Lightweight test for distributed RMSNorm with construct_distributed_memory_view.
+    """End-to-end execution of rmsnorm_4core_2x2.mlir.
 
-    Only verifies that the allreduce fires (inter-core communication exists).
-    Full correctness is tested via the 4x1 variant which computes the same result.
+    Distributed RMSNorm: grid=[2,2], column-sharded with allreduce.
+    Verifies both inter-core communication and numeric correctness
+    against the same NumPy reference used by the 4x1 tests.
     """
 
+    @staticmethod
+    def _rmsnorm_reference(x, w, eps=1e-5):
+        """NumPy reference: RMSNorm(x) = x / sqrt(mean(x^2) + eps) * w."""
+        x_f32 = x.astype(np.float32)
+        w_f32 = w.astype(np.float32)
+        rms = np.sqrt(np.mean(x_f32 ** 2, axis=1, keepdims=True) + eps)
+        return (x_f32 / rms * w_f32).astype(np.float16)
+
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_2x2"))
-    def test_rmsnorm_2x2_has_inter_core_comm(self, path, func_name, entry):
-        """Distributed 2x2 kernel must produce inter-core communication."""
+    def test_rmsnorm_2x2_correctness(self, path, func_name, entry):
+        """Distributed 2x2 kernel output matches NumPy reference."""
         meta = parse_example(path, func_name)
         import math
         num_cores = math.prod(meta.grid)
@@ -1168,3 +1177,14 @@ class TestRMSNorm2x2Execution:
             assert report.counters[core_id].comm_cycles > 0, (
                 f"Core {core_id} has no inter-core communication"
             )
+
+        result = interp.memory.hbm.read(y_stick, seq * hidden_dim, "f16").reshape(seq, hidden_dim)
+        expected = self._rmsnorm_reference(x, w_1d, eps=ek["eps"])
+
+        assert result.shape == expected.shape, f"Shape mismatch: {result.shape} vs {expected.shape}"
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+        np.testing.assert_allclose(
+            result, expected, rtol=1e-2, atol=1e-2,
+            err_msg="Distributed 2x2 RMSNorm output does not match NumPy reference",
+        )
