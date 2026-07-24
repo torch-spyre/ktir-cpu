@@ -371,6 +371,51 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "d_ffn": 1024,
         },
     ],
+    # ---------------------------------------------------------------------------
+    # RMSNorm examples
+    # ---------------------------------------------------------------------------
+    "rmsnorm_4x1": [
+        {
+            "path": "latency/rmsnorm_4core_4x1.mlir",
+            # 4-core embarrassingly parallel RMSNorm, grid=[4, 1].
+            # No allreduce — each core normalizes its own rows independently.
+            # Global: seq=256, hidden_dim=4096.
+            # HBM element-index layout (f16):
+            #   elems [0..1048575]         → X [256, 4096]
+            #   elems [1048576..2097151]   → W [256, 4096] (1D weight tiled)
+            #   elems [2097152..3145727]   → Y [256, 4096]
+            "execute_kwargs": {
+                "X": 0,
+                "Y": 2097152,
+                "W": 1048576,
+                "N": 4096,
+                "eps": 1e-5,
+                "BLOCK_SIZE": 1024,
+            },
+            "seq": 256,
+            "hidden_dim": 4096,
+        },
+    ],
+    "rmsnorm_2x2": [
+        {
+            "path": "latency/rmsnorm_4core_2x2.mlir",
+            # 4-core distributed RMSNorm with hidden-dim sharding (M=2)
+            # and row sharding (K=2), grid=[2, 2].
+            # Uses construct_distributed_memory_view for X, W, Y.
+            # Cross-core allreduce for sum-of-squares across col-partners.
+            # Same HBM layout as rmsnorm_4x1.
+            "execute_kwargs": {
+                "X": 0,
+                "Y": 2097152,
+                "W": 1048576,
+                "N": 4096,
+                "eps": 1e-5,
+                "BLOCK_SIZE": 1024,
+            },
+            "seq": 256,
+            "hidden_dim": 4096,
+        },
+    ],
 }
 
 

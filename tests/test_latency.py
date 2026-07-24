@@ -2868,3 +2868,110 @@ class TestFFNSwiGLU4CoreLatency:
         expected_ratio = 1.0 / hbm_bw
         actual_ratio = scaled_mem / baseline_mem
         assert actual_ratio == pytest.approx(expected_ratio, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# RMSNorm latency — memory-bound, SIMD-dominant
+# ---------------------------------------------------------------------------
+
+
+def _run_rmsnorm(path, func_name, entry, cfg, trace=False):
+    """Run an rmsnorm kernel and return the latency report."""
+    meta = parse_example(path, func_name)
+    seq = entry["seq"]
+    hidden_dim = entry["hidden_dim"]
+    ek = entry["execute_kwargs"]
+
+    _elems_per_stick = 64  # 128 bytes / 2 bytes per f16
+    x_stick = ek["X"] // _elems_per_stick
+    w_stick = ek["W"] // _elems_per_stick
+    y_stick = ek["Y"] // _elems_per_stick
+
+    rng = np.random.default_rng(42)
+    x = rng.standard_normal((seq, hidden_dim)).astype(np.float16)
+    w_1d = rng.uniform(0.5, 1.5, size=hidden_dim).astype(np.float16)
+    w = np.tile(w_1d, (seq, 1))
+    y = np.zeros((seq, hidden_dim), dtype=np.float16)
+
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    _orig = interp._prepare_execution
+
+    def _prepare_and_seed(grid_shape):
+        _orig(grid_shape)
+        interp.memory.hbm.write(x_stick, x.flatten())
+        interp.memory.hbm.write(w_stick, w.flatten())
+        interp.memory.hbm.write(y_stick, y.flatten())
+
+    interp._prepare_execution = _prepare_and_seed
+    interp.execute_function(func_name, **ek)
+    return interp.get_latency_report()
+
+
+class TestRMSNormLatency:
+    """Latency and roofline tests for the embarrassingly parallel RMSNorm kernel.
+
+    grid=[4,1], seq=256, hidden_dim=4096.  Each core independently normalizes
+    its rows over the full hidden dim.  Pure SIMD, no comm, memory-bound.
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_4x1"))
+    def test_rmsnorm_low_ai(self, path, func_name, entry):
+        """RMSNorm AI should be below 1 FLOP/byte."""
+        report = _run_rmsnorm(path, func_name, entry, HardwareConfig())
+        rf = report.roofline()
+
+        assert rf["core_dominant_unit"] == "simd"
+        assert rf["core_AI"] < 1.0
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_4x1"))
+    def test_rmsnorm_is_memory_bound(self, path, func_name, entry):
+        """AI must be below the SIMD ridge point (memory-bound on roofline)."""
+        report = _run_rmsnorm(path, func_name, entry, HardwareConfig())
+        rf = report.roofline()
+
+        dominant = rf["core_dominant_unit"]
+        assert rf["core_AI"] < rf["units"][dominant]["ridge"]
+        assert report.bottleneck == "memory"
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_4x1"))
+    def test_rmsnorm_flops_and_bytes(self, path, func_name, entry):
+        """Per-core FLOPs and bytes match expected RMSNorm work."""
+        report = _run_rmsnorm(path, func_name, entry, HardwareConfig())
+        core0 = report.counters[0]
+
+        rows_per_core = entry["seq"] // 4  # 4 cores, blocked row assignment
+        cols_per_core = entry["hidden_dim"]  # no column sharding
+        elems_per_core = rows_per_core * cols_per_core
+
+        # 4 memory ops per element (2× load X, load W, store Y) × 2 bytes
+        expected_bytes = elems_per_core * 4 * 2
+        assert core0.total_bytes == pytest.approx(expected_bytes, rel=0.01)
+
+        # ~4.5 FLOPs/element (4 per-element ops + amortized reduce)
+        assert core0.total_flops > elems_per_core * 4
+        assert core0.total_flops < elems_per_core * 6
+
+
+class TestRMSNorm2x2Latency:
+    """Latency test for the distributed 2x2 RMSNorm kernel.
+
+    grid=[2,2], seq=256, hidden_dim=4096.  Verifies that allreduce
+    communication cost is insignificant relative to total cycles
+    (serial execution model: compute + memory + comm).
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_2x2"))
+    def test_rmsnorm_2x2_comm_is_insignificant(self, path, func_name, entry):
+        """Allreduce comm cost should be <5% of total per-core cycles."""
+        report = _run_rmsnorm(path, func_name, entry, HardwareConfig())
+
+        for core_id, core in report.counters.items():
+            total = core.total_cycles
+            assert total > 0
+            comm_fraction = core.comm_cycles / total
+            assert comm_fraction < 0.05, (
+                f"Core {core_id}: comm is {comm_fraction:.1%} of total "
+                f"({core.comm_cycles:.0f} / {total:.0f} cycles)"
+            )
