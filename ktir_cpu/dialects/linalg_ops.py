@@ -405,10 +405,16 @@ def linalg__generic(op, context, env):
         if isinstance(val, Tile):
             data = val.data
             dims = getattr(imap, 'exprs', None)
-            # Fast path: plain dim-projection map (all exprs are bare ('dim', N) nodes).
-            # This covers the common case of a simple axis permutation/broadcast.
+            # Fast path: dim-projection map (all exprs are bare ('dim', N) nodes).
+            # Handles identity, permutation, and broadcast via NumPy ops.
             if dims is not None and all(e[0] == 'dim' for e in dims):
                 plain_dims = [e[1] for e in dims]
+                # Transpose input axes to match iteration-space dim order.
+                sorted_dims = sorted(plain_dims)
+                if plain_dims != sorted_dims:
+                    perm = [plain_dims.index(d) for d in sorted_dims]
+                    data = np.transpose(data, perm)
+                # Expand missing dims and broadcast.
                 for d in range(out_ndim):
                     if d not in plain_dims:
                         data = np.expand_dims(data, axis=d)

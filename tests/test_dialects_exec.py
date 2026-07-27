@@ -1092,6 +1092,88 @@ class TestLinalg:
         # Expected: outs (1,2) + ins (10,20) = (11, 22)
         assert np.allclose(result.data, np.array([11, 22], dtype=np.float16), rtol=1e-2)
 
+    def test_generic_permuted_indexing_map(self):
+        # linalg.generic with a permuted indexing map: (d0, d1) -> (d1, d0)
+        # Input is shape (3, 4), output is shape (4, 3) — the map transposes.
+        inp_data = np.arange(12, dtype=np.float16).reshape(3, 4)
+        ins_tile = Tile(inp_data, "f16", (3, 4))
+        outs_tile = Tile(np.zeros((4, 3), dtype=np.float16), "f16", (4, 3))
+
+        ctx = _ctx_with(**{"%ins": ins_tile, "%outs": outs_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%in_arg", "%out_arg"], result="%sum"),
+            _op("linalg.yield", operands=["%sum"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%ins", "%outs"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [parse_affine_map("affine_map<(d0, d1) -> (d1, d0)>")],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        # The map transposes the input: result should be inp_data.T
+        assert result.shape == (4, 3)
+        assert np.allclose(result.data, inp_data.T)
+
+    def test_generic_computed_indexing_map(self):
+        # linalg.generic with a computed indexing map: (d0, d1) -> (d0 * 4 + d1)
+        # Input is a flat 1D array of 8 elements, output is (2, 4).
+        inp_data = np.arange(8, dtype=np.float16)
+        ins_tile = Tile(inp_data, "f16", (8,))
+        outs_tile = Tile(np.zeros((2, 4), dtype=np.float16), "f16", (2, 4))
+
+        ctx = _ctx_with(**{"%ins": ins_tile, "%outs": outs_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%in_arg", "%out_arg"], result="%sum"),
+            _op("linalg.yield", operands=["%sum"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%ins", "%outs"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [parse_affine_map("affine_map<(d0, d1) -> (d0 * 4 + d1)>")],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        # (d0, d1) -> (d0*4+d1): output[0,0]=inp[0], output[0,3]=inp[3], output[1,0]=inp[4]
+        assert result.shape == (2, 4)
+        assert np.allclose(result.data, inp_data.reshape(2, 4))
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()
