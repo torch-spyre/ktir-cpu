@@ -1174,6 +1174,51 @@ class TestLinalg:
         assert result.shape == (2, 4)
         assert np.allclose(result.data, inp_data.reshape(2, 4))
 
+    def test_generic_computed_floordiv_mod_map(self):
+        # linalg.generic with map (d0, d1) -> (d1 floordiv 64, d0, d1 mod 64)
+        # Input shape: (2, 3, 64) — "stickified" tensor
+        # Output shape: (3, 128) — iteration space is (d0=3, d1=128)
+        # The map restickifies: for each (d0, d1), read input at
+        #   (d1 // 64, d0, d1 % 64)
+        inp_data = np.arange(2 * 3 * 64, dtype=np.float16).reshape(2, 3, 64)
+        ins_tile = Tile(inp_data, "f16", (2, 3, 64))
+        outs_tile = Tile(np.zeros((3, 128), dtype=np.float16), "f16", (3, 128))
+
+        ctx = _ctx_with(**{"%ins": ins_tile, "%outs": outs_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%in_arg", "%out_arg"], result="%sum"),
+            _op("linalg.yield", operands=["%sum"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%ins", "%outs"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [parse_affine_map("affine_map<(d0, d1) -> (d1 floordiv 64, d0, d1 mod 64)>")],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        assert result.shape == (3, 128)
+        # Verify a few points: output[d0, d1] = input[d1//64, d0, d1%64]
+        for d0, d1 in [(0, 0), (1, 63), (2, 64), (0, 127)]:
+            assert result.data[d0, d1] == inp_data[d1 // 64, d0, d1 % 64]
+
     def test_generic_reduction(self):
         # linalg.generic with reduction: a simple matmul-contraction.
         # iteration space (d0, d1, d2): d0=M, d1=N parallel; d2=K reduction
