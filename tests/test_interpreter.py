@@ -292,3 +292,88 @@ def test_bundled_lhs_for_exec():
     interp.load(_BUNDLED_FOR_MLIR)
     # Should complete without error (KeyError on %acc#0/%acc#1 was the bug)
     interp.execute_function("bundled_for")
+
+
+# ---------------------------------------------------------------------------
+# Defensive _YieldResult tracking in execute_region
+# ---------------------------------------------------------------------------
+
+class TestExecuteRegionYieldTracking:
+    """Verify that execute_region asserts when scf.yield is not the last op.
+
+    In valid MLIR, scf.yield is always the region terminator (last op).
+    If the parser incorrectly places it before another op, the executor
+    should raise AssertionError rather than silently returning wrong values.
+    """
+
+    def test_yield_not_last_op_raises(self):
+        """execute_region asserts if scf.yield is present but not the last op."""
+        interp = _make_interpreter_with_module("""
+module {
+  func.func @dummy() attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    return
+  }
+}
+""")
+        context = _minimal_core(interp)
+
+        yield_op = Operation(
+            op_type="scf.yield",
+            operands=[],
+            result=None,
+            attributes={},
+            result_type=None,
+        )
+        context.set_value("%val", np.float32(42.0))
+        yield_op.operands = ["%val"]
+
+        constant_op = Operation(
+            op_type="arith.constant",
+            operands=[],
+            result="%dummy",
+            attributes={"value": 99},
+            result_type="index",
+        )
+
+        with pytest.raises(AssertionError, match="possible parser bug"):
+            interp.execute_region(context, [yield_op, constant_op])
+
+    def test_yield_not_last_op_raises_with_comms(self):
+        """execute_region_with_comms asserts if scf.yield is not the last op."""
+        interp = _make_interpreter_with_module("""
+module {
+  func.func @dummy() attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    return
+  }
+}
+""")
+        context = _minimal_core(interp)
+
+        yield_op = Operation(
+            op_type="scf.yield",
+            operands=[],
+            result=None,
+            attributes={},
+            result_type=None,
+        )
+        context.set_value("%val", np.float32(42.0))
+        yield_op.operands = ["%val"]
+
+        constant_op = Operation(
+            op_type="arith.constant",
+            operands=[],
+            result="%dummy",
+            attributes={"value": 99},
+            result_type="index",
+        )
+
+        gen = interp.execute_region_with_comms(context, [yield_op, constant_op])
+        with pytest.raises(AssertionError, match="possible parser bug"):
+            # Drive the generator to completion
+            try:
+                while True:
+                    next(gen)
+            except StopIteration:
+                pass

@@ -412,9 +412,6 @@ class KTIRParser(KTIRParserBase):
     # Regex matching a terminal type token at end of op text.
     # Covers: tensor<...>, memref<...>, !ktdp.access_tile<...>,
     #         index, i32, f16, f32, etc.
-    # Regex matching a terminal type token at end of op text.
-    # Covers: tensor<...>, memref<...>, !ktdp.access_tile<...>,
-    #         index, i32, f16, f32, etc.
     _TYPE_TERMINAL_RE = re.compile(
         r'(?::\s|->)\s*.*(?:>|index|[iuf]\d+)\s*$'
     )

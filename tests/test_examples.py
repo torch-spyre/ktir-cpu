@@ -946,8 +946,7 @@ class TestFFNSwiGLU4CoreExecution:
 class TestNestedYieldExecution(InterpreterTestMixin):
     """End-to-end execution of nested_yield.ktir.
 
-    Reproducer for issue #181: scf.for iter_args dropped when body ends
-    with a nested scf.for before scf.yield.
+    case where there exists nested scf.for's 
     """
 
     @pytest.mark.parametrize("path,func_name,entry", get_test_params("nested_yield"))
