@@ -328,6 +328,17 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
         },
     ],
     # ---------------------------------------------------------------------------
+    # Nested scf.for iter_args bug (Issue #181)
+    # ---------------------------------------------------------------------------
+    "nested_yield": [
+        {
+            "path": "ktir/nested_yield.ktir",
+            # Outer scf.for accumulates 1.0 twice → [2, 2, 2, 2].
+            # Nested scf.for before scf.yield triggers the parser/executor bug.
+            "execute_kwargs": {},
+        },
+    ],
+    # ---------------------------------------------------------------------------
     # FFN-SwiGLU example (Issue #77)
     # ---------------------------------------------------------------------------
     "ffn_swiglu": [
