@@ -76,6 +76,35 @@ class TestArithAdapt(MLIRFrontendParseTestMixin, _TestArithParsers):
 class TestLinalgAdapt(MLIRFrontendParseTestMixin, _TestLinalgParsers):
     """Linalg tests via MLIRFrontendParser."""
 
+    def test_generic_indexing_maps_and_iterator_types(self):
+        """Verify _adapt_linalg_generic parses indexing_maps and iterator_types."""
+        op = self._parse(
+            "%r = linalg.generic {\n"
+            "    indexing_maps = [\n"
+            "      affine_map<(d0, d1, d2) -> (d0, d2)>,\n"
+            "      affine_map<(d0, d1, d2) -> (d2, d1)>,\n"
+            "      affine_map<(d0, d1, d2) -> (d0, d1)>\n"
+            "    ],\n"
+            '    iterator_types = ["parallel", "parallel", "reduction"]\n'
+            "  } ins(%a, %b : tensor<3x5xf32>, tensor<5x4xf32>)\n"
+            "    outs(%c : tensor<3x4xf32>) {\n"
+            "  ^bb0(%aa: f32, %bb: f32, %cc: f32):\n"
+            "    %mul = arith.mulf %aa, %bb : f32\n"
+            "    %add = arith.addf %mul, %cc : f32\n"
+            "    linalg.yield %add : f32\n"
+            "  } -> tensor<3x4xf32>",
+            args={"%a": "tensor<3x5xf32>", "%b": "tensor<5x4xf32>",
+                  "%c": "tensor<3x4xf32>"},
+        )
+        assert op.op_type == "linalg.generic"
+        assert op.attributes["n_ins"] == 2
+        # indexing_maps should be AffineMap objects
+        maps = op.attributes["indexing_maps"]
+        assert len(maps) == 3
+        assert maps[0].n_dims == 3
+        # iterator_types should be parsed
+        assert op.attributes["iterator_types"] == ["parallel", "parallel", "reduction"]
+
 
 # ---------------------------------------------------------------------------
 # Tensor

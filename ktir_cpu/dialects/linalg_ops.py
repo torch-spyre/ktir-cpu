@@ -546,7 +546,12 @@ def linalg__generic(op, context, env):
     combiner_bb0, combiner_ops = combiner_info
 
     # Bind outs arg to identity element so compute ops run without accumulation.
-    identity = _COMBINER_IDENTITY.get(combiner_type, 0.0)
+    if combiner_type not in _COMBINER_IDENTITY:
+        raise ValueError(
+            f"linalg.generic: unsupported combiner '{combiner_type}' for reduction; "
+            f"supported: {list(_COMBINER_IDENTITY)}"
+        )
+    identity = _COMBINER_IDENTITY[combiner_type]
     if n_ins < len(bb0_names):
         id_data = np.full(iter_shape, identity, dtype=out_np_dtype)
         context.set_value(bb0_names[n_ins], Tile(id_data, outs_val.dtype, iter_shape))
