@@ -369,22 +369,117 @@ def linalg__batch_matmul(op, context, env):
     return result
 
 
+_COMBINER_IDENTITY = {
+    "arith.addf": 0.0, "arith.addi": 0,
+    "arith.mulf": 1.0, "arith.muli": 1,
+    "arith.maxf": float("-inf"), "arith.maximumf": float("-inf"),
+    "arith.minf": float("inf"), "arith.minimumf": float("inf"),
+}
+
+
+def _infer_iter_shape(indexing_maps, tensor_shapes):
+    """Infer the full iteration-space shape from indexing maps + tensor shapes.
+
+    For each iteration dim d, finds a map with a bare dim-ref to d at some
+    result position k, then reads the extent from the corresponding tensor shape.
+    """
+    n_dims = indexing_maps[0].n_dims
+    extents = [None] * n_dims
+    for imap, shape in zip(indexing_maps, tensor_shapes):
+        for k, expr in enumerate(imap.exprs):
+            if expr[0] == 'dim' and extents[expr[1]] is None:
+                extents[expr[1]] = shape[k]
+    if any(e is None for e in extents):
+        raise ValueError(
+            f"linalg.generic: cannot infer extent for dims "
+            f"{[i for i, e in enumerate(extents) if e is None]}"
+        )
+    return tuple(extents)
+
+
+def _gather_input(data, imap, target_shape):
+    """Gather a tensor into target_shape using its indexing map."""
+    n_target = len(target_shape)
+    dims = getattr(imap, 'exprs', None)
+    # Fast path: dim-projection map (all exprs are bare ('dim', N) nodes).
+    if dims is not None and all(e[0] == 'dim' for e in dims):
+        plain_dims = [e[1] for e in dims]
+        sorted_dims = sorted(plain_dims)
+        if plain_dims != sorted_dims:
+            perm = [plain_dims.index(d) for d in sorted_dims]
+            data = np.transpose(data, perm)
+        for d in range(n_target):
+            if d not in plain_dims:
+                data = np.expand_dims(data, axis=d)
+        return np.broadcast_to(data, target_shape).copy()
+    # General path: evaluate the affine map for every index.
+    gathered = np.empty(target_shape, dtype=data.dtype)
+    for idx in np.ndindex(*target_shape):
+        gathered[idx] = data[imap.eval(list(idx))]
+    return gathered
+
+
+def _split_combiner(body_ops, outs_bb0_name):
+    """Split body_ops into (compute_ops, combiner_op_type, combiner_ops).
+
+    The combiner is the op whose operands include the outs block-arg and whose
+    result is yielded.  Returns (compute_ops, combiner_type, combiner_region)
+    where combiner_region is a minimal [op, yield] suitable for _tree_fold.
+    """
+    yield_op = next((o for o in body_ops if o.op_type == "linalg.yield"), None)
+    if yield_op is None:
+        return body_ops, None, None
+
+    yielded_name = yield_op.operands[0] if yield_op.operands else None
+
+    # Find the op that produces the yielded value and uses the outs arg.
+    combiner = None
+    for o in body_ops:
+        if o.result == yielded_name and outs_bb0_name in o.operands:
+            combiner = o
+            break
+
+    if combiner is None:
+        return body_ops, None, None
+
+    compute_ops = [o for o in body_ops if o is not combiner and o is not yield_op]
+
+    # Build a minimal combiner region for _tree_fold.
+    # _run_combiner binds bb0_names[0]=lhs, bb0_names[1]=rhs, executes the
+    # region, and returns the yielded result.
+    combiner_bb0 = ["__fold_lhs__", "__fold_rhs__"]
+    combiner_region_op = Operation(
+        result="__fold_combined__",
+        op_type=combiner.op_type,
+        operands=combiner_bb0,
+        attributes=combiner.attributes.copy() if combiner.attributes else {},
+        result_type=combiner.result_type,
+    )
+    combiner_yield = Operation(
+        result=None, op_type="linalg.yield",
+        operands=["__fold_combined__"], attributes={}, result_type=None,
+    )
+
+    return compute_ops, combiner.op_type, (combiner_bb0, [combiner_region_op, combiner_yield])
+
+
 @register("linalg.generic", latency_category=LC.COMPUTE_FLOAT)
 def linalg__generic(op, context, env):
     """Vectorised linalg.generic executor.
 
-    Broadcasts each input to the output shape per its indexing_map
-    (np.expand_dims for missing dims), binds bb0 block-arg names, then
-    executes the region body once with full arrays.
+    Broadcasts each input to the iteration shape per its indexing_map,
+    binds bb0 block-arg names, then executes the region body once with
+    full arrays.  When iterator_types includes reduction dims, the body
+    is split into compute + combiner; compute runs on the full iteration
+    shape and the result is tree-folded along reduction dims.
     """
     n_ins = op.attributes.get("n_ins", 0)
     indexing_maps = op.attributes.get("indexing_maps", [])
+    iterator_types = op.attributes.get("iterator_types")
 
     ins_vals = [context.get_value(op.operands[i]) for i in range(n_ins)]
     outs_val = context.get_value(op.operands[n_ins])
 
-    # Resolve bb0 block-argument names and body via the shared helper
-    # (also used by linalg.reduce).
     bb0_names, body_ops = _resolve_region_body(op)
     if not bb0_names:
         raise ValueError("linalg.generic: cannot determine bb0 argument names")
@@ -392,60 +487,97 @@ def linalg__generic(op, context, env):
     if not isinstance(outs_val, Tile):
         raise TypeError(f"linalg.generic: outs must be a Tile, got {type(outs_val)}")
     out_shape = outs_val.shape
-    out_ndim = len(out_shape)
     out_np_dtype = outs_val.data.dtype
 
+    # Determine reduction dims (if any).
+    reduction_dims = []
+    if iterator_types:
+        reduction_dims = [i for i, t in enumerate(iterator_types) if t == "reduction"]
+
+    if not reduction_dims:
+        # --- All-parallel path (original behaviour) ---
+        iter_shape = out_shape
+    else:
+        # --- Reduction path: compute full iteration shape ---
+        tensor_shapes = [v.shape for v in ins_vals if isinstance(v, Tile)]
+        tensor_shapes.append(out_shape)
+        all_maps = indexing_maps[:n_ins + 1] if len(indexing_maps) > n_ins else indexing_maps[:n_ins]
+        # Use only as many maps as we have shapes
+        maps_for_infer = all_maps[:len(tensor_shapes)]
+        iter_shape = _infer_iter_shape(maps_for_infer, tensor_shapes)
+
     context.push_scope()
+    context.set_value("__linalg_shape__", iter_shape)
 
-    # Store output shape so linalg.index can build index arrays.
-    context.set_value("__linalg_shape__", out_shape)
-
-    # Gather each input into the iteration space and bind to its bb0 arg.
+    # Gather each input into the iteration space.
     for i, (val, imap) in enumerate(zip(ins_vals, indexing_maps[:n_ins])):
         if isinstance(val, Tile):
-            data = val.data
-            dims = getattr(imap, 'exprs', None)
-            # Fast path: dim-projection map (all exprs are bare ('dim', N) nodes).
-            # Handles identity, permutation, and broadcast via NumPy ops.
-            if dims is not None and all(e[0] == 'dim' for e in dims):
-                plain_dims = [e[1] for e in dims]
-                # Transpose input axes to match iteration-space dim order.
-                sorted_dims = sorted(plain_dims)
-                if plain_dims != sorted_dims:
-                    perm = [plain_dims.index(d) for d in sorted_dims]
-                    data = np.transpose(data, perm)
-                # Expand missing dims and broadcast.
-                for d in range(out_ndim):
-                    if d not in plain_dims:
-                        data = np.expand_dims(data, axis=d)
-                arg_val = Tile(np.broadcast_to(data, out_shape).copy(), val.dtype, out_shape)
-            else:
-                # General path: evaluate the affine map for every output index.
-                gathered = np.empty(out_shape, dtype=data.dtype)
-                for idx in np.ndindex(*out_shape):
-                    gathered[idx] = data[imap.eval(list(idx))]
-                arg_val = Tile(gathered, val.dtype, out_shape)
+            gathered = _gather_input(val.data, imap, iter_shape)
+            arg_val = Tile(gathered, val.dtype, iter_shape)
         else:
             arg_val = val
         if i < len(bb0_names):
             context.set_value(bb0_names[i], arg_val)
 
-    # Bind the outs bb0 arg — in MLIR semantics the outs buffer is the
-    # initial value of the output block argument.
-    if n_ins < len(bb0_names):
-        context.set_value(bb0_names[n_ins], Tile(
-            outs_val.data.copy(), outs_val.dtype, out_shape
-        ))
+    if not reduction_dims:
+        # All-parallel: bind outs and run full body.
+        if n_ins < len(bb0_names):
+            context.set_value(bb0_names[n_ins], Tile(
+                outs_val.data.copy(), outs_val.dtype, out_shape
+            ))
+        result = env.execute_region(context, body_ops)
+        context.pop_scope()
+        out_data = unwrap_yield(result)
+        if isinstance(out_data, Tile):
+            data = np.broadcast_to(out_data.data, out_shape).copy().astype(out_np_dtype)
+            return Tile(data, outs_val.dtype, out_shape)
+        return Tile(np.full(out_shape, out_data, dtype=out_np_dtype), outs_val.dtype, out_shape)
 
+    # --- Reduction path ---
+    outs_bb0_name = bb0_names[n_ins] if n_ins < len(bb0_names) else None
+    compute_ops, combiner_type, combiner_info = _split_combiner(body_ops, outs_bb0_name)
+
+    if combiner_info is None:
+        raise ValueError(
+            "linalg.generic: cannot identify combiner op for reduction "
+            f"(outs block-arg '{outs_bb0_name}' not found in body ops)"
+        )
+
+    combiner_bb0, combiner_ops = combiner_info
+
+    # Bind outs arg to identity element so compute ops run without accumulation.
+    identity = _COMBINER_IDENTITY.get(combiner_type, 0.0)
+    if n_ins < len(bb0_names):
+        id_data = np.full(iter_shape, identity, dtype=out_np_dtype)
+        context.set_value(bb0_names[n_ins], Tile(id_data, outs_val.dtype, iter_shape))
+
+    # Run compute + combiner on full iteration shape (produces full-shape result).
     result = env.execute_region(context, body_ops)
     context.pop_scope()
-
     out_data = unwrap_yield(result)
 
-    if isinstance(out_data, Tile):
-        data = np.broadcast_to(out_data.data, out_shape).copy().astype(out_np_dtype)
-        return Tile(data, outs_val.dtype, out_shape)
-    return Tile(np.full(out_shape, out_data, dtype=out_np_dtype), outs_val.dtype, out_shape)
+    if not isinstance(out_data, Tile):
+        out_data = Tile(np.full(iter_shape, out_data, dtype=out_np_dtype), outs_val.dtype, iter_shape)
+
+    # Tree-fold along each reduction dim (rightmost first).
+    folded = out_data.data
+    for d in sorted(reduction_dims, reverse=True):
+        folded = _tree_fold(
+            Tile(folded, outs_val.dtype, folded.shape),
+            d, combiner_bb0, combiner_ops, context, env,
+        )
+    # Squeeze reduction dims.
+    for d in sorted(reduction_dims, reverse=True):
+        folded = np.squeeze(folded, axis=d)
+
+    # Combine with the real outs initial value.
+    reduced_tile = Tile(folded.astype(out_np_dtype), outs_val.dtype, folded.shape)
+    combined = _run_combiner(
+        combiner_bb0, combiner_ops, reduced_tile, outs_val, context, env,
+    )
+    final = combined.data if isinstance(combined, Tile) else np.asarray(combined)
+
+    return Tile(final.astype(out_np_dtype), outs_val.dtype, out_shape)
 
 
 @register("linalg.index")
@@ -607,6 +739,14 @@ def parse_linalg_generic(op_text, parse_ctx):
         for raw in raw_maps:
             maps.append(parse_affine_map(raw))
 
+    # iterator_types = ["parallel", "reduction", ...]
+    iterator_types = None
+    iter_match = re.search(r'iterator_types\s*=\s*\[([^\]]*)\]', op_text)
+    if iter_match:
+        content = iter_match.group(1).strip()
+        if content:
+            iterator_types = [s.strip().strip('"').strip("'") for s in content.split(',')]
+
     ins_operands = []
     ins_match = re.search(r'\bins\s*\(([^)]+)\)', op_text)
     if ins_match:
@@ -617,11 +757,15 @@ def parse_linalg_generic(op_text, parse_ctx):
     if outs_match:
         outs_operands = find_ssa_names(outs_match.group(1).split(':')[0])
 
+    attrs = {"indexing_maps": maps, "n_ins": len(ins_operands)}
+    if iterator_types is not None:
+        attrs["iterator_types"] = iterator_types
+
     return Operation(
         result=None,
         op_type="linalg.generic",
         operands=ins_operands + outs_operands,
-        attributes={"indexing_maps": maps, "n_ins": len(ins_operands)},
+        attributes=attrs,
         result_type="unknown",
     )
 

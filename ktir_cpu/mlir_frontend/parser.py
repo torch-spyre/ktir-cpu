@@ -620,6 +620,14 @@ def _adapt_linalg_generic(mlir_op, attributes, result_type, operands):
         maps.append(parse_affine_map(map_val_str))
     attributes["indexing_maps"] = maps
 
+    # iterator_types: ArrayAttr of IteratorTypeAttr (parallel=0, reduction=1)
+    iter_types_attr = mlir_op.attributes.get("iteratorTypes")
+    if iter_types_attr is not None:
+        _ITER_TYPE_MAP = {0: "parallel", 1: "reduction"}
+        attributes["iterator_types"] = [
+            _ITER_TYPE_MAP.get(int(attr), str(attr)) for attr in iter_types_attr
+        ]
+
     # Block arguments are the bb0 names; stored in attributes for the executor fallback
     block = mlir_op.regions[0].blocks[0]
     attributes["bb0_names"] = [arg.get_name() for arg in block.arguments]
