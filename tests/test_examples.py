@@ -1004,3 +1004,25 @@ class TestFFNSwiGLU4CoreExecution:
         expected = np.zeros((seq, d_model), dtype=np.float16)
 
         np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
+
+
+class TestNestedYieldExecution(InterpreterTestMixin):
+    """End-to-end execution of nested_yield.ktir.
+
+    case where there exists nested scf.for's 
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("nested_yield"))
+    def test_nested_yield(self, path, func_name, entry):
+        """Outer loop accumulates 1.0 twice -> [2, 2, 2, 2]."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        (out_ptr,) = interp.arg_names(func_name)
+        out = np.zeros(4, dtype=np.float32)
+
+        outputs = interp.execute_function(func_name, **{out_ptr: out})
+        result = outputs[out_ptr]
+
+        expected = np.full(4, 2.0, dtype=np.float32)
+        np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)

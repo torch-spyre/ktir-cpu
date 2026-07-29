@@ -347,9 +347,17 @@ class KTIRInterpreter:
         tensor.generate bodies, ktdp combiner bodies).  For scf regions that
         may contain comm ops use ``execute_region_with_comms`` instead.
         """
+        from .ops.control_ops import _YieldResult
         result = None
         for op in operations:
             result = self._execute_op(op, context)
+        if operations and any(
+            op.op_type in ("scf.yield", "linalg.yield", "tensor.yield") for op in operations
+        ):
+            assert isinstance(result, _YieldResult), (
+                "Region contains a yield op but it was not the last op — "
+                "possible parser bug (see issue #181)"
+            )
         return result
 
     def execute_region_with_comms(self, context: CoreContext, operations: List[Operation]):
@@ -361,6 +369,7 @@ class KTIRInterpreter:
         before returning.  When no comm op fires this runs synchronously —
         ``yield from`` on a generator that never yields returns immediately.
         """
+        from .ops.control_ops import _YieldResult
         result = None
         for op in operations:
             result = self._execute_op(op, context)
@@ -376,4 +385,11 @@ class KTIRInterpreter:
                     values = result if isinstance(result, tuple) else [result]
                     for name, val in zip(names, values):
                         context.set_value(name, val, charge=charge)
+        if operations and any(
+            op.op_type in ("scf.yield", "linalg.yield", "tensor.yield") for op in operations
+        ):
+            assert isinstance(result, _YieldResult), (
+                "Region contains a yield op but it was not the last op — "
+                "possible parser bug (see issue #181)"
+            )
         return result

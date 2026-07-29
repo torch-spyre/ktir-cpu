@@ -416,6 +416,14 @@ class KTIRParser(KTIRParserBase):
         r'(?::\s|->)\s*.*(?:>|index|[iuf]\d+)\s*$'
     )
 
+    # Matches parenthesized result types: `-> (type)` or `-> (type, type, ...)`
+    # at end of op text (MLIR uses parens for multi-result or single-result ops
+    # like scf.for ... -> (tensor<4xf32>)).  Separate from _TYPE_TERMINAL_RE to
+    # avoid false positives on `->` inside affine_map<...> attributes.
+    _PAREN_RESULT_TYPE_RE = re.compile(
+        r'->\s*\([^()]*(?:>|index|[iuf]\d+)\)\s*$'
+    )
+
     def _is_op_complete(self, accumulated: str) -> bool:
         """Check whether *accumulated* op text is structurally complete.
 
@@ -438,6 +446,9 @@ class KTIRParser(KTIRParserBase):
             return True
         # Type annotation: `: <type>` or `-> <type>` at end
         if self._TYPE_TERMINAL_RE.search(text):
+            return True
+        # Parenthesized result type: `-> (type)` or `-> (type, type, ...)`
+        if self._PAREN_RESULT_TYPE_RE.search(text):
             return True
         return False
 

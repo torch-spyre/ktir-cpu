@@ -67,9 +67,8 @@ module {
     //      ``groups`` defines 4 groups; each core's group is derived
     //      from its position in ``producer_tiles_per_group``.
     %fut = ktdp.inter_tile_produce
-        producer_tiles_per_group = #all_tiles,
-        groups                   = #all_groups
-        : tensor<1x128xf16> -> !ktdp.tile_future<tensor<1x128xf16>>
+        producer_tiles_per_group = #all_tiles
+        : tensor<1x128xf16> -> !ktdp.tile_future<tensor<1x128xf16>, groups = affine_set<(g) : (g >= 0, -g + 3 >= 0)>>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %partial : tensor<1x128xf16>
@@ -85,9 +84,8 @@ module {
 
     %reduced = ktdp.inter_tile_reduce(%fut)
         consumer_tiles_per_group = #all_tiles,
-        groups                   = #all_groups,
         identity(%add_id : tensor<1x128xf16>)
-        : !ktdp.tile_future<tensor<1x128xf16>> -> tensor<128xf16>
+        : !ktdp.tile_future<tensor<1x128xf16>, groups = affine_set<(g) : (g >= 0, -g + 3 >= 0)>> -> tensor<128xf16>
     {
       ^bb0(%lhs: tensor<1x128xf16>, %rhs: tensor<1x128xf16>):
         %init = tensor.empty() : tensor<1x128xf16>
