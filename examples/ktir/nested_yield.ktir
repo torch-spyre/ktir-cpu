@@ -1,0 +1,23 @@
+module {
+  func.func @nested_yield(%out: index) attributes {grid = [1]} {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %one = arith.constant dense<1.000000e+00> : tensor<4xf32>
+    %zero = arith.constant dense<0.000000e+00> : tensor<4xf32>
+    %o_desc = ktdp.construct_memory_view %out, sizes: [4], strides: [1] {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf32>
+
+    %sum = scf.for %i = %c0 to %c2 step %c1 iter_args(%acc = %zero) -> (tensor<4xf32>) {
+      %next = arith.addf %acc, %one : tensor<4xf32>
+      // Nested loop: result unused, but it is the last op before scf.yield.
+      %inner = scf.for %j = %c0 to %c2 step %c1 iter_args(%iacc = %zero) -> (tensor<4xf32>) {
+        %t = arith.addf %iacc, %one : tensor<4xf32>
+        scf.yield %t : tensor<4xf32>
+      }
+      scf.yield %next : tensor<4xf32>
+    }
+    %tile = ktdp.construct_access_tile %o_desc[%c0] {access_tile_order = affine_map<(d0) -> (d0)>, access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + 3 >= 0)>} : memref<4xf32> -> !ktdp.access_tile<4xindex>
+    ktdp.store %sum, %tile : tensor<4xf32>, <4xindex>
+    return
+  }
+}

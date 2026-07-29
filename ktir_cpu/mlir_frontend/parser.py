@@ -681,44 +681,71 @@ def _adapt_tensor_generate(mlir_op, attributes, result_type, operands):
     attributes["dtype"] = info["dtype"]
 
 
+def _require_groups_from_type(groups_str, *, context):
+    """Parse the ``groups`` affine set extracted from a tile_future type.
+
+    ``groups`` must appear inside the ``!ktdp.tile_future<...>`` type — the
+    op-attribute spelling is no longer accepted. Raises ``ValueError`` if
+    ``groups_str`` is ``None`` (i.e. the type did not carry a ``groups``
+    clause). ``context`` names the op for diagnostics.
+    """
+    if groups_str is None:
+        raise ValueError(
+            f"{context}: missing groups inside !ktdp.tile_future<...> type"
+        )
+    return parse_affine_set(groups_str)
+
+
 @MLIRTypeAdapter.install("ktdp.inter_tile_produce")
 def _adapt_inter_tile_produce(mlir_op, attributes, result_type, operands):
-    """Extract producer_tiles_per_group, groups, and partial_tensor_types from result type.
+    """Extract producer_tiles_per_group, groups, and partial_tensor_types.
 
-    result_type is "!ktdp.tile_future<T_p_1, ...>" — split the inner content to
-    produce partial_tensor_types, matching what the regex parser produces.
+    ``groups`` is read from the ``!ktdp.tile_future`` result type's
+    ``groups`` clause; the earlier op-attribute spelling is no longer
+    accepted.
     """
-    from ..parser_utils import split_top_level
+    from ..parser_utils import parse_tile_future_type
+    ctx = "ktdp.inter_tile_produce"
     attributes["producer_tiles_per_group"] = parse_affine_set(
         str(mlir_op.attributes["producer_tiles_per_group"])
     )
-    attributes["groups"] = parse_affine_set(
-        str(mlir_op.attributes["groups"])
+    partial_types, groups_str = parse_tile_future_type(
+        result_type, context=f"{ctx} result"
     )
-    # Parse "!ktdp.tile_future<T1, T2, ...>" → ("T1", "T2", ...)
-    m = re.match(r"!ktdp\.tile_future<(.+)>", result_type or "")
-    if not m:
-        raise ValueError(
-            f"ktdp.inter_tile_produce: cannot parse tile_future result type {result_type!r}"
-        )
-    inner = m.group(1).strip()
-    attributes["partial_tensor_types"] = tuple(
-        p.strip() for p in split_top_level(inner)
-    )
+    attributes["groups"] = _require_groups_from_type(groups_str, context=ctx)
+    attributes["partial_tensor_types"] = partial_types
 
 
 @MLIRTypeAdapter.install("ktdp.inter_tile_reduce")
 def _adapt_inter_tile_reduce(mlir_op, attributes, result_type, operands):
     """Extract consumer_tiles_per_group, groups, optional producer_dependency_per_consumer,
-    and _result_shape from the result type, matching the regex parser's output.
+    and _result_shape.
+
+    ``groups`` is read from operand 0's ``!ktdp.tile_future`` type's
+    ``groups`` clause (operand 0 is the future produced by
+    ``ktdp.inter_tile_produce``); the earlier op-attribute spelling is
+    no longer accepted.
     """
-    from ..parser_utils import parse_tensor_or_memref_type
+    from ..parser_utils import parse_tensor_or_memref_type, parse_tile_future_type
+    ctx = "ktdp.inter_tile_reduce"
     attributes["consumer_tiles_per_group"] = parse_affine_set(
         str(mlir_op.attributes["consumer_tiles_per_group"])
     )
-    attributes["groups"] = parse_affine_set(
-        str(mlir_op.attributes["groups"])
+    if not mlir_op.operands:
+        raise ValueError(
+            f"{ctx}: expected operand 0 to be a !ktdp.tile_future, "
+            f"got no operands"
+        )
+    future_type = str(mlir_op.operands[0].type)
+    if not future_type.startswith("!ktdp.tile_future"):
+        raise ValueError(
+            f"{ctx}: expected operand 0 to be a !ktdp.tile_future type, "
+            f"got {future_type!r}"
+        )
+    _, groups_str = parse_tile_future_type(
+        future_type, context=f"{ctx} operand 0"
     )
+    attributes["groups"] = _require_groups_from_type(groups_str, context=ctx)
     if "producer_dependency_per_consumer" in mlir_op.attributes:
         attributes["producer_dependency_per_consumer"] = parse_affine_set(
             str(mlir_op.attributes["producer_dependency_per_consumer"])

@@ -386,6 +386,17 @@ def test_type_terminal_arrow():
     )
 
 
+def test_type_terminal_paren_result_types():
+    """_is_op_complete matches parenthesized result types like -> (tensor<4xf32>)."""
+    parser = KTIRParser()
+    assert parser._is_op_complete(
+        "%r = scf.for %i = %c0 to %c2 step %c1 iter_args(%acc = %z) -> (tensor<4xf32>)"
+    )
+    assert parser._is_op_complete(
+        "%r:2 = scf.for %i = %c0 to %c2 step %c1 iter_args(%a = %x, %b = %y) -> (tensor<4xf32>, index)"
+    )
+
+
 def test_type_terminal_void_terminators():
     """_is_op_complete recognises return and scf.yield as complete."""
     parser = KTIRParser()

@@ -35,7 +35,17 @@ from ..ops.comm_ops import CommPlan, RingReduceBackend
 from ..ops.grid_ops import GridOps
 from ..ops.memory_ops import MemoryOps
 from ..parser_ast import enumerate_membership_keys, parse_affine_map, parse_affine_set
-from ..parser_utils import _extract_bracket_content, extract_named_attr, find_ssa_names, parse_attr_block, parse_multi_result_lhs, parse_tensor_or_memref_type, split_top_level
+from ..parser_utils import (
+    _extract_bracket_content,
+    _scan_angle_bracketed,
+    extract_named_attr,
+    find_ssa_names,
+    parse_attr_block,
+    parse_multi_result_lhs,
+    parse_tensor_or_memref_type,
+    parse_tile_future_type,
+    split_top_level,
+)
 from .registry import ParseContext, register, register_parser
 
 
@@ -983,6 +993,61 @@ def ktdp__inter_tile_produce(op, context, env):
     )
 
 
+def _extract_tile_future_result_type(op_text: str) -> str:
+    """Locate the ``!ktdp.tile_future<...>`` result type in ``op_text``.
+
+    Accepts two spellings:
+
+    - **Explicit:** ``... -> !ktdp.tile_future<T [, groups = <affine-set>]>``
+    - **Shortened:** ``... -> <T [, groups = <affine-set>]>`` — the
+      ``!ktdp.tile_future`` prefix is elided; only the parametric ``<...>``
+      block is written. The current MLIR frontend prints this form.
+
+    Returns the fully-qualified ``!ktdp.tile_future<...>`` string so
+    callers can pass it to ``parse_tile_future_type`` without caring
+    which spelling appeared in the input. Raises ``ValueError`` if
+    neither form is found after a ``->`` token.
+    """
+    # `_scan_angle_bracketed` walks angle-bracket depth from a starting
+    # `<`, skipping the constraint operator `>=` and the affine-map arrow
+    # `->` so they are not mistaken for closing brackets. It returns the
+    # index one past the matching `>` on success, or `None` if the string
+    # ended before depth returned to zero — that's how we detect an
+    # unterminated type and raise a clean diagnostic here rather than
+    # silently returning the whole tail of `op_text`.
+    m = re.search(r'!ktdp\.tile_future<', op_text)
+    if m is not None:
+        start = m.end() - 1  # index of '<'
+        end = _scan_angle_bracketed(op_text, start)
+        if end is None:
+            raise ValueError(
+                "ktdp.inter_tile_produce/reduce: unterminated "
+                "!ktdp.tile_future<...> type"
+            )
+        return op_text[m.start(): end]
+
+    # Shortened form: the tile_future is the type immediately after the
+    # trailing `->` (produce) or the trailing `:` (reduce). Anchor to the
+    # LAST `->` or `:` that is followed by `<` so earlier tokens (e.g.
+    # `%id : tensor<...>` inside an identity clause) cannot false-match.
+    matches = list(re.finditer(r'(?:->|:)\s*<', op_text))
+    if not matches:
+        raise ValueError(
+            "ktdp.inter_tile_produce/reduce: missing "
+            "!ktdp.tile_future<...> type"
+        )
+    last = matches[-1]
+    start = last.end() - 1  # index of '<'
+    end = _scan_angle_bracketed(op_text, start)
+    if end is None:
+        raise ValueError(
+            "ktdp.inter_tile_produce/reduce: unterminated "
+            "shortened tile_future <...> type"
+        )
+    inner = op_text[start + 1: end - 1]
+    return f"!ktdp.tile_future<{inner}>"
+
+
 @register_parser("ktdp.inter_tile_produce")
 def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
     m = re.match(r'ktdp\.inter_tile_produce\b', op_text)
@@ -994,22 +1059,24 @@ def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
     )
     if producer_set_str is None:
         raise ValueError("ktdp.inter_tile_produce: missing producer_tiles_per_group")
-    groups_str = extract_named_attr(op_text, "groups", parse_ctx.aliases)
-    if groups_str is None:
-        raise ValueError("ktdp.inter_tile_produce: missing groups")
-
     producer_set = parse_affine_set(producer_set_str)
-    groups_set = parse_affine_set(groups_str)
 
-    # Result type:  !ktdp.tile_future<T_p_1, ..., T_p_N>
-    fut_match = re.search(r'!ktdp\.tile_future<(.+)>', op_text)
-    if not fut_match:
+    # `groups` must live inside the `!ktdp.tile_future<...>` result type —
+    # the op-attribute spelling is no longer accepted. Extract the type
+    # (either explicit `!ktdp.tile_future<...>` or the shortened `-> <...>`
+    # form the MLIR frontend printer emits), then delegate to the shared
+    # grammar helper so the regex path and the MLIR-frontend adapter can't
+    # disagree on what a valid tile_future type looks like.
+    result_type = _extract_tile_future_result_type(op_text)
+    partial_types, groups_str = parse_tile_future_type(
+        result_type, context="ktdp.inter_tile_produce result"
+    )
+    if groups_str is None:
         raise ValueError(
-            "ktdp.inter_tile_produce: missing !ktdp.tile_future<...> result type"
+            "ktdp.inter_tile_produce: missing groups inside "
+            "!ktdp.tile_future<...> type"
         )
-    inner = fut_match.group(1).strip()
-    # split_top_level handles commas inside nested tensor<...> brackets.
-    partial_types = tuple(p.strip() for p in split_top_level(inner))
+    groups_set = parse_affine_set(groups_str)
 
     return Operation(
         result=None,
@@ -1020,7 +1087,7 @@ def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
             "groups": groups_set,
             "partial_tensor_types": partial_types,
         },
-        result_type=f"!ktdp.tile_future<{inner}>",
+        result_type=result_type,
     )
 
 
@@ -1172,9 +1239,21 @@ def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext):
         raise ValueError("ktdp.inter_tile_reduce: missing consumer_tiles_per_group")
     consumer_set = parse_affine_set(consumer_set_str)
 
-    groups_str = extract_named_attr(op_text, "groups", parse_ctx.aliases)
+    # `groups` must live inside the operand's `!ktdp.tile_future<...>`
+    # type — the op-attribute spelling is no longer accepted. The operand
+    # type appears in `op_text` in one of two spellings (explicit
+    # `!ktdp.tile_future<...>` or the shortened `: <...>` form the MLIR
+    # frontend printer emits); `_extract_tile_future_result_type` accepts
+    # both and normalises before handing off to the shared grammar helper.
+    fut_type = _extract_tile_future_result_type(op_text)
+    _, groups_str = parse_tile_future_type(
+        fut_type, context="ktdp.inter_tile_reduce operand 0"
+    )
     if groups_str is None:
-        raise ValueError("ktdp.inter_tile_reduce: missing groups")
+        raise ValueError(
+            "ktdp.inter_tile_reduce: missing groups inside "
+            "!ktdp.tile_future<...> operand type"
+        )
     groups_set = parse_affine_set(groups_str)
 
     pdpc_str = extract_named_attr(

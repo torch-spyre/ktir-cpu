@@ -271,9 +271,8 @@ module {
     // ---- Step 8: all-reduce partial outputs across 4 cores ----
 
     %fut = ktdp.inter_tile_produce
-        producer_tiles_per_group = #all_tiles,
-        groups                   = #one_group
-        : tensor<1024xf16> -> !ktdp.tile_future<tensor<1024xf16>>
+        producer_tiles_per_group = #all_tiles
+        : tensor<1024xf16> -> !ktdp.tile_future<tensor<1024xf16>, groups = affine_set<(g) : (g == 0)>>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %out_partial_flat : tensor<1024xf16>
@@ -285,9 +284,8 @@ module {
 
     %out_reduced_flat = ktdp.inter_tile_reduce(%fut)
         consumer_tiles_per_group = #all_tiles,
-        groups                   = #one_group,
         identity(%add_id : tensor<1024xf16>)
-        : !ktdp.tile_future<tensor<1024xf16>> -> tensor<1024xf16>
+        : !ktdp.tile_future<tensor<1024xf16>, groups = affine_set<(g) : (g == 0)>> -> tensor<1024xf16>
     {
       ^bb0(%lhs: tensor<1024xf16>, %rhs: tensor<1024xf16>):
         %init = tensor.empty() : tensor<1024xf16>
