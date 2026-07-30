@@ -20,6 +20,8 @@ from test_examples import (
     TestSdpaExecution as _TestSdpaExecution,
     TestPagedAttentionExecution as _TestPagedAttentionExecution,
     TestScalarBroadcastExecution as _TestScalarBroadcastExecution,
+    TestRMSNormExecution as _TestRMSNormExecution,
+    TestRMSNorm2x2Execution as _TestRMSNorm2x2Execution,
 )
 
 
@@ -68,3 +70,15 @@ class TestPagedAttentionAdapt(MLIRFrontendInterpMixin, _TestPagedAttentionExecut
 
 class TestScalarBroadcastAdapt(MLIRFrontendInterpMixin, _TestScalarBroadcastExecution):
     """Scalar broadcast (rank-0 collapse) via MLIRFrontendParser."""
+
+
+class TestRMSNormAdapt(MLIRFrontendInterpMixin, _TestRMSNormExecution):
+    """RMSNorm 4x1 tests via MLIRFrontendParser."""
+
+
+class TestRMSNorm2x2Adapt(MLIRFrontendInterpMixin, _TestRMSNorm2x2Execution):
+    """RMSNorm 2x2 tests via MLIRFrontendParser."""
+
+    def _make_interp(self):
+        from ktir_cpu.latency import HardwareConfig
+        return KTIRInterpreter(parser=MLIRFrontendParser(), latency_config=HardwareConfig())

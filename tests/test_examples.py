@@ -1053,7 +1053,7 @@ class TestNestedYieldExecution(InterpreterTestMixin):
         expected = np.full(4, 2.0, dtype=np.float32)
         np.testing.assert_allclose(result, expected, rtol=1e-5, atol=1e-5)
 
-class TestRMSNormExecution:
+class TestRMSNormExecution(InterpreterTestMixin):
     """End-to-end execution of rmsnorm_4core_4x1.mlir.
 
     4-core embarrassingly parallel RMSNorm: grid=[4,1], no allreduce.
@@ -1090,7 +1090,7 @@ class TestRMSNormExecution:
         w = np.tile(w_1d, (seq, 1))
         y = np.zeros((seq, hidden_dim), dtype=np.float16)
 
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
         STICK_BYTES = 128
@@ -1142,7 +1142,7 @@ class TestRMSNormExecution:
         w = np.tile(w_1d, (seq, 1))
         y = np.zeros((seq, hidden_dim), dtype=np.float16)
 
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
         STICK_BYTES = 128
@@ -1190,7 +1190,7 @@ class TestRMSNormExecution:
         w = np.tile(w_1d, (seq, 1))
         y = np.zeros((seq, hidden_dim), dtype=np.float16)
 
-        interp = KTIRInterpreter()
+        interp = self._make_interp()
         interp.load(path)
 
         STICK_BYTES = 128
@@ -1221,13 +1221,17 @@ class TestRMSNormExecution:
         )
 
 
-class TestRMSNorm2x2Execution:
+class TestRMSNorm2x2Execution(InterpreterTestMixin):
     """End-to-end execution of rmsnorm_4core_2x2.mlir.
 
     Distributed RMSNorm: grid=[2,2], column-sharded with allreduce.
     Verifies both inter-core communication and numeric correctness
     against the same NumPy reference used by the 4x1 tests.
     """
+
+    def _make_interp(self):
+        from ktir_cpu.latency import HardwareConfig
+        return KTIRInterpreter(latency_config=HardwareConfig())
 
     @staticmethod
     def _rmsnorm_reference(x, w, eps=1e-5):
@@ -1258,10 +1262,7 @@ class TestRMSNorm2x2Execution:
         w = np.tile(w_1d, (seq, 1))
         y = np.zeros((seq, hidden_dim), dtype=np.float16)
 
-        from ktir_cpu import KTIRInterpreter
-        from ktir_cpu.latency import HardwareConfig
-
-        interp = KTIRInterpreter(latency_config=HardwareConfig())
+        interp = self._make_interp()
         interp.load(path)
 
         STICK_BYTES = 128
