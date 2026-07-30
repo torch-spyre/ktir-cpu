@@ -267,31 +267,33 @@ module {
                                  outs(%out_partial_init : tensor<4x256xf16>) -> tensor<4x256xf16>
 
     %out_partial_flat = tensor.collapse_shape %out_partial [[0, 1]] : tensor<4x256xf16> into tensor<1024xf16>
+    %out_partial_2d = tensor.expand_shape %out_partial_flat [[0, 1]] output_shape [1, 1024]
+                        : tensor<1024xf16> into tensor<1x1024xf16>
 
     // ---- Step 8: all-reduce partial outputs across 4 cores ----
 
     %fut = ktdp.inter_tile_produce
         producer_tiles_per_group = #all_tiles
-        : tensor<1024xf16> -> !ktdp.tile_future<tensor<1024xf16>, groups = affine_set<(g) : (g == 0)>>
+        : tensor<1x1024xf16> -> !ktdp.tile_future<tensor<1x1024xf16>, groups = affine_set<(g) : (g == 0)>>
     {
       ^bb0(%gid: index):
-        ktdp.yield_partial %out_partial_flat : tensor<1024xf16>
+        ktdp.yield_partial %out_partial_2d : tensor<1x1024xf16>
     }
 
     %c_zero = arith.constant 0.0 : f16
-    %id_init = tensor.empty() : tensor<1024xf16>
-    %add_id = linalg.fill ins(%c_zero : f16) outs(%id_init : tensor<1024xf16>) -> tensor<1024xf16>
+    %id_init = tensor.empty() : tensor<1x1024xf16>
+    %add_id = linalg.fill ins(%c_zero : f16) outs(%id_init : tensor<1x1024xf16>) -> tensor<1x1024xf16>
 
     %out_reduced_flat = ktdp.inter_tile_reduce(%fut)
         consumer_tiles_per_group = #all_tiles,
-        identity(%add_id : tensor<1024xf16>)
-        : !ktdp.tile_future<tensor<1024xf16>, groups = affine_set<(g) : (g == 0)>> -> tensor<1024xf16>
+        identity(%add_id : tensor<1x1024xf16>)
+        : !ktdp.tile_future<tensor<1x1024xf16>, groups = affine_set<(g) : (g == 0)>> -> tensor<1024xf16>
     {
-      ^bb0(%lhs: tensor<1024xf16>, %rhs: tensor<1024xf16>):
-        %init = tensor.empty() : tensor<1024xf16>
-        %sum = linalg.add ins(%lhs, %rhs : tensor<1024xf16>, tensor<1024xf16>)
-                          outs(%init : tensor<1024xf16>) -> tensor<1024xf16>
-        ktdp.yield_reduced %sum : tensor<1024xf16>
+      ^bb0(%lhs: tensor<1x1024xf16>, %rhs: tensor<1x1024xf16>):
+        %init = tensor.empty() : tensor<1x1024xf16>
+        %sum = linalg.add ins(%lhs, %rhs : tensor<1x1024xf16>, tensor<1x1024xf16>)
+                          outs(%init : tensor<1x1024xf16>) -> tensor<1x1024xf16>
+        ktdp.yield_reduced %sum : tensor<1x1024xf16>
     }
 
     %out_reduced = tensor.expand_shape %out_reduced_flat [[0, 1]] output_shape [4, 256]
