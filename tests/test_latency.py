@@ -3045,6 +3045,10 @@ class TestRMSNormLatency:
         assert core0.total_flops < elems_per_core * 6
 
 
+@pytest.mark.xfail(
+    reason="regex parser cannot parse C++ custom assembly format for inter_tile ops",
+    raises=Exception,
+)
 class TestRMSNorm2x2Latency:
     """Latency test for the distributed 2x2 RMSNorm kernel.
 

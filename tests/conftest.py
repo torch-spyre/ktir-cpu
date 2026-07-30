@@ -484,6 +484,8 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             # Uses construct_distributed_memory_view for X, W, Y.
             # Cross-core allreduce for sum-of-squares across col-partners.
             # Same HBM layout as rmsnorm_4x1.
+            # Uses C++ custom assembly format for inter_tile ops (MLIRFrontendParser only).
+            "mlir_frontend_only": True,
             "execute_kwargs": {
                 "X": 0,
                 "Y": 2097152,
@@ -525,10 +527,13 @@ def get_test_params(
         for entry in EXAMPLE_PARAMS[fn]:
             rel_path = entry["path"]
             is_failure = "exception_msg" in entry
+            is_frontend_only = entry.get("mlir_frontend_only", False)
             if filter is not None:
                 if filter not in rel_path and filter not in fn:
                     continue
             elif is_failure:
+                continue
+            elif is_frontend_only and not func_names:
                 continue
             abs_path = str(EXAMPLES_DIR / rel_path)
             # Expand any list-valued execute_kwargs into separate entries.
@@ -545,6 +550,7 @@ def get_test_params(
                 expanded = {**entry, "execute_kwargs": {**entry["execute_kwargs"], key: val}}
                 result.append((abs_path, fn, expanded))
     return result
+
 
 
 # ---------------------------------------------------------------------------

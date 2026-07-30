@@ -163,9 +163,7 @@ module {
                         : tensor<1xf16> into tensor<1x1xf16>
 
         // === Allreduce: sum partial sums across M=2 col-partner cores ===
-        %fut = ktdp.inter_tile_produce
-            producer_tiles_per_group = #col_partners
-            : tensor<1x1xf16> -> !ktdp.tile_future<tensor<1x1xf16>, groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>>
+        %fut = ktdp.inter_tile_produce producer_tiles_per_group = #col_partners -> <(tensor<1x1xf16>), groups = #row_groups>
         {
           ^bb0(%gid: index):
             ktdp.yield_partial %partial_2d : tensor<1x1xf16>
@@ -175,10 +173,7 @@ module {
         %add_id  = linalg.fill ins(%zero_scalar : f16) outs(%id_init : tensor<1x1xf16>)
                      -> tensor<1x1xf16>
 
-        %full_sum_2d = ktdp.inter_tile_reduce(%fut)
-            consumer_tiles_per_group = #col_partners,
-            identity(%add_id : tensor<1x1xf16>)
-            : !ktdp.tile_future<tensor<1x1xf16>, groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>> -> tensor<1x1xf16>
+        %full_sum_2d = ktdp.inter_tile_reduce(%fut) consumer_tiles_per_group = #col_partners, identity(%add_id : tensor<1x1xf16>) : <(tensor<1x1xf16>), groups = #row_groups> -> tensor<1x1xf16>
         {
           ^bb0(%lhs: tensor<1x1xf16>, %rhs: tensor<1x1xf16>):
             %init = tensor.empty() : tensor<1x1xf16>
