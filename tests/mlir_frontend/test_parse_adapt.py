@@ -44,21 +44,31 @@ class MLIRFrontendParseTestMixin:
             super().assert_attribute(op, key, value, transform=transform)
 
     def _parse(self, op_text, parse_ctx=None, args=None):
+        """Parse ``op_text`` through the MLIR frontend and return the op under test.
+
+        Wraps the op in a synthetic ``func.func`` whose signature declares
+        ``args`` (external SSA operands as name → MLIR type). See
+        ``ParseTestMixin._parse`` for the shared ``args`` contract.
+        """
         args = self._resolve_args(op_text, args)
-        sig = ", ".join(f"{n}: {t}" for n, t in args.items())
+        func_args = ", ".join(f"{name}: {mlir_type}" for name, mlir_type in args.items())
         module_text = f"""\
 module {{
-  func.func @_test({sig}) attributes {{ grid = [1] }} {{
+  func.func @_test({func_args}) attributes {{ grid = [1] }} {{
     {op_text}
     return
   }}
 }}
 """
         ir_module = MLIRFrontendParser().parse_module(module_text)
+        op_under_test = None
         for op in ir_module.get_function("_test").operations:
             if op.op_type not in ("func.return", "return"):
-                return op
-        raise RuntimeError(f"No target op found in:\n{module_text}")
+                op_under_test = op
+                break
+        if op_under_test is None:
+            raise RuntimeError(f"No op parsed from:\n{module_text}")
+        return op_under_test
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +140,9 @@ class TestKtdpAdapt(MLIRFrontendParseTestMixin, _TestKtdpParsers):
     # test_construct_memory_view_ssa_size_as_operand: inherited
 
     # test_construct_memory_view_multi_dim_mixed_static_dynamic: inherited
+
+    # test_inter_tile_produce: inherited (groups embedded in tile_future type)
+    # test_inter_tile_reduce:  inherited (groups embedded in tile_future type)
 
 
 # ---------------------------------------------------------------------------

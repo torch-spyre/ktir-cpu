@@ -1105,7 +1105,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ktir-mlir-frontend", marker = "extra == 'mlir-frontend'", git = "https://github.com/torch-spyre/ktir-mlir-frontend?rev=c2412cddc2a247ff1700fd594d0dd9011d675404" },
+    { name = "ktir-mlir-frontend", marker = "extra == 'mlir-frontend'", git = "https://github.com/torch-spyre/ktir-mlir-frontend?rev=973d67ee7d535ea41f4adbf9c6eb4ee59450672b" },
     { name = "numpy", specifier = ">=1.20.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
@@ -1122,7 +1122,7 @@ dev = [
 [[package]]
 name = "ktir-mlir-frontend"
 version = "0.1.0"
-source = { git = "https://github.com/torch-spyre/ktir-mlir-frontend?rev=c2412cddc2a247ff1700fd594d0dd9011d675404#c2412cddc2a247ff1700fd594d0dd9011d675404" }
+source = { git = "https://github.com/torch-spyre/ktir-mlir-frontend?rev=973d67ee7d535ea41f4adbf9c6eb4ee59450672b#973d67ee7d535ea41f4adbf9c6eb4ee59450672b" }
 dependencies = [
     { name = "nanobind" },
 ]
