@@ -1235,6 +1235,32 @@ class TestTensor:
         assert result.shape == (4,)
         assert np.array_equal(result.data, [1, 2, 3, 4])
 
+    def test_collapse_shape_to_rank0(self):
+        # collapse a (1, 1) tile to a rank-0 (scalar) tile (empty target_shape)
+        t = Tile(np.array([[3.0]], dtype=np.float16), "f16", (1, 1))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.collapse_shape", ctx, _make_env(),
+                       operands=["%t"], attributes={"target_shape": ()})
+        assert result.shape == ()
+        assert float(np.asarray(result.data)) == 3.0
+
+    def test_expand_shape_from_rank0(self):
+        # the inverse: lift a rank-0 tile back to (1, 1).
+        t = Tile(np.array(3.0, dtype=np.float16), "f16", ())
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.expand_shape", ctx, _make_env(),
+                       operands=["%t"], attributes={"target_shape": (1, 1)})
+        assert result.shape == (1, 1)
+        assert float(np.asarray(result.data).reshape(())) == 3.0
+
+    def test_collapse_shape_missing_target_fails_loud(self):
+        # A missing target_shape attribute is a parser bug; the executor raises
+        # rather than silently returning the source (matches tensor.reshape).
+        t = Tile(np.array([[1, 2], [3, 4]], dtype=np.float16), "f16", (2, 2))
+        ctx = _ctx_with(**{"%t": t})
+        with pytest.raises(ValueError, match="missing 'target_shape'"):
+            _call("tensor.collapse_shape", ctx, _make_env(), operands=["%t"])
+
     def test_reshape(self):
         """1D -> 2D reshape preserves element order and total count."""
         t = Tile(np.arange(8, dtype=np.float16), "f16", (8,))

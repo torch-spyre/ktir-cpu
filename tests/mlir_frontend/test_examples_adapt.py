@@ -19,6 +19,7 @@ from test_examples import (
     TestIndexedAddExecution as _TestIndexedAddExecution,
     TestSdpaExecution as _TestSdpaExecution,
     TestPagedAttentionExecution as _TestPagedAttentionExecution,
+    TestScalarBroadcastExecution as _TestScalarBroadcastExecution,
 )
 
 
@@ -63,3 +64,7 @@ class TestSdpaAdapt(MLIRFrontendInterpMixin, _TestSdpaExecution):
 
 class TestPagedAttentionAdapt(MLIRFrontendInterpMixin, _TestPagedAttentionExecution):
     """Paged attention tests via MLIRFrontendParser."""
+
+
+class TestScalarBroadcastAdapt(MLIRFrontendInterpMixin, _TestScalarBroadcastExecution):
+    """Scalar broadcast (rank-0 collapse) via MLIRFrontendParser."""

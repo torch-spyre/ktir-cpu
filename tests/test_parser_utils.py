@@ -43,10 +43,16 @@ from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_or_memref
         ("tensor<1x64xf32>", (1, 64), "f32"),
         ("tensor<128x16xf16>", (128, 16), "f16"),
         ("tensor<1x16x1x128xf16>", (1, 16, 1, 128), "f16"),
+        # Rank-0 (scalar)
+        ("tensor<f16>", (), "f16"),
+        ("tensor<f32>", (), "f32"),
+        ("tensor<i32>", (), "i32"),
+        ("tensor<index>", (), "index"),
+        ("memref<f16>", (), "f16"),
     ],
 )
 def test_parse_tensor_or_memref_type_basic(type_str, expected_shape, expected_dtype):
-    """Plain numeric/float dtypes round-trip cleanly across rank 1–4."""
+    """Plain numeric/float dtypes round-trip cleanly across rank 0–4."""
     info = parse_tensor_or_memref_type(type_str)
     assert info == {"shape": expected_shape, "dtype": expected_dtype}
 
@@ -84,11 +90,10 @@ def test_parse_tensor_or_memref_type_index_dtype(type_str, expected_shape):
 @pytest.mark.parametrize(
     "type_str",
     [
-        "f32",                  # Bare element type (no dims)
+        "f32",                  # Bare element type, no wrapper — stays None
         "not a tensor",         # Random text
         "",                     # Empty
         "tensor<>",             # Malformed: empty body
-        "tensor<f32>",          # Rank-0 tensor — no dim tokens
         "tensor<?xf16>",        # All-dynamic dims — dropped → empty shape
     ],
 )
