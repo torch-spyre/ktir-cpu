@@ -20,6 +20,7 @@ from test_examples import (
     TestSdpaExecution as _TestSdpaExecution,
     TestPagedAttentionExecution as _TestPagedAttentionExecution,
     TestScalarBroadcastExecution as _TestScalarBroadcastExecution,
+    TestRoPEExecution as _TestRoPEExecution,
 )
 
 
@@ -68,3 +69,7 @@ class TestPagedAttentionAdapt(MLIRFrontendInterpMixin, _TestPagedAttentionExecut
 
 class TestScalarBroadcastAdapt(MLIRFrontendInterpMixin, _TestScalarBroadcastExecution):
     """Scalar broadcast (rank-0 collapse) via MLIRFrontendParser."""
+
+
+class TestRoPEAdapt(MLIRFrontendInterpMixin, _TestRoPEExecution):
+    """RoPE tests via MLIRFrontendParser."""
