@@ -355,6 +355,27 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
         },
     ],
     # ---------------------------------------------------------------------------
+    # Multicore SDPA P@V example
+    #
+    # A functional multicore SDPA P@V kernel.  It computes C = A @ B and
+    # validates through the numpy oracle; M/N/K are the global matmul dims.
+    # Block sizes and grid are baked in as constants, so the only runtime args
+    # are the a/b/c HBM pointers.
+    # ---------------------------------------------------------------------------
+    "sdpa_pv_ksplit": [
+        {
+            "path": "sdsc/sdpa_pv_ksplit.mlir",
+            # Decode SDPA P@V: output split x2 (parallel) AND KV contraction
+            # split x16 (reduce), grid [2, 16] = 32 cores.  The query row face
+            # is 1 (decode), so this is (1x8192) @ (8192x128).  The two reduce
+            # groups are *strided* -- group g = cores {g, g+2, g+4, ...} -- so
+            # it exercises the (i - g) mod 2 == 0 producer set, distinct from
+            # the contiguous grouping in ring_reduce_multi_group.
+            "execute_kwargs": {},
+            "M": 1, "N": 128, "K": 8192,
+        },
+    ],
+    # ---------------------------------------------------------------------------
     # Nested scf.for iter_args bug (Issue #181)
     # ---------------------------------------------------------------------------
     "nested_yield": [
