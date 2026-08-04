@@ -1,3 +1,31 @@
+// Decode SDPA P@V on 32 cores: C[1,128] = A[1,8192] @ B[8192,128], f16.
+//
+// One query token (Sq = 1, decode), KV length 8192, head dim 128.  Shapes,
+// block sizes and grid are baked in; the runtime args are just the a/b/c
+// HBM base pointers.
+//
+// Grid [2, 16] = 32 cores.  Dimension 0 varies fastest, so the flat core id
+// is ``pid_in * 2 + pid_out``:
+//   dim 0 — output (N = 128) split x2: 64 columns = one f16 stick per core
+//   dim 1 — KV contraction (K = 8192) split x16: 512 rows per core (reduce)
+// Each output element is therefore a sum over 16 cores, folded with
+// ktdp.inter_tile_produce / ktdp.inter_tile_reduce in two *strided* reduce
+// groups: group g = cores {g, g+2, ..., g+30}, the ``(i - g) mod 2 == 0``
+// producer set below — distinct from the contiguous grouping in
+// examples/latency/ring_reduce_multi_group.mlir.  The partial, the combiner
+// region and the identity are all f16, so the fold rounds back to f16 at
+// every step.  The ``pid_in == 0`` core of each group (flat core id g) stores
+// that group's 1x64 output slice under an scf.if guard, so each column block
+// has exactly one writer.
+//
+// Source: a torch-spyre SuperDSC capture of
+// F.scaled_dot_product_attention(Q[1,1,1,128], K/V[1,1,8192,128]) at 32
+// cores — op 14 of the 22-op chain, and the only op in it whose work
+// division splits a contraction dimension.  The core-to-slice map is the
+// capture's own: core c takes output slice ``c % 2`` and KV slice ``c / 2``.
+// Decode is the only SDPA shape that crosses cores at all — a prefill
+// shape's parallel dimensions fill the grid on their own, so work division
+// never has to reach for the reduction dimension.
 #red_tiles = affine_set<(i)[g] : ((i - g) mod 2 == 0, i - g >= 0, -i + g + 30 >= 0)>
 module {
   func.func @sdpa_pv_ksplit(%a_ptr: index, %b_ptr: index, %c_ptr: index) attributes {grid = [2, 16]} {

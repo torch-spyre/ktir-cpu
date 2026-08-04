@@ -681,8 +681,12 @@ class TestMulticoreSdpaExecution(InterpreterTestMixin):
         result = outputs[c_ptr]
 
         expected = (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float16)
-        # fp16 accumulation over K (up to 8192), folded across cores in fp32 by
-        # the ring backend -- loose tolerance, as in the other matmul checks.
+        # No fp32 accumulator anywhere in the kernel: the matmul ``outs``, the
+        # combiner region and the identity are all f16, so each of the 16
+        # cross-core fold steps rounds its running sum back to f16.  That fold
+        # is where the error comes from -- max abs diff on these inputs is
+        # 0.375 at output magnitude ~250 (~1.5 f16 ULP).  Loose tolerance, as
+        # in the other matmul checks.
         np.testing.assert_allclose(
             result.astype(np.float32), expected.astype(np.float32),
             rtol=3e-2, atol=1.5,
