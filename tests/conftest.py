@@ -484,8 +484,7 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             # Uses construct_distributed_memory_view for X, W, Y.
             # Cross-core allreduce for sum-of-squares across col-partners.
             # Same HBM layout as rmsnorm_4x1.
-            # Uses C++ custom assembly format for inter_tile ops (MLIRFrontendParser only).
-            "mlir_frontend_only": True,
+            # Uses C++ custom assembly format for inter_tile ops.
             "execute_kwargs": {
                 "X": 0,
                 "Y": 2097152,

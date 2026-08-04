@@ -59,7 +59,6 @@
 // Linearised pids: {0,1} = row-group 0, {2,3} = row-group 1.
 // i in [2*g, 2*g+1] for group g in {0, 1}.
 #col_partners = affine_set<(i)[g] : (i - 2*g >= 0, -i + 2*g + 1 >= 0)>
-#row_groups   = affine_set<(g) : (g >= 0, -g + 1 >= 0)>
 
 module {
   func.func @rmsnorm_2x2(
@@ -158,33 +157,29 @@ module {
             outs(%reduce_init : tensor<1xf16>)
             dimensions = [1]
 
-        // Reshape to 1x1 for inter_tile ops
-        %partial_2d = tensor.expand_shape %partial_sum [[0, 1]] output_shape [1, 1]
-                        : tensor<1xf16> into tensor<1x1xf16>
-
         // === Allreduce: sum partial sums across M=2 col-partner cores ===
-        %fut = ktdp.inter_tile_produce producer_tiles_per_group = #col_partners -> <(tensor<1x1xf16>), groups = #row_groups>
+        %fut = ktdp.inter_tile_produce producer_tiles_per_group = #col_partners -> <(tensor<1xf16>), groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>>
         {
           ^bb0(%gid: index):
-            ktdp.yield_partial %partial_2d : tensor<1x1xf16>
+            ktdp.yield_partial %partial_sum : tensor<1xf16>
         }
 
-        %id_init = tensor.empty() : tensor<1x1xf16>
-        %add_id  = linalg.fill ins(%zero_scalar : f16) outs(%id_init : tensor<1x1xf16>)
-                     -> tensor<1x1xf16>
+        %id_init = tensor.empty() : tensor<1xf16>
+        %add_id  = linalg.fill ins(%zero_scalar : f16) outs(%id_init : tensor<1xf16>)
+                     -> tensor<1xf16>
 
-        %full_sum_2d = ktdp.inter_tile_reduce(%fut) consumer_tiles_per_group = #col_partners, identity(%add_id : tensor<1x1xf16>) : <(tensor<1x1xf16>), groups = #row_groups> -> tensor<1x1xf16>
+        %full_sum = ktdp.inter_tile_reduce(%fut) consumer_tiles_per_group = #col_partners, identity(%add_id : tensor<1xf16>) : <(tensor<1xf16>), groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>> -> tensor<1xf16>
         {
-          ^bb0(%lhs: tensor<1x1xf16>, %rhs: tensor<1x1xf16>):
-            %init = tensor.empty() : tensor<1x1xf16>
-            %sum  = linalg.add ins(%lhs, %rhs : tensor<1x1xf16>, tensor<1x1xf16>)
-                               outs(%init : tensor<1x1xf16>) -> tensor<1x1xf16>
-            ktdp.yield_reduced %sum : tensor<1x1xf16>
+          ^bb0(%lhs: tensor<1xf16>, %rhs: tensor<1xf16>):
+            %init = tensor.empty() : tensor<1xf16>
+            %sum  = linalg.add ins(%lhs, %rhs : tensor<1xf16>, tensor<1xf16>)
+                               outs(%init : tensor<1xf16>) -> tensor<1xf16>
+            ktdp.yield_reduced %sum : tensor<1xf16>
         }
 
         // === Compute rstd = rsqrt(sum_sq / N + eps) ===
         %c0_idx = arith.constant 0 : index
-        %full_sum_scalar = tensor.extract %full_sum_2d[%c0_idx, %c0_idx] : tensor<1x1xf16>
+        %full_sum_scalar = tensor.extract %full_sum[%c0_idx] : tensor<1xf16>
 
         %N_i32 = arith.index_cast %N : index to i32
         %N_f16 = arith.sitofp %N_i32 : i32 to f16
