@@ -80,6 +80,16 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "execute_kwargs": {"n_elements": 4096, "BLOCK_SIZE": 128},
         },
     ],
+    "scalar_broadcast": [
+        {
+            # Rank-0 (scalar) regression anchor: collapse tensor<1x1xf16> to a
+            # scalar tensor<f16>, then broadcast it across a 4x64 output. Mirrors
+            # the 1x1-broadcast shape the Triton -> KTIR lowering emits (e.g.
+            # batch_norm's per-channel multiply). No dynamic params.
+            "path": "ktir/scalar_broadcast.mlir",
+            "execute_kwargs": {},
+        },
+    ],
     "softmax_kernel_small": [
         {
             "path": "latency/softmax_small.mlir",
