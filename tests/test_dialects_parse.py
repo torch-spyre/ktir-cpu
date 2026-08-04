@@ -1182,6 +1182,63 @@ class TestKtdpParsers(ParseTestMixin):
             ),
         )
 
+    @pytest.mark.regex_only
+    def test_inter_tile_produce_groups_alias(self):
+        # Alias reference inside tile_future groups clause must resolve.
+        ctx = make_parse_context(aliases={
+            "#partners": "affine_set<(i)[g] : (i - 2*g >= 0, -i + 2*g + 1 >= 0)>",
+            "#grps": "affine_set<(g) : (g >= 0, -g + 1 >= 0)>",
+        })
+        op = self._parse(
+            "%f = ktdp.inter_tile_produce"
+            " producer_tiles_per_group = #partners"
+            " -> <(tensor<1xf16>), groups = #grps>\n"
+            "    {\n"
+            "      ^bb0(%gid: index):\n"
+            "        ktdp.yield_partial %p : tensor<1xf16>\n"
+            "    }",
+            parse_ctx=ctx,
+            args={"%p": "tensor<1xf16>"},
+        )
+        self.assert_op_type(op, "ktdp.inter_tile_produce")
+        self.assert_attribute(
+            op, "groups",
+            parse_affine_set("affine_set<(g) : (g >= 0, -g + 1 >= 0)>"),
+        )
+
+    @pytest.mark.regex_only
+    def test_inter_tile_reduce_groups_alias(self):
+        # Alias reference in reduce's tile_future groups clause.
+        ctx = make_parse_context(aliases={
+            "#partners": "affine_set<(i)[g] : (i - 2*g >= 0, -i + 2*g + 1 >= 0)>",
+            "#grps": "affine_set<(g) : (g >= 0, -g + 1 >= 0)>",
+        })
+        op = self._parse(
+            "%r = ktdp.inter_tile_reduce(%f)"
+            " consumer_tiles_per_group = #partners,"
+            " identity(%id : tensor<1xf16>)"
+            " : <(tensor<1xf16>), groups = #grps> -> tensor<1xf16>\n"
+            "    {\n"
+            "      ^bb0(%lhs: tensor<1xf16>, %rhs: tensor<1xf16>):\n"
+            "        %s = linalg.add"
+            " ins(%lhs, %rhs : tensor<1xf16>, tensor<1xf16>)"
+            "                        outs(%lhs : tensor<1xf16>)"
+            " -> tensor<1xf16>\n"
+            "        ktdp.yield_reduced %s : tensor<1xf16>\n"
+            "    }",
+            parse_ctx=ctx,
+            args={
+                "%id": "tensor<1xf16>",
+                "%f":  "!ktdp.tile_future<(tensor<1xf16>),"
+                       " groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>>",
+            },
+        )
+        self.assert_op_type(op, "ktdp.inter_tile_reduce")
+        self.assert_attribute(
+            op, "groups",
+            parse_affine_set("affine_set<(g) : (g >= 0, -g + 1 >= 0)>"),
+        )
+
 
 # ---------------------------------------------------------------------------
 # scf dialect parsers
