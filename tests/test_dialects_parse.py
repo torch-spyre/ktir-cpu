@@ -588,6 +588,17 @@ class TestTensorParsers(ParseTestMixin):
         self.assert_operand_names(op, "%in")
         self.assert_attribute(op, "target_shape", (1, 1024))
 
+    def test_collapse_shape_rank0(self):
+        # A rank-0 (scalar) ``into`` type records an empty target_shape.
+        op = self._parse(
+            "%s = tensor.collapse_shape %in [] : tensor<1x1xf16> into tensor<f16>",
+            args={"%in": "tensor<1x1xf16>"},
+        )
+        self.assert_op_type(op, "tensor.collapse_shape")
+        self.assert_operand_names(op, "%in")
+        self.assert_attribute(op, "target_shape", ())
+        self.assert_attribute(op, "dtype", "f16")
+
     def test_generate(self):
         op = self._parse(
             "%mask = tensor.generate {\n"
@@ -1484,8 +1495,12 @@ class TestParseTensorOrMemrefType:
         assert parse_tensor_or_memref_type("tensor<?x4xf32>") == {"shape": (4,), "dtype": "f32"}
         assert parse_tensor_or_memref_type("tensor<?xf16>") is None
 
-    def test_rank0_returns_none(self):
-        assert parse_tensor_or_memref_type("tensor<f32>") is None
+    def test_rank0_wrapped_parses_to_empty_shape(self):
+        # A wrapped rank-0 (scalar) type parses to an empty shape; a bare
+        # dimensionless element type (no wrapper) still returns None.
+        assert parse_tensor_or_memref_type("tensor<f32>") == {"shape": (), "dtype": "f32"}
+        assert parse_tensor_or_memref_type("memref<f16>") == {"shape": (), "dtype": "f16"}
+        assert parse_tensor_or_memref_type("f32") is None
 
     def test_memref_accepted(self):
         assert parse_tensor_or_memref_type("memref<10xf32>") == {"shape": (10,), "dtype": "f32"}

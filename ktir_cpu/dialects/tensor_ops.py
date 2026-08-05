@@ -101,24 +101,33 @@ def tensor__extract(op, context, env):
     return src
 
 
-@register("tensor.expand_shape")
-def tensor__expand_shape(op, context, env):
+def _reshape(op, context, op_name):
+    """Shared executor for tensor.expand_shape and tensor.collapse_shape.
+
+    The target shape is pinned statically by the result type, so the executor
+    reads ``target_shape`` from attributes (synthesized by the parser from the
+    result type). The attribute is required — a missing one is a parser bug and
+    fails loud, matching ``tensor.reshape``. The empty tuple ``()`` is a valid
+    rank-0 (scalar) target, such as ``tensor<1x1xf16> into tensor<f16>``.
+    """
     src = context.get_value(op.operands[0])
     target_shape = op.attributes.get("target_shape")
-    if isinstance(src, Tile) and target_shape:
-        reshaped = src.data.reshape(target_shape)
-        return Tile(reshaped, src.dtype, target_shape)
-    return src
+    if target_shape is None:
+        raise ValueError(f"{op_name}: missing 'target_shape' attribute on op {op}")
+    if not isinstance(src, Tile):
+        return src
+    reshaped = src.data.reshape(target_shape)
+    return Tile(reshaped, src.dtype, target_shape)
+
+
+@register("tensor.expand_shape")
+def tensor__expand_shape(op, context, env):
+    return _reshape(op, context, "tensor.expand_shape")
 
 
 @register("tensor.collapse_shape")
 def tensor__collapse_shape(op, context, env):
-    src = context.get_value(op.operands[0])
-    target_shape = op.attributes.get("target_shape")
-    if isinstance(src, Tile) and target_shape:
-        reshaped = src.data.reshape(target_shape)
-        return Tile(reshaped, src.dtype, target_shape)
-    return src
+    return _reshape(op, context, "tensor.collapse_shape")
 
 
 @register("tensor.reshape")
@@ -436,35 +445,43 @@ def parse_tensor_extract(op_text, parse_ctx):
 
 
 def _parse_reshape_op(op_text, op_name):
-    """Shared parser for tensor.expand_shape and tensor.collapse_shape."""
-    result_match = re.match(
-        r'tensor\.' + op_name + r'\s+(%\w+)', op_text
-    )
+    """Shared parser for tensor.expand_shape and tensor.collapse_shape.
+
+    The target shape/dtype are read from the ``into <type>`` clause and recorded
+    as the ``target_shape`` / ``dtype`` attributes the executors consume. The
+    ``into`` content is re-wrapped as ``tensor<...>`` before parsing so
+    ``parse_tensor_or_memref_type`` accepts a rank-0 type (e.g. ``tensor<f16>``,
+    giving an empty ``target_shape`` ``()``) and normalizes ``tile<...>`` to
+    ``tensor``. Raises ``ValueError`` when the ``into`` clause is absent or
+    unparseable.
+    """
+    result_match = re.match(r'tensor\.' + op_name + r'\s+(%\w+)', op_text)
     if not result_match:
         return None
 
     operand = result_match.group(1)
 
-    target_shape = None
-    target_dtype = "f16"
     into_match = re.search(r'into\s+(?:tile|tensor)<([^>]+)>', op_text)
-    if into_match:
-        info = parse_tensor_or_memref_type(into_match.group(1))
-        if info:
-            target_shape = tuple(d for d in info["shape"] if d is not None)
-            target_dtype = info["dtype"]
+    if not into_match:
+        raise ValueError(
+            f"tensor.{op_name}: missing 'into' type clause in: {op_text!r}"
+        )
+    info = parse_tensor_or_memref_type(f"tensor<{into_match.group(1)}>")
+    if not info:
+        raise ValueError(
+            f"tensor.{op_name}: cannot parse result type from: {op_text!r}"
+        )
 
-    attributes = {}
-    if target_shape:
-        attributes["target_shape"] = target_shape
-        attributes["dtype"] = target_dtype
+    target_shape = tuple(d for d in info["shape"] if d is not None)
+    target_dtype = info["dtype"]
+    dims = "".join(f"{s}x" for s in target_shape)
 
     return Operation(
         result=None,
         op_type=f"tensor.{op_name}",
         operands=[operand],
-        attributes=attributes,
-        result_type=f"tensor<{'x'.join(str(s) for s in target_shape)}x{target_dtype}>" if target_shape else "unknown"
+        attributes={"target_shape": target_shape, "dtype": target_dtype},
+        result_type=f"tensor<{dims}{target_dtype}>",
     )
 
 

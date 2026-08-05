@@ -1174,6 +1174,172 @@ class TestLinalg:
         assert result.shape == (2, 4)
         assert np.allclose(result.data, inp_data.reshape(2, 4))
 
+    def test_generic_computed_floordiv_mod_map(self):
+        # linalg.generic with map (d0, d1) -> (d1 floordiv 64, d0, d1 mod 64)
+        # Input shape: (2, 3, 64) — "stickified" tensor
+        # Output shape: (3, 128) — iteration space is (d0=3, d1=128)
+        # The map restickifies: for each (d0, d1), read input at
+        #   (d1 // 64, d0, d1 % 64)
+        inp_data = np.arange(2 * 3 * 64, dtype=np.float16).reshape(2, 3, 64)
+        ins_tile = Tile(inp_data, "f16", (2, 3, 64))
+        outs_tile = Tile(np.zeros((3, 128), dtype=np.float16), "f16", (3, 128))
+
+        ctx = _ctx_with(**{"%ins": ins_tile, "%outs": outs_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%in_arg", "%out_arg"], result="%sum"),
+            _op("linalg.yield", operands=["%sum"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%ins", "%outs"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [parse_affine_map("affine_map<(d0, d1) -> (d1 floordiv 64, d0, d1 mod 64)>")],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in_arg", "%out_arg"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        assert result.shape == (3, 128)
+        # Verify a few points: output[d0, d1] = input[d1//64, d0, d1%64]
+        for d0, d1 in [(0, 0), (1, 63), (2, 64), (0, 127)]:
+            assert result.data[d0, d1] == inp_data[d1 // 64, d0, d1 % 64]
+
+    def test_generic_reduction(self):
+        # linalg.generic with reduction: a simple matmul-contraction.
+        # iteration space (d0, d1, d2): d0=M, d1=N parallel; d2=K reduction
+        # A: (M, K) -> map (d0, d1, d2) -> (d0, d2)
+        # B: (K, N) -> map (d0, d1, d2) -> (d2, d1)
+        # C: (M, N) -> map (d0, d1, d2) -> (d0, d1)
+        # body: %mul = mulf %a, %b; %acc = addf %mul, %c; yield %acc
+        M, N, K = 3, 4, 5
+        a_data = np.arange(M * K, dtype=np.float32).reshape(M, K)
+        b_data = np.arange(K * N, dtype=np.float32).reshape(K, N)
+        c_data = np.ones((M, N), dtype=np.float32)  # non-zero outs
+
+        a_tile = Tile(a_data, "f32", (M, K))
+        b_tile = Tile(b_data, "f32", (K, N))
+        c_tile = Tile(c_data, "f32", (M, N))
+
+        ctx = _ctx_with(**{"%a": a_tile, "%b": b_tile, "%c": c_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.mulf", operands=["%aa", "%bb"], result="%mul"),
+            _op("arith.addf", operands=["%mul", "%cc"], result="%acc"),
+            _op("linalg.yield", operands=["%acc"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%a", "%b", "%c"],
+            attributes={
+                "n_ins": 2,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d2)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2) -> (d2, d1)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2) -> (d0, d1)>"),
+                ],
+                "iterator_types": ["parallel", "parallel", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%aa", "%bb", "%cc"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        # Expected: A @ B + C (outs is combined via addf)
+        expected = a_data @ b_data + c_data
+        assert result.shape == (M, N)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
+    def test_generic_reduction_issue174(self):
+        # Reproducer from issue #174: stickified matmul contraction.
+        # iteration space (d0, d1, d2, d3, d4):
+        #   d0=n_stick(1), d1=m(4), d2=k_stick(2), d3=k_elem(4), d4=n_elem(4)
+        #   iterator_types = [parallel, parallel, reduction, reduction, parallel]
+        # A: (k_stick, m, k_elem) -> (d2, d1, d3)  [permuted]
+        # W: (n_stick, k_stick*4+k_elem, n_elem) -> (d0, d2*4+d3, d4) [computed]
+        # C: (n_stick, m, n_elem) -> (d0, d1, d4)
+        n_stick, m, k_stick, k_elem, n_elem = 1, 4, 2, 4, 4
+        K = k_stick * k_elem  # 8
+
+        a_data = np.arange(k_stick * m * k_elem, dtype=np.float32).reshape(k_stick, m, k_elem)
+        w_data = np.arange(n_stick * K * n_elem, dtype=np.float32).reshape(n_stick, K, n_elem)
+        c_data = np.zeros((n_stick, m, n_elem), dtype=np.float32)
+
+        a_tile = Tile(a_data, "f32", a_data.shape)
+        w_tile = Tile(w_data, "f32", w_data.shape)
+        c_tile = Tile(c_data, "f32", c_data.shape)
+
+        ctx = _ctx_with(**{"%a": a_tile, "%w": w_tile, "%c": c_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.mulf", operands=["%aa", "%ww"], result="%mul"),
+            _op("arith.addf", operands=["%mul", "%cc"], result="%acc"),
+            _op("linalg.yield", operands=["%acc"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%a", "%w", "%c"],
+            attributes={
+                "n_ins": 2,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1, d2, d3, d4) -> (d2, d1, d3)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3, d4) -> (d0, d2 * 4 + d3, d4)>"),
+                    parse_affine_map("affine_map<(d0, d1, d2, d3, d4) -> (d0, d1, d4)>"),
+                ],
+                "iterator_types": ["parallel", "parallel", "reduction", "reduction", "parallel"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%aa", "%ww", "%cc"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+
+        # Reference: C[n,m,ne] = sum_{ks,ke} A[ks,m,ke] * W[n, ks*4+ke, ne]
+        # A reshaped to (m, K), W reshaped to (n_stick, K, n_elem)
+        a_flat = a_data.transpose(1, 0, 2).reshape(m, K)  # (m, K)
+        w_flat = w_data  # (n_stick, K, n_elem)
+        expected = np.einsum('mk,nkp->nmp', a_flat, w_flat)
+        assert result.shape == (n_stick, m, n_elem)
+        assert np.allclose(result.data, expected, rtol=1e-4)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()
@@ -1234,6 +1400,32 @@ class TestTensor:
                        operands=["%t"], attributes={"target_shape": (4,)})
         assert result.shape == (4,)
         assert np.array_equal(result.data, [1, 2, 3, 4])
+
+    def test_collapse_shape_to_rank0(self):
+        # collapse a (1, 1) tile to a rank-0 (scalar) tile (empty target_shape)
+        t = Tile(np.array([[3.0]], dtype=np.float16), "f16", (1, 1))
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.collapse_shape", ctx, _make_env(),
+                       operands=["%t"], attributes={"target_shape": ()})
+        assert result.shape == ()
+        assert float(np.asarray(result.data)) == 3.0
+
+    def test_expand_shape_from_rank0(self):
+        # the inverse: lift a rank-0 tile back to (1, 1).
+        t = Tile(np.array(3.0, dtype=np.float16), "f16", ())
+        ctx = _ctx_with(**{"%t": t})
+        result = _call("tensor.expand_shape", ctx, _make_env(),
+                       operands=["%t"], attributes={"target_shape": (1, 1)})
+        assert result.shape == (1, 1)
+        assert float(np.asarray(result.data).reshape(())) == 3.0
+
+    def test_collapse_shape_missing_target_fails_loud(self):
+        # A missing target_shape attribute is a parser bug; the executor raises
+        # rather than silently returning the source (matches tensor.reshape).
+        t = Tile(np.array([[1, 2], [3, 4]], dtype=np.float16), "f16", (2, 2))
+        ctx = _ctx_with(**{"%t": t})
+        with pytest.raises(ValueError, match="missing 'target_shape'"):
+            _call("tensor.collapse_shape", ctx, _make_env(), operands=["%t"])
 
     def test_reshape(self):
         """1D -> 2D reshape preserves element order and total count."""

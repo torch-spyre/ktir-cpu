@@ -1,0 +1,93 @@
+name = "indirect-load-path-timing"
+description = "T_indirect_load, T_load, T_offsets for blocked-indirection workloads"
+
+[defaults]
+dtype = "f16"
+n_rounds = 5
+warmup = 2
+
+# MoE expert-weight gather: select n_selected experts from num_experts.
+# Source shape: [num_experts, M, N]. Result: [n_selected, M, N].
+[[workloads]]
+label = "moe-262K"
+pattern = "moe_ffn"
+access_expr = "X[IDX[e], m, n]"
+model_scale_ref = "deepseek-v2"   # 128 routed experts, top-8 selection
+num_experts = 128
+M = 256
+N = 128
+n_selected = 8
+
+[[workloads]]
+label = "moe-1M"
+pattern = "moe_ffn"
+access_expr = "X[IDX[e], m, n]"
+model_scale_ref = "deepseek-v2"   # same expert count, larger hidden dim
+num_experts = 128
+M = 1024
+N = 128
+n_selected = 8
+
+# Paged KV-cache: select n_sel_pages page blocks from a page table.
+# Source shape: [n_pages, n_heads, block_size, head_dim].
+[[workloads]]
+label = "paged-attn-256K"
+pattern = "paged_attn"
+access_expr = "cache[BT[d0], d1, d2, d3]"
+model_scale_ref = "llama-8b"      # 16 KV heads, 128 head_dim
+n_pages = 1024
+n_heads = 16
+block_size = 128
+head_dim = 128
+n_sel_pages = 16
+
+# Sparse attention: select (n_sel_pages, n_sel_tokens) from full sequence.
+# Source shape: [n_pages, n_tokens, hidden_dim]. High sparsity — O(span) hurts.
+[[workloads]]
+label = "sparse-attn-32K"
+pattern = "sparse_attn"
+access_expr = "X[P[e], T[e], h]"
+model_scale_ref = "bigbird-base"  # block-sparse with 64-dim heads
+n_pages = 1024
+n_tokens = 512
+hidden_dim = 64
+n_sel_pages = 4
+n_sel_tokens = 16
+
+[[workloads]]
+label = "sparse-attn-128K"
+pattern = "sparse_attn"
+access_expr = "X[P[e], T[e], h]"
+model_scale_ref = "bigbird-large" # 256-dim, 4096 pages → extreme sparsity (0.003%)
+n_pages = 4096
+n_tokens = 512
+hidden_dim = 256
+n_sel_pages = 4
+n_sel_tokens = 16
+
+# Retrieval-augmented attention: gather neighbor chunks from external memory.
+# Moderate sparsity (0.1%) with realistic chunk/doc dimensions.
+[[workloads]]
+label = "retro-attn-16K"
+pattern = "sparse_attn"
+access_expr = "mem[doc[d], chunk[c], h]"
+model_scale_ref = "retro-7b"      # 1024 docs, 128 chunks each, 128-dim
+n_pages = 1024
+n_tokens = 128
+hidden_dim = 128
+n_sel_pages = 32
+n_sel_tokens = 4
+
+# Multi-head expert: 2 indirect dims (expert + head) + 2 direct (M, N).
+# Source shape: [num_experts, n_heads, M, N]. Largest workload (~537M elems).
+[[workloads]]
+label = "multi-head-4M"
+pattern = "multi_head"
+access_expr = "X[E[e], H[h], m, n]"
+model_scale_ref = "llama-8b"      # hypothetical MoE+MHA fusion
+num_experts = 128
+n_heads = 64
+M = 256
+N = 256
+n_sel_experts = 8
+n_sel_heads = 8

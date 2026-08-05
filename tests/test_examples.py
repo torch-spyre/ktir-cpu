@@ -191,6 +191,32 @@ class TestVectorAddExecution(InterpreterTestMixin):
         np.testing.assert_allclose(result, expected, rtol=1e-2, atol=1e-2)
 
 
+class TestScalarBroadcastExecution(InterpreterTestMixin):
+    """End-to-end execution of scalar_broadcast.mlir.
+
+    Rank-0 (scalar) regression: collapse a 1x1 source to a scalar tensor<f16>,
+    then broadcast it across the output. Every output element must equal the
+    single source value. Pins the shape the Triton -> KTIR lowering emits for a
+    1x1 broadcast (e.g. batch_norm's per-channel multiply).
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("scalar_broadcast"))
+    def test_scalar_broadcast(self, path, func_name, entry):
+        interp = self._make_interp()
+        interp.load(path)
+
+        in_ptr, out_ptr = interp.arg_names(func_name)
+        sizes = interp.tensor_input_output_sizes(func_name)
+        src = np.full(sizes[in_ptr]["shape"], 2.5, dtype=np.float16)
+        out = np.zeros(sizes[out_ptr]["shape"], dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{in_ptr: src, out_ptr: out})
+
+        result = outputs[out_ptr]
+        assert result.shape == tuple(sizes[out_ptr]["shape"])
+        np.testing.assert_array_equal(result, np.full(result.shape, 2.5, dtype=np.float16))
+
+
 class TestVectorAddDynamicExecution(InterpreterTestMixin):
     """End-to-end execution of vector_add_dynamic_ktir.mlir.
 

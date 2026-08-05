@@ -124,6 +124,7 @@ def parse_tensor_or_memref_type(type_str: str, *, keep_dynamic_dims=False) -> Op
       - ``"tensor<128x32xf16>"``
       - ``"memref<128x32xf16, #mem_space>"``
       - ``"128x32xf16"``  (bare inner content)
+      - ``"tensor<f16>"``  (rank-0 scalar)
 
     Args:
         keep_dynamic_dims: If True, dynamic dims (``?``) are kept as None
@@ -136,6 +137,12 @@ def parse_tensor_or_memref_type(type_str: str, *, keep_dynamic_dims=False) -> Op
     inner = m.group(1).strip() if m else type_str.strip()
     prefix = re.match(r'^((?:\d+\s*x\s*|[?]\s*x\s*)+)', inner)
     if not prefix:
+        # Rank-0 case: a wrapped type with no dim prefix (e.g. "tensor<f16>")
+        # is a scalar tensor, so its inner content is just the dtype.
+        if m:
+            dtype = inner.split(',')[0].strip()
+            if dtype:
+                return {"shape": (), "dtype": dtype}
         return None
     if keep_dynamic_dims:
         dims = tuple(
