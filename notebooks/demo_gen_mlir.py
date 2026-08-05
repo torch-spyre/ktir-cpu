@@ -190,6 +190,136 @@ def gen_softmax_mlir(n_rows, row_width, num_cores=32):
 }}"""
 
 
+def gen_rope_mlir(num_heads, seq_len, head_dim, grid_s, grid_h, tile_seq=256):
+    """Generate RoPE forward kernel (half-layout, LLaMA/Granite convention).
+
+    y[:, 0:D/2]  = x[:, 0:D/2] * cos - x[:, D/2:D] * sin
+    y[:, D/2:D]  = x[:, 0:D/2] * sin + x[:, D/2:D] * cos
+
+    Design decisions:
+    - 2D grid [seq_parts, head_groups] aligns with in-projection matmul and SDPA
+      in the prefill pipeline — no tensor redistribution at kernel boundaries.
+    - cos/sin precomputed (standard Llama/Granite convention), loaded once per
+      seq-tile and reused across all heads in the inner loop.
+    - Single pass, no reduction — AI ~0.77, memory-bound SIMD workload.
+    """
+    H = num_heads
+    S = seq_len
+    D = head_dim
+    half_d = D // 2
+    rows = H * S
+
+    seq_per_core = S // grid_s
+    heads_per_core = H // grid_h
+    num_seq_tiles = seq_per_core // tile_seq
+
+    x_view = _mem_view("x_view", "x_ptr", [rows, D], [D, 1])
+    cos_view = _mem_view("cos_view", "cos_ptr", [S, half_d], [half_d, 1])
+    sin_view = _mem_view("sin_view", "sin_ptr", [S, half_d], [half_d, 1])
+    out_view = _mem_view("out_view", "out_ptr", [rows, D], [D, 1])
+
+    return f"""module {{
+  func.func @rope_fwd_kernel(
+      %x_ptr: index, %cos_ptr: index, %sin_ptr: index, %out_ptr: index
+  ) attributes {{grid = [{grid_s}, {grid_h}]}} {{
+    %pid_s, %pid_h = ktdp.get_compute_tile_id : index, index
+
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c_half_d = arith.constant {half_d} : index
+    %c_tile_seq = arith.constant {tile_seq} : index
+    %c_seq_per_core = arith.constant {seq_per_core} : index
+    %c_heads_per_core = arith.constant {heads_per_core} : index
+    %c_num_seq_tiles = arith.constant {num_seq_tiles} : index
+    %c_S = arith.constant {S} : index
+
+    %seq_offset = arith.muli %pid_s, %c_seq_per_core : index
+    %head_offset = arith.muli %pid_h, %c_heads_per_core : index
+
+{x_view}
+
+{cos_view}
+
+{sin_view}
+
+{out_view}
+
+    // Outer loop: seq-tiles (cos/sin loaded once, reused across heads)
+    scf.for %t = %c0 to %c_num_seq_tiles step %c1 {{
+
+        %tile_offset = arith.muli %t, %c_tile_seq : index
+        %cos_row = arith.addi %seq_offset, %tile_offset : index
+
+        %cos_acc = ktdp.construct_access_tile %cos_view[%cos_row, %c0] {{
+            access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + {tile_seq - 1} >= 0, d1 >= 0, -d1 + {half_d - 1} >= 0)>,
+            access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+        }} : memref<{S}x{half_d}xf16> -> !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+        %cos_tile = ktdp.load %cos_acc : !ktdp.access_tile<{tile_seq}x{half_d}xindex> -> tensor<{tile_seq}x{half_d}xf16>
+
+        %sin_acc = ktdp.construct_access_tile %sin_view[%cos_row, %c0] {{
+            access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + {tile_seq - 1} >= 0, d1 >= 0, -d1 + {half_d - 1} >= 0)>,
+            access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+        }} : memref<{S}x{half_d}xf16> -> !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+        %sin_tile = ktdp.load %sin_acc : !ktdp.access_tile<{tile_seq}x{half_d}xindex> -> tensor<{tile_seq}x{half_d}xf16>
+
+        // Inner loop: heads (reuses cos/sin from outer loop)
+        scf.for %h = %c0 to %c_heads_per_core step %c1 {{
+
+            %h_abs = arith.addi %head_offset, %h : index
+            %row_base = arith.muli %h_abs, %c_S : index
+            %row = arith.addi %row_base, %cos_row : index
+
+            // Load x_first [tile_seq, D/2]
+            %x_first_acc = ktdp.construct_access_tile %x_view[%row, %c0] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + {tile_seq - 1} >= 0, d1 >= 0, -d1 + {half_d - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{rows}x{D}xf16> -> !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+            %x_first = ktdp.load %x_first_acc : !ktdp.access_tile<{tile_seq}x{half_d}xindex> -> tensor<{tile_seq}x{half_d}xf16>
+
+            // Load x_second [tile_seq, D/2]
+            %x_second_acc = ktdp.construct_access_tile %x_view[%row, %c_half_d] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + {tile_seq - 1} >= 0, d1 >= 0, -d1 + {half_d - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{rows}x{D}xf16> -> !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+            %x_second = ktdp.load %x_second_acc : !ktdp.access_tile<{tile_seq}x{half_d}xindex> -> tensor<{tile_seq}x{half_d}xf16>
+
+            // y_first = x_first * cos - x_second * sin
+            %tmp1 = arith.mulf %x_first, %cos_tile : tensor<{tile_seq}x{half_d}xf16>
+            %tmp2 = arith.mulf %x_second, %sin_tile : tensor<{tile_seq}x{half_d}xf16>
+            %y_first = arith.subf %tmp1, %tmp2 : tensor<{tile_seq}x{half_d}xf16>
+
+            %y_first_acc = ktdp.construct_access_tile %out_view[%row, %c0] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + {tile_seq - 1} >= 0, d1 >= 0, -d1 + {half_d - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{rows}x{D}xf16> -> !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+            ktdp.store %y_first, %y_first_acc : tensor<{tile_seq}x{half_d}xf16>, !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+            // y_second = x_first * sin + x_second * cos
+            %tmp3 = arith.mulf %x_first, %sin_tile : tensor<{tile_seq}x{half_d}xf16>
+            %tmp4 = arith.mulf %x_second, %cos_tile : tensor<{tile_seq}x{half_d}xf16>
+            %y_second = arith.addf %tmp3, %tmp4 : tensor<{tile_seq}x{half_d}xf16>
+
+            %y_second_acc = ktdp.construct_access_tile %out_view[%row, %c_half_d] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + {tile_seq - 1} >= 0, d1 >= 0, -d1 + {half_d - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{rows}x{D}xf16> -> !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+            ktdp.store %y_second, %y_second_acc : tensor<{tile_seq}x{half_d}xf16>, !ktdp.access_tile<{tile_seq}x{half_d}xindex>
+
+            scf.yield
+        }}
+        scf.yield
+    }}
+    return
+  }}
+}}"""
+
+
 def gen_sdpa_mlir(seq_len, head_dim, block_m):
     """Generate a naive fused SDPA kernel (single-pass, no K-tiling).
 
