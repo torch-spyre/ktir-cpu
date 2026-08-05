@@ -190,6 +190,120 @@ def gen_softmax_mlir(n_rows, row_width, num_cores=32):
 }}"""
 
 
+def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
+    """Generate RMSNorm kernel: y = x * rsqrt(mean(x^2) + eps) * w.
+
+    Two-pass embarrassingly parallel over rows. Grid = [num_cores, 1].
+    Weight W is 1D [hidden_dim] — broadcast to match tile shape.
+
+    Design decisions:
+    - Unfused standalone kernel (no predecessor/successor fusion) — models the
+      HBM-resident pass-through as it appears between matmul stages in prefill.
+    - 1D grid [N,1] row-partition: prefill has abundant row parallelism
+      (seq_len >> num_cores), so hidden-dim sharding (2x2) adds allreduce
+      communication for zero benefit.  Matches adjacent matmul/softmax/SDPA grids.
+    - W is 1D [hidden_dim] per PyTorch convention (nn.Parameter(torch.ones(H))).
+      Avoids inflating HBM traffic — W stays LX-resident after one cold miss (8 KB).
+    """
+    hd = hidden_dim
+    bs = block_size
+    x_view = _mem_view("x_view", "x_ptr", [n_rows, hd], [hd, 1])
+    y_view = _mem_view("y_view", "y_ptr", [n_rows, hd], [hd, 1])
+    w_view = _mem_view("w_view", "w_ptr", [hd], [1])
+    return f"""module {{
+  func.func @rmsnorm_kernel(
+      %x_ptr: index, %y_ptr: index, %w_ptr: index,
+      %n_rows: index, %N: index, %eps: f16, %BLOCK_SIZE: index
+  ) attributes {{grid = [{num_cores}, 1]}} {{
+    %core_id = ktdp.get_compute_tile_id : index
+    %step = arith.constant {num_cores} : index
+    %c0 = arith.constant 0 : index
+    %c_hd = arith.constant {hd} : index
+
+{x_view}
+
+{y_view}
+
+{w_view}
+
+    scf.for %row = %core_id to %n_rows step %step : index {{
+
+        // === Pass 1: sum of squares over hidden dim ===
+        %zero_block = arith.constant dense<0.0> : tensor<1x{bs}xf16>
+
+        %sq_acc = scf.for %col = %c0 to %c_hd step %BLOCK_SIZE
+            iter_args(%acc = %zero_block) -> tensor<1x{bs}xf16> {{
+
+            %x_acc = ktdp.construct_access_tile %x_view[%row, %col] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + {bs - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{n_rows}x{hd}xf16> -> !ktdp.access_tile<1x{bs}xindex>
+
+            %x_blk = ktdp.load %x_acc : !ktdp.access_tile<1x{bs}xindex> -> tensor<1x{bs}xf16>
+
+            %x_sq = arith.mulf %x_blk, %x_blk : tensor<1x{bs}xf16>
+            %acc_next = arith.addf %acc, %x_sq : tensor<1x{bs}xf16>
+
+            scf.yield %acc_next : tensor<1x{bs}xf16>
+        }}
+
+        // Reduce accumulator to scalar
+        %zero_scalar = arith.constant 0.0 : f16
+        %reduce_init = tensor.splat %zero_scalar : tensor<1xf16>
+        %sum_sq = linalg.reduce {{ arith.addf }}
+            ins(%sq_acc : tensor<1x{bs}xf16>)
+            outs(%reduce_init : tensor<1xf16>)
+            dimensions = [1]
+
+        // === Compute rstd = rsqrt(sum_sq / N + eps) ===
+        %c0_idx = arith.constant 0 : index
+        %sum_scalar = tensor.extract %sum_sq[%c0_idx] : tensor<1xf16>
+
+        %N_i32 = arith.index_cast %N : index to i32
+        %N_f16 = arith.sitofp %N_i32 : i32 to f16
+        %mean_sq = arith.divf %sum_scalar, %N_f16 : f16
+        %mean_sq_plus_eps = arith.addf %mean_sq, %eps : f16
+        %rstd_scalar = math.rsqrt %mean_sq_plus_eps : f16
+        %rstd_block = tensor.splat %rstd_scalar : tensor<1x{bs}xf16>
+
+        // === Pass 2: normalize and scale ===
+        scf.for %col = %c0 to %c_hd step %BLOCK_SIZE {{
+
+            %x_acc2 = ktdp.construct_access_tile %x_view[%row, %col] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + {bs - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{n_rows}x{hd}xf16> -> !ktdp.access_tile<1x{bs}xindex>
+
+            %w_acc = ktdp.construct_access_tile %w_view[%col] {{
+                access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + {bs - 1} >= 0)>,
+                access_tile_order = affine_map<(d0) -> (d0)>
+            }} : memref<{hd}xf16> -> !ktdp.access_tile<{bs}xindex>
+
+            %x2 = ktdp.load %x_acc2 : !ktdp.access_tile<1x{bs}xindex> -> tensor<1x{bs}xf16>
+            %w_1d = ktdp.load %w_acc : !ktdp.access_tile<{bs}xindex> -> tensor<{bs}xf16>
+
+            %w_init = arith.constant dense<0.0> : tensor<1x{bs}xf16>
+            %w = linalg.broadcast ins(%w_1d : tensor<{bs}xf16>) outs(%w_init : tensor<1x{bs}xf16>) dimensions = [0]
+
+            %x_norm = arith.mulf %x2, %rstd_block : tensor<1x{bs}xf16>
+            %y_blk = arith.mulf %x_norm, %w : tensor<1x{bs}xf16>
+
+            %y_acc = ktdp.construct_access_tile %y_view[%row, %col] {{
+                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + {bs - 1} >= 0)>,
+                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+            }} : memref<{n_rows}x{hd}xf16> -> !ktdp.access_tile<1x{bs}xindex>
+
+            ktdp.store %y_blk, %y_acc : tensor<1x{bs}xf16>, !ktdp.access_tile<1x{bs}xindex>
+
+            scf.yield
+        }}
+        scf.yield
+    }}
+    return
+  }}
+}}"""
+
+
 def gen_sdpa_mlir(seq_len, head_dim, block_m):
     """Generate a naive fused SDPA kernel (single-pass, no K-tiling).
 
