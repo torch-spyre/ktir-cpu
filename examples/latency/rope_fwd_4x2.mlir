@@ -14,10 +14,10 @@
 //   - No inter-core communication (embarrassingly parallel)
 //
 // Per-core: 20 heads (= 40 total / 2 grid_dim1) × 1024 positions × 128 dim
-// Loop structure: head loop (20 iter) → inner seq-tile loop (4 iter, TILE_SEQ=256)
-// cos/sin [256, 64] loaded per tile (no tensor-slice op → can't hoist [1024,64] across tiles)
+// Loop structure: seq-tile loop (4 iter, TILE_SEQ=256) → head loop (20 iter)
+// cos/sin [256, 64] loaded once per seq-tile, reused across all 20 heads
 //
-// Arithmetic intensity: ~0.63 FLOPs/byte (memory-bound, vector-unit workload)
+// Arithmetic intensity: ~0.77 FLOPs/byte (memory-bound, vector-unit workload)
 // Peak working set per inner iteration: 192 KB (6 × [256,64] × 2B)
 
 module {
@@ -33,15 +33,17 @@ module {
 
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %c4 = arith.constant 4 : index
-    %c20 = arith.constant 20 : index
     %c64 = arith.constant 64 : index
     %c256 = arith.constant 256 : index
     %c1024 = arith.constant 1024 : index
     %c4096 = arith.constant 4096 : index
 
+    // Loop bounds (compile-time constants)
+    %NUM_SEQ_TILES = arith.constant 4 : index   // 1024 positions per core / 256 TILE_SEQ
+    %HEADS_PER_CORE = arith.constant 20 : index // (32 Q + 8 K) heads / 2 grid_dim1
+
     %seq_offset = arith.muli %pid_s, %c1024 : index
-    %head_offset = arith.muli %pid_h, %c20 : index
+    %head_offset = arith.muli %pid_h, %HEADS_PER_CORE : index
 
     // --- Construct memory views ---
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [163840, 128], strides: [128, 1] {
@@ -64,40 +66,37 @@ module {
       memory_space = #ktdp.spyre_memory_space<HBM>
     } : memref<163840x128xf16>
 
-    // --- OUTER LOOP: head loop (20 iterations) ---
-    scf.for %h = %c0 to %c20 step %c1 {
+    // --- OUTER LOOP: seq-tile loop (TILE_SEQ=256) ---
+    scf.for %t = %c0 to %NUM_SEQ_TILES step %c1 {
 
-      // Row base in flattened [H*S, D]: (head_offset + h) * S
-      %h_abs = arith.addi %head_offset, %h : index
-      %row_base = arith.muli %h_abs, %c4096 : index
+      %tile_offset = arith.muli %t, %c256 : index
+      %cos_row = arith.addi %seq_offset, %tile_offset : index
 
-      // --- INNER LOOP: seq-tile loop (4 iterations, TILE_SEQ=256) ---
-      scf.for %t = %c0 to %c4 step %c1 {
+      // Load cos/sin [256, 64] once per seq-tile, reused across all 20 heads
+      %cos_acc = ktdp.construct_access_tile %cos_view[%cos_row, %c0] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<4096x64xf16> -> !ktdp.access_tile<256x64xindex>
 
-        %tile_offset = arith.muli %t, %c256 : index
-        %row = arith.addi %row_base, %seq_offset : index
-        %row_t = arith.addi %row, %tile_offset : index
-        // cos/sin index: position within the [4096, 64] table
-        %cos_row = arith.addi %seq_offset, %tile_offset : index
+      %cos_tile = ktdp.load %cos_acc : !ktdp.access_tile<256x64xindex> -> tensor<256x64xf16>
 
-        // Load cos [256, 64] for this seq tile
-        %cos_acc = ktdp.construct_access_tile %cos_view[%cos_row, %c0] {
-          access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-          access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-        } : memref<4096x64xf16> -> !ktdp.access_tile<256x64xindex>
+      %sin_acc = ktdp.construct_access_tile %sin_view[%cos_row, %c0] {
+        access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
+        access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
+      } : memref<4096x64xf16> -> !ktdp.access_tile<256x64xindex>
 
-        %cos_tile = ktdp.load %cos_acc : !ktdp.access_tile<256x64xindex> -> tensor<256x64xf16>
+      %sin_tile = ktdp.load %sin_acc : !ktdp.access_tile<256x64xindex> -> tensor<256x64xf16>
 
-        // Load sin [256, 64] for this seq tile
-        %sin_acc = ktdp.construct_access_tile %sin_view[%cos_row, %c0] {
-          access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-          access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-        } : memref<4096x64xf16> -> !ktdp.access_tile<256x64xindex>
+      // --- INNER LOOP: head loop ---
+      scf.for %h = %c0 to %HEADS_PER_CORE step %c1 {
 
-        %sin_tile = ktdp.load %sin_acc : !ktdp.access_tile<256x64xindex> -> tensor<256x64xf16>
+        // Row in flattened [H*S, D]: (head_offset + h) * S + seq_offset + tile_offset
+        %h_abs = arith.addi %head_offset, %h : index
+        %row_base = arith.muli %h_abs, %c4096 : index
+        %row = arith.addi %row_base, %cos_row : index
 
         // Load x_first [256, 64] — first half of head_dim
-        %x_first_acc = ktdp.construct_access_tile %x_view[%row_t, %c0] {
+        %x_first_acc = ktdp.construct_access_tile %x_view[%row, %c0] {
           access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
           access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<163840x128xf16> -> !ktdp.access_tile<256x64xindex>
@@ -105,7 +104,7 @@ module {
         %x_first = ktdp.load %x_first_acc : !ktdp.access_tile<256x64xindex> -> tensor<256x64xf16>
 
         // Load x_second [256, 64] — second half of head_dim
-        %x_second_acc = ktdp.construct_access_tile %x_view[%row_t, %c64] {
+        %x_second_acc = ktdp.construct_access_tile %x_view[%row, %c64] {
           access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
           access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<163840x128xf16> -> !ktdp.access_tile<256x64xindex>
@@ -118,7 +117,7 @@ module {
         %y_first = arith.subf %tmp1, %tmp2 : tensor<256x64xf16>
 
         // Store y_first [256, 64]
-        %y_first_acc = ktdp.construct_access_tile %out_view[%row_t, %c0] {
+        %y_first_acc = ktdp.construct_access_tile %out_view[%row, %c0] {
           access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
           access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<163840x128xf16> -> !ktdp.access_tile<256x64xindex>
@@ -131,7 +130,7 @@ module {
         %y_second = arith.addf %tmp3, %tmp4 : tensor<256x64xf16>
 
         // Store y_second [256, 64]
-        %y_second_acc = ktdp.construct_access_tile %out_view[%row_t, %c64] {
+        %y_second_acc = ktdp.construct_access_tile %out_view[%row, %c64] {
           access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
           access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
         } : memref<163840x128xf16> -> !ktdp.access_tile<256x64xindex>
