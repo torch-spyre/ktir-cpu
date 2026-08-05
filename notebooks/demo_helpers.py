@@ -18,6 +18,7 @@ from demo_gen_mlir import (  # noqa: F401 — re-exported for notebook compat
     gen_matmul_mlir,
     gen_softmax_mlir,
     gen_rope_mlir,
+    gen_rmsnorm_mlir,
     gen_sdpa_mlir,
     gen_sdpa_decode_pv_mlir,
     gen_paged_attention_mlir,
@@ -248,7 +249,6 @@ def run_kernel_softmax(hw, n_rows, row_width, num_cores, rng=None):
              input_ptr=rng.standard_normal((n_rows, row_width)).astype(np.float16)),
         dict(n_rows=n_rows))
 
-
 def run_kernel_rope(hw, num_heads, seq_len, head_dim, grid_s, grid_h, tile_seq=256, rng=None):
     """Generate RoPE MLIR, create tensors, run, return LatencyReport."""
     if rng is None:
@@ -266,6 +266,16 @@ def run_kernel_rope(hw, num_heads, seq_len, head_dim, grid_s, grid_h, tile_seq=2
              sin_ptr=sin_table,
              out_ptr=np.zeros((num_heads * seq_len, head_dim), dtype=np.float16)))
 
+def run_kernel_rmsnorm(hw, n_rows, hidden_dim, num_cores, rng=None, block_size=1024):
+    """Generate RMSNorm MLIR, create tensors, run, return LatencyReport."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    mlir = gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores, block_size)
+    return run_kernel(hw, mlir, "rmsnorm_kernel",
+        dict(x_ptr=rng.standard_normal((n_rows, hidden_dim)).astype(np.float16),
+             y_ptr=np.zeros((n_rows, hidden_dim), dtype=np.float16),
+             w_ptr=rng.uniform(0.5, 1.5, (hidden_dim,)).astype(np.float16)),
+        dict(n_rows=n_rows, N=hidden_dim, eps=np.float16(1e-5), BLOCK_SIZE=block_size))
 
 def run_kernel_sdpa(hw, seq_len, head_dim, block_m, rng=None):
     """Generate SDPA MLIR, create tensors, run, return LatencyReport."""
