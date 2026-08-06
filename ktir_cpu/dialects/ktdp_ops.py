@@ -1069,7 +1069,8 @@ def parse_inter_tile_produce(op_text, parse_ctx: ParseContext):
     # disagree on what a valid tile_future type looks like.
     result_type = _extract_tile_future_result_type(op_text)
     partial_types, groups_str = parse_tile_future_type(
-        result_type, context="ktdp.inter_tile_produce result"
+        result_type, context="ktdp.inter_tile_produce result",
+        aliases=parse_ctx.aliases,
     )
     if groups_str is None:
         raise ValueError(
@@ -1247,7 +1248,8 @@ def parse_inter_tile_reduce(op_text, parse_ctx: ParseContext):
     # both and normalises before handing off to the shared grammar helper.
     fut_type = _extract_tile_future_result_type(op_text)
     _, groups_str = parse_tile_future_type(
-        fut_type, context="ktdp.inter_tile_reduce operand 0"
+        fut_type, context="ktdp.inter_tile_reduce operand 0",
+        aliases=parse_ctx.aliases,
     )
     if groups_str is None:
         raise ValueError(
