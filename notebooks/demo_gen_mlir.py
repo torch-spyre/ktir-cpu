@@ -370,11 +370,16 @@ def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
     - W is 1D [hidden_dim] per PyTorch convention (nn.Parameter(torch.ones(H))).
       Avoids inflating HBM traffic — W stays LX-resident after one cold miss (8 KB).
     """
+    assert hidden_dim % block_size == 0, "hidden_dim must be divisible by block_size"
     hd = hidden_dim
     bs = block_size
     x_view = _mem_view("x_view", "x_ptr", [n_rows, hd], [hd, 1])
     y_view = _mem_view("y_view", "y_ptr", [n_rows, hd], [hd, 1])
     w_view = _mem_view("w_view", "w_ptr", [hd], [1])
+    x_acc = _access_tile("x_acc", "x_view", ["%row", "%col"], [1, bs], [n_rows, hd])
+    x_acc2 = _access_tile("x_acc2", "x_view", ["%row", "%col"], [1, bs], [n_rows, hd])
+    w_acc = _access_tile("w_acc", "w_view", ["%col"], [bs], [hd])
+    y_acc = _access_tile("y_acc", "y_view", ["%row", "%col"], [1, bs], [n_rows, hd])
     return f"""module {{
   func.func @rmsnorm_kernel(
       %x_ptr: index, %y_ptr: index, %w_ptr: index,
@@ -399,10 +404,7 @@ def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
         %sq_acc = scf.for %col = %c0 to %c_hd step %BLOCK_SIZE
             iter_args(%acc = %zero_block) -> tensor<1x{bs}xf16> {{
 
-            %x_acc = ktdp.construct_access_tile %x_view[%row, %col] {{
-                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + {bs - 1} >= 0)>,
-                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-            }} : memref<{n_rows}x{hd}xf16> -> !ktdp.access_tile<1x{bs}xindex>
+      {x_acc}
 
             %x_blk = ktdp.load %x_acc : !ktdp.access_tile<1x{bs}xindex> -> tensor<1x{bs}xf16>
 
@@ -434,15 +436,9 @@ def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
         // === Pass 2: normalize and scale ===
         scf.for %col = %c0 to %c_hd step %BLOCK_SIZE {{
 
-            %x_acc2 = ktdp.construct_access_tile %x_view[%row, %col] {{
-                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + {bs - 1} >= 0)>,
-                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-            }} : memref<{n_rows}x{hd}xf16> -> !ktdp.access_tile<1x{bs}xindex>
+      {x_acc2}
 
-            %w_acc = ktdp.construct_access_tile %w_view[%col] {{
-                access_tile_set = affine_set<(d0) : (d0 >= 0, -d0 + {bs - 1} >= 0)>,
-                access_tile_order = affine_map<(d0) -> (d0)>
-            }} : memref<{hd}xf16> -> !ktdp.access_tile<{bs}xindex>
+      {w_acc}
 
             %x2 = ktdp.load %x_acc2 : !ktdp.access_tile<1x{bs}xindex> -> tensor<1x{bs}xf16>
             %w_1d = ktdp.load %w_acc : !ktdp.access_tile<{bs}xindex> -> tensor<{bs}xf16>
@@ -453,10 +449,7 @@ def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
             %x_norm = arith.mulf %x2, %rstd_block : tensor<1x{bs}xf16>
             %y_blk = arith.mulf %x_norm, %w : tensor<1x{bs}xf16>
 
-            %y_acc = ktdp.construct_access_tile %y_view[%row, %col] {{
-                access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + {bs - 1} >= 0)>,
-                access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
-            }} : memref<{n_rows}x{hd}xf16> -> !ktdp.access_tile<1x{bs}xindex>
+      {y_acc}
 
             ktdp.store %y_blk, %y_acc : tensor<1x{bs}xf16>, !ktdp.access_tile<1x{bs}xindex>
 
