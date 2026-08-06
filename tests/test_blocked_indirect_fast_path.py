@@ -720,8 +720,9 @@ class TestGatherScatterOOB:
 
 
 # ---------------------------------------------------------------------------
-# Shared-view patterns: multiple indirect subscripts reference the SAME
-# physical index array (view) but with different expressions.  Real examples:
+# Shared view: two or more dim_subscripts entries that reference the same
+# index_view_idx — i.e., multiple subscriptions reading from one index array,
+# possibly with different idx_exprs.  Real examples:
 #   - Coordinate table: B is (K,3), access B[i,0], B[i,1], B[i,2] for 3D coords
 #   - Shifted window: B is 1D, access B[e] and B[e+1] for adjacent pairs
 #   - Diagonal: B[e], B[e] (degenerate — same value used in two parent dims)
@@ -844,4 +845,202 @@ class TestBlockedIndirectSharedView:
         expected = np.zeros((K, M, N), dtype=np.float16)
         for e in range(K):
             expected[e, :, :] = arr[idx_data[e], idx_data[e], :, :]
+        np.testing.assert_array_equal(tile.data, expected)
+
+
+# ---------------------------------------------------------------------------
+# Correctness gaps between fast path and general path.
+#
+# Three areas where the two paths diverge in capability or behavior:
+# 1. Non-zero vss.lo — fast path starts dep-var iteration at lo[d], not 0
+# 2. Negative indices — _gather_from wraps silently; upstream guard prevents
+# 3. Shared-view below threshold — general path crashes (StopIteration)
+# ---------------------------------------------------------------------------
+
+class TestBlockedIndirectCorrectnessGaps:
+    """Tests for edge cases where fast path and general path diverge."""
+
+    @staticmethod
+    def _build_1d_iat(hbm, num_experts, N, idx_data, lo=None, hi=None):
+        """Helper: allocate W[E[e], n] with optional non-zero lo."""
+        data = np.arange(num_experts * N, dtype=np.float16)
+        base, _ = _alloc_hbm(hbm, data, "f16")
+        idx_memref = _alloc_idx(hbm, idx_data)
+        data_memref = MemRef(base_ptr=base, shape=(num_experts, N),
+                             strides=[N, 1], memory_space="HBM", dtype="f16")
+        if lo is None:
+            return _make_iat(data_memref, (len(idx_data), N),
+                             [_isub(0, 0), _dsub(1)], [idx_memref]), data
+        K = hi[0] - lo[0]
+        vss = BoxSet(lo=lo, hi=hi)
+        iat = IndirectAccessTile(
+            parent_ref=data_memref, shape=(K, N),
+            dim_subscripts=[_isub(0, 0), _dsub(1)],
+            index_views=[idx_memref],
+            variables_space_set=vss, variables_space_order=None,
+        )
+        return iat, data
+
+    # --- Non-zero vss.lo ---
+
+    def test_nonzero_lo_1d_indirect(self):
+        """W[E[e], n] with lo=(2,0) reads indices 2..5, not 0..3."""
+        ctx = _make_context()
+        N = 16
+        idx_data = np.array([10, 3, 7, 20, 15, 1, 28, 5], dtype=np.int32)
+        iat, data = self._build_1d_iat(ctx.hbm, 32, N, idx_data,
+                                       lo=(2, 0), hi=(6, N))
+
+        assert _analyze_blocked_indirect(iat) is not None
+        tile = MemoryOps.indirect_load(ctx, iat)
+
+        arr = data.reshape(32, N)
+        expected = np.stack([arr[idx_data[e]] for e in range(2, 6)])
+        np.testing.assert_array_equal(tile.data, expected)
+
+    def test_nonzero_lo_2d_indirect(self):
+        """cache[P[p], T[t], h] with lo=(1,2,0) — two indirect dims with non-zero lo."""
+        ctx = _make_context()
+        n_pages, n_tokens, H = 16, 8, 16  # H≥16 passes gate 3
+        data = np.arange(n_pages * n_tokens * H, dtype=np.float16)
+        base, _ = _alloc_hbm(ctx.hbm, data, "f16")
+
+        page_idx = np.array([0, 9, 3, 14, 7, 11], dtype=np.int32)
+        token_idx = np.array([1, 5, 0, 7, 2, 6, 3, 4], dtype=np.int32)
+        page_memref = _alloc_idx(ctx.hbm, page_idx)
+        token_memref = _alloc_idx(ctx.hbm, token_idx)
+
+        data_memref = MemRef(base_ptr=base, shape=(n_pages, n_tokens, H),
+                             strides=[n_tokens * H, H, 1],
+                             memory_space="HBM", dtype="f16")
+        vss = BoxSet(lo=(1, 2, 0), hi=(4, 6, H))
+        iat = IndirectAccessTile(
+            parent_ref=data_memref, shape=(3, 4, H),
+            dim_subscripts=[_isub(0, 0), _isub(1, 1), _dsub(2)],
+            index_views=[page_memref, token_memref],
+            variables_space_set=vss, variables_space_order=None,
+        )
+
+        assert _analyze_blocked_indirect(iat) is not None
+        tile = MemoryOps.indirect_load(ctx, iat)
+
+        arr = data.reshape(n_pages, n_tokens, H)
+        expected = np.zeros((3, 4, H), dtype=np.float16)
+        for pi, p in enumerate(range(1, 4)):
+            for ti, t in enumerate(range(2, 6)):
+                expected[pi, ti, :] = arr[page_idx[p], token_idx[t], :]
+        np.testing.assert_array_equal(tile.data, expected)
+
+    def test_nonzero_lo_store_roundtrip(self):
+        """Store with non-zero lo, then load — verifies store uses lo correctly."""
+        ctx = _make_context()
+        N = 16  # ≥16 passes gate 3
+        idx_data = np.array([10, 3, 7, 20, 15, 1], dtype=np.int32)
+        iat, _ = self._build_1d_iat(ctx.hbm, 32, N, idx_data,
+                                    lo=(2, 0), hi=(5, N))
+
+        assert _analyze_blocked_indirect(iat) is not None
+        write_data = np.arange(3 * N, dtype=np.float16).reshape(3, N) + 100
+        write_tile = Tile(data=write_data, shape=(3, N), dtype="f16")
+        ctx.lx.memory.clear()
+        ctx.lx.next_ptr = 0
+        MemoryOps.indirect_store(ctx, write_tile, iat)
+
+        ctx.lx.memory.clear()
+        ctx.lx.next_ptr = 0
+        result = MemoryOps.indirect_load(ctx, iat)
+        np.testing.assert_array_equal(result.data, write_data)
+
+    # --- Negative index guard ---
+
+    def test_negative_index_in_idx_array_raises(self):
+        """_runtime_read_and_expand_sub_space raises IndexError on idx < 0."""
+        ctx = _make_context()
+        N = 16  # ≥16 passes gate 3
+        idx_data = np.array([3, -1, 7], dtype=np.int32)
+        iat, _ = self._build_1d_iat(ctx.hbm, 16, N, idx_data)
+
+        assert _analyze_blocked_indirect(iat) is not None
+        with pytest.raises(IndexError, match="negative"):
+            MemoryOps.indirect_load(ctx, iat)
+
+    def test_gather_primitive_wraps_negative(self):
+        """_gather_from wraps negative offsets (NumPy behavior) — no guard."""
+        from ktir_cpu.memory import _gather_from
+        memory = {0x1000: np.array([10, 20, 30, 40, 50], dtype=np.float16)}
+        offsets = np.array([0, -1, 2], dtype=np.int64)
+        result = _gather_from(memory, 0x1000, offsets, "f16")
+        assert result[0] == 10
+        assert result[1] == 50  # wrap-around: flat[-1] = last element
+        assert result[2] == 30
+
+    # --- Shared-view below threshold (confirmed general-path bug) ---
+
+    @pytest.mark.xfail(
+        raises=StopIteration, strict=True,
+        reason="_build_indirect_coords keys iterators by index_view_idx, "
+               "not sub_i — shared views exhaust the same iterator",
+    )
+    def test_shared_view_below_threshold_general_path(self):
+        """A[B[e], B[e], n]: gate rejects → general path should produce
+        diagonal access (arr[idx[e], idx[e], :]) but crashes instead.
+
+        Root cause: _resolve_idx_reads returns {sub_i: values} (keyed by
+        subscription index: {0: [...], 1: [...]}). _build_indirect_coords
+        wraps them in iterators (line 591), then at line 604 looks them up
+        via sub["index_view_idx"]. When both subs share index_view_idx=0,
+        both consume from idx_iters[0] (sub 0's iterator, which only has K
+        values). After K consumes across 2 subs → StopIteration at point
+        ceil(K/2), sub 1.
+        """
+        ctx = _make_context()
+        n_rows, n_cols, N = 8, 8, 2  # N=2 → blocking factor < 16
+        data = np.arange(n_rows * n_cols * N, dtype=np.float16)
+        data_ptr, _ = _alloc_hbm(ctx.hbm, data, "f16")
+
+        K = 3
+        idx_data = np.array([1, 5, 7], dtype=np.int32)
+        idx_memref = _alloc_idx(ctx.hbm, idx_data)
+        data_memref = MemRef(base_ptr=data_ptr, shape=(n_rows, n_cols, N),
+                             strides=[n_cols * N, N, 1],
+                             memory_space="HBM", dtype="f16")
+        dim_subscripts = [
+            {"kind": "indirect", "index_view_idx": 0,
+             "idx_exprs": [("dim", 0)]},
+            {"kind": "indirect", "index_view_idx": 0,
+             "idx_exprs": [("dim", 0)]},
+            _dsub(1),
+        ]
+        iat = _make_iat(data_memref, (K, N), dim_subscripts, [idx_memref])
+
+        assert _analyze_blocked_indirect(iat) is None
+
+        # Should produce diagonal: arr[idx[e], idx[e], :] for each e
+        tile = MemoryOps.indirect_load(ctx, iat)
+        arr = data.reshape(n_rows, n_cols, N)
+        expected = np.stack([arr[idx_data[e], idx_data[e]] for e in range(K)])
+        np.testing.assert_array_equal(tile.data, expected)
+
+    def test_distinct_view_below_threshold_uses_general_path(self):
+        """A[B[e], C[e], n]: distinct views work fine on general path."""
+        ctx = _make_context()
+        d0, d1, N = 8, 8, 4  # N=4 → blocking factor < 16
+        data = np.arange(d0 * d1 * N, dtype=np.float16)
+        data_ptr, _ = _alloc_hbm(ctx.hbm, data, "f16")
+
+        idx_b = np.array([1, 5, 7], dtype=np.int32)
+        idx_c = np.array([3, 0, 6], dtype=np.int32)
+        b_memref = _alloc_idx(ctx.hbm, idx_b)
+        c_memref = _alloc_idx(ctx.hbm, idx_c)
+        data_memref = MemRef(base_ptr=data_ptr, shape=(d0, d1, N),
+                             strides=[d1 * N, N, 1],
+                             memory_space="HBM", dtype="f16")
+        iat = _make_iat(data_memref, (3, N),
+                        [_isub(0, 0), _isub(1, 0), _dsub(1)],
+                        [b_memref, c_memref])
+
+        assert _analyze_blocked_indirect(iat) is None
+        tile = MemoryOps.indirect_load(ctx, iat)
+        arr = data.reshape(d0, d1, N)
+        expected = np.stack([arr[idx_b[e], idx_c[e]] for e in range(3)])
         np.testing.assert_array_equal(tile.data, expected)
