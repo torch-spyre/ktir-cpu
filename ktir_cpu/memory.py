@@ -220,126 +220,92 @@ def _read_flat(
     n_elements: int,
     np_dtype: np.dtype,
     elem_size: int,
+    *,
+    offsets: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Read *n_elements* elements starting at byte address *ptr*.
+    """Read elements starting at byte address *ptr*.
 
-    Returns a flat array of length *n_elements*.  Elements beyond the end of
-    the containing allocation are zero-padded.  Raises ``ValueError`` if *ptr*
-    is unmapped.
+    Two modes:
+    - **Contiguous** (offsets=None): reads *n_elements* starting at *ptr*.
+      Elements beyond the allocation end are zero-padded.
+    - **Sparse** (offsets=array): gathers elements at the given element
+      offsets relative to the allocation base.  OOB offsets (past end)
+      return zero; *n_elements* and *np_dtype* are derived from offsets.
 
-    Example — reading 13 elements from inside a 4×4 f16 allocation::
-
-        # 4×4 f16 tensor at ptr=0x1000, values 0..15
-        memory = {0x1000: np.arange(16, dtype=np.float16)}
-        # Read 13 elements starting at element 2 (byte offset 4 from base)
-        flat = _read_flat(memory, ptr=0x1004, n_elements=13,
-                          np_dtype=np.float16, elem_size=2)
-        # flat == [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    Raises ``ValueError`` if *ptr* is unmapped.
     """
     alloc = _find_allocation(memory, ptr, elem_size)
     if alloc is None:
         raise ValueError(f"Read from unmapped address 0x{ptr:x} (n_elements={n_elements})")
     _, data, elem_offset = alloc
-    # ravel (a view when the allocation is contiguous, which it is here) instead of
-    # flatten (always a full copy): we only slice + astype(copy=True) out of `flat`,
-    # never mutate it, so copying the whole allocation per read is pure waste — it
-    # was the dominant cost of a whole-model pass once the offset loop was vectorized.
     flat = data.ravel()
+
+    if offsets is not None:
+        indices = elem_offset + offsets
+        oob = indices >= flat.size
+        if oob.any():
+            indices = np.where(oob, 0, indices)
+            result = flat[indices]
+            result[oob] = 0
+            return result
+        return flat[indices]
+
     end = elem_offset + n_elements
     if end <= flat.size:
         return flat[elem_offset:end].astype(np_dtype, copy=True)
-    # Partial allocation — pad remainder with zeros
     result = np.zeros(n_elements, dtype=np_dtype)
     avail = flat.size - elem_offset
     result[:avail] = flat[elem_offset:]
     return result
 
 
-def _write_flat(memory: Dict[int, np.ndarray], ptr: int, data: np.ndarray):
-    """Write *data* (flat ndarray) at byte address *ptr*.
+def _write_flat(
+    memory: Dict[int, np.ndarray],
+    ptr: int,
+    data: np.ndarray,
+    *,
+    offsets: Optional[np.ndarray] = None,
+):
+    """Write *data* at byte address *ptr*.
 
-    Patches an existing allocation in-place when *ptr* falls within one.
-    Creates a new allocation at *ptr* if unmapped.
-
-    Example — writing a single element into the middle of a 4×4 f16 tensor::
-
-        # 4×4 f16 tensor at ptr=0x1000, all zeros
-        memory = {0x1000: np.zeros(16, dtype=np.float16)}
-        # Write value 99 at element [1,2] (flat offset 6, byte offset 12)
-        _write_flat(memory, ptr=0x100C, data=np.array([99.0], dtype=np.float16))
-        # memory[0x1000].reshape(4,4)[1, 2] == 99.0, all other elements unchanged
+    Two modes:
+    - **Contiguous** (offsets=None): writes *data* sequentially starting at
+      *ptr*.  Creates a new allocation if unmapped.
+    - **Sparse** (offsets=array): scatters *data* into the given element
+      offsets relative to the allocation base.  OOB offsets (past end)
+      are silently dropped.  Raises ``ValueError`` if *ptr* is unmapped.
     """
-    bytes_per_elem = data.itemsize
-    alloc = _find_allocation(memory, ptr, bytes_per_elem)
+    bytes_per_elem_val = data.itemsize
+    alloc = _find_allocation(memory, ptr, bytes_per_elem_val)
+
+    if offsets is not None:
+        if alloc is None:
+            raise ValueError(f"Scatter to unmapped address 0x{ptr:x}")
+        _, buf, elem_offset = alloc
+        indices = elem_offset + offsets
+        inbounds = indices < buf.ravel().size
+        if not inbounds.all():
+            buf.ravel()[indices[inbounds]] = data.ravel()[inbounds]
+        else:
+            buf.ravel()[indices] = data.ravel()
+        return
+
     if alloc is not None:
         base_ptr, existing, elem_offset = alloc
-        flat = existing.flatten()  # flatten already returns a fresh (mutable) copy
-        src = data.ravel()         # read-only — a view is fine
+        flat = existing.flatten()
+        src = data.ravel()
         end_elem = elem_offset + src.size
         if end_elem <= flat.size:
             flat[elem_offset:end_elem] = src
             memory[base_ptr] = flat.reshape(existing.shape)
             return
-        # src extends past allocation end — write what fits
         fit = flat.size - elem_offset
         flat[elem_offset:] = src[:fit]
         memory[base_ptr] = flat.reshape(existing.shape)
         return
-    memory[ptr] = data.flatten()  # flatten already copies; the extra .copy() was redundant
+    memory[ptr] = data.flatten()
 
 
-def _gather_from(memory: Dict[int, np.ndarray], byte_addr: int, offsets: "np.ndarray", dtype: str) -> "np.ndarray":
-    """Gather elements at *offsets* from an existing allocation.
-
-    OOB offsets (past the end of the allocation) return zero — matching
-    the zero-padding contract of :func:`_read_flat`.
-
-    Args:
-        memory: backing store dict {byte_addr: ndarray}
-        byte_addr: absolute byte address of the allocation base
-        offsets: 1-D int64 element offsets relative to base
-        dtype: element type (e.g. "f16", "i32")
-    """
-    elem_size = bytes_per_elem(dtype)
-    alloc = _find_allocation(memory, byte_addr, elem_size)
-    if alloc is None:
-        raise ValueError(f"Gather from unmapped address 0x{byte_addr:x}")
-    _, data, elem_offset = alloc
-    flat = data.ravel()
-    indices = elem_offset + offsets
-    oob = indices >= flat.size
-    if oob.any():
-        indices = np.where(oob, 0, indices)
-        result = flat[indices]
-        result[oob] = 0
-        return result
-    return flat[indices]
-
-
-def _scatter_into(memory: Dict[int, np.ndarray], byte_addr: int, offsets: "np.ndarray", data: "np.ndarray", dtype: str) -> None:
-    """Scatter *data* into elements at *offsets* within an existing allocation.
-
-    OOB offsets (past the end of the allocation) are silently dropped —
-    symmetric with :func:`_gather_from`'s zero-fill contract.
-
-    Args:
-        memory: backing store dict {byte_addr: ndarray}
-        byte_addr: absolute byte address of the allocation base
-        offsets: 1-D int64 element offsets relative to base
-        data: values to write (same length as offsets)
-        dtype: element type (e.g. "f16", "i32")
-    """
-    elem_size = bytes_per_elem(dtype)
-    alloc = _find_allocation(memory, byte_addr, elem_size)
-    if alloc is None:
-        raise ValueError(f"Scatter to unmapped address 0x{byte_addr:x}")
-    _, buf, elem_offset = alloc
-    indices = elem_offset + offsets
-    inbounds = indices < buf.ravel().size
-    if not inbounds.all():
-        buf.ravel()[indices[inbounds]] = data[inbounds]
-    else:
-        buf.ravel()[indices] = data
 
 
 class HBMSimulator:
@@ -385,60 +351,37 @@ class HBMSimulator:
         self.next_ptr = (self.next_ptr + self.STICK_BYTES - 1) & ~(self.STICK_BYTES - 1)
         return ptr // self.STICK_BYTES
 
-    def read(self, stick: int, n_elements: int, dtype: str, *, intra_byte: int = 0) -> np.ndarray:
-        """Read *n_elements* elements from HBM.
+    def read(self, stick: int, n_elements: int, dtype: str, *, intra_byte: int = 0, offsets: Optional[np.ndarray] = None) -> np.ndarray:
+        """Read elements from HBM (contiguous or sparse).
 
         Args:
-            stick: HBM stick index (from \`\`allocate()\`\` or \`\`MemRef.split_addr\`\`).
-            n_elements: Number of elements to read.
+            stick: HBM stick index.
+            n_elements: Number of elements (contiguous mode).
             dtype: Data type.
             intra_byte: Byte offset within the stick (default 0).
-
-        Returns:
-            Flat NumPy array of length n_elements.
+            offsets: If provided, gather at these element offsets instead.
         """
         assert 0 <= intra_byte < self.STICK_BYTES, (
             f"intra_byte {intra_byte} out of range [0, {self.STICK_BYTES})"
         )
         np_dtype = to_np_dtype(dtype)
         return _read_flat(self.memory, stick * self.STICK_BYTES + intra_byte,
-                          n_elements, np_dtype, bytes_per_elem(dtype))
+                          n_elements, np_dtype, bytes_per_elem(dtype), offsets=offsets)
 
-    def write(self, stick: int, data: np.ndarray, *, intra_byte: int = 0):
-        """Write *data* (flat ndarray) to HBM.
+    def write(self, stick: int, data: np.ndarray, *, intra_byte: int = 0, offsets: Optional[np.ndarray] = None):
+        """Write data to HBM (contiguous or sparse).
 
         Args:
-            stick: HBM stick index (from \`\`allocate()\`\` or \`\`MemRef.split_addr\`\`).
+            stick: HBM stick index.
             data: Flat NumPy array to write.
             intra_byte: Byte offset within the stick (default 0).
+            offsets: If provided, scatter into these element offsets instead.
         """
         assert 0 <= intra_byte < self.STICK_BYTES, (
             f"intra_byte {intra_byte} out of range [0, {self.STICK_BYTES})"
         )
-        _write_flat(self.memory, stick * self.STICK_BYTES + intra_byte, data)
+        _write_flat(self.memory, stick * self.STICK_BYTES + intra_byte, data, offsets=offsets)
 
-    def gather(self, stick: int, offsets: "np.ndarray", dtype: str, *, intra_byte: int = 0) -> "np.ndarray":
-        """Gather elements at *offsets* directly from the stored allocation.
-
-        Args:
-            stick: HBM stick index (base of the tile)
-            offsets: 1-D int64 element offsets relative to base
-            dtype: element type (e.g. "f16", "i32")
-            intra_byte: byte offset within the stick (default 0)
-        """
-        return _gather_from(self.memory, stick * self.STICK_BYTES + intra_byte, offsets, dtype)
-
-    def scatter(self, stick: int, offsets: "np.ndarray", data: "np.ndarray", dtype: str, *, intra_byte: int = 0) -> None:
-        """Scatter *data* into elements at *offsets* — inverse of gather.
-
-        Args:
-            stick: HBM stick index (base of the tile)
-            offsets: 1-D int64 element offsets relative to base
-            data: values to write (same length as offsets)
-            dtype: element type (e.g. "f16", "i32")
-            intra_byte: byte offset within the stick (default 0)
-        """
-        _scatter_into(self.memory, stick * self.STICK_BYTES + intra_byte, offsets, data, dtype)
 
     def read_element(self, addr: int, dtype: str = "f16"):
         """Read a single element by byte address.
@@ -468,55 +411,28 @@ class LXScratchpad:
         self.memory: Dict[int, np.ndarray] = _AllocStore()
         self.next_ptr = 0  # Local address space
 
-    def read(self, ptr: int, n_elements: int, dtype: str) -> np.ndarray:
-        """Read *n_elements* elements starting at byte address *ptr*.
-
-        Returns a flat array of length *n_elements*.  Raises ValueError if
-        *ptr* is unmapped.
+    def read(self, ptr: int, n_elements: int, dtype: str, *, offsets: Optional[np.ndarray] = None) -> np.ndarray:
+        """Read elements from LX scratchpad (contiguous or sparse).
 
         Args:
             ptr: Local address (byte offset)
-            n_elements: Number of elements to read
+            n_elements: Number of elements (contiguous mode)
             dtype: Data type
-
-        Returns:
-            Flat NumPy array of length n_elements
+            offsets: If provided, gather at these element offsets instead.
         """
         np_dtype = to_np_dtype(dtype)
-        return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype))
+        return _read_flat(self.memory, ptr, n_elements, np_dtype, bytes_per_elem(dtype), offsets=offsets)
 
-    def write(self, ptr: int, data: np.ndarray):
-        """Write *data* (flat ndarray) starting at byte address *ptr*.
-
-        Patches an existing allocation in-place when *ptr* falls within one.
-        Creates a new allocation at *ptr* if unmapped.
+    def write(self, ptr: int, data: np.ndarray, *, offsets: Optional[np.ndarray] = None):
+        """Write data to LX scratchpad (contiguous or sparse).
 
         Args:
             ptr: Local address (byte offset)
             data: Flat NumPy array to write
+            offsets: If provided, scatter into these element offsets instead.
         """
-        _write_flat(self.memory, ptr, data)
+        _write_flat(self.memory, ptr, data, offsets=offsets)
 
-    def gather(self, ptr: int, offsets: "np.ndarray", dtype: str) -> "np.ndarray":
-        """Gather elements at *offsets* directly from the stored allocation.
-
-        Args:
-            ptr: byte address (base of the tile)
-            offsets: 1-D int64 element offsets relative to base
-            dtype: element type (e.g. "f16", "i32")
-        """
-        return _gather_from(self.memory, ptr, offsets, dtype)
-
-    def scatter(self, ptr: int, offsets: "np.ndarray", data: "np.ndarray", dtype: str) -> None:
-        """Scatter *data* into elements at *offsets* — inverse of gather.
-
-        Args:
-            ptr: byte address (base of the tile)
-            offsets: 1-D int64 element offsets relative to base
-            data: values to write (same length as offsets)
-            dtype: element type (e.g. "f16", "i32")
-        """
-        _scatter_into(self.memory, ptr, offsets, data, dtype)
 
     def clear(self):
         """Clear scratchpad and reset allocation."""

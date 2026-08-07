@@ -440,15 +440,15 @@ class TestBlockedIndirectStore:
 
 
 # ---------------------------------------------------------------------------
-# Scatter primitives: unit tests for the underlying HBM/LX scatter ops
-# (these are the building blocks that indirect_store's fast path uses).
+# Sparse write primitives: unit tests for the underlying HBM/LX write(offsets=)
+# ops (these are the building blocks that indirect_store's fast path uses).
 # ---------------------------------------------------------------------------
 
-class TestScatter:
-    """scatter() writes only the targeted offsets, leaving the rest untouched."""
+class TestSparseWrite:
+    """write(offsets=) writes only the targeted offsets, leaving the rest untouched."""
 
-    def test_hbm_scatter_sparse(self):
-        """Scatter into a few elements of a larger allocation."""
+    def test_hbm_write_sparse(self):
+        """Write into a few elements of a larger HBM allocation via offsets."""
         hbm = HBMSimulator()
         data = np.zeros(64, dtype=np.float16)
         stick = hbm.allocate(data.nbytes)
@@ -456,7 +456,7 @@ class TestScatter:
 
         offsets = np.array([5, 17, 42, 63], dtype=np.int64)
         values = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float16)
-        hbm.scatter(stick, offsets, values, "f16")
+        hbm.write(stick, values, offsets=offsets)
 
         result = hbm.read(stick, 64, "f16")
         for o, v in zip(offsets, values):
@@ -464,24 +464,24 @@ class TestScatter:
         untouched = np.delete(np.arange(64), offsets)
         np.testing.assert_array_equal(result[untouched], 0.0)
 
-    def test_lx_scatter_sparse(self):
-        """Scatter into LX scratchpad allocation."""
+    def test_lx_write_sparse(self):
+        """Write into LX scratchpad allocation via offsets."""
         lx = LXScratchpad(size_mb=1)
         data = np.zeros(32, dtype=np.float16)
         lx.write(0, data)
 
         offsets = np.array([0, 15, 31], dtype=np.int64)
         values = np.array([10.0, 20.0, 30.0], dtype=np.float16)
-        lx.scatter(0, offsets, values, "f16")
+        lx.write(0, values, offsets=offsets)
 
-        result = lx.gather(0, np.arange(32, dtype=np.int64), "f16")
+        result = lx.read(0, 32, "f16", offsets=np.arange(32, dtype=np.int64))
         for o, v in zip(offsets, values):
             assert result[o] == v
         untouched = np.delete(np.arange(32), offsets)
         np.testing.assert_array_equal(result[untouched], 0.0)
 
-    def test_scatter_gather_roundtrip(self):
-        """scatter then gather at same offsets returns the scattered values."""
+    def test_write_read_sparse_roundtrip(self):
+        """write(offsets=) then read(offsets=) at same offsets roundtrips."""
         hbm = HBMSimulator()
         data = np.random.randn(128).astype(np.float16)
         stick = hbm.allocate(data.nbytes)
@@ -489,9 +489,9 @@ class TestScatter:
 
         offsets = np.array([10, 50, 100, 127], dtype=np.int64)
         new_vals = np.array([99.0, 88.0, 77.0, 66.0], dtype=np.float16)
-        hbm.scatter(stick, offsets, new_vals, "f16")
+        hbm.write(stick, new_vals, offsets=offsets)
 
-        gathered = hbm.gather(stick, offsets, "f16")
+        gathered = hbm.read(stick, len(offsets), "f16", offsets=offsets)
         np.testing.assert_array_equal(gathered, new_vals)
 
 
@@ -671,49 +671,50 @@ class TestBlockedIndirectIndexUniqueSticks:
 
 # ---------------------------------------------------------------------------
 # OOB handling: when indirect indices point outside the parent allocation,
-# gather returns zero (safe default) and scatter silently drops the write.
-# This prevents crashes from stale or out-of-range index arrays.
+# read(offsets=) returns zero (safe default) and write(offsets=) silently
+# drops the write.  This prevents crashes from stale or out-of-range index
+# arrays.
 # ---------------------------------------------------------------------------
 
-class TestGatherScatterOOB:
-    """Verify that gather zero-pads OOB offsets and scatter drops them."""
+class TestSparseOOB:
+    """Verify that read(offsets=) zero-pads OOB and write(offsets=) drops them."""
 
-    def test_gather_oob_returns_zero(self):
-        """Offsets past allocation end return zero (matching _read_flat)."""
-        from ktir_cpu.memory import _gather_from
+    def test_read_oob_returns_zero(self):
+        """Offsets past allocation end return zero."""
+        from ktir_cpu.memory import _read_flat
         memory = {0x1000: np.arange(10, dtype=np.float16)}
         offsets = np.array([0, 5, 9, 10, 11], dtype=np.int64)
-        result = _gather_from(memory, 0x1000, offsets, "f16")
+        result = _read_flat(memory, 0x1000, len(offsets), np.float16, 2, offsets=offsets)
         expected = np.array([0, 5, 9, 0, 0], dtype=np.float16)
         np.testing.assert_array_equal(result, expected)
 
-    def test_gather_all_inbounds(self):
-        """All-inbounds path returns correct values (no overhead branch)."""
-        from ktir_cpu.memory import _gather_from
+    def test_read_all_inbounds(self):
+        """All-inbounds path returns correct values (no OOB branch)."""
+        from ktir_cpu.memory import _read_flat
         memory = {0x1000: np.arange(10, dtype=np.float16)}
         offsets = np.array([0, 3, 7, 9], dtype=np.int64)
-        result = _gather_from(memory, 0x1000, offsets, "f16")
+        result = _read_flat(memory, 0x1000, len(offsets), np.float16, 2, offsets=offsets)
         expected = np.array([0, 3, 7, 9], dtype=np.float16)
         np.testing.assert_array_equal(result, expected)
 
-    def test_scatter_oob_dropped(self):
-        """OOB scatter offsets are silently dropped; inbounds writes land."""
-        from ktir_cpu.memory import _scatter_into
+    def test_write_oob_dropped(self):
+        """OOB offsets are silently dropped; inbounds writes land."""
+        from ktir_cpu.memory import _write_flat
         memory = {0x1000: np.zeros(10, dtype=np.float16)}
         data = np.array([99, 88, 77], dtype=np.float16)
         offsets = np.array([0, 10, 5], dtype=np.int64)
-        _scatter_into(memory, 0x1000, offsets, data, "f16")
+        _write_flat(memory, 0x1000, data, offsets=offsets)
         assert memory[0x1000][0] == 99
         assert memory[0x1000][5] == 77
         assert memory[0x1000][1] == 0  # untouched
 
-    def test_scatter_all_inbounds(self):
-        """All-inbounds scatter writes correctly."""
-        from ktir_cpu.memory import _scatter_into
+    def test_write_all_inbounds(self):
+        """All-inbounds sparse write lands correctly."""
+        from ktir_cpu.memory import _write_flat
         memory = {0x1000: np.zeros(10, dtype=np.float16)}
         data = np.array([11, 22, 33], dtype=np.float16)
         offsets = np.array([1, 4, 8], dtype=np.int64)
-        _scatter_into(memory, 0x1000, offsets, data, "f16")
+        _write_flat(memory, 0x1000, data, offsets=offsets)
         assert memory[0x1000][1] == 11
         assert memory[0x1000][4] == 22
         assert memory[0x1000][8] == 33
@@ -853,7 +854,7 @@ class TestBlockedIndirectSharedView:
 #
 # Three areas where the two paths diverge in capability or behavior:
 # 1. Non-zero vss.lo — fast path starts dep-var iteration at lo[d], not 0
-# 2. Negative indices — _gather_from wraps silently; upstream guard prevents
+# 2. Negative indices — _read_flat(offsets=) wraps silently; upstream guard prevents
 # 3. Shared-view below threshold — general path crashes (StopIteration)
 # ---------------------------------------------------------------------------
 
@@ -964,35 +965,20 @@ class TestBlockedIndirectCorrectnessGaps:
         with pytest.raises(IndexError, match="negative"):
             MemoryOps.indirect_load(ctx, iat)
 
-    def test_gather_primitive_wraps_negative(self):
-        """_gather_from wraps negative offsets (NumPy behavior) — no guard."""
-        from ktir_cpu.memory import _gather_from
+    def test_sparse_read_wraps_negative(self):
+        """_read_flat(offsets=) wraps negative offsets (NumPy behavior) — no guard."""
+        from ktir_cpu.memory import _read_flat
         memory = {0x1000: np.array([10, 20, 30, 40, 50], dtype=np.float16)}
         offsets = np.array([0, -1, 2], dtype=np.int64)
-        result = _gather_from(memory, 0x1000, offsets, "f16")
+        result = _read_flat(memory, 0x1000, len(offsets), np.float16, 2, offsets=offsets)
         assert result[0] == 10
         assert result[1] == 50  # wrap-around: flat[-1] = last element
         assert result[2] == 30
 
-    # --- Shared-view below threshold (confirmed general-path bug) ---
+    # --- Shared-view below threshold (general path handles it correctly) ---
 
-    @pytest.mark.xfail(
-        raises=StopIteration, strict=True,
-        reason="_build_indirect_coords keys iterators by index_view_idx, "
-               "not sub_i — shared views exhaust the same iterator",
-    )
     def test_shared_view_below_threshold_general_path(self):
-        """A[B[e], B[e], n]: gate rejects → general path should produce
-        diagonal access (arr[idx[e], idx[e], :]) but crashes instead.
-
-        Root cause: _resolve_idx_reads returns {sub_i: values} (keyed by
-        subscription index: {0: [...], 1: [...]}). _build_indirect_coords
-        wraps them in iterators (line 591), then at line 604 looks them up
-        via sub["index_view_idx"]. When both subs share index_view_idx=0,
-        both consume from idx_iters[0] (sub 0's iterator, which only has K
-        values). After K consumes across 2 subs → StopIteration at point
-        ceil(K/2), sub 1.
-        """
+        """A[B[e], B[e], n]: shared view falls to general path, produces diagonal."""
         ctx = _make_context()
         n_rows, n_cols, N = 8, 8, 2  # N=2 → blocking factor < 16
         data = np.arange(n_rows * n_cols * N, dtype=np.float16)
@@ -1014,9 +1000,8 @@ class TestBlockedIndirectCorrectnessGaps:
         iat = _make_iat(data_memref, (K, N), dim_subscripts, [idx_memref])
 
         assert _analyze_blocked_indirect(iat) is None
-
-        # Should produce diagonal: arr[idx[e], idx[e], :] for each e
         tile = MemoryOps.indirect_load(ctx, iat)
+
         arr = data.reshape(n_rows, n_cols, N)
         expected = np.stack([arr[idx_data[e], idx_data[e]] for e in range(K)])
         np.testing.assert_array_equal(tile.data, expected)

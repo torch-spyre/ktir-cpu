@@ -106,8 +106,8 @@ class _MemAccessor:
             return None
         return int(np.unique((base_ptr + offsets * bpe) // HBMSimulator.STICK_BYTES).size)
 
-    def read(self, n: int, dtype: str) -> np.ndarray:
-        return self._sim.read(*self._args, n, dtype, **self._kwargs)
+    def read(self, n: int, dtype: str, *, offsets: Optional[np.ndarray] = None) -> np.ndarray:
+        return self._sim.read(*self._args, n, dtype, **self._kwargs, offsets=offsets)
 
     def read_scattered(
         self, byte_addresses: List[int], dtype: str,
@@ -178,27 +178,9 @@ class _MemAccessor:
         )
         return values, unique_sticks
 
-    def write(self, data: np.ndarray) -> None:
-        self._sim.write(*self._args, data, **self._kwargs)
+    def write(self, data: np.ndarray, *, offsets: Optional[np.ndarray] = None) -> None:
+        self._sim.write(*self._args, data, **self._kwargs, offsets=offsets)
 
-    def gather(self, offsets: np.ndarray, dtype: str) -> np.ndarray:
-        """Gather elements at *offsets* directly from the stored allocation.
-
-        Args:
-            offsets: 1-D int64 element offsets relative to base
-            dtype: element type (e.g. "f16", "i32")
-        """
-        return self._sim.gather(*self._args, offsets, dtype, **self._kwargs)
-
-    def scatter(self, offsets: np.ndarray, data: np.ndarray, dtype: str) -> None:
-        """Scatter *data* into elements at *offsets* — inverse of gather.
-
-        Args:
-            offsets: 1-D int64 element offsets relative to base
-            data: values to write (same length as offsets)
-            dtype: element type (e.g. "f16", "i32")
-        """
-        self._sim.scatter(*self._args, offsets, data, dtype, **self._kwargs)
 
 
 def hbm_read(hbm: "HBMSimulator", byte_addr: int, n_elements: int, dtype: str) -> np.ndarray:
@@ -241,7 +223,7 @@ def _expr_dependent_vars(expr: tuple) -> set:
 
 def _analyze_blocked_indirect(iat: "IndirectAccessTile"):
     """Analyze an indirect-access expression (IAT), extract access pattern
-    for the consideration of fast emulation of the datamoves associated with 
+    for the consideration of fast emulation of the datamoves associated with
     indirect-accesses.
 
     The condition for the fast-path is to meet all of the following:
@@ -262,14 +244,14 @@ def _analyze_blocked_indirect(iat: "IndirectAccessTile"):
     - indirect_subs:  subscripts with kind=="indirect" (the index lookups)
     - dep_vars:       set of variable-space dims the index exprs depend on
     - dep_var_list:   sorted list form of dep_vars (stable iteration order)
-    - dep_extents:    iteration extent per dependent dim (aka, K, the number of 
+    - dep_extents:    iteration extent per dependent dim (aka, K, the number of
                       unique index lookups)
 
     Example: W[e_idx[e], m, n] from MoE (synthetic)
     - indirect_subs has one item: e_idx[e]
-    - dep_vars = {e} for the dependency of the e_idx[e] expression on 'e', index 
+    - dep_vars = {e} for the dependency of the e_idx[e] expression on 'e', index
                  or id of an expert, likely associated with a loop induction var.
-                 They are referred to as "indirect variable" (vs "direct") sometimes.  
+                 They are referred to as "indirect variable" (vs "direct") sometimes.
     """
     # --- Gate 1: must have both indirect and direct subscript dimensions ---
     indirect_subs = [s for s in iat.dim_subscripts if s.get("kind") == "indirect"]
@@ -504,27 +486,6 @@ def _compute_blocked_indirect_offsets(
     return offsets, idx_sticks
 
 
-def _element_offsets(
-    context: CoreContext, iat: "IndirectAccessTile",
-) -> Tuple[np.ndarray, int]:
-    """Reference implementation: compute flat element offsets via Python loop.
-
-    Readable per-point logic — enumerate all N points, read index tensors,
-    build coordinate tuples, linearize.  ~6× slower than the vectorized
-    _get_element_wise_indirect_offsets but kept as a correctness reference
-    and benchmark baseline.
-
-    Returns (offsets, idx_sticks).
-    """
-    idx_values, idx_sticks = _resolve_idx_reads(context, iat)
-    coords = _build_indirect_coords(iat, idx_values)
-    tile_ref = iat.parent_ref.to_tile_ref()
-    mgr = _MemAccessor(context, tile_ref.memref.memory_space, tile_ref.base_ptr, tile_ref.memref.lx_core_id)
-    offsets, _ = MemoryOps._flat_memory_offsets(
-        tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
-        coords, stick_bytes=mgr.stick_bytes,
-    )
-    return offsets, idx_sticks
 
 
 def _enumerate_in_vso_order(iat: "IndirectAccessTile") -> List[Tuple[int, ...]]:
@@ -588,11 +549,12 @@ def _build_indirect_coords(
     construction stays in lockstep (guard symmetry).
     """
     points = _enumerate_in_vso_order(iat)
-    idx_iters = {iv_idx: iter(values) for iv_idx, values in idx_values.items()}
+    idx_iters = {sub_i: iter(values) for sub_i, values in idx_values.items()}
 
     coords: List[Tuple[int, ...]] = []
     for pt in points:
         coord: List[int] = []
+        indirect_counter = 0
         for sub in iat.dim_subscripts:
             kind = sub["kind"]
             if kind == "direct":
@@ -600,14 +562,14 @@ def _build_indirect_coords(
             elif kind == "direct_expr":
                 coord.append(eval_subscript_expr(sub["subscript"], pt))
             elif kind == "indirect":
-                iv_idx = sub["index_view_idx"]
-                raw_idx = int(next(idx_iters[iv_idx]))
+                raw_idx = int(next(idx_iters[indirect_counter]))
                 if raw_idx < 0:
                     raise IndexError(
                         f"indirect index {raw_idx} from "
-                        f"{iat.index_views[iv_idx]} is negative"
+                        f"{iat.index_views[sub['index_view_idx']]} is negative"
                     )
                 coord.append(raw_idx)
+                indirect_counter += 1
             else:
                 raise ValueError(f"Unknown indirect subscript kind: {kind}")
         coords.append(tuple(coord))
@@ -803,7 +765,7 @@ class MemoryOps:
             unique_sticks = _MemAccessor.count_sticks_array(
                 tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
             )
-            gathered = mgr.gather(offsets, tile_ref.dtype)
+            gathered = mgr.read(len(offsets), tile_ref.dtype, offsets=offsets)
             out_shape = result_shape if result_shape is not None else tile_ref.shape
             data = gathered.reshape(out_shape)
             MemoryOps._write_to_lx(context, data)
@@ -825,15 +787,12 @@ class MemoryOps:
                 unique_sticks = None
             return Tile(data, tile_ref.dtype, tile_ref.shape, unique_sticks)
 
-        # Strided or coord-set path: linearize coords, single read, numpy fancy-index.
+        # Strided or coord-set path: linearize coords → sparse read via offsets.
         offsets, unique_sticks = MemoryOps._flat_memory_offsets(
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes
         )
-        span = int(offsets.max()) + 1 if offsets.size else 1
-        flat = mgr.read(span, tile_ref.dtype)
-
-        gathered = flat[offsets]
+        gathered = mgr.read(len(offsets), tile_ref.dtype, offsets=offsets)
         out_shape = result_shape if result_shape is not None else tile_ref.shape
         data = gathered.reshape(out_shape)
 
@@ -881,7 +840,7 @@ class MemoryOps:
             unique_sticks = _MemAccessor.count_sticks_array(
                 tile_ref.memref.memory_space, tile_ref.base_ptr, offsets, bpe,
             )
-            mgr.scatter(offsets, tile.data.ravel(), tile_ref.dtype)
+            mgr.write(tile.data.ravel(), offsets=offsets)
             return unique_sticks if unique_sticks is not None else 0
 
         # Fast path: contiguous tile, no coord filtering — single dict-key write.
@@ -897,15 +856,12 @@ class MemoryOps:
                 - tile_ref.base_ptr // stick_bytes
             )
 
-        # Strided or coord-set path: read-modify-write via scatter offsets.
+        # Strided or coord-set path: sparse write via offsets.
         offsets, unique_sticks = MemoryOps._flat_memory_offsets(
             tile_ref.base_ptr, tile_ref.shape, tile_ref.strides, tile_ref.dtype,
             coords, stick_bytes=stick_bytes,
         )
-        span = int(offsets.max()) + 1 if offsets.size else 1
-        flat = mgr.read(span, tile_ref.dtype)
-        flat[offsets] = tile.data.ravel()
-        mgr.write(flat)
+        mgr.write(tile.data.ravel(), offsets=offsets)
         return unique_sticks if unique_sticks is not None else 0
 
     @staticmethod
@@ -934,13 +890,14 @@ class MemoryOps:
                 f"dimensions; got non-permutation map: {vso.source}"
             )
 
+        out_shape = result_shape if result_shape is not None else iat.shape
+
         # Fast path: blocked-indirect patterns (MoE, paged attention) where the
         # index lookup depends on a small subset of iteration variables.
         # Bypasses the O(N) Python loops in _resolve_idx_reads / _build_indirect_coords.
         block_info = _analyze_blocked_indirect(iat)
         if block_info is not None:
             offsets, idx_sticks = _compute_blocked_indirect_offsets(context, iat, block_info)
-            out_shape = result_shape if result_shape is not None else iat.shape
             tile_ref = iat.parent_ref.to_tile_ref()
             result = MemoryOps.load(context, tile_ref, offsets=offsets, result_shape=out_shape)
             result.index_unique_sticks = idx_sticks
@@ -950,7 +907,6 @@ class MemoryOps:
         idx_values, idx_unique_sticks = _resolve_idx_reads(context, iat)
         coords = _build_indirect_coords(iat, idx_values)
 
-        out_shape = result_shape if result_shape is not None else iat.shape
         result = MemoryOps.load(
             context, iat.parent_ref.to_tile_ref(),
             coords=coords, result_shape=out_shape,
@@ -1221,7 +1177,7 @@ class MemoryOps:
                 survivor.base_ptr, survivor.shape, survivor.strides, survivor.dtype,
                 local_coords, stick_bytes=mgr.stick_bytes,
             )
-            gathered = mgr.gather(offsets, survivor.dtype)
+            gathered = mgr.read(len(offsets), survivor.dtype, offsets=offsets)
             out_idx = tuple(
                 np.fromiter((c[d] for c in access_coords), dtype=np.intp,
                             count=len(access_coords))
@@ -1296,7 +1252,7 @@ class MemoryOps:
                             count=len(access_coords))
                 for d in range(ndim)
             )
-            mgr.scatter(offsets, tile.data[src_idx], survivor.dtype)
+            mgr.write(tile.data[src_idx], offsets=offsets)
             if unique_sticks is not None:
                 total_unique_sticks += unique_sticks
 
