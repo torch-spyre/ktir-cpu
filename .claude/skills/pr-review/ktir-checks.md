@@ -4,6 +4,10 @@ The closed list of traps specific to this repository. Every item was raised in a
 
 `SKILL.md` in this directory owns the review *procedure* and the open-ended judgment passes. This file is the backstop it runs last — **not** a substitute for reading the change. A finding that fits none of these categories is still a finding.
 
+This file names no pull request, and only one item in it — the description check in §10 — needs one to exist. The rest describe code, so they apply equally to code being written; working the list against a branch before pushing is a supported use, and the severities then order the work rather than pass a verdict.
+
+Items are expected to retire. A check that stops firing because its defect stopped happening, or because a linter or CI gate took it over, has done its job and comes out — the list should stay proportional to what is still live, since one that only grows becomes a ritual by weight alone.
+
 Severity is attached per item: **BLOCKER** (fix before merge), **SUGGESTION** (improvement), **QUESTION** (needs clarification).
 
 ## What other repo docs already own
@@ -103,7 +107,7 @@ The boundary is **not** a directory boundary, and assuming it is will mis-scope 
 
 ## 10. PR description and commits
 
-- **SUGGESTION** — The PR description works as the spec of the change: summary, changes by file or area, **what is *not* changing**, test plan, suggested follow-ups, open questions. A reviewer should not have to infer intent from the diff. The "what is not changing" section prevents the most wasted review — it stops a reviewer assuming a neighbouring boundary was also touched. Quantitative changes (latency, byte counts) come with a before/after table rather than prose.
+- **SUGGESTION** — The PR description works as the spec of the change: summary, changes by file or area, **what is *not* changing**, test plan, suggested follow-ups, open questions. A reviewer should not have to infer intent from the diff. Read the "what is not changing" section for what it names, not for whether it is present: its job is to name the specific neighbouring boundary a reviewer would otherwise assume was touched — the sibling op, the dual of a paired guard, the other parse path — and a section that names none of them has not done it. Quantitative changes (latency, byte counts) come with a before/after table rather than prose.
 - **BLOCKER** — Every commit carries a `Signed-off-by:` trailer. The `DCO` check gates this per commit, so a missing trailer is a red build rather than a review nit.
 - **SUGGESTION** — Inline comments are self-contained and role-neutral: no `#NNN` issue references (they rot once the issue closes and the code stays) and no contributor names or first-person pronouns. Issue links and discussion belong in the commit body or PR thread, which records authorship already.
 

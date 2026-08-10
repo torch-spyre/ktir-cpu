@@ -8,6 +8,8 @@ allowed-tools: Bash(gh pr view:*), Bash(gh pr diff:*), Bash(gh pr checks:*), Bas
 
 This file is the review *procedure*. `ktir-checks.md` in this directory is the closed list of traps specific to this repository, and it runs **last** — see step 8.
 
+**What the checks are for is keeping a defect class out of `main`, not scoring a change.** An author who works the list before pushing and fixes what it names has used it as intended, because most items are the property itself rather than a proxy for one — there is nothing to satisfy short of being correct. The parts that do assess a change, and only those, are this file's: the verdict, the severities read as a verdict, and the finding labels. They apply to reviewing someone else's work, not to an author's pass over a branch of their own.
+
 The order matters. Form your own account of the change first; use the list to catch what you missed. Running the list first narrows what you are able to see.
 
 Everything needed is in this repository plus an authenticated `gh` (`gh auth status`), run from inside a checkout. Nothing is read from outside it, and no review state is stored anywhere local — the PR thread is the record, so a reviewer picking a PR up cold has the same ledger as everyone else.
