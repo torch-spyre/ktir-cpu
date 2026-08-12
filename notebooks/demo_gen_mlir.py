@@ -405,7 +405,7 @@ def gen_sdpa_decode_pv_mlir(kv_len=8192, head_dim=128, q_per_kv=4,
         fold = f"""
     %fut = ktdp.inter_tile_produce
         producer_tiles_per_group = #red_tiles
-        : tensor<{m}x{nl}xf16> -> !ktdp.tile_future<tensor<{m}x{nl}xf16>, groups = {groups}>
+        -> <(tensor<{m}x{nl}xf16>), groups = {groups}>
     {{
       ^bb0(%gid: index):
         ktdp.yield_partial %prod : tensor<{m}x{nl}xf16>
@@ -416,7 +416,7 @@ def gen_sdpa_decode_pv_mlir(kv_len=8192, head_dim=128, q_per_kv=4,
     %reduced = ktdp.inter_tile_reduce(%fut)
         consumer_tiles_per_group = #red_tiles,
         identity(%id_init : tensor<{m}x{nl}xf16>)
-        : !ktdp.tile_future<tensor<{m}x{nl}xf16>, groups = {groups}> -> tensor<{m}x{nl}xf16>
+        : <(tensor<{m}x{nl}xf16>), groups = {groups}> -> tensor<{m}x{nl}xf16>
     {{
       ^bb0(%lhs: tensor<{m}x{nl}xf16>, %rhs: tensor<{m}x{nl}xf16>):
         %r_empty = tensor.empty() : tensor<{m}x{nl}xf16>
