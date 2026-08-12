@@ -139,7 +139,7 @@ for _name, _fn in _INT_BINOPS_VIA_OP.items():
 # Integer comparison
 # ---------------------------------------------------------------------------
 
-@register("arith.cmpi", latency_category=LC.COMPUTE_FLOAT)
+@register("arith.cmpi", latency_category=LC.COMPUTE_INT)
 def arith__cmpi(op, context, env):
     a = context.get_value(op.operands[0])
     b = context.get_value(op.operands[1])

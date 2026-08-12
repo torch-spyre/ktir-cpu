@@ -7,10 +7,38 @@ _indirect_kv_tile) factor out repeated boilerplate.
 
 from __future__ import annotations
 
+from ktir_cpu.memory import HBMSimulator
+
+# HBM traffic is charged per unique stick, not per packed byte, so a tile row
+# narrower than one stick is billed as a full one.  Taken from the simulator so
+# the two cannot drift apart.
+_STICK_BYTES = HBMSimulator.STICK_BYTES
+
 
 # ---------------------------------------------------------------------------
 # Private MLIR-string helpers
 # ---------------------------------------------------------------------------
+
+def _require_stick_aligned(what: str, n_elems: int) -> None:
+    """Reject a tile row that is not a whole number of HBM sticks.
+
+    Every generator in this module emits f16, so the element size is fixed at 2
+    bytes rather than taken as a parameter.
+
+    Raised rather than asserted: these are caller-supplied shapes, and ``python
+    -O`` strips asserts, which would let a mis-shaped tile through silently and
+    report an arithmetic intensity that belongs to the padding rather than to
+    the kernel.
+    """
+    row_bytes = n_elems * 2
+    if row_bytes % _STICK_BYTES:
+        raise ValueError(
+            f"{what} is {n_elems} elements = {row_bytes} B, not a whole "
+            f"{_STICK_BYTES} B stick; HBM traffic would be charged for the "
+            f"padding and the reported arithmetic intensity would not be the "
+            f"kernel's own"
+        )
+
 
 def _mem_view(name: str, ptr: str, shape: list[int], strides: list[int],
               dtype: str = "f16") -> str:
@@ -284,6 +312,160 @@ def gen_sdpa_mlir(seq_len, head_dim, block_m):
 {output_view}
 {output_tile}
     ktdp.store %acc, %output_tile : tensor<{bm}x{hd}xf16>, !ktdp.access_tile<{bm}x{hd}xindex>
+    return
+  }}
+}}"""
+
+
+def gen_sdpa_decode_pv_mlir(kv_len=8192, head_dim=128, q_per_kv=4,
+                            out_split=2, k_split=16):
+    """Generate the decode-attention P@V kernel, split across cores on both axes.
+
+    Single-stream decode over one KV head's group: the ``q_per_kv`` query heads
+    that share a key/value head each contribute one row of attention weights over
+    the same ``kv_len`` cached tokens, so the P@V stage is
+
+        ``C[q_per_kv, head_dim] = A[q_per_kv, kv_len] @ B[kv_len, head_dim]``
+
+    with ``A`` the post-softmax weights and ``B`` the shared V.  ``q_per_kv`` is
+    the grouped-query ratio: 4 for Granite-8B, which has 32 query heads over 8
+    key/value heads at ``head_dim = 128`` (32 x 128 = 4096 hidden).  This is the
+    P@V stage only -- no QK^T and no softmax; ``gen_sdpa_mlir`` covers the fused
+    prefill shape.  Decode is the shape that has to cross cores: a prefill shape's
+    parallel dimensions fill the grid on their own, while a single decode step
+    leaves the output axis only ``head_dim / 64`` sticks of parallel work, so the
+    remaining cores come from splitting the KV contraction.
+
+    Grid is ``[out_split, k_split]``, dimension 0 varying fastest, so the flat core
+    id is ``pid_in * out_split + pid_out``: ``out_split`` cores divide the output
+    (``head_dim``) and ``k_split`` cores divide the KV contraction.  Because the
+    contraction is split, each group of ``k_split`` cores holds a partial sum that
+    is folded with ``ktdp.inter_tile_produce`` / ``ktdp.inter_tile_reduce`` over
+    *strided* groups -- group ``g`` is cores ``{g, g + out_split, ...}`` -- and the
+    ``pid_in == 0`` core of each group is the single writer for its output slice.
+    ``k_split = 1`` degenerates to no fold at all and stores the local product.
+
+    Preconditions, raised rather than asserted (``python -O`` strips asserts):
+
+    * ``out_split`` divides ``head_dim`` and ``k_split`` divides ``kv_len``
+    * both tile row widths -- the output slice ``head_dim / out_split`` and the
+      contraction slice ``kv_len / k_split`` -- must be whole 128-byte sticks,
+      i.e. multiples of 64 f16 elements
+    * every value is f16, including the fold's combiner region, so the running sum
+      rounds at each of the ``k_split`` steps and the *inputs* must leave headroom:
+      ``|A@B|`` grows like ``std**2 * sqrt(kv_len)``, which overflows f16 above
+      roughly ``std = 27`` at ``kv_len = 8192``.  The caller owns the input scale;
+      overflow shows up as ``inf`` in the output rather than silently.
+
+    Arithmetic intensity is close to the harmonic mean of the two tile widths,
+
+        ``AI ~= (q_per_kv * n_local) / (q_per_kv + n_local)``,   ``n_local = head_dim / out_split``
+
+    about 3.8 FLOP/B at the Granite ratio, and independent of ``kv_len``, of
+    ``k_split`` and of the core count -- each core reads a disjoint slice of the
+    contraction, so splitting harder moves no fewer bytes.  Memory-bound at 4 and
+    at 32 cores.
+    """
+    if head_dim % out_split:
+        raise ValueError(
+            f"head_dim {head_dim} must be divisible by out_split {out_split}"
+        )
+    if kv_len % k_split:
+        raise ValueError(
+            f"kv_len {kv_len} must be divisible by k_split {k_split}"
+        )
+    n_local = head_dim // out_split
+    k_local = kv_len // k_split
+    _require_stick_aligned(
+        f"output slice head_dim/out_split = {head_dim}/{out_split}", n_local)
+    _require_stick_aligned(
+        f"contraction slice kv_len/k_split = {kv_len}/{k_split}", k_local)
+    hd, kl, nl, m = head_dim, k_local, n_local, q_per_kv
+
+    a_view = _mem_view("a_view", "a_ptr", [m, kv_len], [kv_len, 1])
+    b_view = _mem_view("b_view", "b_ptr", [kv_len, hd], [hd, 1])
+    c_view = _mem_view("c_view", "c_ptr", [m, hd], [hd, 1])
+    a_acc = _access_tile("a_acc", "a_view", ["%c0", "%off_in"],
+                         [m, kl], [m, kv_len])
+    b_acc = _access_tile("b_acc", "b_view", ["%off_in", "%off_out"],
+                         [kl, nl], [kv_len, hd])
+    c_acc = _access_tile("c_acc", "c_view", ["%c0", "%off_out"],
+                         [m, nl], [m, hd])
+
+    # Strided reduce groups: group g owns cores {g, g + out_split, ...}, which is
+    # the set of cores sharing an output slice.  Spelled as a modulo constraint
+    # because the grid varies dimension 0 fastest.
+    red_tiles = (
+        f"#red_tiles = affine_set<(i)[g] : ((i - g) mod {out_split} == 0, "
+        f"i - g >= 0, -i + g + {out_split * (k_split - 1)} >= 0)>\n"
+    )
+    groups = f"affine_set<(g) : (g >= 0, -g + {out_split - 1} >= 0)>"
+
+    if k_split > 1:
+        fold = f"""
+    %fut = ktdp.inter_tile_produce
+        producer_tiles_per_group = #red_tiles
+        : tensor<{m}x{nl}xf16> -> !ktdp.tile_future<tensor<{m}x{nl}xf16>, groups = {groups}>
+    {{
+      ^bb0(%gid: index):
+        ktdp.yield_partial %prod : tensor<{m}x{nl}xf16>
+    }}
+    %zero = arith.constant 0.0 : f16
+    %id_empty = tensor.empty() : tensor<{m}x{nl}xf16>
+    %id_init = linalg.fill ins(%zero : f16) outs(%id_empty : tensor<{m}x{nl}xf16>) -> tensor<{m}x{nl}xf16>
+    %reduced = ktdp.inter_tile_reduce(%fut)
+        consumer_tiles_per_group = #red_tiles,
+        identity(%id_init : tensor<{m}x{nl}xf16>)
+        : !ktdp.tile_future<tensor<{m}x{nl}xf16>, groups = {groups}> -> tensor<{m}x{nl}xf16>
+    {{
+      ^bb0(%lhs: tensor<{m}x{nl}xf16>, %rhs: tensor<{m}x{nl}xf16>):
+        %r_empty = tensor.empty() : tensor<{m}x{nl}xf16>
+        %r_sum = linalg.add ins(%lhs, %rhs : tensor<{m}x{nl}xf16>, tensor<{m}x{nl}xf16>) outs(%r_empty : tensor<{m}x{nl}xf16>) -> tensor<{m}x{nl}xf16>
+        ktdp.yield_reduced %r_sum : tensor<{m}x{nl}xf16>
+    }}
+"""
+        # One writer per output slice: every core of a group holds the same
+        # reduced tile, so guard the store on the group's first core.
+        store = f"""    %is_writer = arith.cmpi eq, %pid_in, %c0 : index
+    scf.if %is_writer {{
+      ktdp.store %reduced, %c_acc : tensor<{m}x{nl}xf16>, !ktdp.access_tile<{m}x{nl}xindex>
+    }}"""
+    else:
+        fold = ""
+        store = (f"    ktdp.store %prod, %c_acc : tensor<{m}x{nl}xf16>, "
+                 f"!ktdp.access_tile<{m}x{nl}xindex>")
+
+    prologue = red_tiles if k_split > 1 else ""
+    return f"""{prologue}module {{
+  func.func @sdpa_decode_pv(
+      %a_ptr: index, %b_ptr: index, %c_ptr: index
+  ) attributes {{grid = [{out_split}, {k_split}]}} {{
+    %pid_out, %pid_in = ktdp.get_compute_tile_id : index, index
+    %c0 = arith.constant 0 : index
+    %blk_in = arith.constant {kl} : index
+    %off_in = arith.muli %pid_in, %blk_in : index
+    %blk_out = arith.constant {nl} : index
+    %off_out = arith.muli %pid_out, %blk_out : index
+
+{a_view}
+
+{b_view}
+
+{c_view}
+
+{a_acc}
+
+{b_acc}
+
+    %a = ktdp.load %a_acc : !ktdp.access_tile<{m}x{kl}xindex> -> tensor<{m}x{kl}xf16>
+    %b = ktdp.load %b_acc : !ktdp.access_tile<{kl}x{nl}xindex> -> tensor<{kl}x{nl}xf16>
+
+    %init = arith.constant dense<0.0> : tensor<{m}x{nl}xf16>
+    %prod = linalg.matmul ins(%a, %b : tensor<{m}x{kl}xf16>, tensor<{kl}x{nl}xf16>) outs(%init : tensor<{m}x{nl}xf16>) -> tensor<{m}x{nl}xf16>
+{fold}
+{c_acc}
+
+{store}
     return
   }}
 }}"""

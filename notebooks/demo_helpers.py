@@ -18,6 +18,7 @@ from demo_gen_mlir import (  # noqa: F401 — re-exported for notebook compat
     gen_matmul_mlir,
     gen_softmax_mlir,
     gen_sdpa_mlir,
+    gen_sdpa_decode_pv_mlir,
     gen_paged_attention_mlir,
 )
 
@@ -26,14 +27,21 @@ from demo_gen_mlir import (  # noqa: F401 — re-exported for notebook compat
 # Run helper
 # ---------------------------------------------------------------------------
 
-def run_kernel(hw, mlir_text, func_name, tensor_kwargs, scalar_kwargs=None):
-    """Load MLIR, execute a kernel, return the LatencyReport."""
+def run_kernel(hw, mlir_text, func_name, tensor_kwargs, scalar_kwargs=None,
+               return_outputs=False):
+    """Load MLIR, execute a kernel, return the LatencyReport.
+
+    With ``return_outputs`` also return the output dict, which is what a caller
+    needs to check the result against a numpy reference -- the interpreter does
+    not write back into the arrays it is handed.
+    """
     if scalar_kwargs is None:
         scalar_kwargs = {}
     interp = KTIRInterpreter(latency_config=hw)
     interp.load(mlir_text)
-    interp.execute_function(func_name, **tensor_kwargs, **scalar_kwargs)
-    return interp.get_latency_report()
+    outputs = interp.execute_function(func_name, **tensor_kwargs, **scalar_kwargs)
+    report = interp.get_latency_report()
+    return (report, outputs) if return_outputs else report
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +184,20 @@ def make_sdpa_tensors(seq_len, head_dim, rng=None):
     )
 
 
+def make_sdpa_decode_pv_tensors(kv_len, head_dim, q_per_kv=4, rng=None):
+    """Create A (weights), B (shared V) and C tensors for the decode P@V kernel.
+
+    One row of A per query head in the grouped-query bundle that shares B.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    return dict(
+        a_ptr=rng.standard_normal((q_per_kv, kv_len)).astype(np.float16),
+        b_ptr=rng.standard_normal((kv_len, head_dim)).astype(np.float16),
+        c_ptr=np.zeros((q_per_kv, head_dim), dtype=np.float16),
+    )
+
+
 def make_pa_tensors(num_tokens, num_query_heads, num_kv_heads, head_dim,
                     block_size, context_len, rng=None):
     """Create query, KV cache, block_tables, and output tensors for paged attention."""
@@ -232,6 +254,36 @@ def run_kernel_sdpa(hw, seq_len, head_dim, block_m, rng=None):
         rng = np.random.default_rng(0)
     mlir = gen_sdpa_mlir(seq_len, head_dim, block_m)
     return run_kernel(hw, mlir, "sdpa_kernel", make_sdpa_tensors(seq_len, head_dim, rng))
+
+
+def run_kernel_sdpa_decode_pv(hw, kv_len, head_dim, q_per_kv=4, out_split=2,
+                              k_split=16, rng=None):
+    """Generate decode P@V MLIR, create tensors, run, return latency and error.
+
+    Returns ``(report, {"max_abs": ..., "max_rel": ..., "zero_rows": ...})``, the
+    error being against an fp32 numpy ``A @ B``.  Always computed, because every
+    value in the kernel is f16 -- including the cross-core fold's running sum --
+    and an input scale large enough to overflow f16 shows up here and nowhere else
+    in the report.  The reference matmul is a few tens of milliseconds at the
+    largest shape the notebook runs, so there is nothing to gain from making it
+    optional.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    mlir = gen_sdpa_decode_pv_mlir(kv_len, head_dim, q_per_kv, out_split, k_split)
+    tensors = make_sdpa_decode_pv_tensors(kv_len, head_dim, q_per_kv, rng)
+    report, outputs = run_kernel(hw, mlir, "sdpa_decode_pv", tensors,
+                                 return_outputs=True)
+    got = np.asarray(outputs["c_ptr"], dtype=np.float32)
+    want = (tensors["a_ptr"].astype(np.float32)
+            @ tensors["b_ptr"].astype(np.float32))
+    abs_err = float(np.max(np.abs(got - want)))
+    scale = float(np.max(np.abs(want)))
+    return report, {
+        "max_abs": abs_err,
+        "max_rel": abs_err / scale if scale else 0.0,
+        "zero_rows": int(np.sum(np.all(got == 0, axis=1))),
+    }
 
 
 def run_kernel_pa(hw, num_tokens, context_len, num_query_heads, num_kv_heads,
