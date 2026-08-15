@@ -51,7 +51,7 @@ module {
     %row_view = ktdp.construct_memory_view %row_ptr,
                   sizes: [1, 128], strides: [128, 1] {
       coordinate_set = #row_set,
-      memory_space   = #ktdp.spyre_memory_space<HBM>
+      memory_space   = #ktdp.memory_space<global>
     } : memref<1x128xf16>
 
     // (2) Access tile and load
@@ -112,7 +112,7 @@ module {
       %out_view = ktdp.construct_memory_view %group_out,
                     sizes: [1, 128], strides: [128, 1] {
         coordinate_set = #row_set,
-        memory_space   = #ktdp.spyre_memory_space<HBM>
+        memory_space   = #ktdp.memory_space<global>
       } : memref<1x128xf16>
 
       %out_acc = ktdp.construct_access_tile %out_view[%c0, %c0] {

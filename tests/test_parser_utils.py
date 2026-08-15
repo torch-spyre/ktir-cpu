@@ -21,7 +21,13 @@ mis-tokenised these by splitting on the ``x`` inside the dtype.
 
 import pytest
 
-from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_or_memref_type, extract_outs_operands
+from ktir_cpu.parser_utils import (
+    extract_outs_operands,
+    format_memory_space,
+    parse_memory_space,
+    parse_multi_result_lhs,
+    parse_tensor_or_memref_type,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +130,7 @@ def test_parse_tensor_or_memref_type_rejects_invalid(type_str):
         ("tensor<4xf32>, %arg0", (4,), "f32"),
         # memref wrapper
         ("memref<128x32xf16>", (128, 32), "f16"),
-        ("memref<4x4xi32, #ktdp.spyre_memory_space<LX>>", (4, 4), "i32"),
+        ("memref<4x4xi32, #ktdp.memory_space<ct_local>>", (4, 4), "i32"),
         # Bare inner content (no wrapper)
         ("64x32xindex", (64, 32), "index"),
         ("256xbf16", (256,), "bf16"),
@@ -242,3 +248,64 @@ def test_parse_multi_result_lhs_mixed_complex():
 def test_parse_multi_result_lhs_malformed():
     with pytest.raises(ValueError, match="cannot parse multi-result LHS"):
         parse_multi_result_lhs("not_valid")
+
+
+# --- memory_space -----------------------------------------------------------
+#
+# `#ktdp.memory_space<global|ct_local[, ct_id = N]>` is the only spelling the
+# dialect accepts (ktir-mlir-frontend#58 removed `spyre_memory_space`).  These
+# two helpers are the single translation point between it and the
+# interpreter's HBM/LX vocabulary, so both directions are pinned here.
+
+@pytest.mark.parametrize("text,expected", [
+    ("memory_space = #ktdp.memory_space<global>", ("HBM", None)),
+    ("memory_space = #ktdp.memory_space<ct_local>", ("LX", None)),
+    ("#ktdp.memory_space<ct_local, ct_id = 0>", ("LX", 0)),
+    ("#ktdp.memory_space<ct_local, ct_id = 7>", ("LX", 7)),
+    # Whitespace inside the attribute is insignificant.
+    ("#ktdp.memory_space<  ct_local ,  ct_id   =  3  >", ("LX", 3)),
+])
+def test_parse_memory_space(text, expected):
+    assert parse_memory_space(text) == expected
+
+
+def test_parse_memory_space_absent_returns_none():
+    """An op with no memory_space attribute is not an error — callers default."""
+    assert parse_memory_space("ktdp.load %acc : tensor<4xf16>") is None
+
+
+@pytest.mark.parametrize("kind", ["HBM", "LX", "unspecified", "GLOBAL"])
+def test_parse_memory_space_rejects_unknown_kind(kind):
+    """The pre-#58 spellings and the dropped `unspecified` must not parse."""
+    with pytest.raises(ValueError, match="Unknown #ktdp.memory_space kind"):
+        parse_memory_space(f"#ktdp.memory_space<{kind}>")
+
+
+@pytest.mark.parametrize("memory_space,ct_id,expected", [
+    ("HBM", None, "#ktdp.memory_space<global>"),
+    ("LX", None, "#ktdp.memory_space<ct_local>"),
+    ("LX", 0, "#ktdp.memory_space<ct_local, ct_id = 0>"),
+    ("LX", 5, "#ktdp.memory_space<ct_local, ct_id = 5>"),
+])
+def test_format_memory_space(memory_space, ct_id, expected):
+    assert format_memory_space(memory_space, ct_id) == expected
+
+
+def test_format_memory_space_rejects_unknown_space():
+    with pytest.raises(ValueError, match="Unknown memory_space"):
+        format_memory_space("LX0")
+
+
+def test_format_memory_space_rejects_ct_id_on_global():
+    """Global memory has no per-tile identity, so ct_id is meaningless there."""
+    with pytest.raises(ValueError, match="only meaningful for tile-local"):
+        format_memory_space("HBM", 3)
+
+
+@pytest.mark.parametrize("memory_space,ct_id", [
+    ("HBM", None), ("LX", None), ("LX", 0), ("LX", 5),
+])
+def test_memory_space_round_trip(memory_space, ct_id):
+    assert parse_memory_space(
+        format_memory_space(memory_space, ct_id)
+    ) == (memory_space, ct_id)

@@ -64,7 +64,7 @@ class MemRef:
     # corner) — relied on by ``distributed_tile_access`` for ``p_i``.
     coordinate_set: Optional[AffineSet] = None
     # Set when memory_space="LX" and a core index was specified via
-    # #ktdp.spyre_memory_space<LX, core = N>.  None means "the executing
+    # #ktdp.memory_space<ct_local, ct_id = N>.  None means "the executing
     # core's own LX scratchpad" (default routing).
     lx_core_id: Optional[int] = None
 

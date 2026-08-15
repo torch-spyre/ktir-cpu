@@ -79,22 +79,22 @@ module {
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xf16>
 
     %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xi32>
 
     %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xi32>
 
     %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xf16>
 
     %X_access_tile = ktdp.construct_indirect_access_tile
@@ -173,12 +173,12 @@ module {
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xf16>
 
     %IDX = ktdp.construct_memory_view %IDX_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xi32>
 
     %tile = ktdp.construct_indirect_access_tile
@@ -205,12 +205,12 @@ module {
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xf16>
 
     %IDX = ktdp.construct_memory_view %IDX_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 3 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xi32>
 
     %tile = ktdp.construct_indirect_access_tile
@@ -328,22 +328,22 @@ module {
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xf16>
 
     %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xi32>
 
     %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xi32>
 
     %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [4, 4], strides: [4, 1] {
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<4x4xf16>
 
     %c0 = arith.constant 0 : index
@@ -497,22 +497,22 @@ module {{
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xf16>
 
     %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xi32>
 
     %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xi32>
 
     %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xf16>
 
     %X_access_tile = ktdp.construct_indirect_access_tile
@@ -553,22 +553,22 @@ module {{
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xf16>
 
     %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xi32>
 
     %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xi32>
 
     %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [4, 4], strides: [4, 1] {{
         coordinate_set = #coord_set_4x4,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     }} : memref<4x4xf16>
 
     %c0 = arith.constant 0 : index
@@ -660,17 +660,17 @@ module {
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x2x2xf16>
 
     %IDX = ktdp.construct_memory_view %IDX_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x2x2xi32>
 
     %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x2x2xf16>
 
     %X_access_tile = ktdp.construct_indirect_access_tile
@@ -750,17 +750,17 @@ module {
 
     %X_view = ktdp.construct_memory_view %X_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x2x2xf16>
 
     %IDX = ktdp.construct_memory_view %IDX_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x2x2xi32>
 
     %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [2, 2, 2], strides: [4, 2, 1] {
         coordinate_set = #coord_set_2x2x2,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x2x2xf16>
 
     %c0 = arith.constant 0 : index
@@ -974,12 +974,12 @@ module {
 
     %src = ktdp.construct_memory_view %src_addr, sizes: [128], strides: [1] {
         coordinate_set = #src_set,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<128xf16>
 
     %dst = ktdp.construct_memory_view %dst_addr, sizes: [2, 64], strides: [64, 1] {
         coordinate_set = #dst_set,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x64xf16>
 
     %src_tile = ktdp.construct_indirect_access_tile

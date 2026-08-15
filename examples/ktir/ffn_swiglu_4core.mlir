@@ -123,12 +123,12 @@ module {
 
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [4, 256], strides: [256, 1] {
       coordinate_set = #x_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<4x256xf16>
 
     %out_view = ktdp.construct_memory_view %out_ptr, sizes: [4, 256], strides: [256, 1] {
       coordinate_set = #x_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<4x256xf16>
 
     // ---- W_gate [256, 1024] distributed view: 4 column shards ----
@@ -139,19 +139,19 @@ module {
 
     %gate_p0 = ktdp.construct_memory_view %w_gate_ptr, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_0,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %gate_p1 = ktdp.construct_memory_view %gate_p1_base, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_1,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %gate_p2 = ktdp.construct_memory_view %gate_p2_base, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_2,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %gate_p3 = ktdp.construct_memory_view %gate_p3_base, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_3,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
 
     %w_gate_dist = ktdp.construct_distributed_memory_view
@@ -166,19 +166,19 @@ module {
 
     %up_p0 = ktdp.construct_memory_view %w_up_ptr, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_0,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %up_p1 = ktdp.construct_memory_view %up_p1_base, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_1,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %up_p2 = ktdp.construct_memory_view %up_p2_base, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_2,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %up_p3 = ktdp.construct_memory_view %up_p3_base, sizes: [256, 256], strides: [1024, 1] {
       coordinate_set = #gate_col_3,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
 
     %w_up_dist = ktdp.construct_distributed_memory_view
@@ -193,19 +193,19 @@ module {
 
     %down_p0 = ktdp.construct_memory_view %w_down_ptr, sizes: [256, 256], strides: [256, 1] {
       coordinate_set = #down_row_0,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %down_p1 = ktdp.construct_memory_view %down_p1_base, sizes: [256, 256], strides: [256, 1] {
       coordinate_set = #down_row_1,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %down_p2 = ktdp.construct_memory_view %down_p2_base, sizes: [256, 256], strides: [256, 1] {
       coordinate_set = #down_row_2,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
     %down_p3 = ktdp.construct_memory_view %down_p3_base, sizes: [256, 256], strides: [256, 1] {
       coordinate_set = #down_row_3,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
 
     %w_down_dist = ktdp.construct_distributed_memory_view

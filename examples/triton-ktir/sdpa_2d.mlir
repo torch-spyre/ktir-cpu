@@ -51,7 +51,7 @@ module {
     // -----------------------------------------------------------------------
     %q_view = ktdp.construct_memory_view %q_ptr, sizes: [32, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<32x64xf16>
 
     %q_tile = ktdp.construct_access_tile %q_view[%pid_m, %c0] {
@@ -71,7 +71,7 @@ module {
     // -----------------------------------------------------------------------
     %k_view = ktdp.construct_memory_view %k_ptr, sizes: [32, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<32x64xf16>
 
     %k_tile = ktdp.construct_access_tile %k_view[%c0, %c0] {
@@ -154,7 +154,7 @@ module {
     // -----------------------------------------------------------------------
     %v_view = ktdp.construct_memory_view %v_ptr, sizes: [32, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<32x64xf16>
 
     %v_tile = ktdp.construct_access_tile %v_view[%c0, %c0] {
@@ -180,7 +180,7 @@ module {
     // -----------------------------------------------------------------------
     %output_view = ktdp.construct_memory_view %output_ptr, sizes: [32, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<32x64xf16>
 
     %output_tile = ktdp.construct_access_tile %output_view[%pid_m, %c0] {

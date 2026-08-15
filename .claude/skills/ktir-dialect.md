@@ -88,7 +88,7 @@ operation ::= `ktdp.construct_memory_view` $offset `,` `sizes` `:`
 ```mlir
 #set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 31 >= 0, d1 >= 0, -d1 + 64 >= 0)>
 %A_view = ktdp.construct_memory_view %A_start_address, sizes: [32, 64], strides: [64, 1] {
-    coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>
+    coordinate_set = #set, memory_space = #ktdp.memory_space<global>
 } : memref<32x64xf16>
 ```
 
@@ -254,11 +254,26 @@ access_tile<1 x 64 x index>     // Fully static
 
 Generic abstraction for device-specific memory space attributes within `ktdp`. Provides a uniform mechanism to associate IR values with a target-specific memory hierarchy while remaining extensible across backends.
 
-Concrete implementations (e.g., `SpyreMemorySpaceAttr`) describe specific memory kinds (on-chip scratchpad, HBM) and optional core affinity. This is preferred over integer-based memory space annotations in memref types, which lack readability and semantic richness for distributed scratchpad architectures.
+`MemorySpaceAttr` describes *where* memory is visible rather than naming device-specific
+memories: `global` is reachable by every compute tile, `ct_local` is private to one, with
+optional per-tile affinity via `ct_id`. This is preferred over integer-based memory space
+annotations in memref types, which lack readability and semantic richness for distributed
+scratchpad architectures.
 
 ```mlir
-memory_space = #ktdp.spyre_memory_space<HBM>
+memory_space = #ktdp.memory_space<global>
+memory_space = #ktdp.memory_space<ct_local>
+memory_space = #ktdp.memory_space<ct_local, ct_id = 7>
 ```
+
+> **Divergence from RFC 0682.** The RFC specifies an abstract `KtdpMemorySpaceAttr`
+> interface with a Spyre-specific `SpyreMemorySpaceAttr` implementation spelled
+> `#ktdp.spyre_memory_space<HBM|LX[, core = N]>` (plus an `unspecified` kind).
+> ktir-mlir-frontend#58 removed that interface and renamed the attribute to the
+> device-agnostic form above; `unspecified` was dropped with no replacement, and the
+> old spelling no longer parses. Treat the syntax here as authoritative over the RFC
+> text. `ktir-cpu` maps `global`→`HBM` and `ct_local`→`LX` at the parse boundary,
+> keeping the concrete Spyre hierarchy in the interpreter and latency model.
 
 Future extensions will include richer metadata for compute-memory affinity.
 
@@ -281,17 +296,17 @@ module {
 
     %A_view = ktdp.construct_memory_view %A_start_address, sizes: [96, 64], strides: [64, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<96x64xf16>
 
     %B_view = ktdp.construct_memory_view %B_start_address, sizes: [96, 64], strides: [64, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<96x64xf16>
 
     %C_view = ktdp.construct_memory_view %C_start_address, sizes: [96, 64], strides: [64, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 95 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<96x64xf16>
 
     scf.for %i = %c0 to %tile_size step %c1 {

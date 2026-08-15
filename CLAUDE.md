@@ -13,7 +13,11 @@ The full spec is also mirrored in `.claude/skills/ktir-dialect.md`.
 - Specifically verify:
   - `ktdp` dialect ops (`get_compute_tile_id`, `construct_memory_view`, `construct_distributed_memory_view`, `construct_access_tile`, `construct_indirect_access_tile`, `load`, `store`) match the spec's syntax, operands, attributes, and semantics.
   - `AccessTileType` element type is always `index`.
-  - `SpyreMemorySpaceAttr` uses `#ktdp.spyre_memory_space<...>` syntax.
+  - `MemorySpaceAttr` uses `#ktdp.memory_space<global|ct_local[, ct_id = N]>` syntax.
+    (This supersedes the RFC's `#ktdp.spyre_memory_space<HBM|LX[, core = N]>`, renamed
+    upstream in ktir-mlir-frontend#58; the old spelling no longer parses. The
+    interpreter still uses `HBM`/`LX` internally — translation happens at the parse
+    boundary via `parse_memory_space`/`format_memory_space` in `parser_utils.py`.)
   - `coordinate_set` uses `IntegerSetAttr` (affine integer sets).
   - `base_map` and `access_tile_order` use `AffineMapAttr`.
   - `access_tile_order` follows lexicographic semantics (rightmost = innermost).

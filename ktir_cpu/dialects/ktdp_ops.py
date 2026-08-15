@@ -41,6 +41,7 @@ from ..parser_utils import (
     extract_named_attr,
     find_ssa_names,
     parse_attr_block,
+    parse_memory_space,
     parse_multi_result_lhs,
     parse_tensor_or_memref_type,
     parse_tile_future_type,
@@ -336,30 +337,27 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
                     ssa_stride_operands.append(token)
         strides = parsed
 
-    memory_space = "HBM"
-    lx_core_id = None
-    # Accept both `<HBM>`/`<LX>` and the RFC's per-core LX form
-    # `<LX, core = N>`.  On real hardware each compute core has its own
-    # private LX SRAM, so a partition tagged `core = N` lives in core N's
-    # scratchpad — captured into lx_core_id and used at load/store time.
-    mem_match = re.search(
-        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
-        op_text,
-    )
-    if mem_match:
-        memory_space = mem_match.group(1)
-        if mem_match.group(2) is not None:
-            lx_core_id = int(mem_match.group(2))
+    # `#ktdp.memory_space<global|ct_local[, ct_id = N]>`, translated to the
+    # interpreter's HBM/LX vocabulary.  Absent attribute defaults to HBM.
+    memory_space, lx_core_id = parse_memory_space(op_text) or ("HBM", None)
 
     # dtype and shape are parsed from the memref result type.
     # Validate sizes against memref dimensions when both are concrete.
     memref_match = re.search(r'(?:}\s*)?:\s*(?:index\s*->\s*)?memref<([^>]+)>', op_text)
     if not memref_match:
         raise ValueError("construct_memory_view: could not parse dtype from memref<> type")
-    info = parse_tensor_or_memref_type(memref_match.group(1), keep_dynamic_dims=True)
+    # Pass the wrapped "memref<...>" form, not the bare inner content: the
+    # rank-0 branch in parse_tensor_or_memref_type only fires for a wrapped
+    # type, since a bare "f32" is otherwise indistinguishable from a failed
+    # parse. Rank 0 (memref<f32>, no dims) is what Triton's LowerScalarLoad
+    # emits for a scalar read.
+    info = parse_tensor_or_memref_type(
+        f"memref<{memref_match.group(1)}>", keep_dynamic_dims=True
+    )
     if not info:
         raise ValueError(
-            f"construct_memory_view: memref<{memref_match.group(1)}> has no dimensions"
+            f"construct_memory_view: memref<{memref_match.group(1)}> "
+            f"has no parsable element type"
         )
     dtype = info["dtype"]
     memref_dims = list(info["shape"])
@@ -512,7 +510,11 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
     # identifier.  A naive split('x') would shred "index" into ['inde', '']
     # because 'index' contains 'x'.  The regex anchors group(1) to the
     # leading "NxMx..." portion and group(2) to the trailing type name.
-    type_match = re.match(r'^(\d+(?:x\d+)*)x([a-zA-Z_]\w*)$', inner)
+    # The dim portion is optional: a rank-0 tile is "index" alone, with no
+    # dims and hence no 'x' separator (emitted by Triton's LowerScalarLoad
+    # for a scalar read). "128" without an element type still fails, since
+    # group(2) is required.
+    type_match = re.match(r'^(?:(\d+(?:x\d+)*)x)?([a-zA-Z_]\w*)$', inner)
     if not type_match:
         raise ValueError(
             f"Malformed access_tile type {inner!r}: expected '<dims>xindex>'"
@@ -522,8 +524,10 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
         raise ValueError(
             f"AccessTileType element type must be 'index', got {elem_type!r}"
         )
-    shape_parts = [int(d) for d in type_match.group(1).strip('x').split('x') if d]
-    access_shape = tuple(shape_parts)
+    dims = type_match.group(1)
+    access_shape = (
+        tuple(int(d) for d in dims.strip('x').split('x') if d) if dims else ()
+    )
 
     # Extract and resolve affine attributes; parse into AffineMap/AffineSet objects.
     # Aliases are resolved immediately so Operation.attributes holds concrete objects.

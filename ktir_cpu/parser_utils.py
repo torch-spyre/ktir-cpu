@@ -30,6 +30,76 @@ def find_ssa_names(text: str) -> list[str]:
     return _SSA_RE.findall(text)
 
 
+_MEMORY_SPACE_RE = re.compile(
+    r'#ktdp\.memory_space<\s*(\w+)(?:\s*,\s*ct_id\s*=\s*(\d+))?\s*>'
+)
+
+# KTDP spells memory spaces in device-agnostic terms: `global` is visible to
+# every compute tile, `ct_local` is private to one.  The interpreter models the
+# concrete Spyre hierarchy those map onto (HBM stick addressing, per-core LX
+# scratchpads, and the latency model keyed off both), so the wire names are
+# translated to the internal vocabulary here at the single parse boundary
+# rather than renaming 130+ interior sites.
+_MEMORY_SPACE_KINDS = {"global": "HBM", "ct_local": "LX"}
+
+
+def parse_memory_space(text: str) -> Optional[tuple[str, Optional[int]]]:
+    """Parse a ``#ktdp.memory_space<...>`` attribute into interpreter terms.
+
+    Accepts ``<global>``, ``<ct_local>`` and the per-tile form
+    ``<ct_local, ct_id = N>``.  On real hardware each compute tile has its own
+    private LX SRAM, so a view tagged ``ct_id = N`` lives in tile N's
+    scratchpad; the id is returned so load/store can route to it.
+
+    Returns:
+        ``(memory_space, ct_id)`` with *memory_space* as the interpreter's
+        ``"HBM"``/``"LX"`` and *ct_id* ``None`` when unqualified, or ``None``
+        if *text* holds no ``memory_space`` attribute at all.
+
+    Raises:
+        ValueError: if the attribute is present but names an unknown kind.
+    """
+    m = _MEMORY_SPACE_RE.search(text)
+    if not m:
+        return None
+    kind = m.group(1)
+    if kind not in _MEMORY_SPACE_KINDS:
+        raise ValueError(
+            f"Unknown #ktdp.memory_space kind {kind!r}; "
+            f"expected one of {sorted(_MEMORY_SPACE_KINDS)}"
+        )
+    ct_id = int(m.group(2)) if m.group(2) is not None else None
+    return _MEMORY_SPACE_KINDS[kind], ct_id
+
+
+def format_memory_space(memory_space: str, ct_id: Optional[int] = None) -> str:
+    """Render a ``#ktdp.memory_space<...>`` attribute from interpreter terms.
+
+    Inverse of :func:`parse_memory_space` — takes the interpreter's
+    ``"HBM"``/``"LX"`` and emits the dialect's ``global``/``ct_local``
+    spelling.  Used to build IR text (examples, generated kernels, tests)
+    from internal values.
+
+    Raises:
+        ValueError: if *memory_space* is not a known interpreter space, or
+            *ct_id* is given for a space that has no per-tile identity.
+    """
+    inverse = {v: k for k, v in _MEMORY_SPACE_KINDS.items()}
+    if memory_space not in inverse:
+        raise ValueError(
+            f"Unknown memory_space {memory_space!r}; "
+            f"expected one of {sorted(inverse)}"
+        )
+    kind = inverse[memory_space]
+    if ct_id is None:
+        return f"#ktdp.memory_space<{kind}>"
+    if memory_space != "LX":
+        raise ValueError(
+            f"ct_id is only meaningful for tile-local memory, got {memory_space!r}"
+        )
+    return f"#ktdp.memory_space<{kind}, ct_id = {ct_id}>"
+
+
 _OUTS_RE = re.compile(r'\bouts\s*\(([^)]+)\)')
 _BB0_RE = re.compile(r'\^bb0\s*\(([^)]*)\)')
 
@@ -276,7 +346,7 @@ def parse_attr_block(op_text: str, aliases: Optional[Dict] = None,
     Values are returned as Python scalars (int/float/list/str).  Handles:
 
     - ``keyword<...>`` values (e.g. ``affine_map<...>``, ``affine_set<...>``,
-      ``#ktdp.spyre_memory_space<HBM>``): ``<``/``>`` depth is counted while
+      ``#ktdp.memory_space<global>``): ``<``/``>`` depth is counted while
       skipping ``>=`` and ``->`` operators so constraint expressions like
       ``d0 >= 0`` do not prematurely close the value.
     - ``#alias`` references: resolved via *aliases* when provided.

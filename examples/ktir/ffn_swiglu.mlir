@@ -26,27 +26,27 @@ module {
     // Create memory views
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [1, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<1x64xf16>
     
     %w_gate_view = ktdp.construct_memory_view %w_gate_ptr, sizes: [64, 128], strides: [128, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x128xf16>
     
     %w_up_view = ktdp.construct_memory_view %w_up_ptr, sizes: [64, 128], strides: [128, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x128xf16>
     
     %w_down_view = ktdp.construct_memory_view %w_down_ptr, sizes: [128, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<128x64xf16>
     
     %out_view = ktdp.construct_memory_view %out_ptr, sizes: [1, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 0 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<1x64xf16>
     
     // Load input x

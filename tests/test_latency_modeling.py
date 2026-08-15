@@ -31,6 +31,7 @@ from ktir_cpu import KTIRInterpreter, HardwareConfig, ExecutionModel
 from ktir_cpu.ir_types import _iter_ops
 
 from ktir_cpu.parser_ast import parse_affine_set
+from ktir_cpu.parser_utils import format_memory_space
 
 from conftest import get_test_params
 
@@ -89,7 +90,7 @@ _EXP_MLIR = textwrap.dedent("""\
         %x_view = ktdp.construct_memory_view %x_ptr,
             sizes: [{total}], strides: [1]
             {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + {total_m1} >= 0)>,
-               memory_space = #ktdp.spyre_memory_space<HBM> }}
+               memory_space = #ktdp.memory_space<global> }}
             : index -> memref<{total}xf16>
         %x_acc = ktdp.construct_access_tile %x_view[%offset] {{
             base_map = affine_map<(i) -> (i)>,
@@ -100,7 +101,7 @@ _EXP_MLIR = textwrap.dedent("""\
         %out_view = ktdp.construct_memory_view %out_ptr,
             sizes: [{total}], strides: [1]
             {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + {total_m1} >= 0)>,
-               memory_space = #ktdp.spyre_memory_space<HBM> }}
+               memory_space = #ktdp.memory_space<global> }}
             : index -> memref<{total}xf16>
         %out_acc = ktdp.construct_access_tile %out_view[%offset] {{
             base_map = affine_map<(i) -> (i)>,
@@ -125,7 +126,7 @@ def _copy_mlir(func_name: str, memory_space: str) -> str:
             %x_view = ktdp.construct_memory_view %x_ptr,
                 sizes: [128], strides: [1]
                 {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,
-                  memory_space = #ktdp.spyre_memory_space<{memory_space}> }}
+                  memory_space = {format_memory_space(memory_space)} }}
                 : index -> memref<128xf16>
             %c0 = arith.constant {{0 : index}} : index
             %x_acc = ktdp.construct_access_tile %x_view[%c0] {{
@@ -136,7 +137,7 @@ def _copy_mlir(func_name: str, memory_space: str) -> str:
             %out_view = ktdp.construct_memory_view %out_ptr,
                 sizes: [128], strides: [1]
                 {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,
-                  memory_space = #ktdp.spyre_memory_space<{memory_space}> }}
+                  memory_space = {format_memory_space(memory_space)} }}
                 : index -> memref<128xf16>
             %c0b = arith.constant {{0 : index}} : index
             %out_acc = ktdp.construct_access_tile %out_view[%c0b] {{

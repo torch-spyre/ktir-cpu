@@ -13,12 +13,12 @@ module {
     %end = arith.select %cmp, %end_raw, %c_R : index  // end = min(end_raw, R)
     %input_view_1 = ktdp.construct_memory_view %input_ptr, sizes: [2, 262144], strides: [262144, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 262143 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x262144xf16>
 
     %output_view_2 = ktdp.construct_memory_view %output_ptr, sizes: [2, 262144], strides: [262144, 1] {
         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 262143 >= 0)>,
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<2x262144xf16>
 
     scf.for %row = %start to %end step %c1  : index {

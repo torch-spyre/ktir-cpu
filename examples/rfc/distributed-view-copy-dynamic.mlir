@@ -47,12 +47,12 @@ module {
     // (1) Per-partition memory views with symbolic trailing dim.
     %A0_view = ktdp.construct_memory_view %a0_ptr, sizes: [64, %s0], strides: [%s0, 1] {
       coordinate_set = #A0_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x?xf16>
 
     %A1_view = ktdp.construct_memory_view %a1_ptr, sizes: [64, %s0], strides: [%s0, 1] {
       coordinate_set = #A1_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x?xf16>
 
     // (1) Compose into a single logical distributed view.  Inputs are
@@ -64,7 +64,7 @@ module {
     // (1) Output view B, dynamic like the partitions (trailing dim = 2*s0).
     %B_view = ktdp.construct_memory_view %b_ptr, sizes: [64, %ub], strides: [%ub, 1] {
       coordinate_set = #B_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x?xf16>
 
     // (2)+(3) Iterate access tiles across the global domain.  Trip count

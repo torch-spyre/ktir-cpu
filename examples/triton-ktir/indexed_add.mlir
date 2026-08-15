@@ -12,14 +12,14 @@ module {
     // Memory view for index tensor: shape [2] (num_indices), stride [1]
     %index_view = ktdp.construct_memory_view %index_ptr, sizes: [2], strides: [1] {
       coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<2xi64>
 
     // Memory view for x: shape [128, 64, 8, 128]
     // strides: [64*8*128, 8*128, 128, 1] = [65536, 1024, 128, 1]
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [128, 64, 8, 128], strides: [65536, 1024, 128, 1] {
       coordinate_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 127 >= 0, d1 >= 0, -d1 + 63 >= 0, d2 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<128x64x8x128xf16>
 
     %x_tile = ktdp.construct_indirect_access_tile
@@ -33,7 +33,7 @@ module {
     // strides: [32*8*128, 8*128, 128, 1] = [32768, 1024, 128, 1]
     %y_view = ktdp.construct_memory_view %y_ptr, sizes: [2, 32, 8, 128], strides: [32768, 1024, 128, 1] {
       coordinate_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<2x32x8x128xf16>
 
     // Direct access tile for y: y[grid0, dim1_start, grid1, 0] covering [1, 32, 1, 128]
@@ -50,7 +50,7 @@ module {
     // Memory view for output (same layout as y)
     %output_view = ktdp.construct_memory_view %output_ptr, sizes: [2, 32, 8, 128], strides: [32768, 1024, 128, 1] {
       coordinate_set = affine_set<(d0, d1, d2, d3) : (d0 >= 0, -d0 + 1 >= 0, d1 >= 0, -d1 + 31 >= 0, d2 >= 0, -d2 + 7 >= 0, d3 >= 0, -d3 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<2x32x8x128xf16>
 
     %output_tile = ktdp.construct_access_tile %output_view[%grid0, %dim1_start, %grid1, %c0] {

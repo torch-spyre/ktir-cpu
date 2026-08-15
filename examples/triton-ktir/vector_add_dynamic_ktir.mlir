@@ -16,7 +16,7 @@ module {
     %n = arith.index_cast %n_elements : i32 to index
 
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [%n], strides: [1] {
-      coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set, memory_space = #ktdp.memory_space<global>
     } : memref<?xf32>
     %x_tile = ktdp.construct_access_tile %x_view[%c0] {
       access_tile_order = #map, access_tile_set = #set1
@@ -24,7 +24,7 @@ module {
     %x = ktdp.load %x_tile : <1024xindex> -> tensor<1024xf32>
 
     %y_view = ktdp.construct_memory_view %y_ptr, sizes: [%n], strides: [1] {
-      coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set, memory_space = #ktdp.memory_space<global>
     } : memref<?xf32>
     %y_tile = ktdp.construct_access_tile %y_view[%c0] {
       access_tile_order = #map, access_tile_set = #set1
@@ -34,7 +34,7 @@ module {
     %output = arith.addf %x, %y : tensor<1024xf32>
 
     %output_view = ktdp.construct_memory_view %output_ptr, sizes: [%n], strides: [1] {
-      coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = #set, memory_space = #ktdp.memory_space<global>
     } : memref<?xf32>
     %output_tile = ktdp.construct_access_tile %output_view[%c0] {
       access_tile_order = #map, access_tile_set = #set1

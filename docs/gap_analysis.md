@@ -23,7 +23,7 @@
 | # | Spec Item | Status | Notes |
 |---|-----------|--------|-------|
 | 3 | `AccessTileType` with dynamic dimensions (`?`) | ❌ | The spec allows `access_tile<? x 64 x index>` (partially/fully dynamic shapes). The parser only extracts static integer dimensions — dynamic `?` dimensions are silently dropped. |
-| 4 | `MemorySpaceAttr` (generic) | 🟡 | The parser extracts `SpyreMemorySpaceAttr` (`HBM`/`LX`), but the spec describes `MemorySpaceAttr` as a generic extensible wrapper that could encapsulate other hardware backends. The implementation hardcodes Spyre-specific memory spaces only. |
+| 4 | `MemorySpaceAttr` (generic) | 🟢 | Resolved upstream by [ktir-mlir-frontend#58](https://github.com/torch-spyre/ktir-mlir-frontend/pull/58), which removed the `KtdpMemorySpaceAttr` interface and replaced Spyre-specific `#ktdp.spyre_memory_space<HBM\|LX[, core = N]>` with device-agnostic `#ktdp.memory_space<global\|ct_local[, ct_id = N]>` (the `unspecified` kind was dropped). Both parsers now accept only the new spelling and translate to the interpreter's `HBM`/`LX` at the parse boundary (`parse_memory_space` / `format_memory_space` in `parser_utils.py`), so the Spyre hierarchy stays confined to the simulator and latency model. |
 
 ## C. Affine/Polyhedral Attributes
 
