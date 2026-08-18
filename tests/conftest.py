@@ -397,6 +397,17 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
         },
     ],
     # ---------------------------------------------------------------------------
+    # RoPE forward (Issue #166)
+    # ---------------------------------------------------------------------------
+    "rope_fwd_kernel": [
+        {
+            "path": "latency/rope_fwd_4x2.mlir",
+            # LLaMA-8B / Granite-8B: H=40, S=4096, D=128, grid=[4,2]
+            # All dimensions baked into MLIR; no scalar kwargs needed.
+            "execute_kwargs": {},
+        },
+    ],
+    # ---------------------------------------------------------------------------
     # FFN-SwiGLU example (Issue #77)
     # ---------------------------------------------------------------------------
     "ffn_swiglu": [
