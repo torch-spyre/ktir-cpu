@@ -165,8 +165,7 @@ module {
         }
 
         %id_init = tensor.empty() : tensor<1xf16>
-        %add_id  = linalg.fill ins(%zero_scalar : f16) outs(%id_init : tensor<1xf16>)
-                     -> tensor<1xf16>
+        %add_id = linalg.fill ins(%zero_scalar : f16) outs(%id_init : tensor<1xf16>) -> tensor<1xf16>
 
         %full_sum = ktdp.inter_tile_reduce(%fut) consumer_tiles_per_group = #col_partners, identity(%add_id : tensor<1xf16>) : <(tensor<1xf16>), groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>> -> tensor<1xf16>
         {
