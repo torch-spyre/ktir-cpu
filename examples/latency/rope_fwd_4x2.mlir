@@ -48,22 +48,22 @@ module {
     // --- Construct memory views ---
     %x_view = ktdp.construct_memory_view %x_ptr, sizes: [163840, 128], strides: [128, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 163839 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<163840x128xf16>
 
     %cos_view = ktdp.construct_memory_view %cos_ptr, sizes: [4096, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 4095 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<4096x64xf16>
 
     %sin_view = ktdp.construct_memory_view %sin_ptr, sizes: [4096, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 4095 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<4096x64xf16>
 
     %out_view = ktdp.construct_memory_view %out_ptr, sizes: [163840, 128], strides: [128, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 163839 >= 0, d1 >= 0, -d1 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<163840x128xf16>
 
     // --- OUTER LOOP: seq-tile loop (TILE_SEQ=256) ---
