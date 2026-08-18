@@ -346,18 +346,10 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
     memref_match = re.search(r'(?:}\s*)?:\s*(?:index\s*->\s*)?memref<([^>]+)>', op_text)
     if not memref_match:
         raise ValueError("construct_memory_view: could not parse dtype from memref<> type")
-    # Pass the wrapped "memref<...>" form, not the bare inner content: the
-    # rank-0 branch in parse_tensor_or_memref_type only fires for a wrapped
-    # type, since a bare "f32" is otherwise indistinguishable from a failed
-    # parse. Rank 0 (memref<f32>, no dims) is what Triton's LowerScalarLoad
-    # emits for a scalar read.
-    info = parse_tensor_or_memref_type(
-        f"memref<{memref_match.group(1)}>", keep_dynamic_dims=True
-    )
+    info = parse_tensor_or_memref_type(memref_match.group(1), keep_dynamic_dims=True)
     if not info:
         raise ValueError(
-            f"construct_memory_view: memref<{memref_match.group(1)}> "
-            f"has no parsable element type"
+            f"construct_memory_view: memref<{memref_match.group(1)}> has no dimensions"
         )
     dtype = info["dtype"]
     memref_dims = list(info["shape"])
@@ -510,11 +502,7 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
     # identifier.  A naive split('x') would shred "index" into ['inde', '']
     # because 'index' contains 'x'.  The regex anchors group(1) to the
     # leading "NxMx..." portion and group(2) to the trailing type name.
-    # The dim portion is optional: a rank-0 tile is "index" alone, with no
-    # dims and hence no 'x' separator (emitted by Triton's LowerScalarLoad
-    # for a scalar read). "128" without an element type still fails, since
-    # group(2) is required.
-    type_match = re.match(r'^(?:(\d+(?:x\d+)*)x)?([a-zA-Z_]\w*)$', inner)
+    type_match = re.match(r'^(\d+(?:x\d+)*)x([a-zA-Z_]\w*)$', inner)
     if not type_match:
         raise ValueError(
             f"Malformed access_tile type {inner!r}: expected '<dims>xindex>'"
@@ -524,10 +512,8 @@ def parse_construct_access_tile(op_text, parse_ctx: ParseContext):
         raise ValueError(
             f"AccessTileType element type must be 'index', got {elem_type!r}"
         )
-    dims = type_match.group(1)
-    access_shape = (
-        tuple(int(d) for d in dims.strip('x').split('x') if d) if dims else ()
-    )
+    shape_parts = [int(d) for d in type_match.group(1).strip('x').split('x') if d]
+    access_shape = tuple(shape_parts)
 
     # Extract and resolve affine attributes; parse into AffineMap/AffineSet objects.
     # Aliases are resolved immediately so Operation.attributes holds concrete objects.

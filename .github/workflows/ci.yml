@@ -38,9 +38,10 @@ jobs:
           curl -fsSL "$SETUP_MLIR" -o /tmp/setup_mlir.py
           MLIR_DIR=$(GIT_PAT="${{ secrets.GITHUB_TOKEN }}" uv run python /tmp/setup_mlir.py --hash "$LLVM_HASH" --repo torch-spyre/ktir-mlir-frontend)
           # The install step below uses --no-build-isolation, which bypasses
-          # ktir-mlir-frontend's build-system.requires — so its `cmake>=4.0`
-          # pin (torch-spyre/ktir-mlir-frontend#59) does not apply and must be
-          # satisfied here instead. cmake>=4.0 is required: CMake 3.x writes the
+          # ktir-mlir-frontend's build-system.requires — so the `cmake>=4.0` pin
+          # it declares upstream (torch-spyre/ktir-mlir-frontend#59) is not
+          # applied and must be satisfied here instead. Keep this in sync with
+          # that pin. cmake>=4.0 is required: CMake 3.x writes the
           # full target name into its file-API reply filename, and MLIR's
           # mlir_generate_type_stubs() builds a 283-char target name by joining
           # DEPENDS_TARGETS, overflowing NAME_MAX (255). CMake 4.0 truncates the

@@ -14,10 +14,16 @@ The full spec is also mirrored in `.claude/skills/ktir-dialect.md`.
   - `ktdp` dialect ops (`get_compute_tile_id`, `construct_memory_view`, `construct_distributed_memory_view`, `construct_access_tile`, `construct_indirect_access_tile`, `load`, `store`) match the spec's syntax, operands, attributes, and semantics.
   - `AccessTileType` element type is always `index`.
   - `MemorySpaceAttr` uses `#ktdp.memory_space<global|ct_local[, ct_id = N]>` syntax.
-    (This supersedes the RFC's `#ktdp.spyre_memory_space<HBM|LX[, core = N]>`, renamed
-    upstream in ktir-mlir-frontend#58; the old spelling no longer parses. The
-    interpreter still uses `HBM`/`LX` internally — translation happens at the parse
-    boundary via `parse_memory_space`/`format_memory_space` in `parser_utils.py`.)
+    **⚠️ This CONFLICTS with RFC 0682**, which still specifies a `KtdpMemorySpaceAttr`
+    interface with a Spyre-specific `SpyreMemorySpaceAttr` spelled
+    `#ktdp.spyre_memory_space<HBM|LX[, core = N]>` (plus an `unspecified` kind).
+    ktir-mlir-frontend#58 removed that interface and renamed the attribute; the RFC
+    has not been updated to match. The dialect is the executable authority here — the
+    RFC spelling no longer parses at all — so follow the syntax above and treat the
+    RFC as stale on this point until it is revised. Tracked as gap row 4a in
+    `docs/gap_analysis.md`. The interpreter still uses `HBM`/`LX` internally;
+    translation happens at the parse boundary via
+    `parse_memory_space`/`format_memory_space` in `parser_utils.py`.
   - `coordinate_set` uses `IntegerSetAttr` (affine integer sets).
   - `base_map` and `access_tile_order` use `AffineMapAttr`.
   - `access_tile_order` follows lexicographic semantics (rightmost = innermost).

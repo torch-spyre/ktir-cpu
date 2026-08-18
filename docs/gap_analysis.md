@@ -3,7 +3,7 @@
 **Date**: 2026-05-30
 **Spec**: [RFC 0682 — KTIR Spec](https://github.com/torch-spyre/RFCs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md)
 
-**Legend**: ✅ implemented — 🟡 partial — ❌ not implemented — 🧪 experimental (tracks an unmerged upstream spec PR; semantics may change)
+**Legend**: ✅ implemented — 🟡 partial — ❌ not implemented — 🧪 experimental (tracks an unmerged upstream spec PR; semantics may change) — ⚠️ spec conflict (implementation intentionally diverges from the RFC; the RFC needs updating)
 
 ---
 
@@ -23,7 +23,8 @@
 | # | Spec Item | Status | Notes |
 |---|-----------|--------|-------|
 | 3 | `AccessTileType` with dynamic dimensions (`?`) | ❌ | The spec allows `access_tile<? x 64 x index>` (partially/fully dynamic shapes). The parser only extracts static integer dimensions — dynamic `?` dimensions are silently dropped. |
-| 4 | `MemorySpaceAttr` (generic) | 🟢 | Resolved upstream by [ktir-mlir-frontend#58](https://github.com/torch-spyre/ktir-mlir-frontend/pull/58), which removed the `KtdpMemorySpaceAttr` interface and replaced Spyre-specific `#ktdp.spyre_memory_space<HBM\|LX[, core = N]>` with device-agnostic `#ktdp.memory_space<global\|ct_local[, ct_id = N]>` (the `unspecified` kind was dropped). Both parsers now accept only the new spelling and translate to the interpreter's `HBM`/`LX` at the parse boundary (`parse_memory_space` / `format_memory_space` in `parser_utils.py`), so the Spyre hierarchy stays confined to the simulator and latency model. |
+| 4 | `MemorySpaceAttr` (generic) | ✅ | The RFC's concern here — that the attribute was Spyre-specific rather than a generic extensible wrapper — was addressed upstream by [ktir-mlir-frontend#58](https://github.com/torch-spyre/ktir-mlir-frontend/pull/58), which removed the `KtdpMemorySpaceAttr` interface and made the attribute itself device-agnostic. `ktir_cpu` parses the new spelling and maps it onto the interpreter's `HBM`/`LX` at the parse boundary (`parse_memory_space` / `format_memory_space` in `parser_utils.py`), so Spyre specifics stay confined to the simulator and latency model. **The RFC text itself is now stale — see row 4a.** |
+| 4a | `MemorySpaceAttr` spelling conflicts with RFC | ⚠️ **spec conflict** | **The implementation intentionally diverges from RFC 0682, and the RFC needs updating.** The RFC specifies `#ktdp.spyre_memory_space<HBM\|LX[, core = N]>` with an `unspecified` kind; [ktir-mlir-frontend#58](https://github.com/torch-spyre/ktir-mlir-frontend/pull/58) replaced this with `#ktdp.memory_space<global\|ct_local[, ct_id = N]>` and dropped `unspecified` with no replacement. This is a semantic change, not just a rename: the enum went from naming *devices* (HBM/LX) to naming *visibility* (reachable by all compute tiles vs. private to one). The RFC spelling no longer parses in the dialect at all, so the implementation follows the dialect. **Action: RFC 0682 §MemorySpaceAttr should be revised to match; until then treat the RFC as stale on this point.** |
 
 ## C. Affine/Polyhedral Attributes
 

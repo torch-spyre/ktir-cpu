@@ -266,14 +266,21 @@ memory_space = #ktdp.memory_space<ct_local>
 memory_space = #ktdp.memory_space<ct_local, ct_id = 7>
 ```
 
-> **Divergence from RFC 0682.** The RFC specifies an abstract `KtdpMemorySpaceAttr`
-> interface with a Spyre-specific `SpyreMemorySpaceAttr` implementation spelled
+> **⚠️ CONFLICTS with RFC 0682 — the RFC is stale here and needs updating.**
+> The RFC specifies an abstract `KtdpMemorySpaceAttr` interface with a Spyre-specific
+> `SpyreMemorySpaceAttr` implementation spelled
 > `#ktdp.spyre_memory_space<HBM|LX[, core = N]>` (plus an `unspecified` kind).
-> ktir-mlir-frontend#58 removed that interface and renamed the attribute to the
-> device-agnostic form above; `unspecified` was dropped with no replacement, and the
-> old spelling no longer parses. Treat the syntax here as authoritative over the RFC
-> text. `ktir-cpu` maps `global`→`HBM` and `ct_local`→`LX` at the parse boundary,
-> keeping the concrete Spyre hierarchy in the interpreter and latency model.
+> [ktir-mlir-frontend#58](https://github.com/torch-spyre/ktir-mlir-frontend/pull/58)
+> removed that interface and renamed the attribute to the device-agnostic form above;
+> `unspecified` was dropped with no replacement. This is a semantic change, not just a
+> rename — the enum went from naming *devices* (HBM/LX) to naming *visibility*
+> (reachable by all compute tiles vs. private to one).
+>
+> The RFC spelling no longer parses in the dialect at all, so **the syntax above is
+> authoritative and the RFC text should be revised to match** (tracked as row 4a in
+> `docs/gap_analysis.md`). Do not flag the new spelling as a spec deviation in reviews.
+> `ktir-cpu` maps `global`→`HBM` and `ct_local`→`LX` at the parse boundary, keeping the
+> concrete Spyre hierarchy in the interpreter and latency model.
 
 Future extensions will include richer metadata for compute-memory affinity.
 
