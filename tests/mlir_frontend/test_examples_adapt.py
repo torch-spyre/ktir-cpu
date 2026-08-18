@@ -6,12 +6,8 @@ Each TestXxxAdapt class inherits the corresponding TestXxxExecution base.
 MLIRFrontendInterpMixin overrides _make_interp() to inject MLIRFrontendParser.
 """
 
-import pytest
-
 from ktir_cpu import KTIRInterpreter
 from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser
-
-from conftest import get_test_params
 from test_examples import (
     TestVectorAddExecution as _TestVectorAddExecution,
     TestVectorAddDynamicExecution as _TestVectorAddDynamicExecution,
@@ -83,11 +79,7 @@ class TestRMSNormAdapt(MLIRFrontendInterpMixin, _TestRMSNormExecution):
 
 
 class TestRMSNorm2x2Adapt(MLIRFrontendInterpMixin, _TestRMSNorm2x2Execution):
-    """RMSNorm 2x2 tests via MLIRFrontendParser."""
-
-    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rmsnorm_2x2"))
-    def test_rmsnorm_2x2_correctness(self, path, func_name, entry):
-        super().test_rmsnorm_2x2_correctness(path, func_name, entry)
+    """RMSNorm 2x2 tests via MLIRFrontendParser — inherits correctness test from base."""
 
     def _make_interp(self):
         from ktir_cpu.latency import HardwareConfig
