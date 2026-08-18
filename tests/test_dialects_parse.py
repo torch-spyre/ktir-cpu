@@ -873,8 +873,8 @@ class TestKtdpParsers(ParseTestMixin):
         # with `#ktdp.memory_space<global|ct_local>`. The old kind names must
         # not be silently accepted (nor fall back to the HBM default).  The
         # exception type differs by frontend — the regex parser raises
-        # ValueError from parse_memory_space, while the MLIR frontend rejects
-        # the enum during module parsing — so assert only that it is refused.
+        # ValueError on the unknown kind, while the MLIR frontend rejects the
+        # enum during module parsing — so assert only that it is refused.
         with pytest.raises(Exception, match="HBM"):
             self._parse(
                 "%view = ktdp.construct_memory_view %ptr, sizes: [1024], strides: [1]"

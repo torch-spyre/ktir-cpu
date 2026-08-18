@@ -42,6 +42,13 @@ from .affine import AffineMap, AffineSet, BoxSet
 CoordinateSet = Union[BoxSet, AffineSet, List[Tuple[int, ...]]]
 
 
+# KTDP names memory spaces by visibility (`global` reaches every compute tile,
+# `ct_local` is private to one); the interpreter names the concrete Spyre
+# memories those map onto, since it models their addressing and latency.
+# Parsers translate on the way in — see MemRef.memory_space.
+KTDP_MEMORY_SPACE_KINDS = {"global": "HBM", "ct_local": "LX"}
+
+
 @dataclass
 class MemRef:
     """Hardware-aware memory view (result of construct_memory_view).
@@ -69,7 +76,7 @@ class MemRef:
     lx_core_id: Optional[int] = None
 
     def __post_init__(self):
-        valid = ("HBM", "LX")
+        valid = tuple(KTDP_MEMORY_SPACE_KINDS.values())
         if self.memory_space not in valid:
             raise ValueError(
                 f"Invalid memory_space {self.memory_space!r}. Must be one of {valid}."

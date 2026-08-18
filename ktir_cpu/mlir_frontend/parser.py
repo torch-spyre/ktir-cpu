@@ -48,7 +48,7 @@ except ImportError:
     _HAS_MLIR = False
 
 from ..affine import AffineMap, AffineSet
-from ..ir_types import IRFunction, IRModule, Operation
+from ..ir_types import KTDP_MEMORY_SPACE_KINDS, IRFunction, IRModule, Operation
 from ..parser_ast import parse_affine_map, parse_affine_set
 from ..parser import KTIRParserBase
 
@@ -302,8 +302,6 @@ def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
     dynamic_strides]; the dynamic_sizes/strides segments line up one-to-one
     (in order) with the sentinel slots in static_sizes/static_strides.
     """
-    from ..parser_utils import parse_memory_space
-
     sizes = list(DenseI64ArrayAttr(mlir_op.attributes["static_sizes"]))
     strides = list(DenseI64ArrayAttr(mlir_op.attributes["static_strides"]))
 
@@ -327,16 +325,19 @@ def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
         raise ValueError(f"ktdp.construct_memory_view: cannot parse dtype from {result_type!r}")
     attributes["dtype"] = m.group(1)
     # str(memory_space attr) -> "#ktdp.memory_space<global>" or
-    # "<ct_local, ct_id = 0>", translated to the interpreter's HBM/LX names.
-    ms = parse_memory_space(str(mlir_op.attributes["memory_space"]))
-    if ms is None:
+    # "<ct_local, ct_id = 0>", mapped to the interpreter's HBM/LX names.
+    ms = re.search(
+        r'#ktdp\.memory_space<\s*(\w+)(?:\s*,\s*ct_id\s*=\s*(\d+))?\s*>',
+        str(mlir_op.attributes["memory_space"]),
+    )
+    if not ms:
         raise ValueError(
             f"ktdp.construct_memory_view: cannot parse memory_space from "
             f"{mlir_op.attributes['memory_space']!r}"
         )
-    attributes["memory_space"], lx_core_id = ms
-    if lx_core_id is not None:
-        attributes["lx_core_id"] = lx_core_id
+    attributes["memory_space"] = KTDP_MEMORY_SPACE_KINDS[ms.group(1)]
+    if ms.group(2) is not None:
+        attributes["lx_core_id"] = int(ms.group(2))
     # str(coordinate_set attr) → "affine_set<(d0) : ...>"
     if "coordinate_set" in mlir_op.attributes:
         attributes["coordinate_set"] = parse_affine_set(

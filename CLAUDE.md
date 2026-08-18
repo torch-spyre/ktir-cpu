@@ -22,8 +22,8 @@ The full spec is also mirrored in `.claude/skills/ktir-dialect.md`.
     RFC spelling no longer parses at all — so follow the syntax above and treat the
     RFC as stale on this point until it is revised. Tracked as gap row 4a in
     `docs/gap_analysis.md`. The interpreter still uses `HBM`/`LX` internally;
-    translation happens at the parse boundary via
-    `parse_memory_space`/`format_memory_space` in `parser_utils.py`.
+    the parsers map the dialect kinds onto those names via
+    `KTDP_MEMORY_SPACE_KINDS` in `ktir_cpu/ir_types.py`.
   - `coordinate_set` uses `IntegerSetAttr` (affine integer sets).
   - `base_map` and `access_tile_order` use `AffineMapAttr`.
   - `access_tile_order` follows lexicographic semantics (rightmost = innermost).

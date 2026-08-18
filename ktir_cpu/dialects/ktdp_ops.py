@@ -23,6 +23,7 @@ from ..ir_types import (
     DistributedMemRef,
     DistributedTileRef,
     IndirectAccessTile,
+    KTDP_MEMORY_SPACE_KINDS,
     MemRef,
     Operation,
     Tile,
@@ -41,7 +42,6 @@ from ..parser_utils import (
     extract_named_attr,
     find_ssa_names,
     parse_attr_block,
-    parse_memory_space,
     parse_multi_result_lhs,
     parse_tensor_or_memref_type,
     parse_tile_future_type,
@@ -337,9 +337,26 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
                     ssa_stride_operands.append(token)
         strides = parsed
 
-    # `#ktdp.memory_space<global|ct_local[, ct_id = N]>`, translated to the
-    # interpreter's HBM/LX vocabulary.  Absent attribute defaults to HBM.
-    memory_space, lx_core_id = parse_memory_space(op_text) or ("HBM", None)
+    memory_space = "HBM"
+    lx_core_id = None
+    # `#ktdp.memory_space<global|ct_local[, ct_id = N]>`, mapped to the
+    # interpreter's HBM/LX names.  On real hardware each compute tile has its
+    # own private LX SRAM, so a view tagged `ct_id = N` lives in tile N's
+    # scratchpad — captured into lx_core_id and used at load/store time.
+    mem_match = re.search(
+        r'#ktdp\.memory_space<\s*(\w+)(?:\s*,\s*ct_id\s*=\s*(\d+))?\s*>',
+        op_text,
+    )
+    if mem_match:
+        kind = mem_match.group(1)
+        if kind not in KTDP_MEMORY_SPACE_KINDS:
+            raise ValueError(
+                f"Unknown #ktdp.memory_space kind {kind!r}; expected one of "
+                f"{sorted(KTDP_MEMORY_SPACE_KINDS)}"
+            )
+        memory_space = KTDP_MEMORY_SPACE_KINDS[kind]
+        if mem_match.group(2) is not None:
+            lx_core_id = int(mem_match.group(2))
 
     # dtype and shape are parsed from the memref result type.
     # Validate sizes against memref dimensions when both are concrete.
