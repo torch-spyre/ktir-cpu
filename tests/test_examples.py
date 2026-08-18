@@ -677,6 +677,51 @@ class TestRingReduceExecution:
                                    err_msg="Core 0 output does not match element-wise sum")
 
 
+class TestMulticoreSdpaExecution(InterpreterTestMixin):
+    """End-to-end execution of the multicore SDPA P@V kernel.
+
+    ``sdpa_pv_ksplit`` is the decode SDPA P@V op on a grid [2, 16]: output split
+    x2 and KV contraction split x16, so the PSUM folds across cores in two
+    *strided* reduce groups (group g = cores {g, g+2, ...}).  The query row face
+    is 1 (decode), so it computes C = A @ B for a (1x8192) @ (8192x128) matmul,
+    and the cross-core folds run through ``RingReduceBackend`` at grid > 1.
+    """
+
+    @pytest.mark.parametrize(
+        "path,func_name,entry",
+        get_test_params("sdpa_pv_ksplit"),
+    )
+    def test_sdpa_pv_ksplit(self, path, func_name, entry):
+        """Decode SDPA P@V kernel: C ≈ A @ B across the [2, 16] grid."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        a_ptr, b_ptr, c_ptr = interp.arg_names(func_name)
+        M, N, K = entry["M"], entry["N"], entry["K"]
+        rng = np.random.default_rng(42)
+        A = rng.standard_normal((M, K)).astype(np.float16)
+        B = rng.standard_normal((K, N)).astype(np.float16)
+        C = np.zeros((M, N), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{a_ptr: A, b_ptr: B, c_ptr: C})
+        result = outputs[c_ptr]
+
+        expected = (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float16)
+        # No fp32 accumulator anywhere in the kernel: the matmul ``outs`` and
+        # the combiner region are both f16, so each of the 16 cross-core fold
+        # steps rounds its running sum back to f16.  That fold
+        # is where the error comes from -- max abs diff on these inputs is
+        # 0.375 at output magnitude ~250 (~1.5 f16 ULP).  The error is
+        # proportional to the output magnitude, so rtol carries it and atol only
+        # has to cover the near-zero outputs: same pair as the split-K matmul
+        # check in TestMatMulExecution, which folds an f16 running sum the same
+        # way.
+        np.testing.assert_allclose(
+            result.astype(np.float32), expected.astype(np.float32),
+            rtol=2e-2, atol=2e-1,
+        )
+
+
 class TestRingReduceInnerLoopExecution:
     """End-to-end execution of ring_reduce_inner_loop.mlir.
 
