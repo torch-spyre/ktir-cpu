@@ -220,12 +220,19 @@ def arith__constant(op, context, env):
     return value
 
 
-# Cast ops — no latency category  (Pattern A.4 — cast cluster)
-# extsi stays bespoke: uses a lambda that can't be expressed as an ArithOps method.
-
-_CAST_UNARY_OPS = {
+# Float cast ops — SIMD pipeline cost  (Pattern A.4)
+_FLOAT_CAST_OPS = {
     "arith.extf":     (ArithOps.extf,     np.float32),
     "arith.truncf":   (ArithOps.truncf,   None),
+}
+for _name, (_fn, _sfn) in _FLOAT_CAST_OPS.items():
+    @register(_name, latency_category=LC.COMPUTE_FLOAT)
+    def _(op, context, env, _fn=_fn, _sfn=_sfn):
+        return _unary(op, context, _fn, _sfn)
+
+# Integer/index cast ops — no latency category  (Pattern A.4 — cast cluster)
+# extsi stays bespoke: uses a lambda that can't be expressed as an ArithOps method.
+_CAST_UNARY_OPS = {
     "arith.extui":    (ArithOps.extui,    int),
     "arith.trunci":   (ArithOps.trunci,   int),
     "arith.fptosi":   (ArithOps.fptosi,   int),

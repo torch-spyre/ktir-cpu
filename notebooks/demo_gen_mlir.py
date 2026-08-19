@@ -368,7 +368,8 @@ def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
       (seq_len >> num_cores), so hidden-dim sharding (2x2) adds allreduce
       communication for zero benefit.  Matches adjacent matmul/softmax/SDPA grids.
     - W is 1D [hidden_dim] per PyTorch convention (nn.Parameter(torch.ones(H))).
-      Avoids inflating HBM traffic — W stays LX-resident after one cold miss (8 KB).
+      Loaded per-block in pass 2; small enough (8 KB) to be LX-resident on real
+      hardware, though the charge-model estimator costs every load from HBM.
     """
     assert hidden_dim % block_size == 0, "hidden_dim must be divisible by block_size"
     hd = hidden_dim
@@ -398,39 +399,44 @@ def gen_rmsnorm_mlir(n_rows, hidden_dim, num_cores=4, block_size=1024):
 
     scf.for %row = %core_id to %n_rows step %step : index {{
 
-        // === Pass 1: sum of squares over hidden dim ===
-        %zero_block = arith.constant dense<0.0> : tensor<1x{bs}xf16>
+        // === Pass 1: sum of squares over hidden dim (f32 accumulator) ===
+        %zero_f32 = arith.constant 0.0 : f32
+        %zero_block = tensor.splat %zero_f32 : tensor<1x{bs}xf32>
 
         %sq_acc = scf.for %col = %c0 to %c_hd step %BLOCK_SIZE
-            iter_args(%acc = %zero_block) -> tensor<1x{bs}xf16> {{
+            iter_args(%acc = %zero_block) -> tensor<1x{bs}xf32> {{
 
       {x_acc}
 
             %x_blk = ktdp.load %x_acc : !ktdp.access_tile<1x{bs}xindex> -> tensor<1x{bs}xf16>
 
             %x_sq = arith.mulf %x_blk, %x_blk : tensor<1x{bs}xf16>
-            %acc_next = arith.addf %acc, %x_sq : tensor<1x{bs}xf16>
+            %x_sq_f32 = arith.extf %x_sq : tensor<1x{bs}xf16> to tensor<1x{bs}xf32>
+            %acc_next = arith.addf %acc, %x_sq_f32 : tensor<1x{bs}xf32>
 
-            scf.yield %acc_next : tensor<1x{bs}xf16>
+            scf.yield %acc_next : tensor<1x{bs}xf32>
         }}
 
-        // Reduce accumulator to scalar
-        %zero_scalar = arith.constant 0.0 : f16
-        %reduce_init = tensor.splat %zero_scalar : tensor<1xf16>
+        // Reduce f32 accumulator
+        %reduce_init = tensor.splat %zero_f32 : tensor<1xf32>
         %sum_sq = linalg.reduce {{ arith.addf }}
-            ins(%sq_acc : tensor<1x{bs}xf16>)
-            outs(%reduce_init : tensor<1xf16>)
+            ins(%sq_acc : tensor<1x{bs}xf32>)
+            outs(%reduce_init : tensor<1xf32>)
             dimensions = [1]
 
-        // === Compute rstd = rsqrt(sum_sq / N + eps) ===
-        %c0_idx = arith.constant 0 : index
-        %sum_scalar = tensor.extract %sum_sq[%c0_idx] : tensor<1xf16>
-
+        // === Compute rstd = rsqrt(sum_sq / N + eps) on tensor<1xf32> ===
         %N_i32 = arith.index_cast %N : index to i32
-        %N_f16 = arith.sitofp %N_i32 : i32 to f16
-        %mean_sq = arith.divf %sum_scalar, %N_f16 : f16
-        %mean_sq_plus_eps = arith.addf %mean_sq, %eps : f16
-        %rstd_scalar = math.rsqrt %mean_sq_plus_eps : f16
+        %N_f32 = arith.sitofp %N_i32 : i32 to f32
+        %N_t = tensor.splat %N_f32 : tensor<1xf32>
+        %eps_f32 = arith.extf %eps : f16 to f32
+        %eps_t = tensor.splat %eps_f32 : tensor<1xf32>
+
+        %mean_sq = arith.divf %sum_sq, %N_t : tensor<1xf32>
+        %mean_sq_plus_eps = arith.addf %mean_sq, %eps_t : tensor<1xf32>
+        %rstd_f32 = math.rsqrt %mean_sq_plus_eps : tensor<1xf32>
+        %rstd_f16 = arith.truncf %rstd_f32 : tensor<1xf32> to tensor<1xf16>
+        %c0_idx = arith.constant 0 : index
+        %rstd_scalar = tensor.extract %rstd_f16[%c0_idx] : tensor<1xf16>
         %rstd_block = tensor.splat %rstd_scalar : tensor<1x{bs}xf16>
 
         // === Pass 2: normalize and scale ===
