@@ -17,6 +17,7 @@ from ktir_cpu.latency import HardwareConfig
 from demo_gen_mlir import (  # noqa: F401 — re-exported for notebook compat
     gen_matmul_mlir,
     gen_softmax_mlir,
+    gen_rope_mlir,
     gen_sdpa_mlir,
     gen_sdpa_decode_pv_mlir,
     gen_paged_attention_mlir,
@@ -246,6 +247,24 @@ def run_kernel_softmax(hw, n_rows, row_width, num_cores, rng=None):
         dict(output_ptr=np.zeros((n_rows, row_width), dtype=np.float16),
              input_ptr=rng.standard_normal((n_rows, row_width)).astype(np.float16)),
         dict(n_rows=n_rows))
+
+
+def run_kernel_rope(hw, num_heads, seq_len, head_dim, grid_s, grid_h, tile_seq=256, rng=None):
+    """Generate RoPE MLIR, create tensors, run, return LatencyReport."""
+    if rng is None:
+        rng = np.random.default_rng(0)
+    mlir = gen_rope_mlir(num_heads, seq_len, head_dim, grid_s, grid_h, tile_seq)
+    half_dim = head_dim // 2
+    freqs = 10000.0 ** (-np.arange(half_dim, dtype=np.float64) * 2.0 / head_dim)
+    positions = np.arange(seq_len, dtype=np.float64)
+    angles = np.outer(positions, freqs)
+    cos_table = np.cos(angles).astype(np.float16)
+    sin_table = np.sin(angles).astype(np.float16)
+    return run_kernel(hw, mlir, "rope_fwd_kernel",
+        dict(x_ptr=rng.standard_normal((num_heads * seq_len, head_dim)).astype(np.float16),
+             cos_ptr=cos_table,
+             sin_ptr=sin_table,
+             out_ptr=np.zeros((num_heads * seq_len, head_dim), dtype=np.float16)))
 
 
 def run_kernel_sdpa(hw, seq_len, head_dim, block_m, rng=None):
