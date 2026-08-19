@@ -34,6 +34,7 @@ import pytest
 
 from ktir_cpu import KTIRInterpreter
 from ktir_cpu.dtypes import stick_to_elem_idx
+from ktir_cpu.ir_types import KTDP_MEMORY_SPACE_KINDS
 from conftest import get_test_params
 
 
@@ -152,8 +153,12 @@ def _build_mlir(spec: DistCopySpec) -> str:
     )
     idx_refs = ", ".join(f"%idx{i}" for i in range(len(idx)))
 
-    p0_ms = f"#ktdp.spyre_memory_space<{p0.memory_space}>"
-    p1_ms = f"#ktdp.spyre_memory_space<{p1.memory_space}>"
+    # PartitionSpec.memory_space holds the interpreter's name (it also selects
+    # the backing memory in the assertions below); the IR needs the dialect
+    # kind, so invert the parse-side mapping.
+    _kind = {v: k for k, v in KTDP_MEMORY_SPACE_KINDS.items()}
+    p0_ms = f"#ktdp.memory_space<{_kind[p0.memory_space]}>"
+    p1_ms = f"#ktdp.memory_space<{_kind[p1.memory_space]}>"
 
     return f"""
 #P0_set   = {p0_set}
@@ -181,7 +186,7 @@ module {{
         : memref<{G[0]}x{G[1]}xf16>
 
     %B = ktdp.construct_memory_view %B_addr, sizes: [{ac[0]}, {ac[1]}], strides: [{ac[1]}, 1] {{
-        coordinate_set = #ac_set, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #ac_set, memory_space = #ktdp.memory_space<global>
     }} : memref<{ac[0]}x{ac[1]}xf16>
 
     %A_at = ktdp.construct_access_tile %A[{idx_refs}] {{

@@ -163,13 +163,13 @@ module {
     %Z_addr = arith.constant 128 : index
 
     %X = ktdp.construct_memory_view %X_addr, sizes: [8], strides: [1] {
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<8xf16>
     %Y = ktdp.construct_memory_view %Y_addr, sizes: [8], strides: [1] {
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<8xf16>
     %Z = ktdp.construct_memory_view %Z_addr, sizes: [8], strides: [1] {
-        memory_space = #ktdp.spyre_memory_space<HBM>
+        memory_space = #ktdp.memory_space<global>
     } : memref<8xf16>
 
     %c0 = arith.constant 0 : index

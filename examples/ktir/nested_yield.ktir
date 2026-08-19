@@ -5,7 +5,7 @@ module {
     %c2 = arith.constant 2 : index
     %one = arith.constant dense<1.000000e+00> : tensor<4xf32>
     %zero = arith.constant dense<0.000000e+00> : tensor<4xf32>
-    %o_desc = ktdp.construct_memory_view %out, sizes: [4], strides: [1] {memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4xf32>
+    %o_desc = ktdp.construct_memory_view %out, sizes: [4], strides: [1] {memory_space = #ktdp.memory_space<global>} : memref<4xf32>
 
     %sum = scf.for %i = %c0 to %c2 step %c1 iter_args(%acc = %zero) -> (tensor<4xf32>) {
       %next = arith.addf %acc, %one : tensor<4xf32>

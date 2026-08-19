@@ -677,6 +677,51 @@ class TestRingReduceExecution:
                                    err_msg="Core 0 output does not match element-wise sum")
 
 
+class TestMulticoreSdpaExecution(InterpreterTestMixin):
+    """End-to-end execution of the multicore SDPA P@V kernel.
+
+    ``sdpa_pv_ksplit`` is the decode SDPA P@V op on a grid [2, 16]: output split
+    x2 and KV contraction split x16, so the PSUM folds across cores in two
+    *strided* reduce groups (group g = cores {g, g+2, ...}).  The query row face
+    is 1 (decode), so it computes C = A @ B for a (1x8192) @ (8192x128) matmul,
+    and the cross-core folds run through ``RingReduceBackend`` at grid > 1.
+    """
+
+    @pytest.mark.parametrize(
+        "path,func_name,entry",
+        get_test_params("sdpa_pv_ksplit"),
+    )
+    def test_sdpa_pv_ksplit(self, path, func_name, entry):
+        """Decode SDPA P@V kernel: C ≈ A @ B across the [2, 16] grid."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        a_ptr, b_ptr, c_ptr = interp.arg_names(func_name)
+        M, N, K = entry["M"], entry["N"], entry["K"]
+        rng = np.random.default_rng(42)
+        A = rng.standard_normal((M, K)).astype(np.float16)
+        B = rng.standard_normal((K, N)).astype(np.float16)
+        C = np.zeros((M, N), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{a_ptr: A, b_ptr: B, c_ptr: C})
+        result = outputs[c_ptr]
+
+        expected = (A.astype(np.float32) @ B.astype(np.float32)).astype(np.float16)
+        # No fp32 accumulator anywhere in the kernel: the matmul ``outs`` and
+        # the combiner region are both f16, so each of the 16 cross-core fold
+        # steps rounds its running sum back to f16.  That fold
+        # is where the error comes from -- max abs diff on these inputs is
+        # 0.375 at output magnitude ~250 (~1.5 f16 ULP).  The error is
+        # proportional to the output magnitude, so rtol carries it and atol only
+        # has to cover the near-zero outputs: same pair as the split-K matmul
+        # check in TestMatMulExecution, which folds an f16 running sum the same
+        # way.
+        np.testing.assert_allclose(
+            result.astype(np.float32), expected.astype(np.float32),
+            rtol=2e-2, atol=2e-1,
+        )
+
+
 class TestRingReduceInnerLoopExecution:
     """End-to-end execution of ring_reduce_inner_loop.mlir.
 
@@ -1030,6 +1075,116 @@ class TestFFNSwiGLU4CoreExecution:
         expected = np.zeros((seq, d_model), dtype=np.float16)
 
         np.testing.assert_allclose(result, expected, rtol=1e-3, atol=1e-3)
+
+
+class TestRoPEExecution(InterpreterTestMixin):
+    """End-to-end execution of rope_fwd_4x2.mlir.
+
+    Tests the standalone RoPE kernel (half-layout, LLaMA convention):
+        y[:, 0:D/2]  = x[:, 0:D/2] * cos - x[:, D/2:D] * sin
+        y[:, D/2:D]  = x[:, 0:D/2] * sin + x[:, D/2:D] * cos
+
+    LLaMA-8B / Granite-8B: H_total=40, S=4096, D=128, grid=[4,2]
+    """
+
+    H_TOTAL = 40
+    S = 4096
+    D = 128
+    D_HALF = 64
+
+    @staticmethod
+    def _make_cos_sin_tables(S, D_half):
+        """Generate cos/sin tables with standard RoPE frequencies."""
+        freqs = 10000.0 ** (-np.arange(D_half).astype(np.float64) * 2.0 / (D_half * 2))
+        positions = np.arange(S, dtype=np.float64)
+        angles = np.outer(positions, freqs)
+        cos_table = np.cos(angles).astype(np.float16)
+        sin_table = np.sin(angles).astype(np.float16)
+        return cos_table, sin_table
+
+    @staticmethod
+    def _rope_reference(x_flat, cos_table, sin_table, H, S, D):
+        """NumPy reference for half-layout RoPE."""
+        D_half = D // 2
+        x_3d = x_flat.reshape(H, S, D).astype(np.float32)
+        cos_f32 = cos_table.astype(np.float32)[np.newaxis, :, :]  # [1, S, D/2]
+        sin_f32 = sin_table.astype(np.float32)[np.newaxis, :, :]
+
+        x_first = x_3d[:, :, :D_half]
+        x_second = x_3d[:, :, D_half:]
+
+        y_first = x_first * cos_f32 - x_second * sin_f32
+        y_second = x_first * sin_f32 + x_second * cos_f32
+
+        return np.concatenate([y_first, y_second], axis=-1).reshape(H * S, D).astype(np.float16)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rope_fwd_kernel"))
+    def test_rope_fwd_correctness(self, path, func_name, entry):
+        """Run RoPE on 8 cores, verify output matches NumPy reference."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        x_ptr, cos_ptr, sin_ptr, out_ptr = interp.arg_names(func_name)
+        sizes = interp.tensor_input_output_sizes(func_name)
+
+        rows, cols = sizes[x_ptr]["shape"]
+        assert rows == self.H_TOTAL * self.S
+        assert cols == self.D
+
+        cos_rows, cos_cols = sizes[cos_ptr]["shape"]
+        assert cos_rows == self.S
+        assert cos_cols == self.D_HALF
+
+        rng = np.random.default_rng(42)
+        x = rng.standard_normal((rows, cols)).astype(np.float16)
+        cos_table, sin_table = self._make_cos_sin_tables(self.S, self.D_HALF)
+        out = np.zeros((rows, cols), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            cos_ptr: cos_table,
+            sin_ptr: sin_table,
+            out_ptr: out,
+        })
+
+        result = outputs[out_ptr]
+        expected = self._rope_reference(x, cos_table, sin_table, self.H_TOTAL, self.S, self.D)
+
+        assert result.shape == expected.shape
+        assert not np.any(np.isnan(result)), "output contains NaN"
+        assert not np.any(np.isinf(result)), "output contains Inf"
+
+        np.testing.assert_allclose(
+            result,
+            expected,
+            rtol=1e-2,
+            atol=1e-2,
+            err_msg="RoPE output does not match NumPy reference",
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rope_fwd_kernel"))
+    def test_rope_fwd_zero_input(self, path, func_name, entry):
+        """Zero input should produce zero output (rotation of origin is origin)."""
+        interp = self._make_interp()
+        interp.load(path)
+
+        x_ptr, cos_ptr, sin_ptr, out_ptr = interp.arg_names(func_name)
+        sizes = interp.tensor_input_output_sizes(func_name)
+        rows, cols = sizes[x_ptr]["shape"]
+
+        x = np.zeros((rows, cols), dtype=np.float16)
+        cos_table, sin_table = self._make_cos_sin_tables(self.S, self.D_HALF)
+        out = np.zeros((rows, cols), dtype=np.float16)
+
+        outputs = interp.execute_function(func_name, **{
+            x_ptr: x,
+            cos_ptr: cos_table,
+            sin_ptr: sin_table,
+            out_ptr: out,
+        })
+
+        result = outputs[out_ptr]
+        np.testing.assert_allclose(result, 0.0, atol=1e-5)
 
 
 class TestNestedYieldExecution(InterpreterTestMixin):

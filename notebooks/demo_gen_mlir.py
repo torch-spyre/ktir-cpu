@@ -55,7 +55,7 @@ def _mem_view(name: str, ptr: str, shape: list[int], strides: list[int],
         f"    %{name} = ktdp.construct_memory_view %{ptr}, "
         f"sizes: [{sizes_str}], strides: [{strides_str}] {{\n"
         f"      coordinate_set = affine_set<({dim_decl}) : ({bounds})>,\n"
-        f"      memory_space = #ktdp.spyre_memory_space<HBM>\n"
+        f"      memory_space = #ktdp.memory_space<global>\n"
         f"    }} : memref<{shape_str}x{dtype}>"
     )
 

@@ -48,15 +48,15 @@ module {
     %pid_m, %pid_n = ktdp.get_compute_tile_id : index, index
     %a_view = ktdp.construct_memory_view %a_ptr, sizes: [8, 8], strides: [8, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<8x8xf16>
     %b_view = ktdp.construct_memory_view %b_ptr, sizes: [8, 8], strides: [8, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<8x8xf16>
     %c_view = ktdp.construct_memory_view %c_ptr, sizes: [8, 8], strides: [8, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 7 >= 0, d1 >= 0, -d1 + 7 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<8x8xf16>
     %c0 = arith.constant 0 : index
     %accum_zero = arith.constant dense<0.0> : tensor<8x8xf16>
@@ -105,17 +105,17 @@ module {
 
     %a_view = ktdp.construct_memory_view %a_ptr, sizes: [512, 256], strides: [256, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<512x256xf16>
 
     %b_view = ktdp.construct_memory_view %b_ptr, sizes: [256, 256], strides: [256, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 255 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<256x256xf16>
 
     %c_view = ktdp.construct_memory_view %c_ptr, sizes: [512, 256], strides: [256, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 511 >= 0, d1 >= 0, -d1 + 255 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<512x256xf16>
 
     %c0 = arith.constant 0 : index
@@ -1225,17 +1225,17 @@ module {
 
     %a_view = ktdp.construct_memory_view %a_ptr, sizes: [64, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x64xf16>
 
     %b_view = ktdp.construct_memory_view %b_ptr, sizes: [64, 32], strides: [32, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x32xf16>
 
     %c_view = ktdp.construct_memory_view %c_ptr, sizes: [64, 32], strides: [32, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x32xf16>
 
     %c0 = arith.constant 0 : index
@@ -1511,9 +1511,9 @@ module {
     %bm_end = arith.addi %pid_0, %c1_i32 : i32
     %bm_end_1 = arith.minsi %bm_end, %c32_i32 : i32
 
-    %a_desc = ktdp.construct_memory_view %arg0, sizes: [4, 128, 32], strides: [4096, 32, 1] {coordinate_set = #set, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4x128x32xf32>
-    %b_desc = ktdp.construct_memory_view %arg1, sizes: [4, 32, 64], strides: [2048, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4x32x64xf32>
-    %c_desc = ktdp.construct_memory_view %arg2, sizes: [4, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<4x128x64xf32>
+    %a_desc = ktdp.construct_memory_view %arg0, sizes: [4, 128, 32], strides: [4096, 32, 1] {coordinate_set = #set, memory_space = #ktdp.memory_space<global>} : memref<4x128x32xf32>
+    %b_desc = ktdp.construct_memory_view %arg1, sizes: [4, 32, 64], strides: [2048, 64, 1] {coordinate_set = #set1, memory_space = #ktdp.memory_space<global>} : memref<4x32x64xf32>
+    %c_desc = ktdp.construct_memory_view %arg2, sizes: [4, 128, 64], strides: [8192, 64, 1] {coordinate_set = #set2, memory_space = #ktdp.memory_space<global>} : memref<4x128x64xf32>
 
     scf.for %arg3 = %pid_0 to %bm_end_1 step %c1_i32  : i32 {
       %b = arith.divsi %arg3, %m_blocks : i32

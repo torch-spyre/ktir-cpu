@@ -2868,3 +2868,97 @@ class TestFFNSwiGLU4CoreLatency:
         expected_ratio = 1.0 / hbm_bw
         actual_ratio = scaled_mem / baseline_mem
         assert actual_ratio == pytest.approx(expected_ratio, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# RoPE forward latency — memory-dominated, vector-unit workload
+# ---------------------------------------------------------------------------
+
+
+def _run_rope(path, func_name, entry, cfg, trace=False):
+    """Run RoPE kernel on 8 cores and return report."""
+    interp = KTIRInterpreter(latency_config=cfg, trace_latency=trace)
+    interp.load(path)
+
+    sizes = interp.tensor_input_output_sizes(func_name)
+    x_ptr, cos_ptr, sin_ptr, out_ptr = interp.arg_names(func_name)
+
+    rows, cols = sizes[x_ptr]["shape"]
+    cos_rows, cos_cols = sizes[cos_ptr]["shape"]
+
+    rng = np.random.default_rng(42)
+    x = rng.standard_normal((rows, cols)).astype(np.float16)
+
+    freqs = 10000.0 ** (-np.arange(cos_cols, dtype=np.float64) * 2.0 / (cos_cols * 2))
+    positions = np.arange(cos_rows, dtype=np.float64)
+    angles = np.outer(positions, freqs)
+    cos_table = np.cos(angles).astype(np.float16)
+    sin_table = np.sin(angles).astype(np.float16)
+    out = np.zeros((rows, cols), dtype=np.float16)
+
+    interp.execute_function(func_name, **{
+        x_ptr: x,
+        cos_ptr: cos_table,
+        sin_ptr: sin_table,
+        out_ptr: out,
+    })
+    return interp.get_latency_report()
+
+
+class TestRoPELatency:
+    """Latency tests for standalone RoPE kernel (issue #166).
+
+    Three properties:
+    1. Memory-bound: data movement dominates, scales with HBM bandwidth
+    2. SIMD compute: vector-unit workload, scales with SIMD width
+    3. No communication: embarrassingly parallel across all 8 cores
+    """
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rope_fwd_kernel"))
+    @pytest.mark.parametrize("hbm_bw", [0.256, 0.512])
+    def test_memory_bound(self, path, func_name, entry, hbm_bw):
+        """Data movement: memory-dominated bottleneck, AI below ridge, scales with BW."""
+        baseline_cfg = HardwareConfig(hbm_bandwidth_tb_s=0.128)
+        scaled_cfg = HardwareConfig(hbm_bandwidth_tb_s=hbm_bw)
+
+        baseline = _run_rope(path, func_name, entry, baseline_cfg)
+        scaled = _run_rope(path, func_name, entry, scaled_cfg)
+
+        # Memory-bound classification (at realistic BW, memory dominates)
+        assert baseline.bottleneck == "memory"
+        assert baseline.counters[0].memory_cycles > baseline.counters[0].compute_cycles
+        rf = baseline.roofline()
+        assert rf["core_AI"] < rf["ridge"]
+
+        # Memory cycles scale as 1/bandwidth
+        expected_ratio = 0.128 / hbm_bw
+        actual_ratio = scaled.counters[0].memory_cycles / baseline.counters[0].memory_cycles
+        assert actual_ratio == pytest.approx(expected_ratio, rel=1e-3)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rope_fwd_kernel"))
+    @pytest.mark.parametrize("simd", [32, 64])
+    def test_simd_compute(self, path, func_name, entry, simd):
+        """Computation: pure vector-unit (simd), no matmul, scales with SIMD width."""
+        baseline_cfg = HardwareConfig(simd_elements_per_cycle=64)
+        scaled_cfg = HardwareConfig(simd_elements_per_cycle=simd)
+
+        baseline = _run_rope(path, func_name, entry, baseline_cfg)
+        scaled = _run_rope(path, func_name, entry, scaled_cfg)
+
+        # Dominant compute unit is simd (mulf/subf/addf, no linalg.matmul)
+        rf = baseline.roofline()
+        assert rf["core_dominant_unit"] == "simd"
+
+        # Compute cycles scale as 1/simd_width
+        expected_ratio = 64.0 / simd
+        actual_ratio = scaled.counters[0].compute_cycles / baseline.counters[0].compute_cycles
+        assert actual_ratio == pytest.approx(expected_ratio, rel=1e-2)
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("rope_fwd_kernel"))
+    def test_no_communication(self, path, func_name, entry):
+        """Communication: embarrassingly parallel — zero inter-core traffic."""
+        report = _run_rope(path, func_name, entry, HardwareConfig())
+        for cid, counters in report.counters.items():
+            assert counters.comm_cycles == 0, (
+                f"Core {cid} has {counters.comm_cycles} comm cycles, expected 0"
+            )

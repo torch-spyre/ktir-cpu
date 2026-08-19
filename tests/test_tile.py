@@ -52,7 +52,7 @@ class TestTileAccess:
 
         %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #Y_coord_set,
-            memory_space = #ktdp.spyre_memory_space<HBM>
+            memory_space = #ktdp.memory_space<global>
         } : memref<64x64xf16>
 
     The parser copies sizes → shape and strides verbatim into a TileRef.

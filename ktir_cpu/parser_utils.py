@@ -276,7 +276,7 @@ def parse_attr_block(op_text: str, aliases: Optional[Dict] = None,
     Values are returned as Python scalars (int/float/list/str).  Handles:
 
     - ``keyword<...>`` values (e.g. ``affine_map<...>``, ``affine_set<...>``,
-      ``#ktdp.spyre_memory_space<HBM>``): ``<``/``>`` depth is counted while
+      ``#ktdp.memory_space<global>``): ``<``/``>`` depth is counted while
       skipping ``>=`` and ``->`` operators so constraint expressions like
       ``d0 >= 0`` do not prematurely close the value.
     - ``#alias`` references: resolved via *aliases* when provided.

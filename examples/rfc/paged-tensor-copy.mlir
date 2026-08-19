@@ -80,7 +80,7 @@ module {
         %Idx_mem_view = ktdp.construct_memory_view %Idx_start_address, 
                         sizes: [%Nb, %Ntkv_Ptkv], strides: [%Ntkv_Ptkv, 1] {
                         coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 31 >= 0)>,
-                        memory_space = #ktdp.spyre_memory_space<HBM>
+                        memory_space = #ktdp.memory_space<global>
         } : memref<4x32xi32>
 
         // (1) Construct memory view for input X
@@ -89,7 +89,7 @@ module {
         %X_mem_view = ktdp.construct_memory_view %X_start_address, 
                         sizes: [%Npages, %Nhkv, %Ptkv, %Ndkv], strides: [65536, 8192, %Ndkv, 1] {
                         coordinate_set = #X_coord_set,
-                        memory_space = #ktdp.spyre_memory_space<HBM>
+                        memory_space = #ktdp.memory_space<global>
         } : memref<10000x8x64x128xf16>
 
         // (2) Construct memory view for output Y
@@ -100,7 +100,7 @@ module {
         %Y_mem_view = ktdp.construct_memory_view %Y_start_address,
                         sizes: [%Nb, %Ntkv, %Nhkv, %Ndkv], strides: [%Y_str_Nb, %Y_str_Ntkv, %Ndkv , 1] {
                         coordinate_set = #Y_coord_set,
-                        memory_space = #ktdp.spyre_memory_space<HBM>
+                        memory_space = #ktdp.memory_space<global>
         } : memref<4x2048x8x128xf16>
 
         // (3) Construct indirect access tile X [Idx[b][tkv/Ptkv]] [h] [tkv%Ptkv] [dkv]

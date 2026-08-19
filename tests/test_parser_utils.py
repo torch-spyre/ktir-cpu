@@ -21,7 +21,11 @@ mis-tokenised these by splitting on the ``x`` inside the dtype.
 
 import pytest
 
-from ktir_cpu.parser_utils import parse_multi_result_lhs, parse_tensor_or_memref_type, extract_outs_operands
+from ktir_cpu.parser_utils import (
+    extract_outs_operands,
+    parse_multi_result_lhs,
+    parse_tensor_or_memref_type,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +128,7 @@ def test_parse_tensor_or_memref_type_rejects_invalid(type_str):
         ("tensor<4xf32>, %arg0", (4,), "f32"),
         # memref wrapper
         ("memref<128x32xf16>", (128, 32), "f16"),
-        ("memref<4x4xi32, #ktdp.spyre_memory_space<LX>>", (4, 4), "i32"),
+        ("memref<4x4xi32, #ktdp.memory_space<ct_local>>", (4, 4), "i32"),
         # Bare inner content (no wrapper)
         ("64x32xindex", (64, 32), "index"),
         ("256xbf16", (256,), "bf16"),

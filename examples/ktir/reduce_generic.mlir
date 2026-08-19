@@ -2,7 +2,7 @@ module {
   func.func @reduce_explicit_region(%arg0: index) attributes {grid = [1, 1]} {
     %c0 = arith.constant 0 : index
     %cst = arith.constant 0.000000e+00 : f16
-    %view = ktdp.construct_memory_view %arg0, sizes : [1, 4], strides : [4, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x4xf16>
+    %view = ktdp.construct_memory_view %arg0, sizes : [1, 4], strides : [4, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>, memory_space = #ktdp.memory_space<global>} : memref<1x4xf16>
     %acc = ktdp.construct_access_tile %view[%c0, %c0] {
         access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>,
         access_tile_order = affine_map<(d0, d1) -> (d0, d1)>
@@ -22,7 +22,7 @@ module {
     // linalg.reduce generic format returns tensor<1xf16>; extract scalar before splat
     %scalar = tensor.extract %reduced[%c0] : tensor<1xf16>
     %splat = tensor.splat %scalar : tensor<1x4xf16>
-    %out_view = ktdp.construct_memory_view %arg0, sizes : [1, 4], strides : [4, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>} : memref<1x4xf16>
+    %out_view = ktdp.construct_memory_view %arg0, sizes : [1, 4], strides : [4, 1] {coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>, memory_space = #ktdp.memory_space<global>} : memref<1x4xf16>
     %out_acc = ktdp.construct_access_tile %out_view[%c0, %c0] {
         access_tile_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 + 3 >= 0)>,
         access_tile_order = affine_map<(d0, d1) -> (d0, d1)>

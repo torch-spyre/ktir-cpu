@@ -37,7 +37,16 @@ jobs:
           LLVM_HASH=$(curl -fsSL "https://raw.githubusercontent.com/torch-spyre/ktir-mlir-frontend/$FRONTEND_COMMIT/cmake/llvm-hash.txt")
           curl -fsSL "$SETUP_MLIR" -o /tmp/setup_mlir.py
           MLIR_DIR=$(GIT_PAT="${{ secrets.GITHUB_TOKEN }}" uv run python /tmp/setup_mlir.py --hash "$LLVM_HASH" --repo torch-spyre/ktir-mlir-frontend)
-          uv pip install scikit-build-core "nanobind>=2.12.0"
+          # The install step below uses --no-build-isolation, which bypasses
+          # ktir-mlir-frontend's build-system.requires — so the `cmake>=4.0` pin
+          # it declares upstream (torch-spyre/ktir-mlir-frontend#59) is not
+          # applied and must be satisfied here instead. Keep this in sync with
+          # that pin. cmake>=4.0 is required: CMake 3.x writes the
+          # full target name into its file-API reply filename, and MLIR's
+          # mlir_generate_type_stubs() builds a 283-char target name by joining
+          # DEPENDS_TARGETS, overflowing NAME_MAX (255). CMake 4.0 truncates the
+          # name and relies on the trailing hash.
+          uv pip install scikit-build-core "nanobind>=2.12.0" "cmake>=4.0" "ninja>=1.11"
           echo "CMAKE_ARGS=-DMLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
 
       - name: Install project and dependencies

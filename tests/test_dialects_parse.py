@@ -844,7 +844,7 @@ class TestKtdpParsers(ParseTestMixin):
         op = self._parse(
             "%view = ktdp.construct_memory_view %ptr, sizes: [1024], strides: [1]"
             " { coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1023 >= 0)>,"
-            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+            " memory_space = #ktdp.memory_space<global> } : memref<1024xf16>",
             args={"%ptr": "index"},
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
@@ -854,6 +854,34 @@ class TestKtdpParsers(ParseTestMixin):
         self.assert_attribute(op, "memory_space", "HBM")
         self.assert_num_operands(op, 1)
         self.assert_operand_names(op, "%ptr")
+
+    def test_construct_memory_view_ct_local_with_ct_id(self):
+        # `ct_local` maps to the interpreter's LX, and `ct_id = N` is captured
+        # as lx_core_id so load/store can route to that tile's scratchpad.
+        op = self._parse(
+            "%view = ktdp.construct_memory_view %ptr, sizes: [128], strides: [1]"
+            " { coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,"
+            " memory_space = #ktdp.memory_space<ct_local, ct_id = 3> }"
+            " : memref<128xf16>",
+            args={"%ptr": "index"},
+        )
+        self.assert_attribute(op, "memory_space", "LX")
+        self.assert_attribute(op, "lx_core_id", 3)
+
+    def test_construct_memory_view_rejects_pre_rename_spelling(self):
+        # ktir-mlir-frontend#58 replaced `#ktdp.spyre_memory_space<HBM|LX>`
+        # with `#ktdp.memory_space<global|ct_local>`. The old kind names must
+        # not be silently accepted (nor fall back to the HBM default).  The
+        # exception type differs by frontend — the regex parser raises
+        # ValueError on the unknown kind, while the MLIR frontend rejects the
+        # enum during module parsing — so assert only that it is refused.
+        with pytest.raises(Exception, match="HBM"):
+            self._parse(
+                "%view = ktdp.construct_memory_view %ptr, sizes: [1024], strides: [1]"
+                " { coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1023 >= 0)>,"
+                " memory_space = #ktdp.memory_space<HBM> } : memref<1024xf16>",
+                args={"%ptr": "index"},
+            )
 
     def test_construct_access_tile(self):
         # construct_access_tile records tile shape and all operands
@@ -913,7 +941,7 @@ class TestKtdpParsers(ParseTestMixin):
         op = self._parse(
             "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
             " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
-            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            " memory_space = #ktdp.memory_space<global> } : memref<?xf32>",
             args={"%ptr": "index", "%n_idx": "index"},
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
@@ -929,7 +957,7 @@ class TestKtdpParsers(ParseTestMixin):
         op = self._parse(
             "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
             " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
-            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            " memory_space = #ktdp.memory_space<global> } : memref<?xf32>",
             args={"%ptr": "index", "%n_idx": "index"},
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
@@ -944,7 +972,7 @@ class TestKtdpParsers(ParseTestMixin):
         op = self._parse(
             "%view = ktdp.construct_memory_view %ptr, sizes: [%n_idx], strides: [1]"
             " { coordinate_set = affine_set<(d0)[s0] : (d0 >= 0, -d0 + s0 - 1 >= 0)>,"
-            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf32>",
+            " memory_space = #ktdp.memory_space<global> } : memref<?xf32>",
             args={"%ptr": "index", "%n_idx": "index"},
         )
         # %ptr + %n_idx = 2 operands
@@ -959,7 +987,7 @@ class TestKtdpParsers(ParseTestMixin):
             "%view = ktdp.construct_memory_view %ptr, sizes: [1024, %n], strides: [%n, 1]"
             " { coordinate_set = affine_set<(d0, d1)[s0] : (d0 >= 0, -d0 + 1023 >= 0,"
             " d1 >= 0, -d1 + s0 - 1 >= 0)>,"
-            " memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024x?xf16>",
+            " memory_space = #ktdp.memory_space<global> } : memref<1024x?xf16>",
             args={"%ptr": "index", "%n": "index"},
         )
         self.assert_op_type(op, "ktdp.construct_memory_view")
@@ -983,7 +1011,7 @@ class TestKtdpParsers(ParseTestMixin):
         with pytest.raises(ValueError, match=r"sizes count.*does not match|mismatch"):
             self._parse(
                 "%view = ktdp.construct_memory_view %ptr, sizes: [1024, 32], strides: [1]"
-                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+                " { memory_space = #ktdp.memory_space<global> } : memref<1024xf16>",
                 args={"%ptr": "index"},
             )
 
@@ -993,7 +1021,7 @@ class TestKtdpParsers(ParseTestMixin):
         with pytest.raises(ValueError, match=r"sizes\[0\]=512 does not match memref dimension 1024"):
             self._parse(
                 "%view = ktdp.construct_memory_view %ptr, sizes: [512], strides: [1]"
-                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<1024xf16>",
+                " { memory_space = #ktdp.memory_space<global> } : memref<1024xf16>",
                 args={"%ptr": "index"},
             )
 
@@ -1016,7 +1044,7 @@ class TestKtdpParsers(ParseTestMixin):
             self._parse(
                 f"%view = ktdp.construct_memory_view %ptr, sizes: {sizes_str},"
                 f" strides: {strides_str}"
-                f" {{ memory_space = #ktdp.spyre_memory_space<HBM> }} : {memref_type}",
+                f" {{ memory_space = #ktdp.memory_space<global> }} : {memref_type}",
                 args=args,
             )
 
@@ -1026,7 +1054,7 @@ class TestKtdpParsers(ParseTestMixin):
         with pytest.raises(ValueError, match=r"dynamic dim|'\\?' dim|no sizes"):
             self._parse(
                 "%view = ktdp.construct_memory_view %ptr, strides: [1]"
-                " { memory_space = #ktdp.spyre_memory_space<HBM> } : memref<?xf16>",
+                " { memory_space = #ktdp.memory_space<global> } : memref<?xf16>",
                 args={"%ptr": "index"},
             )
 

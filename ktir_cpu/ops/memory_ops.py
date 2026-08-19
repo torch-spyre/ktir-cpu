@@ -340,7 +340,7 @@ class MemoryOps:
 
         Builds a MemRef describing a contiguous region in HBM or LX.
         ``lx_core_id``, when set, identifies which core's LX scratchpad
-        the data lives in (parsed from #ktdp.spyre_memory_space<LX, core=N>);
+        the data lives in (parsed from #ktdp.memory_space<ct_local, ct_id = N>);
         load/store use it to route via context.get_lx().
         """
         return MemRef(

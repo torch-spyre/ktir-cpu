@@ -42,13 +42,13 @@ try:
         ShapedType,
     )
     from mlir_ktdp.passmanager import PassManager
-    from tools_ktdp.ir_utils import ktdp_context, walk_module
+    from mlir_ktdp.tools import ktdp_context, walk_module
     _HAS_MLIR = True
 except ImportError:
     _HAS_MLIR = False
 
 from ..affine import AffineMap, AffineSet
-from ..ir_types import IRFunction, IRModule, Operation
+from ..ir_types import KTDP_MEMORY_SPACE_KINDS, IRFunction, IRModule, Operation
 from ..parser_ast import parse_affine_map, parse_affine_set
 from ..parser import KTIRParserBase
 
@@ -324,9 +324,10 @@ def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
     if not m:
         raise ValueError(f"ktdp.construct_memory_view: cannot parse dtype from {result_type!r}")
     attributes["dtype"] = m.group(1)
-    # str(memory_space attr) -> "#ktdp.spyre_memory_space<HBM>" or "<LX, core = 0>"
+    # str(memory_space attr) -> "#ktdp.memory_space<global>" or
+    # "<ct_local, ct_id = 0>", mapped to the interpreter's HBM/LX names.
     ms = re.search(
-        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
+        r'#ktdp\.memory_space<\s*(\w+)(?:\s*,\s*ct_id\s*=\s*(\d+))?\s*>',
         str(mlir_op.attributes["memory_space"]),
     )
     if not ms:
@@ -334,7 +335,7 @@ def _adapt_construct_memory_view(mlir_op, attributes, result_type, operands):
             f"ktdp.construct_memory_view: cannot parse memory_space from "
             f"{mlir_op.attributes['memory_space']!r}"
         )
-    attributes["memory_space"] = ms.group(1)
+    attributes["memory_space"] = KTDP_MEMORY_SPACE_KINDS[ms.group(1)]
     if ms.group(2) is not None:
         attributes["lx_core_id"] = int(ms.group(2))
     # str(coordinate_set attr) → "affine_set<(d0) : ...>"
@@ -819,7 +820,7 @@ class MLIRFrontendParser(KTIRParserBase):
     def __init__(self, adapter: Optional[MLIRTypeAdapter] = None):
         if not _HAS_MLIR:
             raise ImportError(
-                "mlir_ktdp / tools_ktdp not installed; "
+                "mlir_ktdp not installed; "
                 "MLIRFrontendParser is unavailable."
             )
         self._adapter = adapter or MLIRTypeAdapter()

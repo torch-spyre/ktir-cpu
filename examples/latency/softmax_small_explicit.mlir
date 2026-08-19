@@ -14,11 +14,11 @@ module {
     %c0_i32 = arith.constant 0 : index
 
     %input_view = ktdp.construct_memory_view %input_ptr, sizes: [64, 64], strides: [64, 1] {
-      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<64x64xf16>
 
     %output_view = ktdp.construct_memory_view %output_ptr, sizes: [64, 64], strides: [64, 1] {
-      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+      coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 63 >= 0, d1 >= 0, -d1 + 63 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<64x64xf16>
 
     scf.for %row = %core_id to %n_rows step %c32_i32 : index {

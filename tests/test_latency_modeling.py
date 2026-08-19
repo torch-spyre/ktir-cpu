@@ -89,7 +89,7 @@ _EXP_MLIR = textwrap.dedent("""\
         %x_view = ktdp.construct_memory_view %x_ptr,
             sizes: [{total}], strides: [1]
             {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + {total_m1} >= 0)>,
-               memory_space = #ktdp.spyre_memory_space<HBM> }}
+               memory_space = #ktdp.memory_space<global> }}
             : index -> memref<{total}xf16>
         %x_acc = ktdp.construct_access_tile %x_view[%offset] {{
             base_map = affine_map<(i) -> (i)>,
@@ -100,7 +100,7 @@ _EXP_MLIR = textwrap.dedent("""\
         %out_view = ktdp.construct_memory_view %out_ptr,
             sizes: [{total}], strides: [1]
             {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + {total_m1} >= 0)>,
-               memory_space = #ktdp.spyre_memory_space<HBM> }}
+               memory_space = #ktdp.memory_space<global> }}
             : index -> memref<{total}xf16>
         %out_acc = ktdp.construct_access_tile %out_view[%offset] {{
             base_map = affine_map<(i) -> (i)>,
@@ -113,8 +113,9 @@ _EXP_MLIR = textwrap.dedent("""\
 """)
 
 # Copy kernel template: loads 128 f16 elements and stores them back.
-# memory_space controls whether memory_cycles are charged (LX → 0, HBM → positive).
-# Instantiated as _LX_MLIR and _HBM_MLIR for test_lx_reuse_vs_hbm_reload.
+# memory_space is a #ktdp.memory_space kind ("ct_local"/"global") and controls
+# whether memory_cycles are charged (ct_local/LX → 0, global/HBM → positive).
+# Instantiated for both kinds by test_lx_reuse_vs_hbm_reload.
 def _copy_mlir(func_name: str, memory_space: str) -> str:
     return textwrap.dedent(f"""\
         module {{
@@ -125,7 +126,7 @@ def _copy_mlir(func_name: str, memory_space: str) -> str:
             %x_view = ktdp.construct_memory_view %x_ptr,
                 sizes: [128], strides: [1]
                 {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,
-                  memory_space = #ktdp.spyre_memory_space<{memory_space}> }}
+                  memory_space = #ktdp.memory_space<{memory_space}> }}
                 : index -> memref<128xf16>
             %c0 = arith.constant {{0 : index}} : index
             %x_acc = ktdp.construct_access_tile %x_view[%c0] {{
@@ -136,7 +137,7 @@ def _copy_mlir(func_name: str, memory_space: str) -> str:
             %out_view = ktdp.construct_memory_view %out_ptr,
                 sizes: [128], strides: [1]
                 {{ coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 127 >= 0)>,
-                  memory_space = #ktdp.spyre_memory_space<{memory_space}> }}
+                  memory_space = #ktdp.memory_space<{memory_space}> }}
                 : index -> memref<128xf16>
             %c0b = arith.constant {{0 : index}} : index
             %out_acc = ktdp.construct_access_tile %out_view[%c0b] {{
@@ -654,8 +655,8 @@ class TestModelingAssumptions:
         """
         cfg = HardwareConfig()
 
-        lx_report = _run_inline(_copy_mlir("lx_kernel", "LX"), "lx_kernel", cfg=cfg, seed_lx=True)
-        hbm_report = _run_inline(_copy_mlir("hbm_kernel", "HBM"), "hbm_kernel", cfg=cfg)
+        lx_report = _run_inline(_copy_mlir("lx_kernel", "ct_local"), "lx_kernel", cfg=cfg, seed_lx=True)
+        hbm_report = _run_inline(_copy_mlir("hbm_kernel", "global"), "hbm_kernel", cfg=cfg)
 
         lx_mem = lx_report.counters[0].memory_cycles
         hbm_mem = hbm_report.counters[0].memory_cycles

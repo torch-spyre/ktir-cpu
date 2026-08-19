@@ -17,7 +17,7 @@ module {
     // Load the 1x1 scalar source from HBM.
     %in_view = ktdp.construct_memory_view %in_ptr, sizes: [1, 1], strides: [1, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 >= 0, d1 >= 0, -d1 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<1x1xf16>
 
     %in_tile = ktdp.construct_access_tile %in_view[%c0, %c0] {
@@ -39,7 +39,7 @@ module {
     // Store to HBM.
     %out_view = ktdp.construct_memory_view %out_ptr, sizes: [4, 64], strides: [64, 1] {
       coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 3 >= 0, d1 >= 0, -d1 + 63 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<4x64xf16>
 
     %out_tile = ktdp.construct_access_tile %out_view[%c0, %c0] {

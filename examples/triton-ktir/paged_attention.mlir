@@ -100,7 +100,7 @@ module {
           d0 >= 0, -d0 + 7   >= 0,
           d1 >= 0, -d1 + 31  >= 0,
           d2 >= 0, -d2 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<8x32x128xf16>
 
     // key_cache: [64, 16, 8, 128]  strides [16384, 1024, 128, 1]
@@ -112,7 +112,7 @@ module {
           d1 >= 0, -d1 + 15  >= 0,
           d2 >= 0, -d2 + 7   >= 0,
           d3 >= 0, -d3 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x16x8x128xf16>
 
     // value_cache: [64, 16, 8, 128]  strides [16384, 1024, 128, 1]
@@ -123,7 +123,7 @@ module {
           d1 >= 0, -d1 + 15  >= 0,
           d2 >= 0, -d2 + 7   >= 0,
           d3 >= 0, -d3 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x16x8x128xf16>
 
     // block_tables: [1, 16]  strides [16, 1]
@@ -132,7 +132,7 @@ module {
       coordinate_set = affine_set<(d0, d1) : (
           d0 >= 0, -d0 + 0  >= 0,
           d1 >= 0, -d1 + 15 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<1x16xi32>
 
     // output: [8, 32, 128]  strides [4096, 128, 1]
@@ -142,7 +142,7 @@ module {
           d0 >= 0, -d0 + 7   >= 0,
           d1 >= 0, -d1 + 31  >= 0,
           d2 >= 0, -d2 + 127 >= 0)>,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<8x32x128xf16>
 
     // -----------------------------------------------------------------------

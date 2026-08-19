@@ -49,12 +49,12 @@ module {
     // (1) Per-partition memory views with symbolic trailing dim (shared s0).
     %A0_view = ktdp.construct_memory_view %a0_ptr, sizes: [64, %s0], strides: [%s0, 1] {
       coordinate_set = #A0_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x?xf16>
 
     %A1_view = ktdp.construct_memory_view %a1_ptr, sizes: [64, %s0], strides: [%s0, 1] {
       coordinate_set = #A1_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<64x?xf16>
 
     // (1) Compose along the concrete row axis: 64 + 64 = 128 rows, s0 cols.
@@ -65,7 +65,7 @@ module {
     // (1) Output view B, 128 x s0.
     %B_view = ktdp.construct_memory_view %b_ptr, sizes: [128, %s0], strides: [%s0, 1] {
       coordinate_set = #B_set,
-      memory_space = #ktdp.spyre_memory_space<HBM>
+      memory_space = #ktdp.memory_space<global>
     } : memref<128x?xf16>
 
     // (2)+(3) Iterate: cols over the symbolic extent, rows over the two

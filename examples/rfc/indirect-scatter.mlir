@@ -25,25 +25,25 @@ module {
         // (1) Construct memory view for X (source)
         %X_view = ktdp.construct_memory_view %X_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #X_coord_set,
-            memory_space = #ktdp.spyre_memory_space<HBM>
+            memory_space = #ktdp.memory_space<global>
         } : memref<64x64xf16>
 
         // (1) Construct memory view for IDX1 (row indices into Y)
         %IDX1 = ktdp.construct_memory_view %IDX1_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #IDX_coord_set,
-            memory_space = #ktdp.spyre_memory_space<HBM>
+            memory_space = #ktdp.memory_space<global>
         } : memref<64x64xi32>
 
         // (1) Construct memory view for IDX2 (column indices into Y)
         %IDX2 = ktdp.construct_memory_view %IDX2_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #IDX_coord_set,
-            memory_space = #ktdp.spyre_memory_space<HBM>
+            memory_space = #ktdp.memory_space<global>
         } : memref<64x64xi32>
 
         // (1) Construct memory view for Y (destination)
         %Y_view = ktdp.construct_memory_view %Y_addr, sizes: [64, 64], strides: [64, 1] {
             coordinate_set = #Y_coord_set,
-            memory_space = #ktdp.spyre_memory_space<HBM>
+            memory_space = #ktdp.memory_space<global>
         } : memref<64x64xf16>
 
         // (2) Direct access tile for X[m, k] — load source contiguously

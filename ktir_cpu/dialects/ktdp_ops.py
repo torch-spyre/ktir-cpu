@@ -23,6 +23,7 @@ from ..ir_types import (
     DistributedMemRef,
     DistributedTileRef,
     IndirectAccessTile,
+    KTDP_MEMORY_SPACE_KINDS,
     MemRef,
     Operation,
     Tile,
@@ -338,16 +339,22 @@ def parse_construct_memory_view(op_text, parse_ctx: ParseContext):
 
     memory_space = "HBM"
     lx_core_id = None
-    # Accept both `<HBM>`/`<LX>` and the RFC's per-core LX form
-    # `<LX, core = N>`.  On real hardware each compute core has its own
-    # private LX SRAM, so a partition tagged `core = N` lives in core N's
+    # `#ktdp.memory_space<global|ct_local[, ct_id = N]>`, mapped to the
+    # interpreter's HBM/LX names.  On real hardware each compute tile has its
+    # own private LX SRAM, so a view tagged `ct_id = N` lives in tile N's
     # scratchpad — captured into lx_core_id and used at load/store time.
     mem_match = re.search(
-        r'#ktdp\.spyre_memory_space<\s*(\w+)(?:\s*,\s*core\s*=\s*(\d+))?\s*>',
+        r'#ktdp\.memory_space<\s*(\w+)(?:\s*,\s*ct_id\s*=\s*(\d+))?\s*>',
         op_text,
     )
     if mem_match:
-        memory_space = mem_match.group(1)
+        kind = mem_match.group(1)
+        if kind not in KTDP_MEMORY_SPACE_KINDS:
+            raise ValueError(
+                f"Unknown #ktdp.memory_space kind {kind!r}; expected one of "
+                f"{sorted(KTDP_MEMORY_SPACE_KINDS)}"
+            )
+        memory_space = KTDP_MEMORY_SPACE_KINDS[kind]
         if mem_match.group(2) is not None:
             lx_core_id = int(mem_match.group(2))
 

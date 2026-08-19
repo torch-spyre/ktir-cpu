@@ -18,27 +18,27 @@ module {
     %f1_f16 = arith.constant 1.0 : f16
 
     %X_view = ktdp.construct_memory_view %X, sizes: [1151, 8192], strides: [8192, 1] {
-        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<1151x8192xf16>
 
     %Y_view = ktdp.construct_memory_view %Y, sizes: [1151, 8192], strides: [8192, 1] {
-        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<1151x8192xf16>
 
     %W_view = ktdp.construct_memory_view %W, sizes: [1151, 8192], strides: [8192, 1] {
-        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<1151x8192xf16>
 
     %B_view = ktdp.construct_memory_view %B, sizes: [1151, 8192], strides: [8192, 1] {
-        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = affine_set<(d0, d1) : (d0 >= 0, -d0 + 1150 >= 0, d1 >= 0, -d1 + 8191 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<1151x8192xf16>
 
     %Mean_view = ktdp.construct_memory_view %Mean, sizes: [1151], strides: [1] {
-        coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1150 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1150 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<1151xf16>
 
     %Rstd_view = ktdp.construct_memory_view %Rstd, sizes: [1151], strides: [1] {
-        coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1150 >= 0)>, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = affine_set<(d0) : (d0 >= 0, -d0 + 1150 >= 0)>, memory_space = #ktdp.memory_space<global>
     } : memref<1151xf16>
 
     scf.for %row = %core_id to %c1151_i32 step %c32_i32  : index {
