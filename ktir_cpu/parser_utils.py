@@ -513,7 +513,7 @@ def _coerce_attr_value(value_str: str):
     return value_str
 
 
-def parse_tile_future_type(type_str: str, *, context: str):
+def parse_tile_future_type(type_str: str, *, context: str, aliases: Optional[Dict] = None):
     """Parse a ``!ktdp.tile_future<...>`` type string.
 
     The grammar accepted here has an optional ``groups`` clause and a
@@ -555,7 +555,7 @@ def parse_tile_future_type(type_str: str, *, context: str):
     # scans <> depth correctly for keyword<...> values. Locate the key
     # position separately so the trailing clause (including any leading
     # ``,\s*`` separator) can be stripped from ``partials_text``.
-    groups_str = extract_named_attr(inner, "groups")
+    groups_str = extract_named_attr(inner, "groups", aliases)
     if groups_str is not None:
         key_m = re.search(r",?\s*\bgroups\s*=", inner)
         # extract_named_attr found "groups", so the key literal is present

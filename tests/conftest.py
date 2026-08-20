@@ -451,6 +451,52 @@ EXAMPLE_PARAMS: dict[str, list[dict]] = {
             "d_ffn": 1024,
         },
     ],
+    # ---------------------------------------------------------------------------
+    # RMSNorm examples
+    # ---------------------------------------------------------------------------
+    "rmsnorm_4x1": [
+        {
+            "path": "latency/rmsnorm_4core_4x1.mlir",
+            # 4-core embarrassingly parallel RMSNorm, grid=[4, 1].
+            # No allreduce — each core normalizes its own rows independently.
+            # Global: seq=256, hidden_dim=4096.
+            # HBM element-index layout (f16):
+            #   elems [0..1048575]         → X [256, 4096]
+            #   elems [1048576..2097151]   → W [256, 4096] (1D weight tiled)
+            #   elems [2097152..3145727]   → Y [256, 4096]
+            "execute_kwargs": {
+                "X": 0,
+                "Y": 2097152,
+                "W": 1048576,
+                "N": 4096,
+                "eps": 1e-5,
+                "BLOCK_SIZE": 1024,
+            },
+            "seq": 256,
+            "hidden_dim": 4096,
+        },
+    ],
+    "rmsnorm_2x2": [
+        {
+            "path": "latency/rmsnorm_4core_2x2.mlir",
+            # 4-core distributed RMSNorm with hidden-dim sharding (M=2)
+            # and row sharding (K=2), grid=[2, 2].
+            # Uses construct_distributed_memory_view for X, W, Y.
+            # Cross-core allreduce for sum-of-squares across col-partners.
+            # Same HBM layout as rmsnorm_4x1.
+            # Uses C++ custom assembly format for inter_tile ops.
+            "execute_kwargs": {
+                "X": 0,
+                "Y": 2097152,
+                "W": 1048576,
+                "N": 4096,
+                "eps": 1e-5,
+                "BLOCK_SIZE": 1024,
+            },
+            "seq": 256,
+            "hidden_dim": 4096,
+        },
+    ],
 }
 
 
@@ -480,10 +526,13 @@ def get_test_params(
         for entry in EXAMPLE_PARAMS[fn]:
             rel_path = entry["path"]
             is_failure = "exception_msg" in entry
+            is_frontend_only = entry.get("mlir_frontend_only", False)
             if filter is not None:
                 if filter not in rel_path and filter not in fn:
                     continue
             elif is_failure:
+                continue
+            elif is_frontend_only and not func_names:
                 continue
             abs_path = str(EXAMPLES_DIR / rel_path)
             # Expand any list-valued execute_kwargs into separate entries.
@@ -500,6 +549,7 @@ def get_test_params(
                 expanded = {**entry, "execute_kwargs": {**entry["execute_kwargs"], key: val}}
                 result.append((abs_path, fn, expanded))
     return result
+
 
 
 # ---------------------------------------------------------------------------
