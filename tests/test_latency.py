@@ -2961,6 +2961,7 @@ class TestRoPELatency:
         for cid, counters in report.counters.items():
             assert counters.comm_cycles == 0, (
                 f"Core {cid} has {counters.comm_cycles} comm cycles, expected 0"
+            )
 
 # ---------------------------------------------------------------------------
 # RMSNorm latency — memory-bound, SIMD-dominant

@@ -88,11 +88,11 @@ module {
 
     // === Construct distributed views for X ===
     %X_p0 = ktdp.construct_memory_view %X, sizes: [256, 2048], strides: [4096, 1] {
-        coordinate_set = #part_col_0, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #part_col_0, memory_space = #ktdp.memory_space<global>
     } : memref<256x2048xf16>
 
     %X_p1 = ktdp.construct_memory_view %X_base_1, sizes: [256, 2048], strides: [4096, 1] {
-        coordinate_set = #part_col_1, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #part_col_1, memory_space = #ktdp.memory_space<global>
     } : memref<256x2048xf16>
 
     %X_view = ktdp.construct_distributed_memory_view
@@ -101,11 +101,11 @@ module {
 
     // === Construct distributed views for W ===
     %W_p0 = ktdp.construct_memory_view %W, sizes: [256, 2048], strides: [4096, 1] {
-        coordinate_set = #part_col_0, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #part_col_0, memory_space = #ktdp.memory_space<global>
     } : memref<256x2048xf16>
 
     %W_p1 = ktdp.construct_memory_view %W_base_1, sizes: [256, 2048], strides: [4096, 1] {
-        coordinate_set = #part_col_1, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #part_col_1, memory_space = #ktdp.memory_space<global>
     } : memref<256x2048xf16>
 
     %W_view = ktdp.construct_distributed_memory_view
@@ -114,11 +114,11 @@ module {
 
     // === Construct distributed views for Y ===
     %Y_p0 = ktdp.construct_memory_view %Y, sizes: [256, 2048], strides: [4096, 1] {
-        coordinate_set = #part_col_0, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #part_col_0, memory_space = #ktdp.memory_space<global>
     } : memref<256x2048xf16>
 
     %Y_p1 = ktdp.construct_memory_view %Y_base_1, sizes: [256, 2048], strides: [4096, 1] {
-        coordinate_set = #part_col_1, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #part_col_1, memory_space = #ktdp.memory_space<global>
     } : memref<256x2048xf16>
 
     %Y_view = ktdp.construct_distributed_memory_view

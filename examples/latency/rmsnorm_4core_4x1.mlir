@@ -42,15 +42,15 @@ module {
     %row_end = arith.addi %row_start, %c64 : index
 
     %X_view = ktdp.construct_memory_view %X, sizes: [256, 4096], strides: [4096, 1] {
-        coordinate_set = #tensor_set, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #tensor_set, memory_space = #ktdp.memory_space<global>
     } : memref<256x4096xf16>
 
     %Y_view = ktdp.construct_memory_view %Y, sizes: [256, 4096], strides: [4096, 1] {
-        coordinate_set = #tensor_set, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #tensor_set, memory_space = #ktdp.memory_space<global>
     } : memref<256x4096xf16>
 
     %W_view = ktdp.construct_memory_view %W, sizes: [256, 4096], strides: [4096, 1] {
-        coordinate_set = #tensor_set, memory_space = #ktdp.spyre_memory_space<HBM>
+        coordinate_set = #tensor_set, memory_space = #ktdp.memory_space<global>
     } : memref<256x4096xf16>
 
     // Row loop: each core processes a contiguous block of 64 rows
