@@ -24,7 +24,6 @@ from ..dtypes import to_np_dtype
 from ..ir_types import Operation, Tile
 from ..parser_utils import find_ssa_names, parse_tensor_or_memref_type
 from .registry import register, register_parser
-from ..latency import LatencyCategory as LC
 
 
 def _infer_splat_shape(context: CoreContext) -> Optional[Tuple[int, ...]]:
@@ -55,7 +54,7 @@ def tensor__empty(op, context, env):
     return Tile(data, dtype_str, shape)
 
 
-@register("tensor.splat", latency_category=LC.COMPUTE_FLOAT)
+@register("tensor.splat")
 def tensor__splat(op, context, env):
     scalar = context.get_value(op.operands[0])
 

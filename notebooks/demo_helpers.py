@@ -82,7 +82,7 @@ def print_hw_config(hw: HardwareConfig):
     print(f"  {'cores_active':<14} {'systolic':>10} {'SIMD':>10}")
     for nc in [4, 32]:
         bw = chip_bw_per_cycle / nc
-        print(f"  {nc:<14} {hw.systolic_flops_per_cycle / bw:>7.0f} F/B {hw.simd_elements_per_cycle / bw:>7.0f} F/B")
+        print(f"  {nc:<14} {hw.systolic_flops_per_cycle / bw:>7.2f} F/B {hw.simd_elements_per_cycle / bw:>7.2f} F/B")
 
 
 def print_core_roofline(report, hw: HardwareConfig):
