@@ -46,7 +46,11 @@ jobs:
           # mlir_generate_type_stubs() builds a 283-char target name by joining
           # DEPENDS_TARGETS, overflowing NAME_MAX (255). CMake 4.0 truncates the
           # name and relies on the trailing hash.
-          uv pip install scikit-build-core "nanobind>=2.12.0" "cmake>=4.0" "ninja>=1.11"
+          # nanobind is bounded below 3: MLIRDetectPythonEnv.cmake asks
+          # find_package for nanobind 2.9, and nanobind ships CMake's
+          # SameMajorVersion compatibility file, so a 3.x config is rejected on
+          # the major version alone. Widen only when MLIR's request changes.
+          uv pip install scikit-build-core "nanobind>=2.12.0,<3" "cmake>=4.0" "ninja>=1.11"
           echo "CMAKE_ARGS=-DMLIR_DIR=$MLIR_DIR" >> $GITHUB_ENV
 
       - name: Install project and dependencies
