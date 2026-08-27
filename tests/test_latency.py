@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ktir_cpu import KTIRInterpreter, HardwareConfig, LatencyReport
 from ktir_cpu.dtypes import stick_to_elem_idx
+from ktir_cpu.memory import HBMSimulator
 
 from conftest import EXAMPLES_DIR, get_test_params, parse_example
 
@@ -91,6 +92,30 @@ def _run_matmul(path, func_name, entry, cfg, trace=False):
         **kwargs,
     )
     return interp.get_latency_report()
+
+
+def _matmul_hand_count(entry):
+    """A matmul entry's execute kwargs, and the stick rule that prices one tile.
+
+    Shared by the two tests that hand-count this kernel, because the stick rule is
+    exactly the part that has to stay identical between them: rounding a tile row
+    up to a whole stick is where a hand count and the model most easily disagree,
+    and two copies of it can only be corrected in one place.
+
+    The rule is specific to these shapes -- every tile row here is a contiguous run
+    of at most one stick and every view's row stride is a whole number of sticks,
+    so a row costs one stick and a tile costs one stick per row. It does not
+    generalise, which is why it is written out here rather than read back out of
+    the model the tests are checking.
+    """
+    kwargs = {k: v for k, v in entry["execute_kwargs"].items() if v is not None}
+    f16 = 2
+
+    def tile_bytes(rows, cols):
+        stick = HBMSimulator.STICK_BYTES
+        return rows * -(-cols * f16 // stick) * stick   # ceil to whole sticks
+
+    return kwargs, tile_bytes
 
 
 def _run_vector_reduce(path, func_name, entry, cfg, trace=False):
@@ -649,6 +674,124 @@ class TestRoofline:
 
         # Each iteration does one linalg.matmul of shape (bm × bk) × (bk × bn)
         assert core0.total_flops >= 2.0 * bm * bn * bk * n_iters
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("matmul_kernel_small"))
+    def test_matmul_chip_bytes_and_flops_match_hand_count(self, path, func_name, entry):
+        """Chip-wide traffic and FLOPs, counted off the IR by hand, exactly.
+
+        The companion to ``test_vector_add_flops_and_bytes``: that one pins one
+        core of the simplest kernel, this one pins the whole chip of a tiled one,
+        where the count has to get the grid, the loop trip count and stick
+        granularity right rather than just the element count.
+
+        Exact equality and not a tolerance. Both sides are integer counts, so the
+        only thing a tolerance would buy is silence about a real disagreement —
+        and a small one is what a mis-charged operation looks like. Charging an
+        integer compare as a float compute, which is what the model did until
+        recently, moves a total by parts in 100,000.
+
+        The stick rule the count rests on is written out in
+        ``_matmul_hand_count``, which the other hand-counting test shares.
+        """
+        kwargs, tile_bytes = _matmul_hand_count(entry)
+        M, N, K = kwargs["M"], kwargs["N"], kwargs["K"]
+        bm, bn, bk = (kwargs["BLOCK_SIZE_M"], kwargs["BLOCK_SIZE_N"],
+                      kwargs["BLOCK_SIZE_K"])
+        cores = (M // bm) * (N // bn)          # grid [M/bm, N/bn], one C tile each
+        k_iters = K // bk                      # scf.for trip count per core
+        # Per core: one A tile and one B tile per iteration, then one C store.
+        per_core = k_iters * (tile_bytes(bm, bk) + tile_bytes(bk, bn))
+        per_core += tile_bytes(bm, bn)
+        # Per core: one linalg.matmul per iteration, plus the accumulate that folds
+        # it into the running C tile.
+        flops = cores * k_iters * (2 * bm * bn * bk + bm * bn)
+
+        report = _run_matmul(path, func_name, entry, HardwareConfig())
+        assert sum(c.dram_bytes for c in report.counters.values()) == cores * per_core
+        assert sum(c.total_flops for c in report.counters.values()) == flops
+        assert sum(c.comm_bytes for c in report.counters.values()) == 0, (
+            "a matmul on independent C tiles has nothing to exchange"
+        )
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("matmul_kernel_small"))
+    def test_traffic_by_target_attributes_every_byte_to_an_argument(
+        self, path, func_name, entry
+    ):
+        """Per-tensor attribution, hand-counted, with nothing left over.
+
+        This is the method that makes a prose claim about one tensor checkable.
+        The chip total here is 45,056 bytes and says nothing about the split; the
+        breakdown says B moves four times what A moves, because every core reads
+        a (bk x bn) B tile against an (bm x bk) A tile. A sentence calling one of
+        the two negligible survives the total and does not survive this.
+
+        What discriminates is the key set together with the per-row counts:
+        attribution that resolved every byte but keyed it on something
+        uncomparable -- a tile's byte address rather than a view's element index
+        -- would still add up. The closing sum against ``dram_bytes`` is not
+        independent of those on this kernel, where every byte is attributable and
+        no ``None`` row exists; it is here as the invariant the method's docstring
+        promises, so a later change that starts dropping underivable bytes rather
+        than parking them under ``None`` fails on a kernel that has some.
+        """
+        kwargs, tile_bytes = _matmul_hand_count(entry)
+        M, N, K = kwargs["M"], kwargs["N"], kwargs["K"]
+        bm, bn, bk = (kwargs["BLOCK_SIZE_M"], kwargs["BLOCK_SIZE_N"],
+                      kwargs["BLOCK_SIZE_K"])
+        cores = (M // bm) * (N // bn)
+        k_iters = K // bk
+
+        interp = KTIRInterpreter(latency_config=HardwareConfig(), trace_latency=True)
+        interp.load(path)
+        rng = np.random.default_rng(42)
+        A = rng.standard_normal((M, K)).astype(np.float16)
+        B = rng.standard_normal((K, N)).astype(np.float16)
+        C = np.zeros((M, N), dtype=np.float16)
+        interp.execute_function(func_name, a_ptr=A, b_ptr=B, c_ptr=C, **kwargs)
+        report = interp.get_latency_report()
+
+        rows = report.traffic_by_target()
+        # One key per argument, at the element index that argument was bound to.
+        assert set(rows) == {interp.arg_ptrs[n] for n in ("a_ptr", "b_ptr", "c_ptr")}
+        # Every core loads one A tile and one B tile per iteration, and stores its
+        # C tile once at the end.
+        expected = {
+            interp.arg_ptrs["a_ptr"]: (cores * k_iters, tile_bytes(bm, bk), "ktdp.load"),
+            interp.arg_ptrs["b_ptr"]: (cores * k_iters, tile_bytes(bk, bn), "ktdp.load"),
+            interp.arg_ptrs["c_ptr"]: (cores, tile_bytes(bm, bn), "ktdp.store"),
+        }
+        for target, (n_ops, per_op, op_type) in expected.items():
+            assert rows[target]["nbytes"] == n_ops * per_op
+            assert rows[target]["ops"] == {op_type: n_ops}
+        assert sum(r["nbytes"] for r in rows.values()) == sum(
+            c.dram_bytes for c in report.counters.values()
+        ), "attribution dropped bytes instead of parking them under None"
+
+    @pytest.mark.parametrize("path,func_name,entry", get_test_params("matmul_kernel_small"))
+    def test_traffic_by_target_without_trace_raises(self, path, func_name, entry):
+        """No trace is not zero traffic, so it raises instead of returning {}.
+
+        The per-op figures only exist under ``trace_latency=True``. An empty
+        mapping is a valid answer -- a kernel that moved nothing has one -- so
+        returning it here would make a missing constructor argument look like a
+        finding about the kernel.
+        """
+        report = _run_matmul(path, func_name, entry, HardwareConfig(), trace=False)
+        assert report.counters, "the run itself should still have been counted"
+        with pytest.raises(RuntimeError, match="trace_latency=True"):
+            report.traffic_by_target()
+
+    def test_traffic_by_target_on_an_empty_report_says_nothing_ran(self):
+        """An empty report is not a tracing mistake, and must not be reported as one.
+
+        Both states have no trace to attribute, and the fixes are opposite: pass
+        ``trace_latency=True``, or run the kernel at all. One message covering both
+        sends half its readers to the wrong one.
+        """
+        from ktir_cpu.latency import LatencyReport
+        report = LatencyReport(config=HardwareConfig(), counters={})
+        with pytest.raises(RuntimeError, match="covers no core"):
+            report.traffic_by_target()
 
     def test_empty_report_roofline(self):
         """roofline() on empty report returns empty dict."""
