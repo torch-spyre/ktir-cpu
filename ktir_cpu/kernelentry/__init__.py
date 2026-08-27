@@ -115,7 +115,10 @@ class KernelEntry:
     *path* is the kernel's ``.mlir``, relative to ``examples/``, and it is the
     kernel's source — hand-written IR, or captured compiler output such as
     ``examples/triton-ktir/``, which is "kernels as the Triton -> KTIR path emits
-    them".
+    them".  A declaration's path is relative because the report names it that way,
+    and a row pointing at somebody's own disk is a row nobody else can regenerate.
+    An absolute path is what a kernel read cold from outside this repository carries
+    instead: it is answering the questions that need no declaration.
 
     *gate_params* is deliberately a reduced shape: gate cost is driven by shape and
     not by the number of entries, which is why ``examples/latency/`` holds reduced

@@ -27,6 +27,11 @@ function. A path is read cold — no declaration is consulted even if one exists
 this step is available before step 2 rather than after it. Once the kernel is
 declared, name it instead: `probe my_kernel`.
 
+The file does not have to be in this repository. `examples/` holds fixtures, while
+the kernels this interpreter is asked to support are versioned elsewhere, so a cold
+probe takes any path — a checkout beside this one, a scratch file you are still
+editing. Only the steps that write anything need the kernel to live here.
+
 It answers the questions that need no declaration: which of your kernel's ops have
 no execution handler, and whether it survives both parse paths. Anything that needs
 to *run* the kernel reports that there is no declaration yet. `probe` writes

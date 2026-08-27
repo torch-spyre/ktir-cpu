@@ -338,6 +338,26 @@ class TestProbingAKernelWithNoDeclaration:
         assert "tensors=" in claims["exec.runs"].detail
         assert claims["cost.derivation"].state == "undetermined"
 
+    def test_a_kernel_outside_this_repository_is_probed_where_it_lies(self, tmp_path):
+        """The case the tool is for: a kernel somebody brings, versioned elsewhere.
+
+        The entry keeps the absolute path, there being no relative form for it to
+        have, and every claim that needs no declaration is answered anyway.
+        """
+        from ktir_cpu.kernelentry import EXAMPLES_DIR
+        from ktir_cpu.kernelentry.cli import entry_for_bare_kernel
+
+        outside = tmp_path / "brought_from_elsewhere.mlir"
+        outside.write_text((EXAMPLES_DIR / self.KERNEL).read_text())
+
+        entry = entry_for_bare_kernel(outside)
+        assert entry.mlir_path.resolve() == outside.resolve()
+
+        states = {c.id: c.state for c in probe(entry).claims}
+        handlers = [v for k, v in states.items() if k.endswith(".handler")]
+        assert handlers and all(v == CLOSED for v in handlers)
+        assert states["parse.regex"] == CLOSED
+
     def test_a_multi_function_module_asks_which_one(self, tmp_path):
         """Guessing would probe an arbitrary function and report on the wrong kernel.
 

@@ -185,11 +185,14 @@ def entry_for_bare_kernel(path: Path, func: Optional[str] = None) -> KernelEntry
                 "name one with --func"
             )
         func = names[0]
-    try:
-        rel = str(path.resolve().relative_to(EXAMPLES_DIR))
-    except ValueError:
-        raise SystemExit(f"{path} is not under examples/; move it there first")
-    return KernelEntry(name=f"{path.stem} (no declaration)", func=func, path=rel)
+    # Relative under ``examples/``, so a cold probe and a declared entry name the
+    # same kernel the same way; absolute for a kernel versioned outside this
+    # repository, which a cold read takes because it writes nothing.
+    resolved = path.resolve()
+    where = (resolved.relative_to(EXAMPLES_DIR)
+             if resolved.is_relative_to(EXAMPLES_DIR) else resolved)
+    return KernelEntry(name=f"{path.stem} (no declaration)", func=func,
+                       path=str(where))
 
 
 def _resolve(target: Optional[str], use_all: bool,
@@ -786,8 +789,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ):
         child = sub.add_parser(name, help=helptext)
         child.add_argument("target", nargs="?",
-                           help="a declared kernel's name, or the path of a "
-                                ".mlir under examples/ to read cold")
+                           help="a declared kernel's name, or the path of any "
+                                ".mlir to read cold, inside this repository "
+                                "or not")
         child.add_argument("--func", default=None,
                            help="function to probe, when a bare .mlir declares "
                                 "more than one")
