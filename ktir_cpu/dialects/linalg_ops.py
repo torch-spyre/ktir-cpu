@@ -551,6 +551,15 @@ def linalg__generic(op, context, env):
                 "linalg.generic: reduction combiner has no non-outs operand"
             )
         out_data = context.get_value(raw_operand)
+        if not isinstance(out_data, Tile):
+            out_data = Tile(np.full(iter_shape, out_data, dtype=out_np_dtype), outs_val.dtype, iter_shape)
+        # Reading raw_operand skips dispatch, so it charges no latency.
+        # Pre-fix, running the full body here charged the combiner's pass
+        # over iter_shape; replay it for that charge alone and discard the
+        # result (out_data is already correct). Aliasing is safe: combiner
+        # ops are pure scalar ops on generic-region block args, never the
+        # DPS in-place ops this interpreter models for named linalg ops.
+        _run_combiner(combiner_bb0, combiner_ops, out_data, out_data, context, env)
     context.pop_scope()
 
     if not isinstance(out_data, Tile):
