@@ -1340,6 +1340,106 @@ class TestLinalg:
         assert result.shape == (n_stick, m, n_elem)
         assert np.allclose(result.data, expected, rtol=1e-4)
 
+    def test_generic_reduction_maxnumf(self):
+        # linalg.generic reduction with a maxnumf combiner and a real compute
+        # op ahead of it (non-empty compute_ops).
+        M, K = 3, 5
+        in_data = np.arange(M * K, dtype=np.float32).reshape(M, K) - 6.0
+        out_data = np.full((M,), 5.0, dtype=np.float32)
+
+        in_tile = Tile(in_data, "f32", (M, K))
+        out_tile = Tile(out_data, "f32", (M,))
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.mulf", operands=["%ii", "%ii"], result="%sq"),
+            _op("arith.maxnumf", operands=["%sq", "%oo"], result="%m"),
+            _op("linalg.yield", operands=["%m"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+                    parse_affine_map("affine_map<(d0, d1) -> (d0)>"),
+                ],
+                "iterator_types": ["parallel", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        expected = np.maximum((in_data ** 2).max(axis=1), out_data)
+        assert result.shape == (M,)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
+    def test_generic_reduction_no_compute_op(self):
+        # linalg.generic reduction whose body is exactly the combiner reading
+        # the outs block-arg directly, with no separate compute op ahead of
+        # it (the linalg.reduce shorthand shape inlined into a generic body).
+        # Uses a non-idempotent combiner (addf) with a non-neutral outs, so a
+        # per-reduction-step re-add of outs would show up as a wrong result.
+        M, K = 3, 5
+        in_data = np.arange(M * K, dtype=np.float32).reshape(M, K)
+        out_data = np.full((M,), 1.0, dtype=np.float32)  # non-neutral outs
+
+        in_tile = Tile(in_data, "f32", (M, K))
+        out_tile = Tile(out_data, "f32", (M,))
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("arith.addf", operands=["%ii", "%oo"], result="%s"),
+            _op("linalg.yield", operands=["%s"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+                    parse_affine_map("affine_map<(d0, d1) -> (d0)>"),
+                ],
+                "iterator_types": ["parallel", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        expected = in_data.sum(axis=1) + out_data
+        assert result.shape == (M,)
+        assert np.allclose(result.data, expected, rtol=1e-5)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()

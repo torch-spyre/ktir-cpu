@@ -369,14 +369,6 @@ def linalg__batch_matmul(op, context, env):
     return result
 
 
-_COMBINER_IDENTITY = {
-    "arith.addf": 0.0, "arith.addi": 0,
-    "arith.mulf": 1.0, "arith.muli": 1,
-    "arith.maxf": float("-inf"), "arith.maximumf": float("-inf"),
-    "arith.minf": float("inf"), "arith.minimumf": float("inf"),
-}
-
-
 def _infer_iter_shape(indexing_maps, tensor_shapes):
     """Infer the full iteration-space shape from indexing maps + tensor shapes.
 
@@ -420,15 +412,15 @@ def _gather_input(data, imap, target_shape):
 
 
 def _split_combiner(body_ops, outs_bb0_name):
-    """Split body_ops into (compute_ops, combiner_op_type, combiner_ops).
+    """Split body_ops into (compute_ops, combiner_op_type, combiner_region, raw_operand).
 
-    The combiner is the op whose operands include the outs block-arg and whose
-    result is yielded.  Returns (compute_ops, combiner_type, combiner_region)
-    where combiner_region is a minimal [op, yield] suitable for _tree_fold.
+    combiner_region is a minimal [op, yield] for _tree_fold. raw_operand is
+    the combiner's other operand (not outs_bb0_name), used when compute_ops
+    is empty.
     """
     yield_op = next((o for o in body_ops if o.op_type == "linalg.yield"), None)
     if yield_op is None:
-        return body_ops, None, None
+        return body_ops, None, None, None
 
     yielded_name = yield_op.operands[0] if yield_op.operands else None
 
@@ -440,9 +432,10 @@ def _split_combiner(body_ops, outs_bb0_name):
             break
 
     if combiner is None:
-        return body_ops, None, None
+        return body_ops, None, None, None
 
     compute_ops = [o for o in body_ops if o is not combiner and o is not yield_op]
+    raw_operand = next((o for o in combiner.operands if o != outs_bb0_name), None)
 
     # Build a minimal combiner region for _tree_fold.
     # _run_combiner binds bb0_names[0]=lhs, bb0_names[1]=rhs, executes the
@@ -460,7 +453,11 @@ def _split_combiner(body_ops, outs_bb0_name):
         operands=["__fold_combined__"], attributes={}, result_type=None,
     )
 
-    return compute_ops, combiner.op_type, (combiner_bb0, [combiner_region_op, combiner_yield])
+    return (
+        compute_ops, combiner.op_type,
+        (combiner_bb0, [combiner_region_op, combiner_yield]),
+        raw_operand,
+    )
 
 
 @register("linalg.generic", latency_category=LC.COMPUTE_FLOAT)
@@ -535,7 +532,7 @@ def linalg__generic(op, context, env):
 
     # --- Reduction path ---
     outs_bb0_name = bb0_names[n_ins] if n_ins < len(bb0_names) else None
-    compute_ops, combiner_type, combiner_info = _split_combiner(body_ops, outs_bb0_name)
+    compute_ops, _, combiner_info, raw_operand = _split_combiner(body_ops, outs_bb0_name)
 
     if combiner_info is None:
         raise ValueError(
@@ -545,21 +542,16 @@ def linalg__generic(op, context, env):
 
     combiner_bb0, combiner_ops = combiner_info
 
-    # Bind outs arg to identity element so compute ops run without accumulation.
-    if combiner_type not in _COMBINER_IDENTITY:
-        raise ValueError(
-            f"linalg.generic: unsupported combiner '{combiner_type}' for reduction; "
-            f"supported: {list(_COMBINER_IDENTITY)}"
-        )
-    identity = _COMBINER_IDENTITY[combiner_type]
-    if n_ins < len(bb0_names):
-        id_data = np.full(iter_shape, identity, dtype=out_np_dtype)
-        context.set_value(bb0_names[n_ins], Tile(id_data, outs_val.dtype, iter_shape))
-
-    # Run compute + combiner on full iteration shape (produces full-shape result).
-    result = env.execute_region(context, body_ops)
+    if compute_ops:
+        result = env.execute_region(context, compute_ops)
+        out_data = unwrap_yield(result)
+    else:
+        if raw_operand is None:
+            raise ValueError(
+                "linalg.generic: reduction combiner has no non-outs operand"
+            )
+        out_data = context.get_value(raw_operand)
     context.pop_scope()
-    out_data = unwrap_yield(result)
 
     if not isinstance(out_data, Tile):
         out_data = Tile(np.full(iter_shape, out_data, dtype=out_np_dtype), outs_val.dtype, iter_shape)
