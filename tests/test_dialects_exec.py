@@ -1440,6 +1440,79 @@ class TestLinalg:
         assert result.shape == (M,)
         assert np.allclose(result.data, expected, rtol=1e-5)
 
+    @pytest.mark.parametrize(
+        "combiner,np_dtype,reduce_fn",
+        [
+            ("arith.minnumf", np.float32, np.min),
+            ("arith.maxsi", np.int32, np.max),
+            ("arith.minsi", np.int32, np.min),
+            ("arith.maxui", np.uint32, np.max),
+            ("arith.minui", np.uint32, np.min),
+        ],
+        ids=["minnumf", "maxsi", "minsi", "maxui", "minui"],
+    )
+    def test_generic_reduction_minmax_combiners(self, combiner, np_dtype, reduce_fn):
+        # linalg.generic reduction covering the remaining reported combiners
+        # (maxnumf has its own test above): outs pre-filled with the true
+        # identity, no separate compute op -- the reporter's own
+        # tensor.empty + linalg.fill(neutral) + linalg.generic shape.
+        M, K = 3, 5
+        is_float = np.issubdtype(np_dtype, np.floating)
+        type_label = "f32" if is_float else "i32"
+        if is_float:
+            in_data = (np.arange(M * K, dtype=np_dtype) - (M * K) / 2)
+            identity = np.inf if "min" in combiner else -np.inf
+        else:
+            info = np.iinfo(np_dtype)
+            in_data = (np.arange(M * K, dtype=np_dtype) % 17)
+            identity = info.max if "min" in combiner else info.min
+        in_data = in_data.reshape(M, K)
+        out_data = np.full((M,), identity, dtype=np_dtype)
+
+        in_tile = Tile(in_data, type_label, (M, K))
+        out_tile = Tile(out_data, type_label, (M,))
+
+        ctx = _ctx_with(**{"%in": in_tile, "%out": out_tile})
+        env = _make_env()
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op(combiner, operands=["%ii", "%oo"], result="%r"),
+            _op("linalg.yield", operands=["%r"]),
+        ]
+
+        op = _op(
+            "linalg.generic",
+            operands=["%in", "%out"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+                    parse_affine_map("affine_map<(d0, d1) -> (d0)>"),
+                ],
+                "iterator_types": ["parallel", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%ii", "%oo"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        expected = reduce_fn(in_data, axis=1)
+        assert result.shape == (M,)
+        if is_float:
+            assert np.allclose(result.data, expected, rtol=1e-5)
+        else:
+            assert np.array_equal(result.data, expected)
+
     def test_linalg_index(self):
         # linalg.index returns a broadcasting index array for a dimension
         ctx = _make_ctx()
