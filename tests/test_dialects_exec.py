@@ -542,6 +542,16 @@ class TestArithCastsConstants:
         assert result.data.dtype == np.float32
         np.testing.assert_array_equal(result.data, [1.0, -2.0])
 
+    def test_sitofp_tensor_result_type(self):
+        # MLIR-bindings frontend reports the full tensor type (e.g.
+        # "tensor<128xf32>") as result_type, not a bare dtype like "f32".
+        t = Tile(np.array([1, -2, 3], dtype=np.int32), "i32", (3,))
+        ctx = _ctx_with(**{"%a": t})
+        result = _call("arith.sitofp", ctx, _make_env(), operands=["%a"],
+                       result_type="tensor<3xf32>")
+        assert result.data.dtype == np.float32
+        np.testing.assert_array_equal(result.data, [1.0, -2.0, 3.0])
+
 
 class TestArithBitcast:
     def test_bitcast_i32_to_f32_scalar(self):

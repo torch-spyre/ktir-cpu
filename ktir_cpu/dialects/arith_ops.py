@@ -20,7 +20,7 @@ import re
 import numpy as np
 
 from ..dtypes import to_np_dtype
-from ..parser_utils import find_ssa_names
+from ..parser_utils import find_ssa_names, parse_tensor_type
 from ..ir_types import Operation, Tile
 from ..latency import LatencyCategory as LC
 from ..ops.arith_ops import ArithOps
@@ -246,7 +246,9 @@ def arith__extsi(op, context, env):
 
 @register("arith.sitofp")
 def arith__sitofp(op, context, env):
-    dtype = op.result_type or "f32"
+    result_type = op.result_type or "f32"
+    tensor_info = parse_tensor_type(result_type)
+    dtype = tensor_info["dtype"] if tensor_info else result_type
     return _unary(op, context, lambda v: ArithOps.sitofp(v, dtype))
 
 
