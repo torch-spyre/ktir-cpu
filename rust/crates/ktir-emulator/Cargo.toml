@@ -1,0 +1,97 @@
+[package]
+name = "ktir-emulator"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"  # f16 NEON SIMD intrinsics (ktir-core codec) stabilized in 1.94; verified MSRV
+description = "KTIR execution layer — the Spyre emulator: ktdp interpreter, machine-state model, and Metal/NAX/AMX accelerator backend (RFC 0682)."
+license = "Apache-2.0"
+repository = "https://github.com/torch-spyre/ktir-cpu"
+# The real-model e2e fixtures (vendored programs + f16/gz goldens) are ~38 MB —
+# exclude them from the published package (crates.io caps at 10 MB; the e2e tests
+# only run from a full checkout anyway).
+exclude = ["tests/fixtures/**"]
+build = "build.rs"
+
+# The default build is intentionally dependency-light: portable, instant, and the
+# parity oracle. Acceleration is opt-in via the feature flags below.
+[features]
+# `optimizer` (default ON) pulls in ktir-optimizer and enables the whole-program
+# fusion + the fused/serving execution drivers (`segmented`, `resident`) that run
+# the GPU offloads. Disable it (`--no-default-features`) for the bare per-node
+# parity oracle (`execute_function`) with no optimizer dependency.
+default = ["optimizer"]
+optimizer = ["dep:ktir-optimizer"]
+
+# Experimental KTIR -> Metal Shading Language backend. The codegen is pure
+# string emission (no GPU needed); the runtime dispatch pulls the objc2-metal
+# crates (macOS-only) to compile the MSL and run it on a MTLDevice.
+metal = ["dep:objc2", "dep:objc2-metal", "dep:objc2-foundation"]
+
+# BLAS matmul for NON-macOS platforms — pick one. (macOS uses Apple Accelerate
+# automatically; see the target deps below.)
+openblas        = ["dep:cblas-sys", "dep:blas-src", "blas-src/openblas"]
+openblas-system = ["openblas", "dep:openblas-src", "openblas-src/system"]
+mkl             = ["dep:cblas-sys", "dep:blas-src", "blas-src/intel-mkl"]
+blis            = ["dep:cblas-sys", "dep:blas-src", "blas-src/blis"]
+
+[dependencies]
+ktir-core = { path = "../ktir-core", version = "0.1.0" }
+# Partial-fusion planning (plan_segments / fuse_program) for the production
+# `segmented::execute_segmented` / `resident` serving paths. Optional, behind the
+# default-on `optimizer` feature (the optimizer stays core-only — no reverse
+# dependency on this execution crate — so this is a one-way edge).
+ktir-optimizer = { path = "../ktir-optimizer", version = "0.1.0", optional = true }
+cblas-sys = { version = "0.1", optional = true }
+objc2 = { version = "0.6", optional = true }
+objc2-metal = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", optional = true }
+blas-src = { version = "0.10", optional = true, default-features = false }
+openblas-src = { version = "0.10", optional = true, default-features = false }
+
+# macOS: Apple Accelerate AND the Metal/NAX backend ship with / target the OS,
+# so link them unconditionally. build.rs emits cfg(metal) on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+blas-src = { version = "0.10", default-features = false, features = ["accelerate"] }
+cblas-sys = "0.1"
+objc2 = "0.6"
+objc2-metal = "0.3"
+objc2-foundation = "0.3"
+
+[lib]
+name = "ktir_emulator"
+path = "src/lib.rs"
+
+# Test-only: the SmolLM2 model runner (e2e_smollm2.rs) parses manifest.json,
+# and the fuse-then-run e2e builds a ProgramSpec from the manifest to drive the
+# production `segmented::execute_segmented`. (ktir-optimizer is now a regular
+# dependency — see [dependencies] above — so tests reach it through the lib.)
+[dev-dependencies]
+serde_json = "1"
+# Real-model e2e (tests/e2e_real_forward.rs): fetch real weights from PUBLIC HF
+# repos (no HF_TOKEN) + read safetensors. Runs in default `cargo test` (NOT
+# env-gated); weights are fetched once via hf-hub and then cached in
+# ~/.cache/huggingface (content-addressed, immutable — not the scratchy bundle
+# cache). hf-hub default backend is blocking ureq.
+hf-hub = "0.3"
+safetensors = "0.4"
+# Vendored e2e fixtures (goldens + runtime inputs) are stored f16 + gzip -9 (Spyre
+# is f16; the `max_abs` band is looser than f16 precision). Already in the lock.
+flate2 = "1"
+# Each fixture (manifest + node*.mlir + f16.gz inputs/golden) is vendored as one
+# `<name>.tar.gz`; `e2e_real_forward::fixture_dir` unpacks it on demand. Keeps the
+# repo to 4 archives instead of ~1.6k loose files.
+tar = "0.4"
+
+# Profiling target for the real-model run. Plain `fn main` (no libtest harness).
+[[bench]]
+name = "smollm2_bench"
+harness = false
+
+# docs.rs builds on Linux, where `cfg(metal)` is off — so the Metal/NAX backend
+# (`metal.rs`, gated on `cfg(metal)`) would be missing from the published docs.
+# Build the docs targeting Apple Silicon instead: build.rs emits `cfg(metal)` for
+# `target_os = "macos"`, and rustdoc doesn't link, so the macOS-only objc2 deps
+# are fine to document on docs.rs's cross-target doc build.
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
+default-target = "aarch64-apple-darwin"

@@ -1,0 +1,6 @@
+/target
+Cargo.lock
+
+# e2e fixtures are vendored as `<name>.tar.gz` and unpacked on demand; an
+# unpacked dir (from `tar xzf` or `gen_golden.py`) must not be re-committed.
+/crates/ktir-emulator/tests/fixtures/*/

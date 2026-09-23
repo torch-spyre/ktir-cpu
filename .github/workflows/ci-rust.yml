@@ -1,0 +1,113 @@
+name: CI - Rust
+
+on:
+  push:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/ci-rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - '.github/workflows/ci-rust.yml'
+
+# Supersede an in-flight run when a new commit lands on the same branch / PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+# The Rust port is a cargo workspace under rust/.
+defaults:
+  run:
+    working-directory: rust
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux: the accelerated path is a CPU BLAS provider. There is NO
+          # CUDA/cuBLAS backend in the port (and GitHub Linux runners have no
+          # GPU), so we link the system OpenBLAS and select it with the
+          # `openblas-system` feature (matmul -> cblas_sgemm). See blas.rs.
+          - os: ubuntu-latest
+            features: '--features openblas-system'
+          # macOS: Apple Accelerate (AMX) + the Metal/NAX backend are auto-on —
+          # build.rs emits cfg(metal) on macOS and objc2 + Accelerate are
+          # unconditional target deps — so no extra feature flags are needed.
+          - os: macos-26
+            features: ''
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # The real-model e2e fetches public HF weights at test time (no HF_TOKEN);
+      # they are content-addressed and immutable, so cache them across runs.
+      - name: Cache HuggingFace weights
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/huggingface
+          key: hf-weights-${{ runner.os }}-v1
+
+      - name: Install OpenBLAS (Linux accelerated path)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # --release throughout: the matmuls already use accelerated BLAS (Accelerate
+      # /Metal on macOS, AVX OpenBLAS on Linux), but the node-by-node interpreter
+      # around them (tile mgmt, affine eval, HBM/LX simulation) is ~7x slower in a
+      # debug build — which dominates the real-model e2e (1B-param llama decode:
+      # ~44s debug vs ~7s release locally). One release profile is shared by
+      # clippy/test/e2e, so deps compile once.
+      - name: Clippy
+        run: cargo clippy --release --workspace --all-targets ${{ matrix.features }} -- -D warnings
+
+      # Test + E2E, OVERLAPPED on the one runner. cargo runs test *binaries*
+      # sequentially (and locks the target dir per invocation), so to hide the
+      # slow real-model e2e (HF weight download + 1B-param forward) behind the
+      # fast unit/integration tests we build once, then run the e2e binary
+      # DIRECTLY in the background (no cargo lock) while cargo runs everything
+      # else in the foreground. The e2e binary bakes in CARGO_MANIFEST_DIR /
+      # CARGO_TARGET_TMPDIR at compile time, so it runs standalone; it stays
+      # --test-threads=1 (one shared Metal device on macOS), and concurrent Metal
+      # use by the unit tests was measured to cost ~nothing. Decode e2e runs on
+      # both OSes; prefill is cfg(metal) => macOS only.
+      - name: Test + E2E (real-model golden)
+        run: |
+          cargo test --release --workspace ${{ matrix.features }} --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          e2e=$(jq -r 'select(.target.name=="e2e_real_forward" and .executable != null) | .executable' "$RUNNER_TEMP/build.json" | head -1)
+          test -n "$e2e" || { echo "could not locate the e2e_real_forward test binary"; exit 1; }
+          echo "e2e binary: $e2e"
+          set +e
+          # e2e in the background while the foreground runs the fast unit tests.
+          # --test-threads=1: ONE whole-model forward resident at a time (~2.5 GB);
+          # running two concurrently doubled peak RSS and swap-thrashed the 7 GB
+          # macOS runner. Downloads are HF-cached so there's nothing to overlap.
+          # --nocapture so the per-model "[weights …s, forward …s]" timing prints
+          # (libtest hides passing-test stderr otherwise).
+          "$e2e" --test-threads=1 --nocapture &
+          e2e_pid=$!
+          cargo test --release --workspace ${{ matrix.features }} -- --skip real_forward
+          test_rc=$?
+          wait "$e2e_pid"; e2e_rc=$?
+          echo "::notice::unit/integration rc=$test_rc, e2e rc=$e2e_rc"
+          [ "$test_rc" -eq 0 ] && [ "$e2e_rc" -eq 0 ]
