@@ -37,6 +37,10 @@ mlir-frontend = [
 
 [tool.setuptools.packages.find]
 include = ["ktir_cpu*"]
+# ktir_cpu.kernelentry is a development tool rather than part of the library: it
+# reads examples/ and tests/ by path, and a wheel carries neither.  Excluded for
+# the same reason examples/ itself is not packaged.
+exclude = ["ktir_cpu.kernelentry*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.mlir"]

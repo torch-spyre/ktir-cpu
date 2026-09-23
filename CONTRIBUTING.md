@@ -21,6 +21,17 @@ once wheels are available.
 uv run pytest -v
 ```
 
+## Adding a kernel
+
+If your change adds a KTIR kernel, see [docs/kernelentry.md](docs/kernelentry.md) —
+the path from "here is a kernel" to "the simulator supports it", and what the machine
+checks along it versus what only a person can. Start before you write anything, by
+pointing the tool at the IR:
+
+```bash
+uv run python -m ktir_cpu.kernelentry probe examples/latency/my_kernel.mlir
+```
+
 ## Pull Requests
 
 1. Fork the repository and create a feature branch.

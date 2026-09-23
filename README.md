@@ -184,20 +184,27 @@ This keeps operation knowledge (behavior + cost classification) co-located in on
 
 This interpreter covers a **subset** of KTIR ([RFC 0682](https://github.com/torch-spyre/RFCs/blob/main/0682-KtirSpec/0682-KtirSpecRFC.md)). The following are supported:
 
-- Embarrassingly parallel kernels (no inter-core communication required)
-- `ktdp.load` / `ktdp.store` with rectangular-slice semantics
-- `ktdp.construct_access_tile` (rectangular tiles only)
-- Arithmetic, math, and linalg dialect ops (see `ktir_cpu/dialects/`)
+- Embarrassingly parallel kernels, plus cross-core reduction through the experimental `ktdp.inter_tile_produce` / `ktdp.inter_tile_reduce` pair
+- `ktdp.load` / `ktdp.store` over general affine coordinate sets, not only rectangular slices
+- `ktdp.construct_access_tile` with `base_map`, `access_tile_set` and `access_tile_order` evaluated
+- `ktdp.construct_memory_view`, `construct_distributed_memory_view` and `construct_indirect_access_tile`
+- Arithmetic, math, linalg and tensor dialect ops (see `ktir_cpu/dialects/`)
 - `scf.for` / `scf.if` control flow
 - Multi-core grid execution
 - Cycle-approximate latency estimation
 
+Per-op status is generated from the registries rather than listed here: [`docs/supported_ops.md`](docs/supported_ops.md). Per-kernel status: [`docs/kernel_support.md`](docs/kernel_support.md).
+
 **Not yet supported or unreliable:**
 
-- `ktdp.construct_distributed_memory_view` — not implemented
-- `ktdp.construct_indirect_access_tile` — not implemented
-- `ktdp.transfer` / `ktdp.reduce` (communication ops) — present but **unreliable**: the multi-round communication model re-executes the entire function per round, causing incorrect latency accumulation and potential correctness issues with cyclic communication patterns. See `docs/gap_analysis.md` for details.
-- `tensor.extract_slice` / `memref.subview`
+- `memref.subview`, and the `memref` dialect generally — no module exists
+- `linalg.map`
+- `scf.parallel` / `scf.forall` / `scf.reduce`
+- `ktdp.inter_tile_consume` (broadcast) and `ktdp.inter_tile_reduce_scatter` — the reduce half of the four-op inter-tile design is implemented, these two are not
+- `ktdp.region_terminator` — has an MLIR frontend adapter but no execution handler; no kernel under `examples/` reaches it
+- `coordinate_set` overlap between the partitions of a distributed view is unchecked — `find_partition` returns the first match, which RFC 0682 §3.3 leaves unspecified
+
+See [`docs/gap_analysis.md`](docs/gap_analysis.md) for the full conformance picture. `ktdp.transfer` / `ktdp.reduce` no longer exist — the experimental `ktdp.inter_tile_produce` / `ktdp.inter_tile_reduce` pair replaced them.
 
 ## RFC conformance
 

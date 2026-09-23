@@ -71,6 +71,9 @@ class KTIRInterpreter:
         # Keeping the old name for now; the type is TransferBackend.
         self.ring_backend: Optional[TransferBackend] = None
         self._env: Optional[ExecutionEnv] = None
+        # arg name -> pointer value bound by the last execute_function call.
+        # Element index for tensor arguments, verbatim for scalars.
+        self.arg_ptrs: Dict[str, Any] = {}
         self._parser: Optional[KTIRParserBase] = parser
         self._latency_config: Optional[HardwareConfig] = latency_config
         self._latency_tracker: Optional[LatencyTracker] = (
@@ -141,6 +144,10 @@ class KTIRInterpreter:
         if not self.module:
             raise RuntimeError("No module loaded. Call load() first.")
 
+        # Cleared before anything can raise, so a failed run leaves no pointer map
+        # behind: cost attribution reading the previous call's bindings would name
+        # the wrong tensors and look like a correct breakdown while doing it.
+        self.arg_ptrs = {}
         func = self.module.get_function(func_name)
         self._prepare_execution(func.grid)
 
@@ -170,6 +177,11 @@ class KTIRInterpreter:
             else:
                 # Scalar argument (like n)
                 input_ptrs[arg_name] = tensor
+
+        # Retained for cost attribution: LatencyReport.traffic_by_target keys on
+        # the element index a view starts at, which is exactly the value bound
+        # here, so this is what turns those keys back into argument names.
+        self.arg_ptrs = dict(input_ptrs)
 
         for core in self.grid_executor.cores:
             core._use_counts = func.use_counts

@@ -91,7 +91,7 @@ module {
     %prod_16 = linalg.matmul ins(%a_13, %b_14 : tensor<1x512xf16>, tensor<512x64xf16>) outs(%init_15 : tensor<1x64xf16>) -> tensor<1x64xf16>
     %fut_17 = ktdp.inter_tile_produce
         producer_tiles_per_group = #red_tiles
-        : tensor<1x64xf16> -> !ktdp.tile_future<tensor<1x64xf16>, groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>>
+        -> <(tensor<1x64xf16>), groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>>
     {
       ^bb0(%gid: index):
         ktdp.yield_partial %prod_16 : tensor<1x64xf16>
@@ -102,7 +102,7 @@ module {
     %reduced_21 = ktdp.inter_tile_reduce(%fut_17)
         consumer_tiles_per_group = #red_tiles,
         identity(%add_id_20 : tensor<1x64xf16>)
-        : !ktdp.tile_future<tensor<1x64xf16>, groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>> -> tensor<1x64xf16>
+        : <(tensor<1x64xf16>), groups = affine_set<(g) : (g >= 0, -g + 1 >= 0)>> -> tensor<1x64xf16>
     {
       ^bb0(%lhs: tensor<1x64xf16>, %rhs: tensor<1x64xf16>):
         %r_init_22 = tensor.empty() : tensor<1x64xf16>

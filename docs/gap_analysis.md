@@ -13,7 +13,7 @@
 |---|---------------|--------|-------|
 | 1 | `ktdp.construct_distributed_memory_view` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; produces `DistributedMemRef` (composition of N per-partition `MemRef`s). Per-partition routing at access time via `MemoryOps.distributed_tile_access` → `DistributedTileRef`. Tests in `tests/test_distributed_view.py`. |
 | 2 | `ktdp.construct_indirect_access_tile` | ✅ | Handler and parser implemented in `ktir_cpu/dialects/ktdp_ops.py`; tests passing in `tests/test_indirect_access.py`. Both `ktdp.load` (gather, via `MemoryOps.indirect_load`) and `ktdp.store` (scatter, via `MemoryOps.indirect_store`) accept `IndirectAccessTile` (#44 closed). |
-| 2a | `ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce` (four-op design, reduce path) | 🧪 experimental | **Spec status: not yet merged** — the four-op design lives in [ktir-mlir-frontend PR #23](https://github.com/torch-spyre/ktir-mlir-frontend/pull/23). Implemented here ahead of merge so the simulator can exercise it. Op names, attribute keys, and `!ktdp.tile_future<...>` type may change to track the upstream PR. Implementation: handlers and parsers in `ktir_cpu/dialects/ktdp_ops.py`; `TileFuture` per-core handle binds the local partial and a not-yet-running `RingReduceBackend`; reduce delivery triggers the backend with the combiner region as `reduce_fn`. Per-core wire bytes flow to the latency tracker via `Tile.comm_bytes` (mirrors `unique_sticks`). End-to-end tests: `tests/test_examples.py::TestRingReduceExecution` (contiguous reduce groups) and `tests/test_examples.py::TestMulticoreSdpaExecution` (strided reduce groups, 32 cores). Replaces the legacy `ktdp.reduce` / `ktdp.transfer` ops. See `docs/cross_core_scheduling.md`. |
+| 2a | `ktdp.inter_tile_produce` + `ktdp.inter_tile_reduce` (four-op design, reduce path) | 🧪 experimental | The four-op design lives in [ktir-mlir-frontend PR #23](https://github.com/torch-spyre/ktir-mlir-frontend/pull/23). **One divergence stands:** `ktdp.inter_tile_reduce` here takes its result type as a reshape target (`_result_shape` → `attach_reshape`), while the dialect verifies `result types must match future partial types`, so a reduce that reshapes cannot be written in the dialect's own assembly. `examples/ktir/ring_reduce.mlir`, `examples/ktir/ring_reduce_inner_loop.mlir` and `examples/latency/ring_reduce_multi_group.mlir` reduce `tensor<1x128xf16>` to `tensor<128xf16>` — the only non-identity reduce reshape here — and are read by the regex parser only; the other three inter-tile kernels reduce shape-to-shape and the frontend accepts them. Implementation: handlers and parsers in `ktir_cpu/dialects/ktdp_ops.py`; `TileFuture` per-core handle binds the local partial and a not-yet-running `RingReduceBackend`; reduce delivery triggers the backend with the combiner region as `reduce_fn`. Per-core wire bytes flow to the latency tracker via `Tile.comm_bytes` (mirrors `unique_sticks`). End-to-end tests: `tests/test_examples.py::TestRingReduceExecution` (contiguous reduce groups) and `tests/test_examples.py::TestMulticoreSdpaExecution` (strided reduce groups, 32 cores). Replaces the legacy `ktdp.reduce` / `ktdp.transfer` ops. See `docs/cross_core_scheduling.md`. |
 | 2b | `ktdp.inter_tile_consume` (broadcast delivery) | ❌ experimental | Same upstream PR. Not implemented. |
 | 2c | `ktdp.inter_tile_reduce_scatter` | ❌ experimental | Same upstream PR. Not implemented. |
 | 2d | `producer_dependency_per_consumer` (per-tile sync) | 🟡 experimental | Same upstream PR. Parsed and stored on the delivery op AST; runtime is full-barrier mode (waits for all producers). Per-tile mode unimplemented. |
@@ -54,24 +54,25 @@ Currently implemented: `scf.for`, `scf.if`, `scf.yield`.
 
 This section is best read as a **coverage backlog**, not a list of equally
 strong RFC violations. The RFC explicitly defines the `ktdp` surface and
-explicitly calls out only a small subset of non-`ktdp` ops. Missing
-`linalg.add`, `tensor.extract_slice`, and `memref.subview` are more directly
-grounded in the RFC text than every absent op from the broader Arith/Math
-dialects.
+explicitly calls out only a small subset of non-`ktdp` ops, so an absent op the
+RFC names — `memref.subview` is the one still missing — is a stronger finding
+than an absent op from the broader Arith/Math dialects.
 
 ### Arith dialect
 
-The spec references the [full Arith dialect](https://mlir.llvm.org/docs/Dialects/ArithOps/). Currently implemented: `addf`, `subf`, `mulf`, `divf`, `addi`, `subi`, `muli`, `divui`, `remui`, `constant`, `maxf`, `maxnumf`, `extf`, `truncf`, `index_cast`, `sitofp`, `cmpi`, `select`.
+The spec references the [full Arith dialect](https://mlir.llvm.org/docs/Dialects/ArithOps/).
+
+Which arith ops have a handler is no longer listed here. It is generated per op in [`docs/supported_ops.md`](supported_ops.md), read from the registry itself and held current by `tests/test_kernelentry.py` — an inventory copied into prose is what let rows 13–19 below sit at ❌ for months after they were implemented.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 13 | `arith.cmpf` | ❌ | float compare — only `arith.cmpi` (int compare) exists |
-| 14 | `arith.negf` | ❌ | |
-| 15 | `arith.absf` | ❌ | |
-| 16 | `arith.minf` | ❌ | only `maxf` / `maxnumf` exist |
-| 17 | `arith.minnumf` | ❌ | |
-| 18 | `arith.fptosi`, `arith.fptoui`, `arith.uitofp` | 🟡 | only `sitofp` exists |
-| 19 | `arith.divsi`, `arith.remsi`, `arith.andi`, `arith.ori`, `arith.xori`, `arith.ceildivsi`, `arith.floordivsi` | ❌ | only unsigned variants `divui`/`remui` exist |
+| 13 | `arith.cmpf` | ✅ | `ktir_cpu/dialects/arith_ops.py:170`, priced `COMPUTE_FLOAT`; shares a parser with `arith.cmpi`. Used by `examples/ktir/reduce_multiop.mlir` to build a max fold. |
+| 14 | `arith.negf` | ✅ | Registered in `ktir_cpu/dialects/arith_ops.py`; used by `examples/ktir/ffn_swiglu.mlir`. |
+| 15 | `arith.absf` | ✅ | Registered in `ktir_cpu/dialects/arith_ops.py`. |
+| 16 | `arith.minf` | ✅ | Registered alongside `maxf` / `maxnumf` / `minimumf` / `minnumf` in `ktir_cpu/dialects/arith_ops.py`. |
+| 17 | `arith.minnumf` | ✅ | Same registration as row 16. |
+| 18 | `arith.fptosi`, `arith.fptoui`, `arith.uitofp` | ✅ | All three registered in `ktir_cpu/dialects/arith_ops.py` alongside `sitofp`. |
+| 19 | `arith.divsi`, `arith.remsi`, `arith.andi`, `arith.ori`, `arith.xori`, `arith.ceildivsi`, `arith.floordivsi` | ✅ | All registered in `ktir_cpu/dialects/arith_ops.py` alongside the unsigned variants. |
 
 ### Math dialect
 
@@ -97,12 +98,12 @@ The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialect
 
 ### Tensor dialect
 
-Currently implemented: `tensor.splat`, `tensor.extract`, `tensor.expand_shape`, `tensor.collapse_shape`.
+Which tensor ops have a handler is generated in [`docs/supported_ops.md`](supported_ops.md), for the reason given under Arith above.
 
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
-| 28 | `tensor.extract_slice` | ❌ | Spec explicitly calls this out for tensor-level slicing |
-| 29 | `tensor.insert_slice`, `tensor.collapse_shape` | 🟡 | `collapse_shape` implemented; `insert_slice` still missing |
+| 28 | `tensor.extract_slice` | ✅ | Handler at `ktir_cpu/dialects/tensor_ops.py:217`, frontend adapter at `ktir_cpu/mlir_frontend/parser.py:772`. No example under `examples/` uses it, so only unit tests cover it. |
+| 29 | `tensor.insert_slice`, `tensor.collapse_shape` | ✅ | Both implemented. `insert_slice` handler at `ktir_cpu/dialects/tensor_ops.py:258`, regex parser at `:714`, frontend adapter at `ktir_cpu/mlir_frontend/parser.py:786`. No example under `examples/` uses it; `tests/test_dialects_exec.py` and `tests/test_dialects_parse.py` cover it. |
 
 ### MemRef dialect
 
@@ -122,6 +123,7 @@ The spec explicitly mentions `memref.subview` for view-based transformations. **
 | 34 | `ktdp.load` only implements rectangular slice semantics | ✅ | Now enumerates coordinates from `access_tile_set` and applies `access_tile_order`; supports general polyhedral regions. |
 | 35 | `ktdp.store` only implements rectangular slice semantics | ✅ | Same coordinate-set enumeration as load. |
 | 36 | `module { }` is tolerated, but module-level structure is not modeled | 🟡 | The parser can find `func.func` inside a `module { ... }` wrapper, but it does not model module-level attributes, declarations, or non-function top-level constructs. |
+| 36a | `ktdp.region_terminator` has a frontend adapter and no execution handler | ❌ | The MLIR bindings' region walk emits an implicit terminator that never appears in text IR; `ktir_cpu/mlir_frontend/parser.py:238` installs an adapter for it so the walk survives, and `adapt_block` keeps it in the region's op list. The interpreter has no handler, so `_execute_op` would raise `Unknown operation` if a kernel ever reached one. None does: walking every op the frontend produces for the three inter-tile kernels it accepts — `examples/latency/rmsnorm_4core_2x2.mlir`, `examples/ktir/ffn_swiglu_4core.mlir` and `examples/sdsc/sdpa_pv_ksplit.mlir`, regions included — finds `ktdp.yield_partial` / `ktdp.yield_reduced` terminating them and no `ktdp.region_terminator` anywhere. So the asymmetry is real and the adapter unreached, but which construct makes the bindings emit an implicit terminator is not established. `docs/supported_ops.md` shows it as the one op with a frontend adapter and no handler. |
 
 ## G. Parser Limitations
 
@@ -142,16 +144,16 @@ Blocks running spec-compliant KTIR programs:
 Limits dialect coverage for real-world kernels:
 
 - **#9–12**: ❌ SCF parallel/reduce operations
-- **#13–19**: ❌/🟡 Many standard arith ops (cmpf, negf, absf, minf, signed int ops)
 - **#20–24**: ✅ All math ops now implemented (log2, log1p, tanh, sin, cos, rsqrt, absf, ceil, floor, erf, powf, fma)
-- **#28, #30–31**: ❌ `tensor.extract_slice`, entire `memref` dialect
+- **#30–31**: ❌ Entire `memref` dialect
+- **#36a**: ❌ `ktdp.region_terminator` has a frontend adapter and no execution handler — an asymmetry no kernel under `examples/` reaches, on a construct whose trigger is not established
 - **#32**: 🟡 Dynamic sizes/strides not supported
 
 ### Lower Priority
 Extensibility and completeness:
 
 - **#3, #4**: ❌/🟡 Dynamic access tile dimensions, generic `MemorySpaceAttr`
-- **#27, #29**: 🟡 Remaining linalg/tensor ops (`linalg.map`, `tensor.insert_slice`)
+- **#27**: 🟡 `linalg.map` still missing (`broadcast` and `transpose` implemented)
 - **#36, #39**: 🟡 Module-level handling, full function signatures
 
 ### Resolved
@@ -159,7 +161,9 @@ Extensibility and completeness:
 - **#6, #7, #8**: ✅ `access_tile_set`, `access_tile_order`, `base_map`
 - **#20–24**: ✅ All math ops (rsqrt, log2, log1p, tanh, sin, cos, absf, ceil, floor, erf, powf, fma)
 - **#25**: ✅ `linalg.add`
+- **#13–19**: ✅ The standard arith ops (cmpf, negf, absf, minf/minnumf, the float casts, the signed and bitwise int ops)
 - **#26**: ✅ `linalg.generic`
+- **#28, #29**: ✅ `tensor.extract_slice`, `tensor.insert_slice`
 - **#33, #34, #35**: ✅ Access tile coordinate semantics
 - **#37, #38**: ✅ Affine expression evaluation and alias support
 

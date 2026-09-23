@@ -123,6 +123,46 @@ Total:                          40,960 bytes
 
 **Open question**: the model applies `hbm_bandwidth_tb_s` uniformly across all dtypes. Whether f16 data tensors and i32 index tensors achieve the same effective HBM bandwidth on Spyre is unconfirmed — if they differ, a separate bandwidth parameter would be needed.
 
+## Per-tensor traffic attribution
+
+`dram_bytes` says how much HBM traffic a kernel moved; `traffic_by_target()` says
+*which tensor* moved it — which is what makes a claim about composition ("this
+weight tensor's traffic is negligible") checkable at all. Both read the same
+per-operation figures: `record()` folds each op's `nbytes` and `flops` into the
+per-category aggregates and, with `trace_latency=True`, also keeps them per op
+alongside the memory that op addressed.
+
+```python
+interp = KTIRInterpreter(latency_config=HardwareConfig(), trace_latency=True)
+interp.load(mlir); interp.execute_function("add_kernel", **args)
+report = interp.get_latency_report()
+
+ptr_to_arg = {p: a for a, p in interp.arg_ptrs.items() if isinstance(p, int)}
+for target, row in report.traffic_by_target().items():
+    print(ptr_to_arg.get(target, target), row["nbytes"], row["ops"])
+```
+
+For `examples/triton-ktir/vector_add_ktir.mlir` at 4096 elements, `grid = [32, 1]`:
+
+```
+x_ptr        8192  {'ktdp.load': 32}
+y_ptr        8192  {'ktdp.load': 32}
+output_ptr   8192  {'ktdp.store': 32}
+```
+
+Keys are element indices — the origin of the view an operation addressed, which is
+the same value `execute_function` binds to a pointer argument, hence the `arg_ptrs`
+lookup. Two properties matter when reading the result:
+
+- **The rows always sum to the category total.** Traffic whose origin could not be
+  resolved is kept under the key `None` rather than dropped, so a breakdown never
+  adds up to less than `dram_bytes` while looking complete.
+- **A distributed memory view appears as one key per partition**, not one per
+  tensor: `distributed_load` charges each surviving partition separately, and each
+  partition is a distinct region of memory. The report cannot fold them into
+  arguments — it does not know each argument's element extent; fold key `t` into
+  argument `a` when `ptr[a] <= t < ptr[a] + numel(a)`.
+
 ## Hardware parameters
 
 Default `HardwareConfig()` values:

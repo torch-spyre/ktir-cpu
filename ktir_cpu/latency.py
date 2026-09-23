@@ -184,12 +184,41 @@ class HardwareConfig:
 # Per-core latency counters
 # ---------------------------------------------------------------------------
 
+def _sole_partition_origin(ref: DistributedTileRef) -> Optional[int]:
+    """Origin of the one partition *ref* survived into, or ``None`` if not one.
+
+    A distributed access resolves to the partitions it actually touches. When
+    that is a single partition its origin identifies the memory; when it is
+    several there is no single origin, and naming one of them would report a
+    guess as a fact.
+    """
+    if len(ref.partitions) != 1:
+        return None
+    return ref.partitions[0].memref.base_ptr
+
+
 @dataclass
 class _TraceEntry:
-    """Single operation trace entry."""
+    """Single operation trace entry.
+
+    ``nbytes`` and ``flops`` are the same figures ``record`` folds into the
+    per-category aggregates.  Keeping them per-op as well is what lets a caller
+    attribute a kernel's HBM traffic to individual tensors instead of reading a
+    single total: a claim that "the weight tensor is negligible" is checkable
+    against ``traffic_by_target`` and not against ``dram_bytes``.
+
+    ``target`` identifies the memory the op addressed, as the **element index**
+    of the origin of the enclosing view (``MemRef.base_ptr``), or ``None`` when
+    the op touches no memory or the origin is not derivable.  It is an element
+    index rather than a byte address so it can be compared directly with the
+    pointer values ``KTIRInterpreter.execute_function`` binds to arguments.
+    """
     op_type: str
     cycles: float
     category: str
+    nbytes: int = 0
+    flops: float = 0.0
+    target: Optional[int] = None
 
 
 @dataclass
@@ -242,7 +271,8 @@ class CoreLatencyCounters:
         return self.bytes_by_category.get("memory", 0)
 
     def record(self, category: str, cycles: float, op_type: str = "",
-               flops: float = 0.0, nbytes: int = 0):
+               flops: float = 0.0, nbytes: int = 0,
+               target: Optional[int] = None):
         if category.startswith("compute_"):
             self.cycles_by_category[category] = self.cycles_by_category.get(category, 0.0) + cycles
             self.flops_by_category[category] = self.flops_by_category.get(category, 0.0) + flops
@@ -257,7 +287,10 @@ class CoreLatencyCounters:
             self.bytes_by_category[category] = self.bytes_by_category.get(category, 0) + nbytes
 
         if self.trace is not None:
-            self.trace.append(_TraceEntry(op_type=op_type, cycles=cycles, category=category))
+            self.trace.append(_TraceEntry(
+                op_type=op_type, cycles=cycles, category=category,
+                nbytes=nbytes, flops=flops, target=target,
+            ))
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +333,10 @@ class LatencyTracker:
                 trace=[] if self._trace else None
             )
         category, cycles, flops, nbytes = self._estimate(op_type, result, operands)
-        self.counters[core_id].record(category, cycles, op_type, flops=flops, nbytes=nbytes)
+        self.counters[core_id].record(
+            category, cycles, op_type, flops=flops, nbytes=nbytes,
+            target=self._target(operands) if nbytes else None,
+        )
 
     def report(self) -> "LatencyReport":
         """Build a LatencyReport from accumulated counters."""
@@ -393,6 +429,74 @@ class LatencyTracker:
         raise NotImplementedError(f"Unknown category {category}")
 
     @staticmethod
+    def _first_ref(operands: List[Any], *types: type) -> Optional[Any]:
+        """The first operand that is one of *types*, or ``None``.
+
+        The walk is shared because the two questions asked over it are not: what
+        tensor an op addressed and what memory space it landed in are answered by
+        different bodies, but by the same operand.  Two hand-written copies of the
+        ladder had already drifted — ``_target`` answers for a bare
+        ``DistributedTileRef`` operand and ``_memory_space`` does not — and the
+        remaining difference is now a visible argument list rather than a
+        discrepancy between two ladders nobody reads side by side.
+
+        The five ref types are unrelated classes, so the order of *types* selects
+        nothing; it is each caller's own dispatch that depends on order.
+        """
+        for v in operands:
+            if isinstance(v, types):
+                return v
+        return None
+
+    @staticmethod
+    def _target(operands: List[Any]) -> Optional[int]:
+        """Element index of the origin of the view this op addressed.
+
+        Mirrors the operand walk in :meth:`_memory_space`, but answers *which
+        tensor* rather than *which memory space*.  Always the enclosing
+        ``MemRef.base_ptr`` (an element index), never ``TileRef.base_ptr``
+        (a byte address), so the value is directly comparable with the pointer
+        an argument was bound to.
+
+        A ``DistributedTileRef`` carries the partitions *this access* survived
+        into, not every partition of the view, so its origin is that partition's
+        and not the logical tensor's: a tensor sharded two ways yields two
+        distinct targets. Folding those back into one row per tensor is the
+        caller's job, and needs each argument's element extent.
+
+        An access surviving into more than one partition has no single origin, so
+        it returns ``None`` and its bytes are reported unattributed. Charging
+        them to the lowest origin would read as a fact about that partition; no
+        kernel available here exercises the case, which is the other reason not
+        to encode a guess about it.
+
+        Returns ``None`` when no origin is derivable.  Callers must surface an
+        unattributed bucket rather than dropping it: silently omitting bytes
+        from an attribution table makes the remaining rows add up to something
+        that looks complete and is not.
+        """
+        v = LatencyTracker._first_ref(
+            operands, MemRef, TileRef, DistributedTileRef, AccessTile,
+            IndirectAccessTile)
+        if isinstance(v, MemRef):
+            return v.base_ptr
+        if isinstance(v, TileRef):
+            return v.memref.base_ptr
+        if isinstance(v, DistributedTileRef):
+            return _sole_partition_origin(v)
+        if isinstance(v, AccessTile):
+            parent = v.parent_ref
+            if isinstance(parent, DistributedTileRef):
+                return _sole_partition_origin(parent)
+            return parent.memref.base_ptr
+        if isinstance(v, IndirectAccessTile):
+            # An indirect load charges the gathered data and the index lookups
+            # as one figure (see _data_size), so this row carries both.  The
+            # parent is the larger of the two by construction.
+            return v.parent_ref.base_ptr
+        return None
+
+    @staticmethod
     def _memory_space(operands: List[Any]) -> str:
         """Return the memory space of the memory op's TileRef target.
 
@@ -403,22 +507,28 @@ class LatencyTracker:
         Returns "HBM" when no TileRef is found (e.g. tt.load which always
         reads from HBM via pointer arithmetic).
         """
-        for v in operands:
-            if isinstance(v, MemRef):
-                return v.memory_space
-            if isinstance(v, TileRef):
-                return v.memref.memory_space
-            if isinstance(v, AccessTile):
-                if isinstance(v.parent_ref, DistributedTileRef):
-                    if any(p.memref.memory_space == "HBM"
-                           for p in v.parent_ref.partitions):
-                        return "HBM"
-                    return v.parent_ref.partitions[0].memref.memory_space
-                return v.parent_ref.memref.memory_space
-            if isinstance(v, IndirectAccessTile):
-                all_lx = (v.parent_ref.memory_space == "LX" and
-                          all(iv.memory_space == "LX" for iv in v.index_views))
-                return "LX" if all_lx else "HBM"
+        # No DistributedTileRef in the list, and that is the pre-existing
+        # asymmetry with _target rather than a new decision: a bare one reaches
+        # here only through an op whose operand is the whole distributed view,
+        # which nothing under examples/ emits, and "HBM" is the safe default for
+        # a space this cannot resolve.  Adding it would change a reported figure.
+        v = LatencyTracker._first_ref(
+            operands, MemRef, TileRef, AccessTile, IndirectAccessTile)
+        if isinstance(v, MemRef):
+            return v.memory_space
+        if isinstance(v, TileRef):
+            return v.memref.memory_space
+        if isinstance(v, AccessTile):
+            if isinstance(v.parent_ref, DistributedTileRef):
+                if any(p.memref.memory_space == "HBM"
+                       for p in v.parent_ref.partitions):
+                    return "HBM"
+                return v.parent_ref.partitions[0].memref.memory_space
+            return v.parent_ref.memref.memory_space
+        if isinstance(v, IndirectAccessTile):
+            all_lx = (v.parent_ref.memory_space == "LX" and
+                      all(iv.memory_space == "LX" for iv in v.index_views))
+            return "LX" if all_lx else "HBM"
         return "HBM"
 
     @staticmethod
@@ -621,6 +731,56 @@ class LatencyReport:
                 "total_cycles": self._effective_cycles(c),
             })
         return summaries
+
+    def traffic_by_target(self, category: str = "memory") -> Dict[Any, Dict[str, Any]]:
+        """Chip-wide bytes of one transport, attributed per tensor.
+
+        ``dram_bytes`` answers *how much* traffic a kernel moved;  this answers
+        *which tensor moved it*.  The distinction is what makes a claim like
+        "the weight tensor's traffic is negligible" checkable — against a
+        breakdown, not against a total.
+
+        Keys are ``_TraceEntry.target`` (the element index a view starts at, so
+        comparable with the pointer an argument was bound to).  Bytes whose
+        origin was not derivable are kept under the key ``None`` instead of
+        being dropped, so the rows always sum to the category total.
+
+        A key is the origin of the view the op addressed, which for a
+        distributed memory view is **one partition**, not the whole tensor:
+        ``distributed_load`` charges each surviving partition separately, so a
+        tensor sharded two ways appears as two keys at its two partition
+        origins.  That is the accurate answer to "which memory moved" and not
+        the answer to "which argument moved"; folding partitions back into
+        arguments needs each argument's element extent, which this class does
+        not know.  Callers that want per-argument rows should fold a key ``t``
+        into argument ``a`` when ``ptr[a] <= t < ptr[a] + numel(a)``.
+
+        Requires the tracker to have been created with ``trace_latency=True``:
+        the per-op figures are only retained then.  Raises otherwise rather
+        than returning an empty mapping, which would read as "no traffic".
+        The two ways of having no trace are reported separately, because
+        "nothing ran" and "tracing was off" call for different fixes and one
+        condition covering both names the wrong one half the time.
+        """
+        if not self.counters:
+            raise RuntimeError(
+                "traffic_by_target has nothing to attribute: this report "
+                "covers no core, so the kernel has not been run through it."
+            )
+        if all(c.trace is None for c in self.counters.values()):
+            raise RuntimeError(
+                "traffic_by_target needs the per-op trace: construct the "
+                "interpreter with trace_latency=True."
+            )
+        out: Dict[Any, Dict[str, Any]] = {}
+        for counters in self.counters.values():
+            for entry in counters.trace or ():
+                if entry.category != category or not entry.nbytes:
+                    continue
+                row = out.setdefault(entry.target, {"nbytes": 0, "ops": {}})
+                row["nbytes"] += entry.nbytes
+                row["ops"][entry.op_type] = row["ops"].get(entry.op_type, 0) + 1
+        return out
 
     # ------------------------------------------------------------------
     # Roofline — unified formulation
