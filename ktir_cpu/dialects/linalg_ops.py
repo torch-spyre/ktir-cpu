@@ -389,13 +389,41 @@ def _infer_iter_shape(indexing_maps, tensor_shapes):
     return tuple(extents)
 
 
+def _is_bare_dim_projection(imap):
+    """True if every result expr of ``imap`` is a bare dim-ref, no composite affine expr.
+
+    Shared by ``_gather_input`` and ``_scatter_output`` so both the input and
+    output sides of ``linalg.generic`` recognize the fast-path map shape
+    identically.
+    """
+    exprs = getattr(imap, 'exprs', None)
+    return exprs is not None and all(e[0] == 'dim' for e in exprs)
+
+
+def _eval_map_bounded(imap, dims, shape, op_desc):
+    """Evaluate ``imap`` at ``dims``, bounds-checked against ``shape``.
+
+    Shared by ``_gather_input``'s and ``_scatter_output``'s general
+    (composite affine map) paths, so a fix to the eval/bounds-check logic
+    lands once for both directions instead of being hand-applied twice. On
+    an out-of-range result, raises a ``ValueError`` naming the map and the
+    offending dims instead of letting a raw NumPy ``IndexError`` surface.
+    """
+    out_idx = imap.eval(list(dims))
+    if len(out_idx) != len(shape) or any(i < 0 or i >= s for i, s in zip(out_idx, shape)):
+        raise ValueError(
+            f"{op_desc}: indexing map {imap.source!r} mapped dims {list(dims)} "
+            f"to out-of-range index {out_idx} for shape {shape}"
+        )
+    return out_idx
+
+
 def _gather_input(data, imap, target_shape):
     """Gather a tensor into target_shape using its indexing map."""
     n_target = len(target_shape)
-    dims = getattr(imap, 'exprs', None)
     # Fast path: dim-projection map (all exprs are bare ('dim', N) nodes).
-    if dims is not None and all(e[0] == 'dim' for e in dims):
-        plain_dims = [e[1] for e in dims]
+    if _is_bare_dim_projection(imap):
+        plain_dims = [e[1] for e in imap.exprs]
         sorted_dims = sorted(plain_dims)
         if plain_dims != sorted_dims:
             perm = [plain_dims.index(d) for d in sorted_dims]
@@ -407,8 +435,70 @@ def _gather_input(data, imap, target_shape):
     # General path: evaluate the affine map for every index.
     gathered = np.empty(target_shape, dtype=data.dtype)
     for idx in np.ndindex(*target_shape):
-        gathered[idx] = data[imap.eval(list(idx))]
+        in_idx = _eval_map_bounded(imap, idx, data.shape, "linalg.generic (gather)")
+        gathered[idx] = data[in_idx]
     return gathered
+
+
+def _scatter_output(
+    reduced_tile, out_map, out_shape, outs_val, reduction_dims,
+    combiner_bb0, combiner_ops, context, env,
+):
+    """Combine ``reduced_tile`` into ``outs_val`` per ``out_map`` — the output-side
+    counterpart to ``_gather_input``, used by ``linalg__generic``'s reduction path.
+
+    ``reduced_tile`` already has its reduction dims folded and squeezed, so its
+    shape is the iteration shape restricted to the non-reduction dims, in
+    increasing dim-index order.
+
+    Fast path (bare dim-projection): identical to the previous behaviour — one
+    vectorised ``_run_combiner`` call relying on ``reduced_tile`` already
+    lining up 1:1 with ``outs_val``. This must stay a no-op change for every
+    map shape the existing tests exercise.
+
+    General path (composite output map, e.g. a stick-split ``d2 * 32 + d3``):
+    the map is many-to-one, so it can't be expressed as a broadcast. Evaluate
+    it per-index and accumulate via the combiner, mirroring
+    ``_gather_input``'s general path but inverted (scatter+accumulate instead
+    of a plain read); both share ``_eval_map_bounded`` for the affine-eval
+    step so a fix there applies to both directions at once.
+
+    A many-to-one map means multiple ``reduced_tile`` indices land in the
+    same ``accumulator[out_idx]`` bucket, combined in ``np.ndindex`` order
+    over the non-reduction dims — an order nothing here chooses on purpose.
+    Correctness on collision therefore requires the combiner to be
+    commutative as well as associative (the latter already assumed by
+    ``_tree_fold``'s pairwise reduction above). This is not checked at
+    runtime; it is a documented precondition on the combiner, same as the
+    associativity assumption it sits alongside.
+    """
+    if _is_bare_dim_projection(out_map):
+        return _run_combiner(combiner_bb0, combiner_ops, reduced_tile, outs_val, context, env)
+
+    n_dims = out_map.n_dims
+    n_out_dims = n_dims - len(reduction_dims)
+    if reduced_tile.data.ndim != n_out_dims:
+        raise ValueError(
+            f"linalg.generic: reduced_tile has {reduced_tile.data.ndim} dims, "
+            f"expected {n_out_dims} ({n_dims} map dims minus "
+            f"{len(reduction_dims)} reduction dims). This mismatch means the "
+            "caller did not squeeze reduction dims in increasing dim-index "
+            "order before calling _scatter_output, which is the order this "
+            "function's full_dims reconstruction below assumes."
+        )
+    accumulator = outs_val.data.copy()
+    for idx in np.ndindex(*reduced_tile.data.shape):
+        full_dims = [0] * n_dims
+        it = iter(idx)
+        for d in range(n_dims):
+            if d not in reduction_dims:
+                full_dims[d] = next(it)
+        out_idx = _eval_map_bounded(out_map, full_dims, out_shape, "linalg.generic (scatter)")
+        lhs = Tile(np.asarray(reduced_tile.data[idx]), reduced_tile.dtype, ())
+        rhs = Tile(np.asarray(accumulator[out_idx]), outs_val.dtype, ())
+        combined = _run_combiner(combiner_bb0, combiner_ops, lhs, rhs, context, env)
+        accumulator[out_idx] = combined.data if isinstance(combined, Tile) else combined
+    return Tile(accumulator, outs_val.dtype, out_shape)
 
 
 def _split_combiner(body_ops, outs_bb0_name):
@@ -572,14 +662,19 @@ def linalg__generic(op, context, env):
             Tile(folded, outs_val.dtype, folded.shape),
             d, combiner_bb0, combiner_ops, context, env,
         )
-    # Squeeze reduction dims.
+    # Squeeze reduction dims. _scatter_output's general path reconstructs
+    # full_dims from reduced_tile's shape assuming exactly this order
+    # (reduction dims removed, remaining dims left in increasing dim-index
+    # order); it asserts on the resulting ndim, so a reordering here that
+    # breaks that assumption fails loudly instead of scattering silently.
     for d in sorted(reduction_dims, reverse=True):
         folded = np.squeeze(folded, axis=d)
 
     # Combine with the real outs initial value.
     reduced_tile = Tile(folded.astype(out_np_dtype), outs_val.dtype, folded.shape)
-    combined = _run_combiner(
-        combiner_bb0, combiner_ops, reduced_tile, outs_val, context, env,
+    combined = _scatter_output(
+        reduced_tile, indexing_maps[n_ins], out_shape, outs_val, reduction_dims,
+        combiner_bb0, combiner_ops, context, env,
     )
     final = combined.data if isinstance(combined, Tile) else np.asarray(combined)
 

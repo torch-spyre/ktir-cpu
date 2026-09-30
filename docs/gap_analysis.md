@@ -92,7 +92,7 @@ The spec references the [full Linalg dialect](https://mlir.llvm.org/docs/Dialect
 | # | Operation | Status | Notes |
 |---|-----------|--------|-------|
 | 25 | `linalg.add` | ✅ | Implemented in `ktir_cpu/dialects/linalg_ops.py` as elementwise `Tile + Tile`. Used by `ktdp.inter_tile_reduce`'s combiner region in the rewritten `ring_reduce.mlir` example. |
-| 26 | `linalg.generic` | ✅ | Full `bb0` block handling in `ktir_cpu/dialects/linalg_ops.py` |
+| 26 | `linalg.generic` | 🟡 | Full `bb0` block handling. Reduction now scatters into composite output maps (`_scatter_output`), see [torch-spyre/ktir-cpu#216](https://github.com/torch-spyre/ktir-cpu/issues/216). Open: a dim referenced only inside a composite output expr can't have its extent inferred. |
 | 27 | `linalg.map`, `linalg.broadcast`, `linalg.transpose` | 🟡 | `broadcast` and `transpose` implemented; `map` still missing |
 
 ### Tensor dialect
@@ -151,7 +151,7 @@ Limits dialect coverage for real-world kernels:
 Extensibility and completeness:
 
 - **#3, #4**: ❌/🟡 Dynamic access tile dimensions, generic `MemorySpaceAttr`
-- **#27, #29**: 🟡 Remaining linalg/tensor ops (`linalg.map`, `tensor.insert_slice`)
+- **#26, #27, #29**: 🟡 Remaining linalg/tensor gaps (composite-output-map extent inference, `linalg.map`, `tensor.insert_slice`)
 - **#36, #39**: 🟡 Module-level handling, full function signatures
 
 ### Resolved
@@ -159,7 +159,7 @@ Extensibility and completeness:
 - **#6, #7, #8**: ✅ `access_tile_set`, `access_tile_order`, `base_map`
 - **#20–24**: ✅ All math ops (rsqrt, log2, log1p, tanh, sin, cos, absf, ceil, floor, erf, powf, fma)
 - **#25**: ✅ `linalg.add`
-- **#26**: ✅ `linalg.generic`
+- **#26**: 🟡 `linalg.generic` composite output-map scatter now handled; narrow extent-inference case remains
 - **#33, #34, #35**: ✅ Access tile coordinate semantics
 - **#37, #38**: ✅ Affine expression evaluation and alias support
 
