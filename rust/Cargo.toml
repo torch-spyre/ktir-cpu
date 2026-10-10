@@ -1,0 +1,12 @@
+# KTIR Rust workspace.
+#   ktir-core      — IR types, parser, affine, dtypes, f16 codec. Dependency-free.
+#   ktir-emulator       — the execution layer (interpreter + Metal/NAX backend).
+#   ktir-optimizer — IR→IR passes (fusion, trace packing). Depends only on core.
+[workspace]
+resolver = "2"
+members = ["crates/ktir-core", "crates/ktir-emulator", "crates/ktir-optimizer"]
+
+# Keep symbol info in the optimized bench build so cargo flamegraph / instruments
+# attribute samples to functions instead of raw addresses.
+[profile.bench]
+debug = true

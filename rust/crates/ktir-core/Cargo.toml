@@ -1,0 +1,12 @@
+[package]
+name = "ktir-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"  # f16 NEON SIMD intrinsics (codec.rs) stabilized in 1.94; verified MSRV
+description = "KTIR IR types, parser, affine, dtypes, and f16 codec (RFC 0682). Dependency-free."
+license = "Apache-2.0"
+repository = "https://github.com/torch-spyre/ktir-cpu"
+
+[lib]
+name = "ktir_core"
+path = "src/lib.rs"
