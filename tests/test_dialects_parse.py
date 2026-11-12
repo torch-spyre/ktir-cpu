@@ -1437,6 +1437,95 @@ class TestMathParsers(ParseTestMixin):
         self.assert_operand_names(op, "%a", "%b", "%c")
 
 
+# ---------------------------------------------------------------------------
+# spyreop — Spyre hardware intrinsics reachable from Triton's
+# tl.spyre_op/tts.spyre_op (see torch-spyre/triton's spyreop-frontend-api.md).
+# Every op here is scalar-typed: tts.spyre_op's own tensor operands are
+# unwrapped by LowerComputeOps into a linalg.generic body of scalar
+# operands before any spyreop.* op is built, so f16/f32/i32/i64 (never a
+# tensor type) is the only shape this repo ever has to parse.
+# ---------------------------------------------------------------------------
+
+class TestSpyreOpParsers(ParseTestMixin):
+    """Most spyreop ops parse via the fallback (no custom parser needed) --
+    same reason math.sqrt/math.exp need none: their assembly format is
+    `` %operand(s)[ : type]`` and the fallback's SSA-name scan finds every
+    %-operand in call order regardless of interleaved bare keywords
+    (``squares``/``scale``/``weight``/``bias``, ``base``/``stride``).
+    softplus is the one exception (see test_softplus, below).
+    """
+
+    @pytest.mark.parametrize("op_name", ["spyreop.gelu", "spyreop.silu", "spyreop.reciprocal"])
+    def test_unary_op(self, op_name):
+        op = self._parse(f"%y = {op_name} %x : f16", args={"%x": "f16"})
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+        self.assert_result_type(op, "f16")
+
+    @pytest.mark.parametrize("op_name,itype", [
+        ("spyreop.addi32toi32", "i32"),
+        ("spyreop.muli32toi32", "i32"),
+        ("spyreop.addi64toi64", "i64"),
+    ])
+    def test_int_binary_op(self, op_name, itype):
+        op = self._parse(
+            f"%y = {op_name} %a, %b",
+            args={"%a": itype, "%b": itype},
+        )
+        self.assert_op_type(op, op_name)
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%a", "%b")
+
+    def test_idx32toaddr(self):
+        op = self._parse(
+            "%y = spyreop.idx32toaddr %i base %b stride %s",
+            args={"%i": "i32", "%b": "i32", "%s": "i32"},
+        )
+        self.assert_op_type(op, "spyreop.idx32toaddr")
+        self.assert_num_operands(op, 3)
+        self.assert_operand_names(op, "%i", "%b", "%s")
+
+    def test_softplus(self):
+        op = self._parse(
+            "%y = spyreop.softplus %x beta 2.000000e-01 threshold 1.000000e-01 : f16",
+            args={"%x": "f16"},
+        )
+        self.assert_op_type(op, "spyreop.softplus")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+        self.assert_attribute(op, "beta", 0.2, transform=lambda v: round(v, 2))
+        self.assert_attribute(op, "threshold", 0.1, transform=lambda v: round(v, 2))
+
+    def test_layernormscale(self):
+        op = self._parse(
+            "%y = spyreop.layernormscale %mean squares %msq : f16",
+            args={"%mean": "f16", "%msq": "f16"},
+        )
+        self.assert_op_type(op, "spyreop.layernormscale")
+        self.assert_num_operands(op, 2)
+        self.assert_operand_names(op, "%mean", "%msq")
+
+    def test_layernormnorm(self):
+        op = self._parse(
+            "%y = spyreop.layernormnorm %x squares %mean scale %scale "
+            "weight %weight bias %bias : f16",
+            args={"%x": "f16", "%mean": "f16", "%scale": "f16",
+                  "%weight": "f16", "%bias": "f16"},
+        )
+        self.assert_op_type(op, "spyreop.layernormnorm")
+        self.assert_num_operands(op, 5)
+        self.assert_operand_names(op, "%x", "%mean", "%scale", "%weight", "%bias")
+
+    def test_exx2(self):
+        op = self._parse(
+            "%mean, %msq = spyreop.exx2 %x : f16",
+            args={"%x": "f16"},
+        )
+        self.assert_op_type(op, "spyreop.exx2")
+        self.assert_num_operands(op, 1)
+        self.assert_operand_names(op, "%x")
+
 
 # ---------------------------------------------------------------------------
 # parser infrastructure (tokenizer, region detection, line joining)

@@ -559,22 +559,36 @@ def linalg__generic(op, context, env):
     full arrays.  When iterator_types includes reduction dims, the body
     is split into compute + combiner; compute runs on the full iteration
     shape and the result is tree-folded along reduction dims.
+
+    Two reduction-body shapes are supported:
+
+    - the classic accumulator combiner (single outs, body reads and
+      updates its outs block arg) — unchanged from before, still the only
+      shape with more than one outs operand's worth of fold logic;
+    - a "whole-body" reduction whose body never references ANY outs block
+      arg at all — e.g. ``spyreop.exx2``'s ``(mean, squares)`` pair, which
+      is applied once per un-reduced row, not folded pairwise over one
+      (see :func:`_whole_body_reduce`). This shape is what makes N>1 outs
+      meaningful here; the classic combiner path stays single-output,
+      since nothing in scope needs an N-accumulator pairwise fold.
     """
     n_ins = op.attributes.get("n_ins", 0)
     indexing_maps = op.attributes.get("indexing_maps", [])
     iterator_types = op.attributes.get("iterator_types")
 
     ins_vals = [context.get_value(op.operands[i]) for i in range(n_ins)]
-    outs_val = context.get_value(op.operands[n_ins])
+    n_outs = len(op.operands) - n_ins
+    outs_vals = [context.get_value(op.operands[n_ins + i]) for i in range(n_outs)]
 
     bb0_names, body_ops = _resolve_region_body(op)
     if not bb0_names:
         raise ValueError("linalg.generic: cannot determine bb0 argument names")
 
-    if not isinstance(outs_val, Tile):
-        raise TypeError(f"linalg.generic: outs must be a Tile, got {type(outs_val)}")
-    out_shape = outs_val.shape
-    out_np_dtype = outs_val.data.dtype
+    for outs_val in outs_vals:
+        if not isinstance(outs_val, Tile):
+            raise TypeError(f"linalg.generic: outs must be a Tile, got {type(outs_val)}")
+    out_shape = outs_vals[0].shape
+    out_np_dtype = outs_vals[0].data.dtype
 
     # Determine reduction dims (if any).
     reduction_dims = []
@@ -582,7 +596,7 @@ def linalg__generic(op, context, env):
         reduction_dims = [i for i, t in enumerate(iterator_types) if t == "reduction"]
 
     if not reduction_dims:
-        # --- All-parallel path (original behaviour) ---
+        # --- All-parallel path ---
         iter_shape = out_shape
     else:
         # --- Reduction path: compute full iteration shape ---
@@ -595,6 +609,7 @@ def linalg__generic(op, context, env):
 
     context.push_scope()
     context.set_value("__linalg_shape__", iter_shape)
+    context.set_value("__linalg_reduction_dims__", tuple(reduction_dims))
 
     # Gather each input into the iteration space.
     for i, (val, imap) in enumerate(zip(ins_vals, indexing_maps[:n_ins])):
@@ -607,21 +622,53 @@ def linalg__generic(op, context, env):
             context.set_value(bb0_names[i], arg_val)
 
     if not reduction_dims:
-        # All-parallel: bind outs and run full body.
-        if n_ins < len(bb0_names):
-            context.set_value(bb0_names[n_ins], Tile(
-                outs_val.data.copy(), outs_val.dtype, out_shape
-            ))
+        # All-parallel: bind every outs block arg and run the full body once.
+        for j, outs_val in enumerate(outs_vals):
+            if n_ins + j < len(bb0_names):
+                context.set_value(bb0_names[n_ins + j], Tile(
+                    outs_val.data.copy(), outs_val.dtype, out_shape
+                ))
         result = env.execute_region(context, body_ops)
         context.pop_scope()
         out_data = unwrap_yield(result)
-        if isinstance(out_data, Tile):
-            data = np.broadcast_to(out_data.data, out_shape).copy().astype(out_np_dtype)
-            return Tile(data, outs_val.dtype, out_shape)
-        return Tile(np.full(out_shape, out_data, dtype=out_np_dtype), outs_val.dtype, out_shape)
+        out_datas = out_data if isinstance(out_data, tuple) else (out_data,)
+        results = []
+        for out_val, outs_val in zip(out_datas, outs_vals):
+            if isinstance(out_val, Tile):
+                data = np.broadcast_to(out_val.data, out_shape).copy().astype(out_np_dtype)
+            else:
+                data = np.full(out_shape, out_val, dtype=out_np_dtype)
+            results.append(Tile(data, outs_val.dtype, out_shape))
+        return results[0] if len(results) == 1 else tuple(results)
 
     # --- Reduction path ---
-    outs_bb0_name = bb0_names[n_ins] if n_ins < len(bb0_names) else None
+    outs_bb0_names = [
+        bb0_names[n_ins + j] if n_ins + j < len(bb0_names) else None
+        for j in range(n_outs)
+    ]
+    body_reads_an_outs = any(
+        o.op_type != "linalg.yield" and any(name in o.operands for name in outs_bb0_names if name)
+        for o in body_ops
+    )
+
+    if not body_reads_an_outs:
+        results = _whole_body_reduce(
+            body_ops, outs_vals, iter_shape, out_shape, out_np_dtype,
+            reduction_dims, indexing_maps[n_ins:n_ins + n_outs], context, env,
+        )
+        context.pop_scope()
+        return results[0] if len(results) == 1 else tuple(results)
+
+    if n_outs != 1:
+        raise NotImplementedError(
+            "linalg.generic: a reduction body that reads its own outs "
+            "accumulator is only supported with exactly one outs operand "
+            f"(got {n_outs}); spyreop.exx2's N-outs shape is the one case "
+            "whose body never reads its accumulators, handled above"
+        )
+
+    outs_val = outs_vals[0]
+    outs_bb0_name = outs_bb0_names[0]
     compute_ops, _, combiner_info, raw_operand = _split_combiner(body_ops, outs_bb0_name)
 
     if combiner_info is None:
@@ -679,6 +726,50 @@ def linalg__generic(op, context, env):
     final = combined.data if isinstance(combined, Tile) else np.asarray(combined)
 
     return Tile(final.astype(out_np_dtype), outs_val.dtype, out_shape)
+
+
+def _whole_body_reduce(
+    body_ops, outs_vals, iter_shape, out_shape, out_np_dtype,
+    reduction_dims, out_maps, context, env,
+):
+    """Reduce a body that never reads any of its own outs accumulators.
+
+    ``spyreop.exx2``'s shape: a single op (its only non-yield body op) is
+    applied once to the gathered, un-reduced input — not as a per-step
+    pairwise combiner, but as a primitive that already produces the
+    reduced-axis result directly (it reads ``__linalg_reduction_dims__``
+    from context itself to know which axis, the same way ``linalg.index``
+    reads ``__linalg_shape__``). So there is nothing left to fold or
+    squeeze here: running the body ONCE over the full ``iter_shape`` IS
+    the reduction, and each yielded result already has the reduction
+    dims gone from its own shape. The only remaining work is scattering
+    each result onto its own ``outs`` per its own indexing map (support
+    for a composite, many-to-one output map is deliberately not included
+    here — exx2 only emits a bare dim-projection map, and a body that
+    cannot read its accumulator has no accumulation semantics for the
+    general path's combiner-based scatter to use anyway).
+    """
+    result = env.execute_region(context, body_ops)
+    out_data = unwrap_yield(result)
+    out_datas = out_data if isinstance(out_data, tuple) else (out_data,)
+    if len(out_datas) != len(outs_vals):
+        raise ValueError(
+            f"linalg.generic: reduction yields {len(out_datas)} value(s) "
+            f"but has {len(outs_vals)} outs operand(s)"
+        )
+
+    results = []
+    for out_val, outs_val, out_map in zip(out_datas, outs_vals, out_maps):
+        if not isinstance(out_val, Tile):
+            out_val = Tile(np.full((), out_val, dtype=out_np_dtype), outs_val.dtype, ())
+        if not _is_bare_dim_projection(out_map):
+            raise NotImplementedError(
+                "linalg.generic: a reduction body that never reads its "
+                "accumulators only supports a bare dim-projection output "
+                f"indexing map, got {out_map.source!r}"
+            )
+        results.append(Tile(out_val.data.astype(out_np_dtype), outs_val.dtype, out_val.shape))
+    return results
 
 
 @register("linalg.index")
