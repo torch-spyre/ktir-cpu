@@ -236,7 +236,26 @@ MLIRTypeAdapter.install(
     "linalg.batch_matmul",
     # emitted by the bindings walk but not present in text IR
     "ktdp.region_terminator",
+    # spyreop — Spyre hardware intrinsics Triton's tl.spyre_op/tts.spyre_op
+    # lower directly into a linalg.generic body (see spyreop_ops.py). 
+    "spyreop.gelu",
+    "spyreop.silu",
+    "spyreop.reciprocal",
+    "spyreop.addi32toi32",
+    "spyreop.addi64toi64",
+    "spyreop.muli32toi32",
+    "spyreop.idx32toaddr",
+    "spyreop.layernormscale",
+    "spyreop.layernormnorm",
+    "spyreop.exx2",
 )(_no_attrs)
+
+
+@MLIRTypeAdapter.install("spyreop.softplus")
+def _adapt_spyreop_softplus(mlir_op, attributes, result_type, operands):
+    """Extract beta/threshold — the one spyreop op with its own attributes."""
+    attributes["beta"] = FloatAttr(mlir_op.attributes["beta"]).value
+    attributes["threshold"] = FloatAttr(mlir_op.attributes["threshold"]).value
 
 
 @MLIRTypeAdapter.install("scf.for")

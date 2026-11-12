@@ -25,6 +25,7 @@ from . import (  # noqa: F401 — imported for registration side effects
     linalg_ops,
     math_ops,
     scf_ops,
+    spyreop_ops,
     tensor_ops,
 )
 from .registry import ExecutionEnv, ParseContext, dispatch, dispatch_parser, make_parse_context

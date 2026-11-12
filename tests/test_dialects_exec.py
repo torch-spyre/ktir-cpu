@@ -858,6 +858,210 @@ class TestMath:
         ctx = _ctx_with(**{"%a": np.float16(3.0), "%b": np.float16(4.0), "%c": np.float16(1.0)})
         assert float(_call("math.fma", ctx, _make_env(), operands=["%a", "%b", "%c"])) == 13.0
 
+
+# ---------------------------------------------------------------------------
+# spyreop dialect exec — Spyre hardware intrinsics reachable from Triton's
+# tl.spyre_op/tts.spyre_op (see torch-spyre/triton's spyreop-frontend-api.md).
+# ---------------------------------------------------------------------------
+
+class TestSpyreOp:
+    def test_gelu_tile(self):
+        x = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float32)
+        ctx = _ctx_with(**{"%x": _tile(x)})
+        result = _call("spyreop.gelu", ctx, _make_env(), operands=["%x"])
+        assert isinstance(result, Tile)
+        inner = np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)
+        expected = 0.5 * x * (1.0 + np.tanh(inner))
+        assert np.allclose(result.data, expected.astype(np.float16), rtol=1e-2, atol=1e-3)
+
+    def test_gelu_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(1.0)})
+        result = _call("spyreop.gelu", ctx, _make_env(), operands=["%x"])
+        # gelu(1.0) ~= 0.8413
+        assert abs(float(result) - 0.8413) < 0.01
+
+    def test_silu_tile(self):
+        x = np.array([-1.0, 0.0, 1.0, 2.0], dtype=np.float32)
+        ctx = _ctx_with(**{"%x": _tile(x)})
+        result = _call("spyreop.silu", ctx, _make_env(), operands=["%x"])
+        expected = x * (1.0 / (1.0 + np.exp(-x)))
+        assert np.allclose(result.data, expected.astype(np.float16), rtol=1e-2, atol=1e-3)
+
+    def test_reciprocal_tile(self):
+        ctx = _ctx_with(**{"%x": _tile([1.0, 2.0, 4.0])})
+        result = _call("spyreop.reciprocal", ctx, _make_env(), operands=["%x"])
+        assert np.allclose(result.data, np.array([1.0, 0.5, 0.25], dtype=np.float16), rtol=1e-2)
+
+    def test_reciprocal_scalar(self):
+        ctx = _ctx_with(**{"%x": np.float16(4.0)})
+        assert abs(float(_call("spyreop.reciprocal", ctx, _make_env(), operands=["%x"])) - 0.25) < 1e-3
+
+    def test_softplus_tile_below_threshold(self):
+        x = np.array([0.0, 1.0, -1.0], dtype=np.float32)
+        beta, threshold = 1.0, 20.0
+        ctx = _ctx_with(**{"%x": _tile(x)})
+        result = _call(
+            "spyreop.softplus", ctx, _make_env(), operands=["%x"],
+            attributes={"beta": beta, "threshold": threshold},
+        )
+        expected = (1.0 / beta) * np.log1p(np.exp(beta * x))
+        assert np.allclose(result.data, expected.astype(np.float16), rtol=1e-2, atol=1e-3)
+
+    def test_softplus_reverts_to_identity_above_threshold(self):
+        # beta*x > threshold: softplus must revert to x for numerical stability.
+        x = np.array([100.0], dtype=np.float32)
+        beta, threshold = 1.0, 20.0
+        ctx = _ctx_with(**{"%x": _tile(x)})
+        result = _call(
+            "spyreop.softplus", ctx, _make_env(), operands=["%x"],
+            attributes={"beta": beta, "threshold": threshold},
+        )
+        assert np.allclose(result.data, x.astype(np.float16), rtol=1e-3)
+
+    def test_addi32toi32_tile(self):
+        a = Tile(np.array([1, 2, 3], dtype=np.int32), "i32", (3,))
+        b = Tile(np.array([10, 20, 30], dtype=np.int32), "i32", (3,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("spyreop.addi32toi32", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([11, 22, 33], dtype=np.int32))
+
+    def test_addi32toi32_wraps(self):
+        a = Tile(np.array([2**31 - 1], dtype=np.int32), "i32", (1,))
+        b = Tile(np.array([1], dtype=np.int32), "i32", (1,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("spyreop.addi32toi32", ctx, _make_env(), operands=["%a", "%b"])
+        assert result.data[0] == np.int32(-2**31)
+
+    def test_addi64toi64_tile(self):
+        a = Tile(np.array([1, 2], dtype=np.int64), "i64", (2,))
+        b = Tile(np.array([10, 20], dtype=np.int64), "i64", (2,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("spyreop.addi64toi64", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([11, 22], dtype=np.int64))
+
+    def test_muli32toi32_tile(self):
+        a = Tile(np.array([2, 3, 4], dtype=np.int32), "i32", (3,))
+        b = Tile(np.array([5, 6, 7], dtype=np.int32), "i32", (3,))
+        ctx = _ctx_with(**{"%a": a, "%b": b})
+        result = _call("spyreop.muli32toi32", ctx, _make_env(), operands=["%a", "%b"])
+        assert np.array_equal(result.data, np.array([10, 18, 28], dtype=np.int32))
+
+    def test_idx32toaddr_tile(self):
+        # base + stride * index
+        index = Tile(np.array([0, 1, 2, 3], dtype=np.int32), "i32", (4,))
+        base = Tile(np.full(4, 1000, dtype=np.int32), "i32", (4,))
+        stride = Tile(np.full(4, 4, dtype=np.int32), "i32", (4,))
+        ctx = _ctx_with(**{"%idx": index, "%base": base, "%stride": stride})
+        result = _call(
+            "spyreop.idx32toaddr", ctx, _make_env(),
+            operands=["%idx", "%base", "%stride"],
+        )
+        assert np.array_equal(result.data, np.array([1000, 1004, 1008, 1012], dtype=np.int32))
+
+    def test_idx32toaddr_scalar(self):
+        ctx = _ctx_with(**{"%idx": 2, "%base": 100, "%stride": 4})
+        result = _call(
+            "spyreop.idx32toaddr", ctx, _make_env(),
+            operands=["%idx", "%base", "%stride"],
+        )
+        assert int(result) == 108
+
+    def test_layernormscale(self):
+        # 1/sqrt(E[x^2] - E[x]^2 + eps)
+        mean = _tile([1.0, 2.0])
+        msq = _tile([2.0, 5.0])
+        ctx = _ctx_with(**{"%mean": mean, "%msq": msq})
+        result = _call(
+            "spyreop.layernormscale", ctx, _make_env(), operands=["%mean", "%msq"],
+        )
+        var = np.array([2.0, 5.0]) - np.array([1.0, 2.0]) ** 2
+        expected = 1.0 / np.sqrt(var + 1e-5)
+        assert np.allclose(result.data, expected.astype(np.float16), rtol=1e-2)
+
+    def test_layernormnorm(self):
+        # (x - mean) * scale * weight + bias
+        x = _tile([3.0])
+        mean = _tile([1.0])
+        scale = _tile([2.0])
+        weight = _tile([0.5])
+        bias = _tile([1.0])
+        ctx = _ctx_with(**{
+            "%x": x, "%mean": mean, "%scale": scale, "%weight": weight, "%bias": bias,
+        })
+        result = _call(
+            "spyreop.layernormnorm", ctx, _make_env(),
+            operands=["%x", "%mean", "%scale", "%weight", "%bias"],
+        )
+        expected = (3.0 - 1.0) * 2.0 * 0.5 + 1.0  # = 3.0
+        assert abs(float(result.data[0]) - expected) < 1e-2
+
+    def test_exx2_via_linalg_generic(self):
+        # LayerNorm stage 0: (mean, mean-of-squares) over axis=1 of a
+        # tts.spyre_op-shaped linalg.generic -- see
+        # spyreop-frontend-api.md's "Lowering tts.spyre_op to spyreop.*"
+        # worked example: ins(%x) outs(%mean_init, %sq_init), body calls
+        # spyreop.exx2 once over the un-reduced row, never reading either
+        # outs accumulator.
+        M, N = 4, 8
+        rng = np.random.default_rng(0)
+        x_data = rng.standard_normal((M, N)).astype(np.float32)
+        x_tile = Tile(x_data, "f16", (M, N))
+        mean_init = Tile(np.zeros((M,), dtype=np.float32), "f16", (M,))
+        sq_init = Tile(np.zeros((M,), dtype=np.float32), "f16", (M,))
+
+        ctx = _ctx_with(**{"%x": x_tile, "%mean_init": mean_init, "%sq_init": sq_init})
+        env = _make_env()
+
+        # _make_env's default execute_region only binds a single-name
+        # op.result; spyreop.exx2 here yields a list of two names, so bind
+        # multi-result the same way the real interpreter._execute_op does.
+        def _exec_region(context, ops):
+            result = None
+            for region_op in ops:
+                handler = dispatch(region_op.op_type)
+                result = handler(region_op, context, env)
+                if region_op.result and result is not None:
+                    if isinstance(region_op.result, list) and isinstance(result, tuple):
+                        for name, val in zip(region_op.result, result):
+                            context.set_value(name, val)
+                    else:
+                        context.set_value(region_op.result, result)
+            return result
+        env.execute_region = _exec_region
+
+        region_ops = [
+            _op("spyreop.exx2", operands=["%in"], result=["%r0", "%r1"]),
+            _op("linalg.yield", operands=["%r0", "%r1"]),
+        ]
+        op = _op(
+            "linalg.generic",
+            operands=["%x", "%mean_init", "%sq_init"],
+            attributes={
+                "n_ins": 1,
+                "indexing_maps": [
+                    parse_affine_map("affine_map<(d0, d1) -> (d0, d1)>"),
+                    parse_affine_map("affine_map<(d0, d1) -> (d0)>"),
+                    parse_affine_map("affine_map<(d0, d1) -> (d0)>"),
+                ],
+                "iterator_types": ["parallel", "reduction"],
+            },
+            regions=[[
+                Operation(op_type="region.bb0_args", operands=[], attributes={"names": ["%in", "%acc0", "%acc1"]}, result=None, result_type=None),
+            ] + region_ops],
+        )
+
+        result = dispatch("linalg.generic")(op, ctx, env)
+        assert isinstance(result, tuple) and len(result) == 2
+        mean_result, msq_result = result
+        assert mean_result.shape == (M,)
+        assert msq_result.shape == (M,)
+
+        expected_mean = x_data.mean(axis=1)
+        expected_msq = (x_data * x_data).mean(axis=1)
+        assert np.allclose(mean_result.data, expected_mean.astype(np.float16), rtol=1e-2, atol=1e-2)
+        assert np.allclose(msq_result.data, expected_msq.astype(np.float16), rtol=1e-2, atol=1e-2)
+
+
 # ---------------------------------------------------------------------------
 # linalg dialect exec
 # ---------------------------------------------------------------------------

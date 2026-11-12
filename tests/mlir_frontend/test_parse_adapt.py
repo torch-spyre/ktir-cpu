@@ -18,6 +18,7 @@ from test_dialects_parse import (
     TestKtdpParsers as _TestKtdpParsers,
     TestScfParsers as _TestScfParsers,
     TestMathParsers as _TestMathParsers,
+    TestSpyreOpParsers as _TestSpyreOpParsers,
 )
 
 from ktir_cpu.mlir_frontend.parser import MLIRFrontendParser  # noqa: E402
@@ -179,3 +180,11 @@ class TestScfAdapt(MLIRFrontendParseTestMixin, _TestScfParsers):
 
 class TestMathAdapt(MLIRFrontendParseTestMixin, _TestMathParsers):
     """Math tests via MLIRFrontendParser."""
+
+
+# ---------------------------------------------------------------------------
+# SpyreOp
+# ---------------------------------------------------------------------------
+
+class TestSpyreOpAdapt(MLIRFrontendParseTestMixin, _TestSpyreOpParsers):
+    """Spyreop tests via MLIRFrontendParser."""
